@@ -1,5 +1,5 @@
 {
-  "name": "@fli/postgres-typed-sql",
+  "name": "postgres-typed-sql",
   "version": "0.1.0-beta.1",
   "description": "PostgreSQL-native typed SQL generation for TypeScript",
   "type": "module",

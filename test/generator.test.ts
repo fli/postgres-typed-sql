@@ -29,7 +29,7 @@ test('generates PostgreSQL-derived types, nullability, and cardinality', async (
   assert.match(account, /readonly displayName: string \| null/u)
   assert.match(account, /readonly status: AccountStatus/u)
   assert.match(account, /readonly role: AccountsRole/u)
-  assert.match(account, /@fli\/postgres-typed-sql\/runtime/u)
+  assert.match(account, /postgres-typed-sql\/runtime/u)
 
   const joined = await readFile(join(root, 'queries/list-accounts-with-posts.typed-sql.ts'), 'utf8')
   assert.match(joined, /readonly title: string \| null/u)

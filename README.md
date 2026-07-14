@@ -20,13 +20,13 @@ Supported extensions are `btree_gin`, `btree_gist`, `pg_trgm`, `pgcrypto`, `plpg
 ## Install
 
 ```sh
-npm install --save-dev @fli/postgres-typed-sql
+npm install --save-dev postgres-typed-sql
 ```
 
 Create `postgres-typed-sql.config.mjs`:
 
 ```js
-import { defineConfig } from '@fli/postgres-typed-sql'
+import { defineConfig } from 'postgres-typed-sql'
 
 export default defineConfig({
   schema: './db/schema.sql',
@@ -73,7 +73,7 @@ The generated statement can be used with any driver that accepts PostgreSQL quer
 const result = await client.query(findAccountByEmail.query({ email }))
 ```
 
-The optional runtime helpers under `@fli/postgres-typed-sql/runtime` enforce `one`, `optional`, and `many` result shapes.
+The optional runtime helpers under `postgres-typed-sql/runtime` enforce `one`, `optional`, and `many` result shapes.
 
 ## Directives
 
@@ -107,7 +107,7 @@ PostgreSQL major versions and extensions can change analysis results. Version `0
 ## Programmatic API
 
 ```ts
-import { generateTypedSql } from '@fli/postgres-typed-sql'
+import { generateTypedSql } from 'postgres-typed-sql'
 
 const result = await generateTypedSql({
   rootDir: process.cwd(),

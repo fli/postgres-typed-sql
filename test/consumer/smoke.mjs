@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { readFile } from 'node:fs/promises'
 
-import { generateTypedSql, postgresVersion } from '@fli/postgres-typed-sql'
+import { generateTypedSql, postgresVersion } from 'postgres-typed-sql'
 
 assert.equal(postgresVersion, '18.3')
 const result = await generateTypedSql({

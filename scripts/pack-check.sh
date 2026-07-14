@@ -24,7 +24,7 @@ if [ "$before" != "$after" ]; then
   exit 1
 fi
 
-node -e "const p=require('./node_modules/@fli/postgres-typed-sql/package.json'); for (const key of ['preinstall','install','postinstall','prepare']) if (p.scripts?.[key]) throw new Error('lifecycle script: '+key)"
+node -e "const p=require('./node_modules/postgres-typed-sql/package.json'); for (const key of ['preinstall','install','postinstall','prepare']) if (p.scripts?.[key]) throw new Error('lifecycle script: '+key)"
 
 if tar -tzf "$pack_dir/$tarball" | grep -E '(^|/)source/|(^|/)test/|(^|/)engine/'; then
   echo 'The npm tarball contains publisher-only source.' >&2

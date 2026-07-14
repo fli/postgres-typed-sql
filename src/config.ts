@@ -44,7 +44,7 @@ export function resolveConfig(config: PostgresTypedSqlConfig): ResolvedPostgresT
   return {
     extensions: config.extensions ?? [],
     include: (config.include ?? ['.']).map((entry) => fromRoot(rootDir, entry)),
-    packageImport: config.packageImport ?? '@fli/postgres-typed-sql',
+    packageImport: config.packageImport ?? 'postgres-typed-sql',
     rootDir,
     schemaFiles: schema.map((entry) => fromRoot(rootDir, entry)),
     typesOutput: fromRoot(rootDir, config.typesOutput ?? 'postgres-typed-sql.types.ts'),
