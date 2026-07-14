@@ -1,5 +1,7 @@
 #include "postgres.h"
 
+#include "catalog/pg_attribute.h"
+#include "catalog/pg_type.h"
 #include "catalog/pg_type_d.h"
 #include "fmgr.h"
 #include "nodes/bitmapset.h"
@@ -12,6 +14,7 @@
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
+#include "utils/syscache.h"
 
 PG_MODULE_MAGIC;
 
@@ -21,6 +24,377 @@ static void append_expr_node(StringInfo out, const Query *query, const Node *exp
 static void append_query_summary(StringInfo out, const Query *query, int depth);
 static void append_from_node(StringInfo out, const Query *query, const Node *node, int depth);
 static void append_rtable(StringInfo out, const Query *query, int depth);
+static const char *command_type_name(CmdType command_type);
+static void append_json_string(StringInfo out, const char *value);
+static void append_bool_field(StringInfo out, const char *name, bool value);
+static void append_oid_field(StringInfo out, const char *name, Oid value);
+static void append_optional_name_field(StringInfo out, const char *name, const char *value);
+
+typedef struct QueryScope
+{
+  const Query *query;
+  const struct QueryScope *parent;
+} QueryScope;
+
+typedef struct DmlParameterTargetKey
+{
+  int param_id;
+  Oid target_relid;
+  AttrNumber target_attnum;
+  const char *source;
+} DmlParameterTargetKey;
+
+static const TargetEntry *
+target_entry_by_resno(const List *target_list, AttrNumber resno)
+{
+  ListCell *cell;
+
+  foreach(cell, target_list)
+  {
+    const TargetEntry *target = lfirst_node(TargetEntry, cell);
+
+    if (!target->resjunk && target->resno == resno)
+    {
+      return target;
+    }
+  }
+
+  return NULL;
+}
+
+static const CommonTableExpr *
+cte_by_name(const Query *query, const char *name)
+{
+  ListCell *cell;
+
+  if (name == NULL)
+  {
+    return NULL;
+  }
+
+  foreach(cell, query->cteList)
+  {
+    const CommonTableExpr *cte = lfirst_node(CommonTableExpr, cell);
+
+    if (strcmp(cte->ctename, name) == 0 && cte->ctequery != NULL && IsA(cte->ctequery, Query))
+    {
+      return cte;
+    }
+  }
+
+  return NULL;
+}
+
+static const Node *
+unwrap_direct_assignment_expr(const Node *expr)
+{
+  const Node *current = expr;
+
+  while (current != NULL)
+  {
+    switch (nodeTag(current))
+    {
+      case T_RelabelType:
+        current = (const Node *) ((const RelabelType *) current)->arg;
+        break;
+      case T_CoerceViaIO:
+        current = (const Node *) ((const CoerceViaIO *) current)->arg;
+        break;
+      case T_CollateExpr:
+        current = (const Node *) ((const CollateExpr *) current)->arg;
+        break;
+      case T_ArrayCoerceExpr:
+        current = (const Node *) ((const ArrayCoerceExpr *) current)->arg;
+        break;
+      case T_ConvertRowtypeExpr:
+        current = (const Node *) ((const ConvertRowtypeExpr *) current)->arg;
+        break;
+      case T_FuncExpr:
+      {
+        const FuncExpr *function = (const FuncExpr *) current;
+
+        if (function->funcretset ||
+            (function->funcformat != COERCE_EXPLICIT_CAST &&
+             function->funcformat != COERCE_IMPLICIT_CAST) ||
+            list_length(function->args) != 1 || !func_strict(function->funcid))
+        {
+          return current;
+        }
+        current = (const Node *) linitial(function->args);
+        break;
+      }
+      default:
+        return current;
+    }
+  }
+
+  return NULL;
+}
+
+static void
+append_dml_parameter_target(StringInfo out, Oid relid, AttrNumber attnum,
+                            int param_id, const char *source, bool *first, List **seen)
+{
+  HeapTuple tuple;
+  Form_pg_attribute attribute;
+  DmlParameterTargetKey *key;
+  ListCell *cell;
+  Oid type_oid;
+  char *type_name;
+
+  if (!OidIsValid(relid) || attnum <= 0 || param_id <= 0)
+  {
+    return;
+  }
+
+  foreach(cell, *seen)
+  {
+    const DmlParameterTargetKey *existing = (const DmlParameterTargetKey *) lfirst(cell);
+
+    if (existing->param_id == param_id && existing->target_relid == relid &&
+        existing->target_attnum == attnum && strcmp(existing->source, source) == 0)
+    {
+      return;
+    }
+  }
+
+  tuple = SearchSysCache2(ATTNUM, ObjectIdGetDatum(relid), Int16GetDatum(attnum));
+  if (!HeapTupleIsValid(tuple))
+  {
+    return;
+  }
+
+  attribute = (Form_pg_attribute) GETSTRUCT(tuple);
+  if (attribute->attisdropped)
+  {
+    ReleaseSysCache(tuple);
+    return;
+  }
+
+  type_oid = attribute->atttypid;
+  type_name = OidIsValid(type_oid)
+                ? format_type_extended(type_oid, attribute->atttypmod, FORMAT_TYPE_TYPEMOD_GIVEN)
+                : NULL;
+
+  key = palloc(sizeof(DmlParameterTargetKey));
+  key->param_id = param_id;
+  key->target_relid = relid;
+  key->target_attnum = attnum;
+  key->source = source;
+  *seen = lappend(*seen, key);
+
+  if (!*first)
+  {
+    appendStringInfoChar(out, ',');
+  }
+  *first = false;
+
+  appendStringInfo(out,
+                   "{\"paramId\":%d,\"targetRelid\":%u,\"targetAttnum\":%d,\"targetAttname\":",
+                   param_id, relid, attnum);
+  append_json_string(out, NameStr(attribute->attname));
+  append_bool_field(out, "targetNullable",
+                    !attribute->attnotnull && get_typtype(type_oid) != TYPTYPE_DOMAIN);
+  append_oid_field(out, "targetTypeOid", type_oid);
+  append_optional_name_field(out, "targetTypeName", type_name);
+  appendStringInfoString(out, ",\"source\":");
+  append_json_string(out, source);
+  appendStringInfoChar(out, '}');
+
+  ReleaseSysCache(tuple);
+}
+
+static const QueryScope *
+query_scope_at_level(const QueryScope *scope, Index levels_up)
+{
+  const QueryScope *current = scope;
+
+  while (current != NULL && levels_up > 0)
+  {
+    current = current->parent;
+    levels_up--;
+  }
+
+  return current;
+}
+
+static void
+append_direct_parameter_targets(StringInfo out, const QueryScope *scope, const Node *expr,
+                                Oid target_relid, AttrNumber target_attnum,
+                                const char *source, bool *first, List **seen, int depth)
+{
+  const Query *query = scope->query;
+  const Node *unwrapped;
+
+  if (expr == NULL || depth <= 0)
+  {
+    return;
+  }
+
+  unwrapped = unwrap_direct_assignment_expr(expr);
+  if (unwrapped == NULL)
+  {
+    return;
+  }
+
+  if (IsA(unwrapped, Param))
+  {
+    const Param *param = (const Param *) unwrapped;
+
+    if (param->paramkind == PARAM_EXTERN)
+    {
+      append_dml_parameter_target(out, target_relid, target_attnum,
+                                  param->paramid, source, first, seen);
+    }
+    return;
+  }
+
+  if (IsA(unwrapped, Var))
+  {
+    const Var *var = (const Var *) unwrapped;
+    const RangeTblEntry *rte;
+
+    if (var->varlevelsup != 0 || var->varattno <= 0 ||
+        var->varno <= 0 || var->varno > list_length(query->rtable))
+    {
+      return;
+    }
+
+    rte = rt_fetch(var->varno, query->rtable);
+    if (rte->rtekind == RTE_VALUES)
+    {
+      ListCell *row_cell;
+
+      foreach(row_cell, rte->values_lists)
+      {
+        const List *row = (const List *) lfirst(row_cell);
+
+        if (var->varattno <= list_length(row))
+        {
+          append_direct_parameter_targets(out, scope,
+                                          (const Node *) list_nth(row, var->varattno - 1),
+                                          target_relid, target_attnum, source, first, seen, depth - 1);
+        }
+      }
+      return;
+    }
+
+    if (rte->rtekind == RTE_SUBQUERY && rte->subquery != NULL && rte->subquery->setOperations == NULL)
+    {
+      const TargetEntry *target = target_entry_by_resno(rte->subquery->targetList, var->varattno);
+
+      if (target != NULL)
+      {
+        QueryScope child_scope = {rte->subquery, scope};
+
+        append_direct_parameter_targets(out, &child_scope, (const Node *) target->expr,
+                                        target_relid, target_attnum, source, first, seen, depth - 1);
+      }
+      return;
+    }
+
+    if (rte->rtekind == RTE_CTE)
+    {
+      const QueryScope *owner_scope = query_scope_at_level(scope, rte->ctelevelsup);
+      const CommonTableExpr *cte = owner_scope == NULL
+                                     ? NULL
+                                     : cte_by_name(owner_scope->query, rte->ctename);
+      const Query *cte_query = cte == NULL ? NULL : (const Query *) cte->ctequery;
+      const TargetEntry *target = cte_query == NULL || cte->cterecursive || cte_query->setOperations != NULL
+                                    ? NULL
+                                    : target_entry_by_resno(cte_query->targetList, var->varattno);
+
+      if (target != NULL)
+      {
+        QueryScope cte_scope = {cte_query, owner_scope};
+
+        append_direct_parameter_targets(out, &cte_scope, (const Node *) target->expr,
+                                        target_relid, target_attnum, source, first, seen, depth - 1);
+      }
+      return;
+    }
+
+    if (rte->rtekind == RTE_JOIN && var->varattno <= list_length(rte->joinaliasvars))
+    {
+      append_direct_parameter_targets(out, scope,
+                                      (const Node *) list_nth(rte->joinaliasvars, var->varattno - 1),
+                                      target_relid, target_attnum, source, first, seen, depth - 1);
+    }
+  }
+}
+
+static void
+append_targets_from_list(StringInfo out, const QueryScope *scope, const List *target_list,
+                         Oid target_relid, const char *source, bool *first, List **seen)
+{
+  ListCell *cell;
+
+  foreach(cell, target_list)
+  {
+    const TargetEntry *target = lfirst_node(TargetEntry, cell);
+
+    if (!target->resjunk && target->resno > 0)
+    {
+      append_direct_parameter_targets(out, scope, (const Node *) target->expr,
+                                      target_relid, target->resno, source, first, seen, 12);
+    }
+  }
+}
+
+static void
+append_dml_parameter_targets(StringInfo out, const Query *query)
+{
+  const RangeTblEntry *target_rte = NULL;
+  Oid target_relid = InvalidOid;
+  bool first = true;
+  List *seen = NIL;
+  QueryScope scope = {query, NULL};
+
+  appendStringInfoString(out, ",\"dmlParameterTargets\":[");
+
+  if (query->resultRelation > 0 && query->resultRelation <= list_length(query->rtable))
+  {
+    target_rte = rt_fetch(query->resultRelation, query->rtable);
+    target_relid = target_rte->relid;
+  }
+
+  if (OidIsValid(target_relid) &&
+      (query->commandType == CMD_INSERT || query->commandType == CMD_UPDATE))
+  {
+    append_targets_from_list(out, &scope, query->targetList, target_relid,
+                             command_type_name(query->commandType), &first, &seen);
+  }
+
+  if (OidIsValid(target_relid) && query->onConflict != NULL &&
+      query->onConflict->action == ONCONFLICT_UPDATE)
+  {
+    append_targets_from_list(out, &scope, query->onConflict->onConflictSet,
+                             target_relid, "ON_CONFLICT_UPDATE", &first, &seen);
+  }
+
+  if (OidIsValid(target_relid) && query->commandType == CMD_MERGE)
+  {
+    ListCell *cell;
+
+    foreach(cell, query->mergeActionList)
+    {
+      const MergeAction *action = lfirst_node(MergeAction, cell);
+
+      if (action->commandType == CMD_INSERT)
+      {
+        append_targets_from_list(out, &scope, action->targetList,
+                                 target_relid, "MERGE_INSERT", &first, &seen);
+      }
+      else if (action->commandType == CMD_UPDATE)
+      {
+        append_targets_from_list(out, &scope, action->targetList,
+                                 target_relid, "MERGE_UPDATE", &first, &seen);
+      }
+    }
+  }
+
+  appendStringInfoChar(out, ']');
+}
 
 static const char *
 command_type_name(CmdType command_type)
@@ -720,6 +1094,13 @@ append_expr_node(StringInfo out, const Query *query, const Node *expr, int depth
       append_expr_node(out, query, (const Node *) coerce->arg, depth - 1);
       break;
     }
+    case T_CoerceToDomain:
+    {
+      const CoerceToDomain *coerce = (const CoerceToDomain *) expr;
+      appendStringInfoString(out, ",\"arg\":");
+      append_expr_node(out, query, (const Node *) coerce->arg, depth - 1);
+      break;
+    }
     case T_CaseExpr:
     {
       const CaseExpr *case_expr = (const CaseExpr *) expr;
@@ -1040,6 +1421,7 @@ append_query_summary(StringInfo out, const Query *query, int depth)
   appendStringInfoChar(out, ',');
   append_target_list(out, query);
   append_returning_list(out, query);
+  append_dml_parameter_targets(out, query);
   append_cte_list(out, query, depth);
   append_rtable(out, query, depth);
   appendStringInfoString(out, ",\"fromTree\":");
@@ -1079,6 +1461,20 @@ read_param_type_oids(ArrayType *array, int *count)
   return oids;
 }
 
+static bool
+param_types_need_inference(const Oid *param_types, int param_count)
+{
+  for (int index = 0; index < param_count; index++)
+  {
+    if (!OidIsValid(param_types[index]))
+    {
+      return true;
+    }
+  }
+
+  return false;
+}
+
 Datum
 postgres_typed_sql_analyze(PG_FUNCTION_ARGS)
 {
@@ -1093,7 +1489,7 @@ postgres_typed_sql_analyze(PG_FUNCTION_ARGS)
   bool first_raw = true;
 
   initStringInfo(&out);
-  appendStringInfoString(&out, "{\"schemaVersion\":2,\"postgresVersionNum\":");
+  appendStringInfoString(&out, "{\"schemaVersion\":3,\"postgresVersionNum\":");
   appendStringInfo(&out, "%d", PG_VERSION_NUM);
   appendStringInfoString(&out, ",\"rawStatementCount\":");
   appendStringInfo(&out, "%d", list_length(raw_trees));
@@ -1102,7 +1498,7 @@ postgres_typed_sql_analyze(PG_FUNCTION_ARGS)
   foreach(raw_cell, raw_trees)
   {
     RawStmt *raw_stmt = lfirst_node(RawStmt, raw_cell);
-    List *rewritten_queries = param_count == 0
+    List *rewritten_queries = param_count == 0 || param_types_need_inference(param_types, param_count)
                                 ? pg_analyze_and_rewrite_varparams(raw_stmt, sql, &param_types, &param_count, NULL)
                                 : pg_analyze_and_rewrite_fixedparams(raw_stmt, sql, param_types, param_count, NULL);
     ListCell *query_cell;

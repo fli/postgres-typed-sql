@@ -7,7 +7,7 @@ import {
 } from './check-constraint-type-facts.js'
 import type { PostgresQueryable } from './database.js'
 
-const ANALYZER_SCHEMA_VERSION = 2
+const ANALYZER_SCHEMA_VERSION = 3
 const ANALYZER_SQL_FUNCTION = 'pg_temp.postgres_typed_sql_analyze'
 
 export interface TypedSqlPostgresIr {
@@ -109,6 +109,7 @@ export interface TypedSqlPostgresIrCompiledConfig {
 interface PgAnalyzerResult {
   readonly paramTypeOids: readonly number[]
   readonly postgresVersionNum: number
+  readonly rawStatementCount: number
   readonly schemaVersion: number
   readonly statements: readonly PgAnalyzerStatement[]
 }
@@ -123,17 +124,21 @@ export async function bindTypedSqlPostgresAnalyzer(client: PostgresQueryable): P
 
 interface PgAnalyzerStatement {
   readonly queries: readonly PgAnalyzerQuery[]
+  readonly rewrittenQueryCount: number
 }
 
 interface PgAnalyzerQuery {
+  readonly canSetTag: boolean
   readonly commandType: string
   readonly cteList?: readonly PgAnalyzerCte[]
+  readonly dmlParameterTargets: readonly PgAnalyzerDmlParameterTarget[]
   readonly distinctClauseCount?: number
   readonly groupClauseCount?: number
   readonly groupingSetsCount?: number
   readonly hasAggs?: boolean
   readonly hasHavingQual?: boolean
   readonly hasLimitOffset?: boolean
+  readonly hasLimitCount?: boolean
   readonly hasSetOperations?: boolean
   readonly hasTargetSRFs?: boolean
   readonly hasWindowFuncs?: boolean
@@ -143,6 +148,17 @@ interface PgAnalyzerQuery {
   readonly rtable?: readonly PgAnalyzerRte[]
   readonly targetList?: readonly PgAnalyzerTarget[]
   readonly whereQual?: PgAnalyzerExpr | null
+}
+
+interface PgAnalyzerDmlParameterTarget {
+  readonly paramId: number
+  readonly source: 'INSERT' | 'MERGE_INSERT' | 'MERGE_UPDATE' | 'ON_CONFLICT_UPDATE' | 'UPDATE'
+  readonly targetAttname: string
+  readonly targetAttnum: number
+  readonly targetNullable: boolean
+  readonly targetRelid: number
+  readonly targetTypeName: string | null
+  readonly targetTypeOid: number
 }
 
 interface PgAnalyzerTarget {

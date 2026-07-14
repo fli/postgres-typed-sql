@@ -94,6 +94,33 @@ where account.email = :email
   assert.doesNotMatch(output, /Unknown/u)
 })
 
+test('preserves explicit parameter types while PostgreSQL infers unspecified parameter types', async () => {
+  const root = await copyFixture()
+  await writeFile(
+    join(root, 'queries/mixed-parameter-oids.typed.sql'),
+    `-- @name mixedParameterOids
+-- @param label text
+select :label as label
+from public.accounts account
+where account.id = :account_id
+`
+  )
+
+  const result = await generateTypedSql({
+    include: ['queries'],
+    rootDir: root,
+    schema: 'schema.sql',
+  })
+
+  assert.equal(result.statementCount, 5)
+  const output = await readFile(join(root, 'queries/mixed-parameter-oids.typed-sql.ts'), 'utf8')
+  assert.match(output, /parameterNames: \['label', 'accountId'\]/u)
+  assert.match(output, /readonly label: string/u)
+  assert.match(output, /readonly accountId: PgInt8String/u)
+  assert.match(output, /name: 'label',[\s\S]*?pgType: 'text'/u)
+  assert.match(output, /name: 'account_id',[\s\S]*?pgType: 'bigint'/u)
+})
+
 test('rejects nullable column assertions because PostgreSQL determines result nullability', async () => {
   const root = await copyFixture()
   await writeFile(
