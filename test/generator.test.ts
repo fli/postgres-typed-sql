@@ -75,6 +75,43 @@ test('surfaces native PostgreSQL diagnostics for invalid SQL', async () => {
   )
 })
 
+test('rejects unresolved parameter types instead of generating a phantom Unknown import', async () => {
+  const root = await copyFixture()
+  await writeFile(join(root, 'queries/unresolved-parameter.typed.sql'), 'select pg_typeof(:value)\n')
+
+  await assert.rejects(
+    generateTypedSql({
+      include: ['queries'],
+      rootDir: root,
+      scalarProfile: 'node-postgres',
+      schema: 'schema.sql',
+    }),
+    /could not determine data type of parameter \$1/u
+  )
+  await assert.rejects(
+    readFile(join(root, 'queries/unresolved-parameter.typed-sql.ts'), 'utf8'),
+    (error: unknown) => error instanceof Error && 'code' in error && error.code === 'ENOENT'
+  )
+})
+
+test('does not allow directives to downgrade PostgreSQL write access', async () => {
+  const root = await copyFixture()
+  await writeFile(
+    join(root, 'queries/downgraded-write.typed.sql'),
+    '-- @access read\ndelete from public.posts where id = :id\n'
+  )
+
+  await assert.rejects(
+    generateTypedSql({
+      include: ['queries'],
+      rootDir: root,
+      scalarProfile: 'node-postgres',
+      schema: 'schema.sql',
+    }),
+    /@access read conflicts with PostgreSQL's write classification/u
+  )
+})
+
 test('preserves non-code parameter text and limits directives to the header', async () => {
   const root = await copyFixture()
   await writeFile(

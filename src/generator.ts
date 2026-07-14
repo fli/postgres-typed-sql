@@ -958,10 +958,14 @@ async function resolveTypedSqlWithAnalyzer(
       config.sourceFile
     )
 
+    const inferredAccess = ir.isWrite ? 'write' : typedSqlAccessForCommand(typedSqlCommandFromPostgres(ir.command))
+    if (config.access === 'read' && inferredAccess === 'write') {
+      throw new Error(`${config.sourceFile}: @access read conflicts with PostgreSQL's write classification.`)
+    }
+
     resolvedQueries.push({
       columns,
-      access:
-        config.access ?? (ir.isWrite ? 'write' : typedSqlAccessForCommand(typedSqlCommandFromPostgres(ir.command))),
+      access: config.access ?? inferredAccess,
       cardinality: ir.rowCardinality,
       catalogTypeImports: [...typeImports.catalog].toSorted(),
       command: typedSqlCommandFromPostgres(ir.command),
