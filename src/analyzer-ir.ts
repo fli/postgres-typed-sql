@@ -1,9 +1,5 @@
 /* oxlint-disable eslint/no-use-before-define -- The analyzer IR traversal uses small mutually recursive local helpers. */
 
-import { readFileSync } from 'node:fs'
-import { readdir } from 'node:fs/promises'
-import { basename, join } from 'node:path'
-
 import {
   checkConstraintLiteralUnionColumnKey,
   loadCheckConstraintLiteralUnionFacts,
@@ -13,7 +9,6 @@ import type { PostgresQueryable } from './database.js'
 
 const ANALYZER_SCHEMA_VERSION = 2
 const ANALYZER_SQL_FUNCTION = 'pg_temp.postgres_typed_sql_analyze'
-const TYPED_SQL_SOURCE_SUFFIX = '.typed.sql'
 
 export interface TypedSqlPostgresIr {
   readonly analyzerSchemaVersion: number
@@ -102,17 +97,6 @@ export type TypedSqlPostgresIrColumnSource =
       readonly kind: 'expression'
       readonly tag: string
     }
-
-interface SqlConfig {
-  readonly name: string
-  readonly params: ReadonlyMap<string, string>
-  readonly sourceFile: string
-  readonly sql: string
-}
-
-interface CompiledSqlConfig extends SqlConfig {
-  readonly parameterNames: readonly string[]
-}
 
 export interface TypedSqlPostgresIrCompiledConfig {
   readonly name: string
@@ -359,23 +343,6 @@ function splitSchemaQualifiedPgType(pgType: string): { readonly schema: string; 
   return { schema: match[1], typeName: `${match[2]}${match[3] ?? ''}` }
 }
 
-function lowerCamelCaseFromPathBase(base: string): string {
-  const parts = base.split(/[^A-Za-z0-9]+/u)
-  const head = parts.find((part) => part.length > 0)
-  if (!head) {
-    throw new Error(`${base}: typed SQL filename must contain at least one identifier segment.`)
-  }
-  const tail = parts.slice(parts.indexOf(head) + 1).filter((part) => part.length > 0)
-  const identifier = [
-    head.toLowerCase(),
-    ...tail.map((part) => `${part.slice(0, 1).toUpperCase()}${part.slice(1).toLowerCase()}`),
-  ].join('')
-  if (!/^[a-z][A-Za-z0-9]*$/u.test(identifier)) {
-    throw new Error(`${base}: typed SQL filename must produce a lower camel-case identifier.`)
-  }
-  return identifier
-}
-
 function pascalCaseIdentifier(identifier: string): string {
   const camel = camelCaseIdentifier(identifier)
   return `${camel.slice(0, 1).toUpperCase()}${camel.slice(1)}`
@@ -419,100 +386,6 @@ function tsTypeForPgType(typeFact: Pick<TypedSqlPostgresIrColumn, 'pgType' | 'pg
   }
 
   return tsType
-}
-
-function parseDirectiveLine(line: string): readonly string[] | null {
-  const match = /^--\s*@(\w+)\s+(.+)$/u.exec(line)
-  if (!match) {
-    return null
-  }
-
-  const kind = match[1]
-  const body = match[2]
-  return kind && body ? [kind, ...body.trim().split(/\s+/u)] : null
-}
-
-function stripNullablePgTypeSuffix(pgType: string): string {
-  return pgType.endsWith('?') ? pgType.slice(0, -1) : pgType
-}
-
-async function readConfigs(sqlDir: string): Promise<readonly SqlConfig[]> {
-  const sourceFiles = (await readdir(sqlDir)).filter((file) => file.endsWith(TYPED_SQL_SOURCE_SUFFIX)).toSorted()
-  return sourceFiles.map((sourceFile) => {
-    const params = new Map<string, string>()
-    const sqlLines: string[] = []
-    let name = lowerCamelCaseFromPathBase(basename(sourceFile, TYPED_SQL_SOURCE_SUFFIX))
-
-    for (const line of readFileSync(join(sqlDir, sourceFile), 'utf8').split(/\r?\n/u)) {
-      const directive = parseDirectiveLine(line)
-      if (!directive) {
-        sqlLines.push(line)
-        continue
-      }
-
-      const [kind, identifier, pgType] = directive
-      if (kind === 'name') {
-        if (identifier) {
-          name = identifier
-        }
-      } else if (kind === 'param' && identifier && pgType) {
-        params.set(identifier, stripNullablePgTypeSuffix(pgType))
-      }
-    }
-
-    return {
-      name,
-      params,
-      sourceFile,
-      sql: sqlLines.join('\n').trim(),
-    } satisfies SqlConfig
-  })
-}
-
-function compileNamedParams(config: SqlConfig): CompiledSqlConfig {
-  const parameterNames: string[] = []
-  const placeholdersByName = new Map<string, number>()
-  const sql = config.sql.replaceAll(/(?<!:):([A-Za-z_][A-Za-z0-9_]*)/gu, (_match, name: string) => {
-    const existing = placeholdersByName.get(name)
-    if (existing !== undefined) {
-      return `$${existing}`
-    }
-
-    const index = parameterNames.length + 1
-    placeholdersByName.set(name, index)
-    parameterNames.push(name)
-    return `$${index}`
-  })
-
-  return {
-    ...config,
-    parameterNames,
-    sql,
-  }
-}
-
-async function explicitParamTypeOids(client: PostgresQueryable, config: CompiledSqlConfig): Promise<readonly number[]> {
-  if (config.parameterNames.length === 0 || !config.parameterNames.every((name) => config.params.has(name))) {
-    return []
-  }
-
-  const typeOids: number[] = []
-  for (const name of config.parameterNames) {
-    const pgType = config.params.get(name)
-    if (!pgType) {
-      throw new Error(`${config.sourceFile}: missing parameter type for ${name}.`)
-    }
-
-    const result = await client.query<{ readonly oid: number | null }>('select to_regtype($1)::oid::int as oid', [
-      pgType,
-    ])
-    const oid = result.rows[0]?.oid
-    if (!oid) {
-      throw new Error(`${config.sourceFile}: unknown explicit parameter type ${pgType}.`)
-    }
-    typeOids.push(oid)
-  }
-  return typeOids
 }
 
 async function explicitCompiledParamTypeOids(
@@ -1590,61 +1463,6 @@ function renderTypePreview(ir: Omit<TypedSqlPostgresIr, 'typePreview'>): string 
   ].join('\n')
 }
 
-function normalizeIr(catalog: CatalogFacts, config: CompiledSqlConfig, analysis: PgAnalyzerResult): TypedSqlPostgresIr {
-  const query = analysis.statements[0]?.queries[0]
-  if (!query) {
-    throw new Error(`${config.sourceFile}: analyzer returned no query.`)
-  }
-
-  const resultColumns = resultTargets(query).map((target): TypedSqlPostgresIrColumn => {
-    const expr = target.expr
-    const typeFact = typeFactForOid(catalog, expr?.typeOid, expr?.typeName)
-    const tsType = tsTypeForExpr(catalog, query, expr, typeFact)
-    return {
-      jsonShape: isJsonType(typeFact.pgTypeName) ? (inferJsonShape(catalog, query, expr) ?? undefined) : undefined,
-      name: target.resname ?? null,
-      nullable: expressionNullable(catalog, query, expr),
-      ...typeFact,
-      source: sourceForExpr(expr),
-      tsType,
-    }
-  })
-
-  const checkConstraintParamTypes = checkedColumnParamTypes(catalog, query)
-  const params = config.parameterNames.map((name, index): TypedSqlPostgresIrParam => {
-    const oid = analysis.paramTypeOids[index]
-    const typeFact = typeFactForOid(catalog, oid, config.params.get(name))
-    const checkConstraintTsType = checkConstraintParamTypes.get(index + 1)
-    return {
-      name,
-      ...typeFact,
-      propertyName: camelCaseIdentifier(name),
-      tsType: checkConstraintTsType ?? tsTypeForPgType(typeFact),
-      ...(checkConstraintTsType ? { tsTypeSource: 'checkConstraint' as const } : {}),
-    }
-  })
-  const rowBounds = inferRowBounds(catalog, query, resultColumns.length)
-
-  const partial = {
-    analyzerSchemaVersion: analysis.schemaVersion,
-    command: query.commandType,
-    diagnostics: [],
-    hasDataModifyingCte: queryHasDataModifyingCte(query),
-    name: config.name,
-    params,
-    postgresVersionNum: analysis.postgresVersionNum,
-    resultColumns,
-    rowBounds,
-    rowCardinality: rowCardinalityFromBounds(rowBounds),
-    sourceFile: config.sourceFile,
-  } satisfies Omit<TypedSqlPostgresIr, 'typePreview'>
-
-  return {
-    ...partial,
-    typePreview: renderTypePreview(partial),
-  }
-}
-
 function normalizeCompiledIr(
   catalog: CatalogFacts,
   config: TypedSqlPostgresIrCompiledConfig,
@@ -1704,18 +1522,6 @@ function normalizeCompiledIr(
   }
 }
 
-async function analyzeConfig(client: PostgresQueryable, config: CompiledSqlConfig): Promise<PgAnalyzerResult> {
-  const result = await client.query<{ readonly analysis: PgAnalyzerResult }>(
-    `select ${ANALYZER_SQL_FUNCTION}($1, $2::oid[])::jsonb as analysis`,
-    [config.sql, await explicitParamTypeOids(client, config)]
-  )
-  const analysis = result.rows[0]?.analysis
-  if (!analysis || analysis.schemaVersion !== ANALYZER_SCHEMA_VERSION) {
-    throw new Error(`${config.sourceFile}: analyzer returned unsupported schema.`)
-  }
-  return analysis
-}
-
 async function analyzeCompiledConfig(
   client: PostgresQueryable,
   config: TypedSqlPostgresIrCompiledConfig
@@ -1729,35 +1535,6 @@ async function analyzeCompiledConfig(
     throw new Error(`${config.sourceFile}: analyzer returned unsupported schema.`)
   }
   return analysis
-}
-
-export async function buildTypedSqlPostgresIr(
-  client: PostgresQueryable,
-  sqlDir: string
-): Promise<TypedSqlPostgresIrBuildResult> {
-  const configs = (await readConfigs(sqlDir)).map(compileNamedParams)
-  const analyses: {
-    readonly analysis: PgAnalyzerResult
-    readonly config: CompiledSqlConfig
-  }[] = []
-  for (const config of configs) {
-    analyses.push({ analysis: await analyzeConfig(client, config), config })
-  }
-
-  const catalog = await loadCatalog(
-    client,
-    analyses.map((entry) => entry.analysis)
-  )
-  return {
-    catalogFacts: {
-      checkConstraintLiteralUnions: catalog.checkConstraintTypesByColumn.size,
-      columns: catalog.columns.size,
-      procs: catalog.procs.size,
-      types: catalog.types.size,
-      uniqueIndexes: [...catalog.uniqueIndexesByRelid.values()].reduce((count, entries) => count + entries.length, 0),
-    },
-    queries: analyses.map(({ analysis, config }) => normalizeIr(catalog, config, analysis)),
-  }
 }
 
 export async function buildTypedSqlPostgresIrFromCompiledConfigs(
