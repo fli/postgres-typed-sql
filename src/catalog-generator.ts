@@ -1,6 +1,3 @@
-import { mkdir, writeFile } from 'node:fs/promises'
-import { dirname } from 'node:path'
-
 import {
   checkConstraintLiteralUnionCatalogKey,
   loadCheckConstraintLiteralUnionFacts,
@@ -314,25 +311,21 @@ ${renderCatalogDb(columns)}
 `
 }
 
-export async function generateCatalogTypes(
+export async function buildCatalogTypes(
   client: PostgresQueryable,
   config: ResolvedPostgresTypedSqlConfig
-): Promise<void> {
+): Promise<string> {
   const enums = await loadEnums(client)
   const domains = await loadDomains(client)
   const columns = await loadColumns(client)
   const schemas = [...new Set(columns.map((row) => row.schema))]
   const checkConstraintLiteralUnions = await loadCheckConstraintLiteralUnionFacts(client, { schemas })
-  await mkdir(dirname(config.typesOutput), { recursive: true })
-  await writeFile(
-    config.typesOutput,
-    renderCatalogTypes(
-      enums,
-      domains,
-      columns,
-      checkConstraintLiteralUnions,
-      config.packageImport,
-      config.scalarProfile
-    )
+  return renderCatalogTypes(
+    enums,
+    domains,
+    columns,
+    checkConstraintLiteralUnions,
+    config.packageImport,
+    config.scalarProfile
   )
 }
