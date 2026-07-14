@@ -1,0 +1,12 @@
+diff --git a/pglite/other_extensions/Makefile b/pglite/other_extensions/Makefile
+index 5ad7ef5bd3..e377ea6898 100644
+--- a/pglite/other_extensions/Makefile
++++ b/pglite/other_extensions/Makefile
+@@ -2,6 +2,7 @@ top_builddir = ../..
+ include $(top_builddir)/src/Makefile.global
+ 
+ SUBDIRS = \
++		postgres_typed_sql_analyzer \
+ 		pg_ivm \
+ 		vector \
+ 		pgtap \

@@ -1,0 +1,6 @@
+Postgres Typed SQL bundles a custom build of PGlite and PostgreSQL for local
+SQL analysis. Their license texts and the licenses for bundled PostgreSQL
+contrib modules are included under dist/vendor/licenses in published packages.
+
+PGlite: Copyright ElectricSQL contributors, Apache License 2.0.
+PostgreSQL: Copyright PostgreSQL Global Development Group, PostgreSQL License.

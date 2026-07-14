@@ -1,0 +1,5 @@
+{
+  "name": "postgres-typed-sql-consumer-proof",
+  "private": true,
+  "type": "module"
+}

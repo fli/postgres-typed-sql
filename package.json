@@ -1,0 +1,76 @@
+{
+  "name": "@fli/postgres-typed-sql",
+  "version": "0.1.0-beta.1",
+  "description": "PostgreSQL-native typed SQL generation for TypeScript",
+  "type": "module",
+  "license": "MIT",
+  "author": "Francis Li",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/fli/postgres-typed-sql.git"
+  },
+  "bugs": {
+    "url": "https://github.com/fli/postgres-typed-sql/issues"
+  },
+  "homepage": "https://github.com/fli/postgres-typed-sql#readme",
+  "keywords": [
+    "postgres",
+    "postgresql",
+    "sql",
+    "typescript",
+    "codegen",
+    "pglite"
+  ],
+  "engines": {
+    "node": ">=20.19"
+  },
+  "packageManager": "pnpm@10.13.1",
+  "bin": {
+    "postgres-typed-sql": "./dist/cli.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./runtime": {
+      "types": "./dist/runtime.d.ts",
+      "import": "./dist/runtime.js"
+    },
+    "./scalars": {
+      "types": "./dist/scalars.d.ts",
+      "import": "./dist/scalars.js"
+    }
+  },
+  "files": [
+    "dist",
+    "LICENSE",
+    "NOTICE",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "pnpm run clean && tsc -p tsconfig.build.json && node scripts/stage-engine.mjs",
+    "build:engine": "sh scripts/build-engine.sh",
+    "clean": "rm -rf dist",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "lint": "eslint .",
+    "pack:check": "sh scripts/pack-check.sh",
+    "test": "node --test --test-reporter=spec dist-test/test/*.test.js",
+    "test:build": "tsc -p tsconfig.test.json && node scripts/stage-test-engine.mjs",
+    "test:all": "pnpm run scan:independence && pnpm run typecheck && pnpm run lint && pnpm run format:check && pnpm run build && pnpm run test:build && pnpm test && pnpm run pack:check",
+    "scan:independence": "node scripts/check-independence.mjs",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "devDependencies": {
+    "@eslint/js": "9.31.0",
+    "@types/node": "24.0.14",
+    "eslint": "9.31.0",
+    "prettier": "3.6.2",
+    "typescript": "5.8.3",
+    "typescript-eslint": "8.37.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

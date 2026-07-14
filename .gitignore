@@ -1,0 +1,8 @@
+dist/
+dist-test/
+node_modules/
+artifacts/
+source/
+test/fixtures/**/*.typed-sql.ts
+test/fixtures/postgres-typed-sql.types.ts
+
