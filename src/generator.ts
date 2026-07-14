@@ -14,6 +14,7 @@ import type { ResolvedPostgresTypedSqlConfig } from './config.js'
 import { resolveConfig, type PostgresTypedSqlConfig } from './config.js'
 import type { PostgresQueryable } from './database.js'
 import { createAnalysisDatabase } from './engine.js'
+import { compileNamedParameters, parseTypedSqlSource } from './sql-source.js'
 
 let activeConfig: ResolvedPostgresTypedSqlConfig | undefined
 let generationInProgress = false
@@ -519,21 +520,6 @@ function collectDmlParameterTargets(
   return targets
 }
 
-function parseDirectiveLine(line: string): readonly string[] | null {
-  const match = /^--\s*@(\w+)\s+(.+)$/u.exec(line)
-  if (!match) {
-    return null
-  }
-
-  const kind = match[1]
-  const body = match[2]
-  if (!kind || !body) {
-    return null
-  }
-
-  return [kind, ...body.trim().split(/\s+/u)]
-}
-
 function parseDirectivePgType(pgType: string | undefined): {
   readonly nullable: boolean
   readonly pgType?: string
@@ -546,7 +532,12 @@ function parseDirectivePgType(pgType: string | undefined): {
     return { nullable: true }
   }
 
-  return pgType.endsWith('?') ? { nullable: true, pgType: pgType.slice(0, -1) } : { nullable: false, pgType }
+  if (pgType.endsWith('?')) {
+    const typeWithoutSuffix = pgType.slice(0, -1).trimEnd()
+    return { nullable: true, ...(typeWithoutSuffix ? { pgType: typeWithoutSuffix } : {}) }
+  }
+
+  return { nullable: false, pgType }
 }
 
 async function walkTypedSqlFiles(directory: string, output: string[]): Promise<void> {
@@ -589,37 +580,33 @@ async function readTypedSqlConfigs(): Promise<TypedSqlConfig[]> {
   for (const sourcePath of sourcePaths) {
     const sourceFile = relativePath(sourcePath)
     const text = readFileSync(sourcePath, 'utf8')
-    const lines = text.split(/\r?\n/u)
+    const parsedSource = parseTypedSqlSource(text, sourceFile)
     const defaultName = lowerCamelCaseFromPathBase(basename(sourceFile, typedSqlSourceSuffix))
     let access: TypedSqlAccess | undefined
     let name = defaultName
     const parameters: SqlParameter[] = []
     const columns: SqlColumn[] = []
-    const sqlLines: string[] = []
 
-    for (const line of lines) {
-      const directive = parseDirectiveLine(line)
-      if (!directive) {
-        sqlLines.push(line)
-        continue
-      }
-
-      const kind = directive[0]
-      const identifier = directive[1]
-      const parsedPgType = parseDirectivePgType(directive[2])
+    for (const directive of parsedSource.directives) {
+      const location = `${sourceFile}:${directive.line}`
+      const kind = directive.kind
+      const bodyParts = /^(\S+)(?:\s+([\s\S]*))?$/u.exec(directive.body)
+      const identifier = bodyParts?.[1]
+      const rawPgType = bodyParts?.[2]?.trim()
+      const parsedPgType = parseDirectivePgType(rawPgType)
       const pgType = parsedPgType.pgType
       if (kind === 'name') {
-        if (!identifier) {
-          throw new Error(`${sourceFile}: @name requires an identifier.`)
+        if (!identifier || rawPgType) {
+          throw new Error(`${location}: @name requires exactly one identifier.`)
         }
 
-        name = requireSqlName(identifier, sourceFile)
+        name = requireSqlName(identifier, location)
         continue
       }
 
       if (kind === 'access') {
-        if (identifier !== 'read' && identifier !== 'write') {
-          throw new Error(`${sourceFile}: @access requires read or write.`)
+        if ((identifier !== 'read' && identifier !== 'write') || rawPgType) {
+          throw new Error(`${location}: @access requires exactly read or write.`)
         }
 
         access = identifier
@@ -627,11 +614,17 @@ async function readTypedSqlConfigs(): Promise<TypedSqlConfig[]> {
       }
 
       if (kind !== 'param' && kind !== 'column') {
-        throw new Error(`${sourceFile}: unsupported typed SQL directive @${kind}.`)
+        throw new Error(`${location}: unsupported typed SQL directive @${kind}.`)
       }
 
       if (!identifier) {
-        throw new Error(`${sourceFile}: @${kind} requires a name.`)
+        throw new Error(`${location}: @${kind} requires a name.`)
+      }
+      if (kind === 'param' && !/^[A-Za-z_][A-Za-z0-9_]*$/u.test(identifier)) {
+        throw new Error(`${location}: @param requires a named-parameter identifier.`)
+      }
+      if (kind === 'column' && parsedPgType.nullable) {
+        throw new Error(`${location}: @column does not support ?; PostgreSQL determines result nullability.`)
       }
 
       const entry = {
@@ -639,7 +632,7 @@ async function readTypedSqlConfigs(): Promise<TypedSqlConfig[]> {
         nullable: parsedPgType.nullable,
         pgType,
         propertyName: camelCaseIdentifier(identifier),
-        tsType: pgType ? tsTypeForPgType(pgType, sourceFile) : undefined,
+        tsType: pgType ? tsTypeForPgType(pgType, location) : undefined,
       }
 
       if (kind === 'param') {
@@ -657,7 +650,7 @@ async function readTypedSqlConfigs(): Promise<TypedSqlConfig[]> {
       parameters,
       sourceFile,
       sourcePath,
-      sql: sqlLines.join('\n').trim(),
+      sql: parsedSource.sql,
     })
   }
 
@@ -677,16 +670,10 @@ function assertUniqueTypedSqlNames(configs: readonly TypedSqlConfig[]): void {
 
 function compileTypedSql(config: TypedSqlConfig): CompiledTypedSql {
   const parametersByName = new Map(config.parameters.map((parameter) => [parameter.name, parameter]))
-  const parameterNames: string[] = []
+  const compiled = compileNamedParameters(config.sql, config.sourceFile)
   const parameterTypes: (string | undefined)[] = []
-  const placeholdersByName = new Map<string, number>()
   const parameters: SqlParameter[] = []
-  const sql = config.sql.replaceAll(/(?<!:):([A-Za-z_][A-Za-z0-9_]*)/gu, (match, name: string) => {
-    const existingIndex = placeholdersByName.get(name)
-    if (existingIndex !== undefined) {
-      return `$${existingIndex}`
-    }
-
+  const parameterNames = compiled.parameterNames.map((name) => {
     const parameter =
       parametersByName.get(name) ??
       ({
@@ -695,11 +682,8 @@ function compileTypedSql(config: TypedSqlConfig): CompiledTypedSql {
       } satisfies SqlParameter)
 
     parameters.push(parameter)
-    parameterNames.push(parameter.propertyName)
     parameterTypes.push(parameter.pgType)
-    const placeholderIndex = parameterNames.length
-    placeholdersByName.set(name, placeholderIndex)
-    return `$${placeholderIndex}`
+    return parameter.propertyName
   })
 
   const unusedParameters = config.parameters.filter(
@@ -721,7 +705,7 @@ function compileTypedSql(config: TypedSqlConfig): CompiledTypedSql {
     parameterTypes,
     sourceFile: config.sourceFile,
     sourcePath: config.sourcePath,
-    sql,
+    sql: compiled.sql,
   }
 }
 

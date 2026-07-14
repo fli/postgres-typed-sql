@@ -53,3 +53,60 @@ test('surfaces native PostgreSQL diagnostics for invalid SQL', async () => {
     /column "missing_column" does not exist/u
   )
 })
+
+test('preserves non-code parameter text and limits directives to the header', async () => {
+  const root = await copyFixture()
+  await writeFile(
+    join(root, 'queries/lexical-contexts.typed.sql'),
+    `-- @name lexicalContexts
+-- @param cutoff timestamp with time zone?
+-- @param email text
+-- @column cutoff timestamp with time zone
+select
+  ':not_a_parameter' as literal_value,
+  $$:also_not$$ as dollar_value,
+  :cutoff as cutoff,
+  account.display_name
+from public.accounts account
+where account.email = :email
+  and /* outer :not_this /* inner :nor_this */ */ true
+-- @todo this body comment must remain SQL
+-- :comment_parameter
+`
+  )
+
+  const result = await generateTypedSql({
+    include: ['queries'],
+    rootDir: root,
+    schema: 'schema.sql',
+  })
+
+  assert.equal(result.statementCount, 5)
+  const output = await readFile(join(root, 'queries/lexical-contexts.typed-sql.ts'), 'utf8')
+  assert.match(output, /parameterNames: \['cutoff', 'email'\]/u)
+  assert.match(output, /readonly cutoff: PgTimestamptzString \| null/u)
+  assert.match(output, /name: 'cutoff',[\s\S]*?nullable: true/u)
+  assert.match(output, /':not_a_parameter'/u)
+  assert.match(output, /\$\$:also_not\$\$/u)
+  assert.match(output, /\/\* outer :not_this \/\* inner :nor_this \*\/ \*\//u)
+  assert.match(output, /@todo this body comment must remain SQL/u)
+  assert.match(output, /-- :comment_parameter/u)
+  assert.doesNotMatch(output, /Unknown/u)
+})
+
+test('rejects nullable column assertions because PostgreSQL determines result nullability', async () => {
+  const root = await copyFixture()
+  await writeFile(
+    join(root, 'queries/invalid-column-nullability.typed.sql'),
+    '-- @column id bigint?\nselect id from public.accounts\n'
+  )
+
+  await assert.rejects(
+    generateTypedSql({
+      include: ['queries'],
+      rootDir: root,
+      schema: 'schema.sql',
+    }),
+    /queries\/invalid-column-nullability\.typed\.sql:1: @column does not support \?; PostgreSQL determines result nullability/u
+  )
+})
