@@ -15,6 +15,7 @@ export interface TypedSqlPostgresIr {
   readonly command: string
   readonly diagnostics: readonly string[]
   readonly hasDataModifyingCte: boolean
+  readonly isWrite: boolean
   readonly name: string
   readonly params: readonly TypedSqlPostgresIrParam[]
   readonly postgresVersionNum: number
@@ -35,6 +36,7 @@ export interface TypedSqlPostgresIrRowBounds {
 
 export interface TypedSqlPostgresIrParam {
   readonly name: string
+  readonly nullable: boolean
   readonly pgType: string
   readonly pgTypeName: string
   readonly pgTypeSchema: string
@@ -139,6 +141,7 @@ interface PgAnalyzerQuery {
   readonly hasHavingQual?: boolean
   readonly hasLimitOffset?: boolean
   readonly hasLimitCount?: boolean
+  readonly hasModifyingCTE?: boolean
   readonly hasSetOperations?: boolean
   readonly hasTargetSRFs?: boolean
   readonly hasWindowFuncs?: boolean
@@ -191,7 +194,9 @@ interface PgAnalyzerExpr {
   readonly constInteger?: string
   readonly constIsNull?: boolean
   readonly constString?: string
+  readonly condition?: PgAnalyzerExpr | null
   readonly defresult?: PgAnalyzerExpr | null
+  readonly elements?: readonly PgAnalyzerExpr[]
   readonly expr?: PgAnalyzerExpr | null
   readonly funcid?: number
   readonly funcname?: string
@@ -203,7 +208,10 @@ interface PgAnalyzerExpr {
   readonly relid?: number
   readonly relname?: string | null
   readonly result?: PgAnalyzerExpr | null
+  readonly subLinkType?: string
+  readonly subquery?: PgAnalyzerQuery | null
   readonly tag: string
+  readonly testExpr?: PgAnalyzerExpr | null
   readonly typeName?: string
   readonly typeOid?: number
   readonly varattno?: number
@@ -211,6 +219,13 @@ interface PgAnalyzerExpr {
   readonly varno?: number
   readonly varnullingrels?: readonly number[]
   readonly whenClauses?: readonly PgAnalyzerExpr[]
+}
+
+interface AnalyzedCompiledConfig {
+  readonly analysis: PgAnalyzerResult
+  readonly config: TypedSqlPostgresIrCompiledConfig
+  readonly primaryQuery: PgAnalyzerQuery
+  readonly rewrittenQueries: readonly PgAnalyzerQuery[]
 }
 
 interface TypeCatalogRow {
@@ -438,12 +453,13 @@ async function explicitCompiledParamTypeOids(
 
 function exprChildren(expr: PgAnalyzerExpr): readonly PgAnalyzerExpr[] {
   const children: PgAnalyzerExpr[] = []
-  for (const key of ['arg', 'defresult', 'expr'] as const) {
+  for (const key of ['arg', 'condition', 'defresult', 'expr', 'result', 'testExpr'] as const) {
     const child = expr[key]
     if (child) {
       children.push(child)
     }
   }
+  children.push(...(expr.elements ?? []))
   for (const whenClause of expr.whenClauses ?? []) {
     children.push(whenClause)
   }
@@ -503,33 +519,76 @@ function constNonNegativeSafeInteger(expr: PgAnalyzerExpr | null | undefined): n
   return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : null
 }
 
-function applyLimitBounds(query: PgAnalyzerQuery, base: TypedSqlPostgresIrRowBounds): TypedSqlPostgresIrRowBounds {
-  const limit = constNonNegativeSafeInteger(query.limitCount)
-  const maxAfterLimit = limit === null ? base.max : base.max === null ? limit : Math.min(base.max, limit)
-  const minAfterLimit = limit === 0 || query.hasLimitOffset === true ? 0 : base.min
+type LimitFact =
+  | { readonly kind: 'absent' | 'unbounded' }
+  | { readonly kind: 'constant'; readonly value: number }
+  | { readonly kind: 'dynamic' }
 
-  if (limit === null && query.hasLimitOffset !== true) {
+function limitFact(query: PgAnalyzerQuery): LimitFact {
+  if (query.hasLimitCount !== true) {
+    return { kind: 'absent' }
+  }
+
+  const unwrapped = unwrapTransparentExpr(query.limitCount)
+  if (unwrapped?.tag === 'Const' && unwrapped.constIsNull === true) {
+    return { kind: 'unbounded' }
+  }
+
+  const value = constNonNegativeSafeInteger(query.limitCount)
+  return value === null ? { kind: 'dynamic' } : { kind: 'constant', value }
+}
+
+function applyLimitBounds(query: PgAnalyzerQuery, base: TypedSqlPostgresIrRowBounds): TypedSqlPostgresIrRowBounds {
+  const limit = limitFact(query)
+  const hasOffset = query.hasLimitOffset === true
+  if ((limit.kind === 'absent' || limit.kind === 'unbounded') && !hasOffset) {
     return base
   }
+
+  const maxAfterLimit =
+    limit.kind === 'constant' ? (base.max === null ? limit.value : Math.min(base.max, limit.value)) : base.max
+  const minAfterLimit =
+    hasOffset || limit.kind === 'dynamic' || (limit.kind === 'constant' && limit.value === 0) ? 0 : base.min
 
   return {
     max: maxAfterLimit,
     min: maxAfterLimit === 0 ? 0 : Math.min(minAfterLimit, maxAfterLimit ?? minAfterLimit),
     proof: [
       base.proof,
-      limit === null ? null : `constant_limit_${limit}`,
-      query.hasLimitOffset === true ? 'offset_can_drop_rows' : null,
+      limit.kind === 'constant' ? `constant_limit_${limit.value}` : null,
+      limit.kind === 'dynamic' ? 'dynamic_limit_can_drop_rows' : null,
+      hasOffset ? 'offset_can_drop_rows' : null,
     ]
       .filter((part): part is string => part !== null)
       .join('+'),
   }
 }
 
-function simpleRelationRelid(query: PgAnalyzerQuery): number | null {
-  const relationRtes = (query.rtable ?? []).filter(
-    (rte): rte is PgAnalyzerRte & { readonly relid: number } => rte.kind === 'RELATION' && typeof rte.relid === 'number'
-  )
-  return relationRtes.length === 1 ? (relationRtes[0]?.relid ?? null) : null
+interface UniqueProofRelation {
+  readonly relid: number
+  readonly varno: number
+}
+
+function uniqueProofRelation(query: PgAnalyzerQuery): UniqueProofRelation | null {
+  const rtable = query.rtable ?? []
+  if (query.commandType === 'SELECT') {
+    const rowSources = rtable.map((rte, index) => ({ rte, varno: index + 1 })).filter(({ rte }) => rte.kind !== 'JOIN')
+    const source = rowSources.length === 1 ? rowSources[0] : undefined
+    return source?.rte.kind === 'RELATION' && typeof source.rte.relid === 'number'
+      ? { relid: source.rte.relid, varno: source.varno }
+      : null
+  }
+
+  if (query.commandType !== 'UPDATE' && query.commandType !== 'DELETE') {
+    return null
+  }
+
+  const varno = query.resultRelation
+  if (!varno) {
+    return null
+  }
+  const target = rtable[varno - 1]
+  return target?.kind === 'RELATION' && typeof target.relid === 'number' ? { relid: target.relid, varno } : null
 }
 
 function isParamOrConstValue(expr: PgAnalyzerExpr | null | undefined): boolean {
@@ -539,7 +598,7 @@ function isParamOrConstValue(expr: PgAnalyzerExpr | null | undefined): boolean {
 
 function constrainedAttnumsFromQual(
   expr: PgAnalyzerExpr | null | undefined,
-  relid: number,
+  relation: UniqueProofRelation,
   output = new Set<number>()
 ): ReadonlySet<number> {
   if (!expr) {
@@ -548,7 +607,7 @@ function constrainedAttnumsFromQual(
 
   if (expr.tag === 'BoolExpr' && expr.boolOp === 'AND') {
     for (const child of exprChildren(expr)) {
-      constrainedAttnumsFromQual(child, relid, output)
+      constrainedAttnumsFromQual(child, relation, output)
     }
     return output
   }
@@ -561,9 +620,23 @@ function constrainedAttnumsFromQual(
   const right = targetExprFromAggregateArg(expr.args[1])
   const leftVar = unwrapTransparentExpr(left)
   const rightVar = unwrapTransparentExpr(right)
-  if (leftVar?.tag === 'Var' && leftVar.relid === relid && leftVar.varattno && isParamOrConstValue(right)) {
+  if (
+    leftVar?.tag === 'Var' &&
+    leftVar.relid === relation.relid &&
+    leftVar.varno === relation.varno &&
+    (leftVar.varlevelsup ?? 0) === 0 &&
+    leftVar.varattno &&
+    isParamOrConstValue(right)
+  ) {
     output.add(leftVar.varattno)
-  } else if (rightVar?.tag === 'Var' && rightVar.relid === relid && rightVar.varattno && isParamOrConstValue(left)) {
+  } else if (
+    rightVar?.tag === 'Var' &&
+    rightVar.relid === relation.relid &&
+    rightVar.varno === relation.varno &&
+    (rightVar.varlevelsup ?? 0) === 0 &&
+    rightVar.varattno &&
+    isParamOrConstValue(left)
+  ) {
     output.add(rightVar.varattno)
   }
 
@@ -603,14 +676,14 @@ function uniqueIndexRowBounds(catalog: CatalogFacts, query: PgAnalyzerQuery): Ty
     return null
   }
 
-  const relid = simpleRelationRelid(query)
-  if (relid === null || !query.whereQual) {
+  const relation = uniqueProofRelation(query)
+  if (!relation || !query.whereQual) {
     return null
   }
 
-  const constrainedAttnums = constrainedAttnumsFromQual(query.whereQual, relid)
+  const constrainedAttnums = constrainedAttnumsFromQual(query.whereQual, relation)
   const uniqueIndex = catalog.uniqueIndexesByRelid
-    .get(relid)
+    .get(relation.relid)
     ?.find((index) => index.attnums.every((attnum) => constrainedAttnums.has(attnum)))
   if (!uniqueIndex) {
     return null
@@ -723,38 +796,72 @@ function isDataModifyingCommand(commandType: string | undefined): boolean {
   return commandType === 'UPDATE' || commandType === 'INSERT' || commandType === 'DELETE' || commandType === 'MERGE'
 }
 
-function queryHasDataModifyingCte(query: PgAnalyzerQuery): boolean {
-  for (const cte of query.cteList ?? []) {
-    if (isDataModifyingCommand(cte.commandType) || (cte.query && isDataModifyingCommand(cte.query.commandType))) {
-      return true
-    }
-    if (cte.query && queryHasDataModifyingCte(cte.query)) {
-      return true
-    }
-  }
-  for (const rte of query.rtable ?? []) {
-    if (rte.subquery && queryHasDataModifyingCte(rte.subquery)) {
-      return true
-    }
-  }
-  return false
-}
-
-function walkQuery(query: PgAnalyzerQuery, visitExpr: (expr: PgAnalyzerExpr) => void): void {
+function walkDirectQueryExpressions(query: PgAnalyzerQuery, visitExpr: (expr: PgAnalyzerExpr) => void): void {
   for (const target of [...(query.targetList ?? []), ...(query.returningList ?? [])]) {
     walkExpr(target.expr, visitExpr)
   }
   walkExpr(query.whereQual, visitExpr)
-  for (const cte of query.cteList ?? []) {
-    if (cte.query) {
-      walkQuery(cte.query, visitExpr)
-    }
-  }
+}
+
+function walkQueryTree(query: PgAnalyzerQuery, visitQuery: (query: PgAnalyzerQuery) => void): void {
+  visitQuery(query)
   for (const rte of query.rtable ?? []) {
     if (rte.subquery) {
-      walkQuery(rte.subquery, visitExpr)
+      walkQueryTree(rte.subquery, visitQuery)
     }
   }
+  for (const cte of query.cteList ?? []) {
+    if (cte.query) {
+      walkQueryTree(cte.query, visitQuery)
+    }
+  }
+  walkDirectQueryExpressions(query, (expr) => {
+    if (expr.subquery) {
+      walkQueryTree(expr.subquery, visitQuery)
+    }
+  })
+}
+
+function queryHasDataModifyingCte(query: PgAnalyzerQuery): boolean {
+  if (query.hasModifyingCTE === true) {
+    return true
+  }
+
+  let hasDataModifyingCte = false
+  walkQueryTree(query, (nested) => {
+    if (nested !== query && isDataModifyingCommand(nested.commandType)) {
+      hasDataModifyingCte = true
+    }
+  })
+  return hasDataModifyingCte
+}
+
+function queryTreeIsWrite(query: PgAnalyzerQuery): boolean {
+  let isWrite = query.hasModifyingCTE === true
+  walkQueryTree(query, (nested) => {
+    if (isDataModifyingCommand(nested.commandType)) {
+      isWrite = true
+    }
+  })
+  return isWrite
+}
+
+function dmlParameterNullability(queries: readonly PgAnalyzerQuery[]): ReadonlyMap<number, boolean> {
+  const nullableByParamId = new Map<number, boolean>()
+  for (const query of queries) {
+    walkQueryTree(query, (nested) => {
+      for (const target of nested.dmlParameterTargets) {
+        nullableByParamId.set(target.paramId, (nullableByParamId.get(target.paramId) ?? true) && target.targetNullable)
+      }
+    })
+  }
+  return nullableByParamId
+}
+
+function walkQuery(query: PgAnalyzerQuery, visitExpr: (expr: PgAnalyzerExpr) => void): void {
+  walkQueryTree(query, (nested) => {
+    walkDirectQueryExpressions(nested, visitExpr)
+  })
 }
 
 function collectOids(analysis: PgAnalyzerResult): {
@@ -807,19 +914,13 @@ function collectOids(analysis: PgAnalyzerResult): {
 }
 
 function walkQueryRelations(query: PgAnalyzerQuery, visitRelid: (relid: number) => void): void {
-  for (const rte of query.rtable ?? []) {
-    if (rte.kind === 'RELATION' && typeof rte.relid === 'number') {
-      visitRelid(rte.relid)
+  walkQueryTree(query, (nested) => {
+    for (const rte of nested.rtable ?? []) {
+      if (rte.kind === 'RELATION' && typeof rte.relid === 'number') {
+        visitRelid(rte.relid)
+      }
     }
-    if (rte.subquery) {
-      walkQueryRelations(rte.subquery, visitRelid)
-    }
-  }
-  for (const cte of query.cteList ?? []) {
-    if (cte.query) {
-      walkQueryRelations(cte.query, visitRelid)
-    }
-  }
+  })
 }
 
 async function loadCatalog(client: PostgresQueryable, analyses: readonly PgAnalyzerResult[]): Promise<CatalogFacts> {
@@ -992,24 +1093,27 @@ function exprKey(expr: PgAnalyzerExpr | null | undefined): string | null {
   return `${expr.varno}:${expr.varattno}:${expr.varlevelsup ?? 0}`
 }
 
-function collectNonNullVarKeys(
-  expr: PgAnalyzerExpr | null | undefined,
-  output = new Set<string>()
-): ReadonlySet<string> {
-  if (!expr) {
-    return output
+function collectNonNullVarKeys(expr: PgAnalyzerExpr | null | undefined): ReadonlySet<string> {
+  if (expr?.tag === 'NullTest' && expr.nullTestType === 'IS_NOT_NULL') {
+    const key = exprKey(expr.arg)
+    return key ? new Set([key]) : new Set()
   }
 
-  if (expr.tag === 'NullTest' && expr.nullTestType === 'IS_NOT_NULL') {
-    const key = exprKey(expr.arg)
-    if (key) {
-      output.add(key)
-    }
+  if (expr?.tag !== 'BoolExpr' || expr.boolOp === 'NOT') {
+    return new Set()
   }
-  for (const child of exprChildren(expr)) {
-    collectNonNullVarKeys(child, output)
+
+  const branches = exprChildren(expr).map(collectNonNullVarKeys)
+  if (expr.boolOp === 'AND') {
+    return new Set(branches.flatMap((branch) => [...branch]))
   }
-  return output
+
+  if (expr.boolOp === 'OR' && branches.length > 0) {
+    const [first, ...rest] = branches
+    return new Set([...(first ?? [])].filter((key) => rest.every((branch) => branch.has(key))))
+  }
+
+  return new Set()
 }
 
 function cteByName(query: PgAnalyzerQuery, name: string | undefined): PgAnalyzerCte | undefined {
@@ -1071,68 +1175,36 @@ function tsTypeForExpr(
   return checkConstraintTypeForExpr(catalog, query, expr) ?? tsTypeForPgType(typeFact)
 }
 
-function resultRelationRelid(query: PgAnalyzerQuery): number | null {
-  const resultRelationIndex = query.resultRelation
-  if (!resultRelationIndex) {
-    return null
-  }
-
-  const rte = query.rtable?.[resultRelationIndex - 1]
-  return rte?.kind === 'RELATION' && typeof rte.relid === 'number' ? rte.relid : null
-}
-
-function directParamId(expr: PgAnalyzerExpr | null | undefined): number | null {
-  const unwrapped = unwrapTransparentExpr(expr)
-  return unwrapped?.tag === 'Param' && Number.isInteger(unwrapped.paramId) ? (unwrapped.paramId ?? null) : null
-}
-
-function collectDirectCheckedColumnParamTypes(
+function checkedColumnParamTypes(
   catalog: CatalogFacts,
-  query: PgAnalyzerQuery,
-  output = new Map<number, Set<string>>()
-): Map<number, Set<string>> {
-  if (query.commandType === 'INSERT' || query.commandType === 'UPDATE') {
-    const relid = resultRelationRelid(query)
-    if (relid) {
-      for (const target of query.targetList ?? []) {
-        if (target.resjunk === true) {
+  queries: readonly PgAnalyzerQuery[],
+  paramTypeOids: readonly number[]
+): ReadonlyMap<number, string> {
+  const candidates = new Map<number, Set<string>>()
+  for (const query of queries) {
+    walkQueryTree(query, (nested) => {
+      for (const target of nested.dmlParameterTargets) {
+        if (paramTypeOids[target.paramId - 1] !== target.targetTypeOid) {
           continue
         }
 
-        const attnum = target.resno
-        const paramId = directParamId(target.expr)
-        if (!attnum || !paramId) {
-          continue
-        }
-
-        const fact = catalog.checkConstraintTypesByColumn.get(checkConstraintLiteralUnionColumnKey({ attnum, relid }))
+        const fact = catalog.checkConstraintTypesByColumn.get(
+          checkConstraintLiteralUnionColumnKey({
+            attnum: target.targetAttnum,
+            relid: target.targetRelid,
+          })
+        )
         if (!fact) {
           continue
         }
 
-        const types = output.get(paramId) ?? new Set<string>()
+        const types = candidates.get(target.paramId) ?? new Set<string>()
         types.add(fact.typeName)
-        output.set(paramId, types)
+        candidates.set(target.paramId, types)
       }
-    }
+    })
   }
 
-  for (const cte of query.cteList ?? []) {
-    if (cte.query) {
-      collectDirectCheckedColumnParamTypes(catalog, cte.query, output)
-    }
-  }
-  for (const rte of query.rtable ?? []) {
-    if (rte.subquery) {
-      collectDirectCheckedColumnParamTypes(catalog, rte.subquery, output)
-    }
-  }
-
-  return output
-}
-
-function checkedColumnParamTypes(catalog: CatalogFacts, query: PgAnalyzerQuery): ReadonlyMap<number, string> {
-  const candidates = collectDirectCheckedColumnParamTypes(catalog, query)
   const resolved = new Map<number, string>()
   for (const [paramId, types] of candidates) {
     if (types.size === 1) {
@@ -1189,8 +1261,11 @@ function expressionNullable(
   if (expr.tag === 'Param') {
     return true
   }
-  if (expr.tag === 'NullTest' || expr.tag === 'BooleanTest' || expr.tag === 'SubLink') {
+  if (expr.tag === 'NullTest' || expr.tag === 'BooleanTest') {
     return false
+  }
+  if (expr.tag === 'SubLink') {
+    return expr.subLinkType !== 'EXISTS' && expr.subLinkType !== 'ARRAY'
   }
   if (expr.tag === 'Aggref') {
     return expr.aggname !== 'count'
@@ -1462,7 +1537,7 @@ function renderTypePreview(ir: Omit<TypedSqlPostgresIr, 'typePreview'>): string 
     renderInterface(
       `${baseName}Params`,
       ir.params.map((param) => ({
-        nullable: false,
+        nullable: param.nullable,
         propertyName: param.propertyName,
         tsType: param.tsType,
       }))
@@ -1479,15 +1554,8 @@ function renderTypePreview(ir: Omit<TypedSqlPostgresIr, 'typePreview'>): string 
   ].join('\n')
 }
 
-function normalizeCompiledIr(
-  catalog: CatalogFacts,
-  config: TypedSqlPostgresIrCompiledConfig,
-  analysis: PgAnalyzerResult
-): TypedSqlPostgresIr {
-  const query = analysis.statements[0]?.queries[0]
-  if (!query) {
-    throw new Error(`${config.sourceFile}: analyzer returned no query.`)
-  }
+function normalizeCompiledIr(catalog: CatalogFacts, analyzed: AnalyzedCompiledConfig): TypedSqlPostgresIr {
+  const { analysis, config, primaryQuery: query, rewrittenQueries } = analyzed
 
   const resultColumns = resultTargets(query).map((target): TypedSqlPostgresIrColumn => {
     const expr = target.expr
@@ -1503,13 +1571,15 @@ function normalizeCompiledIr(
     }
   })
 
-  const checkConstraintParamTypes = checkedColumnParamTypes(catalog, query)
+  const checkConstraintParamTypes = checkedColumnParamTypes(catalog, rewrittenQueries, analysis.paramTypeOids)
+  const nullableByParamId = dmlParameterNullability(rewrittenQueries)
   const params = config.parameterNames.map((name, index): TypedSqlPostgresIrParam => {
     const oid = analysis.paramTypeOids[index]
     const typeFact = typeFactForOid(catalog, oid, config.parameterTypes?.[index])
     const checkConstraintTsType = checkConstraintParamTypes.get(index + 1)
     return {
       name,
+      nullable: nullableByParamId.get(index + 1) ?? false,
       ...typeFact,
       propertyName: name,
       tsType: checkConstraintTsType ?? tsTypeForPgType(typeFact),
@@ -1522,7 +1592,8 @@ function normalizeCompiledIr(
     analyzerSchemaVersion: analysis.schemaVersion,
     command: query.commandType,
     diagnostics: [],
-    hasDataModifyingCte: queryHasDataModifyingCte(query),
+    hasDataModifyingCte: rewrittenQueries.some(queryHasDataModifyingCte),
+    isWrite: rewrittenQueries.some(queryTreeIsWrite),
     name: config.name,
     params,
     postgresVersionNum: analysis.postgresVersionNum,
@@ -1541,32 +1612,52 @@ function normalizeCompiledIr(
 async function analyzeCompiledConfig(
   client: PostgresQueryable,
   config: TypedSqlPostgresIrCompiledConfig
-): Promise<PgAnalyzerResult> {
+): Promise<AnalyzedCompiledConfig> {
   const result = await client.query<{ readonly analysis: PgAnalyzerResult }>(
     `select ${ANALYZER_SQL_FUNCTION}($1, $2::oid[])::jsonb as analysis`,
     [config.sql, await explicitCompiledParamTypeOids(client, config)]
   )
   const analysis = result.rows[0]?.analysis
   if (!analysis || analysis.schemaVersion !== ANALYZER_SCHEMA_VERSION) {
-    throw new Error(`${config.sourceFile}: analyzer returned unsupported schema.`)
+    throw new Error('analyzer returned unsupported schema.')
   }
-  return analysis
+  if (analysis.rawStatementCount !== 1) {
+    throw new Error(`typed SQL must contain exactly one PostgreSQL statement; received ${analysis.rawStatementCount}.`)
+  }
+  if (analysis.statements.length !== 1) {
+    throw new Error(`analyzer returned ${analysis.statements.length} statement envelopes for one raw statement.`)
+  }
+  if (analysis.paramTypeOids.length !== config.parameterNames.length) {
+    throw new Error(
+      `analyzer returned ${analysis.paramTypeOids.length} parameter types for ${config.parameterNames.length} compiled parameters.`
+    )
+  }
+
+  const statement = analysis.statements[0]
+  if (!statement || statement.rewrittenQueryCount !== statement.queries.length) {
+    throw new Error('analyzer returned an inconsistent rewritten-query envelope.')
+  }
+  const tagSettingQueries = statement.queries.filter((query) => query.canSetTag)
+  if (tagSettingQueries.length !== 1) {
+    throw new Error(`expected exactly one tag-setting rewritten query; received ${tagSettingQueries.length}.`)
+  }
+
+  return {
+    analysis,
+    config,
+    primaryQuery: tagSettingQueries[0] as PgAnalyzerQuery,
+    rewrittenQueries: statement.queries,
+  }
 }
 
 export async function buildTypedSqlPostgresIrFromCompiledConfigs(
   client: PostgresQueryable,
   configs: readonly TypedSqlPostgresIrCompiledConfig[]
 ): Promise<TypedSqlPostgresIrBuildResult> {
-  const analyses: {
-    readonly analysis: PgAnalyzerResult
-    readonly config: TypedSqlPostgresIrCompiledConfig
-  }[] = []
+  const analyses: AnalyzedCompiledConfig[] = []
   for (const config of configs) {
     try {
-      analyses.push({
-        analysis: await analyzeCompiledConfig(client, config),
-        config,
-      })
+      analyses.push(await analyzeCompiledConfig(client, config))
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
       throw new Error(`${config.sourceFile}: failed to analyze typed SQL ${config.name}: ${message}`, {
@@ -1587,6 +1678,6 @@ export async function buildTypedSqlPostgresIrFromCompiledConfigs(
       types: catalog.types.size,
       uniqueIndexes: [...catalog.uniqueIndexesByRelid.values()].reduce((count, entries) => count + entries.length, 0),
     },
-    queries: analyses.map(({ analysis, config }) => normalizeCompiledIr(catalog, config, analysis)),
+    queries: analyses.map((analyzed) => normalizeCompiledIr(catalog, analyzed)),
   }
 }

@@ -121,6 +121,60 @@ where account.id = :account_id
   assert.match(output, /name: 'account_id',[\s\S]*?pgType: 'bigint'/u)
 })
 
+test('uses native DML facts for parameter nullability and nested write access', async () => {
+  const root = await copyFixture()
+  await writeFile(
+    join(root, 'queries/native-dml-facts.typed.sql'),
+    `-- @name nativeDmlFacts
+insert into public.accounts(email, display_name)
+values (:email, :display_name), (:second_email, :display_name)
+returning id
+`
+  )
+  await writeFile(
+    join(root, 'queries/mixed-dml-target.typed.sql'),
+    `-- @name mixedDmlTarget
+insert into public.accounts(email, display_name)
+values (:value, :value)
+returning id
+`
+  )
+  await writeFile(
+    join(root, 'queries/modifying-cte.typed.sql'),
+    `-- @name modifyingCte
+-- @param email text?
+with inserted as (
+  insert into public.accounts(email, display_name)
+  values (:email, :display_name)
+  returning id
+)
+select id from inserted
+`
+  )
+
+  const result = await generateTypedSql({
+    include: ['queries'],
+    rootDir: root,
+    schema: 'schema.sql',
+  })
+
+  assert.equal(result.statementCount, 7)
+
+  const nativeFacts = await readFile(join(root, 'queries/native-dml-facts.typed-sql.ts'), 'utf8')
+  assert.match(nativeFacts, /readonly email: string\n/u)
+  assert.match(nativeFacts, /readonly displayName: string \| null/u)
+  assert.match(nativeFacts, /readonly secondEmail: string\n/u)
+
+  const mixedTarget = await readFile(join(root, 'queries/mixed-dml-target.typed-sql.ts'), 'utf8')
+  assert.match(mixedTarget, /readonly value: string\n/u)
+  assert.doesNotMatch(mixedTarget, /readonly value: string \| null/u)
+
+  const modifyingCte = await readFile(join(root, 'queries/modifying-cte.typed-sql.ts'), 'utf8')
+  assert.match(modifyingCte, /access: 'write'/u)
+  assert.match(modifyingCte, /readonly email: string \| null/u)
+  assert.match(modifyingCte, /readonly displayName: string \| null/u)
+})
+
 test('rejects nullable column assertions because PostgreSQL determines result nullability', async () => {
   const root = await copyFixture()
   await writeFile(

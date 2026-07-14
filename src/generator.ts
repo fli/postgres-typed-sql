@@ -364,162 +364,6 @@ function typedSqlAccessForCommand(command: TypedSqlCommand): TypedSqlAccess {
   return command === 'select' ? 'read' : 'write'
 }
 
-function splitTopLevelSqlList(input: string): string[] {
-  const values: string[] = []
-  let current = ''
-  let depth = 0
-  let quote: '"' | "'" | null = null
-
-  for (let index = 0; index < input.length; index += 1) {
-    const char = input[index]
-    const next = input[index + 1]
-    if (!char) {
-      continue
-    }
-
-    if (quote) {
-      current += char
-      if (char === quote) {
-        if (next === quote) {
-          current += next
-          index += 1
-        } else {
-          quote = null
-        }
-      }
-      continue
-    }
-
-    if (char === "'" || char === '"') {
-      quote = char
-      current += char
-      continue
-    }
-
-    if (char === '(') {
-      depth += 1
-      current += char
-      continue
-    }
-
-    if (char === ')') {
-      depth = Math.max(0, depth - 1)
-      current += char
-      continue
-    }
-
-    if (char === ',' && depth === 0) {
-      values.push(current.trim())
-      current = ''
-      continue
-    }
-
-    current += char
-  }
-
-  const trimmed = current.trim()
-  if (trimmed.length > 0) {
-    values.push(trimmed)
-  }
-  return values
-}
-
-function parseQualifiedTableName(input: string): { readonly schema: string; readonly table: string } | null {
-  const parts = input
-    .trim()
-    .replaceAll('"', '')
-    .split('.')
-    .filter((part) => part.length > 0)
-
-  const table = parts.at(-1)
-  if (!table) {
-    return null
-  }
-
-  const schema = parts.length > 1 ? parts.at(-2) : undefined
-  return {
-    schema: schema ?? 'public',
-    table,
-  }
-}
-
-function normalizeColumnIdentifier(input: string): string | null {
-  const column = input.trim().replaceAll('"', '').split('.').at(-1)
-
-  return column && /^[A-Za-z_][A-Za-z0-9_]*$/u.test(column) ? column : null
-}
-
-function directParameterName(input: string, parameterNames: readonly string[]): string | null {
-  const trimmed = input.trim()
-  const namedMatch = /^\(?\s*:([A-Za-z_][A-Za-z0-9_]*)\s*(?:::[A-Za-z_][A-Za-z0-9_.]*)?\s*\)?$/u.exec(trimmed)
-  if (namedMatch?.[1]) {
-    return namedMatch[1]
-  }
-
-  const positionalMatch = /^\(?\s*\$(\d+)\s*(?:::[A-Za-z_][A-Za-z0-9_.]*)?\s*\)?$/u.exec(trimmed)
-  if (!positionalMatch?.[1]) {
-    return null
-  }
-
-  return parameterNames[Number(positionalMatch[1]) - 1] ?? null
-}
-
-function collectDmlParameterTargets(
-  sql: string,
-  parameterNames: readonly string[]
-): {
-  readonly column: string
-  readonly parameter: string
-  readonly table: string
-}[] {
-  const targets: {
-    readonly column: string
-    readonly parameter: string
-    readonly table: string
-  }[] = []
-
-  const insertMatch =
-    /\binsert\s+into\s+([A-Za-z_][A-Za-z0-9_".]*(?:\.[A-Za-z_][A-Za-z0-9_".]*)?)\s*\(([\s\S]*?)\)\s*values\s*\(([\s\S]*)\)\s*(?:on\s+conflict\b|returning\b|$)/iu.exec(
-      sql
-    )
-  if (insertMatch?.[1] && insertMatch[2] && insertMatch[3]) {
-    const tableName = parseQualifiedTableName(insertMatch[1])
-    if (tableName) {
-      const table = `${tableName.schema}.${tableName.table}`
-      const columns = splitTopLevelSqlList(insertMatch[2]).map(normalizeColumnIdentifier)
-      const values = splitTopLevelSqlList(insertMatch[3]).map((value) => directParameterName(value, parameterNames))
-      for (const [index, column] of columns.entries()) {
-        const parameter = values[index]
-        if (column && parameter) {
-          targets.push({ column, parameter, table })
-        }
-      }
-    }
-  }
-
-  const updateMatch =
-    /\bupdate\s+([A-Za-z_][A-Za-z0-9_".]*(?:\.[A-Za-z_][A-Za-z0-9_".]*)?)\s+set\s+([\s\S]*?)(?:\bwhere\b|$)/iu.exec(sql)
-  if (updateMatch?.[1] && updateMatch[2]) {
-    const tableName = parseQualifiedTableName(updateMatch[1])
-    if (tableName) {
-      const table = `${tableName.schema}.${tableName.table}`
-      for (const assignment of splitTopLevelSqlList(updateMatch[2])) {
-        const assignmentMatch = /^(.+?)\s*=\s*(.+)$/u.exec(assignment)
-        if (!assignmentMatch?.[1] || !assignmentMatch[2]) {
-          continue
-        }
-        const column = normalizeColumnIdentifier(assignmentMatch[1])
-        const parameter = directParameterName(assignmentMatch[2], parameterNames)
-        if (column && parameter) {
-          targets.push({ column, parameter, table })
-        }
-      }
-    }
-  }
-
-  return targets
-}
-
 function parseDirectivePgType(pgType: string | undefined): {
   readonly nullable: boolean
   readonly pgType?: string
@@ -1008,52 +852,6 @@ function assertColumnAssertions(config: CompiledTypedSql, resolvedColumns: reado
   }
 }
 
-async function inferDmlParameterNullability(
-  client: PostgresQueryable,
-  config: CompiledTypedSql
-): Promise<ReadonlyMap<string, boolean>> {
-  const targets = collectDmlParameterTargets(
-    config.sql,
-    config.parameters.map((parameter) => parameter.name)
-  )
-  if (targets.length === 0) {
-    return new Map()
-  }
-
-  const { rows } = await client.query<{
-    readonly attname: string
-    readonly nullable: boolean
-    readonly table_name: string
-  }>(
-    `select
-       format('%I.%I', namespace.nspname, class.relname) as table_name,
-       attribute.attname,
-       not attribute.attnotnull as nullable
-     from pg_catalog.pg_attribute attribute
-     join pg_catalog.pg_class class
-       on class.oid = attribute.attrelid
-     join pg_catalog.pg_namespace namespace
-       on namespace.oid = class.relnamespace
-     where format('%I.%I', namespace.nspname, class.relname) = any($1::text[])
-       and attribute.attnum > 0
-       and not attribute.attisdropped`,
-    [[...new Set(targets.map((target) => target.table))]]
-  )
-
-  const nullableByColumn = new Map(rows.map((row) => [`${row.table_name}.${row.attname}`, row.nullable]))
-  const nullableByParameter = new Map<string, boolean>()
-  for (const target of targets) {
-    const nullable = nullableByColumn.get(`${target.table}.${target.column}`)
-    if (nullable === undefined) {
-      continue
-    }
-
-    nullableByParameter.set(target.parameter, (nullableByParameter.get(target.parameter) ?? true) && nullable)
-  }
-
-  return nullableByParameter
-}
-
 async function resolveTypedSqlWithAnalyzer(
   configs: readonly CompiledTypedSql[],
   client: PostgresQueryable
@@ -1103,8 +901,6 @@ async function resolveTypedSqlWithAnalyzer(
       }
     })
     assertColumnAssertions(config, columns)
-    const parameterNullability = await inferDmlParameterNullability(client, config)
-
     const parameters = config.parameters.map((parameter, paramIndex): ResolvedSqlParameter => {
       const analyzed = ir.params[paramIndex]
       if (!analyzed) {
@@ -1113,7 +909,7 @@ async function resolveTypedSqlWithAnalyzer(
 
       return {
         name: parameter.name,
-        nullable: parameter.nullable === true ? true : (parameterNullability.get(parameter.name) ?? false),
+        nullable: parameter.nullable === true ? true : analyzed.nullable,
         pgType: analyzed.pgType,
         pgTypeName: analyzed.pgTypeName,
         pgTypeSchema: analyzed.pgTypeSchema,
@@ -1128,8 +924,7 @@ async function resolveTypedSqlWithAnalyzer(
     resolvedQueries.push({
       columns,
       access:
-        config.access ??
-        (ir.hasDataModifyingCte ? 'write' : typedSqlAccessForCommand(typedSqlCommandFromPostgres(ir.command))),
+        config.access ?? (ir.isWrite ? 'write' : typedSqlAccessForCommand(typedSqlCommandFromPostgres(ir.command))),
       cardinality: ir.rowCardinality,
       command: typedSqlCommandFromPostgres(ir.command),
       generatedTypeDeclarations: generatedDeclarations.map(renderGeneratedTypeDeclaration),
