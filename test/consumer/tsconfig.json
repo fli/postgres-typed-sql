@@ -1,0 +1,16 @@
+{
+  "compilerOptions": {
+    "exactOptionalPropertyTypes": true,
+    "forceConsistentCasingInFileNames": true,
+    "lib": ["ES2023"],
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "noEmit": true,
+    "noUncheckedIndexedAccess": true,
+    "strict": true,
+    "target": "ES2023",
+    "types": [],
+    "verbatimModuleSyntax": true
+  },
+  "include": ["*.mts", "*.typed-sql.ts", "postgres-typed-sql.types.ts"]
+}

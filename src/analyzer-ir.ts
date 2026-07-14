@@ -6,6 +6,7 @@ import {
   type CheckConstraintLiteralUnionFact,
 } from './check-constraint-type-facts.js'
 import type { PostgresQueryable } from './database.js'
+import { pascalCaseIdentifier, quotePropertyName, schemaQualifiedPascalName } from './typescript-names.js'
 
 const ANALYZER_SCHEMA_VERSION = 3
 const ANALYZER_SQL_FUNCTION = 'pg_temp.postgres_typed_sql_analyze'
@@ -325,10 +326,6 @@ for (const rangeType of ['daterange', 'int4range', 'int8range', 'numrange', 'tsr
   pgTypeToTsType.set(rangeType, 'string')
 }
 
-function camelCaseIdentifier(identifier: string): string {
-  return identifier.replaceAll(/_([a-z0-9])/gu, (_match, letter: string) => letter.toUpperCase())
-}
-
 function normalizePgTypeName(pgType: string): string {
   if (pgType.startsWith('character varying') || pgType.startsWith('character(') || pgType === 'varchar') {
     return 'text'
@@ -352,14 +349,14 @@ function normalizePgTypeName(pgType: string): string {
 }
 
 function postgresArrayElementType(pgType: string, typeName: string): string | null {
-  const normalizedPgType = normalizePgTypeName(pgType)
-  if (normalizedPgType.endsWith('[]')) {
-    return normalizedPgType.slice(0, -2)
-  }
-
   const normalizedTypeName = normalizePgTypeName(typeName)
   if (normalizedTypeName.startsWith('_') && normalizedTypeName.length > 1) {
     return normalizedTypeName.slice(1)
+  }
+
+  const normalizedPgType = normalizePgTypeName(pgType)
+  if (normalizedPgType.endsWith('[]')) {
+    return normalizedPgType.slice(0, -2)
   }
 
   return null
@@ -372,15 +369,6 @@ function splitSchemaQualifiedPgType(pgType: string): { readonly schema: string; 
   }
 
   return { schema: match[1], typeName: `${match[2]}${match[3] ?? ''}` }
-}
-
-function pascalCaseIdentifier(identifier: string): string {
-  const camel = camelCaseIdentifier(identifier)
-  return `${camel.slice(0, 1).toUpperCase()}${camel.slice(1)}`
-}
-
-function quotePropertyName(propertyName: string): string {
-  return /^[A-Za-z_$][\w$]*$/u.test(propertyName) ? propertyName : JSON.stringify(propertyName)
 }
 
 function tsTypeForPgType(typeFact: Pick<TypedSqlPostgresIrColumn, 'pgType' | 'pgTypeName' | 'pgTypeSchema'>): string {
@@ -403,12 +391,12 @@ function tsTypeForPgType(typeFact: Pick<TypedSqlPostgresIrColumn, 'pgType' | 'pg
             pgTypeName: arrayElementType,
             pgTypeSchema: 'pg_catalog',
           })
-        : pascalCaseIdentifier(arrayElementType)
+        : schemaQualifiedPascalName(typeFact.pgTypeSchema, arrayElementType)
     return `readonly ${elementType}[]`
   }
 
   if (typeFact.pgTypeSchema !== 'pg_catalog') {
-    return pascalCaseIdentifier(typeFact.pgTypeName || typeFact.pgType)
+    return schemaQualifiedPascalName(typeFact.pgTypeSchema, typeFact.pgTypeName || typeFact.pgType)
   }
 
   const tsType = pgTypeToTsType.get(normalizePgTypeName(typeFact.pgType))
@@ -1547,7 +1535,7 @@ function renderTypePreview(ir: Omit<TypedSqlPostgresIr, 'typePreview'>): string 
       `${baseName}Row`,
       ir.resultColumns.map((entry, index) => ({
         nullable: entry.nullable,
-        propertyName: camelCaseIdentifier(entry.name ?? `column_${index + 1}`),
+        propertyName: entry.name ?? `column_${index + 1}`,
         tsType: entry.tsType,
       }))
     ),

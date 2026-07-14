@@ -1,4 +1,5 @@
 import type { PostgresQueryable } from './database.js'
+import { pascalCaseIdentifier, schemaQualifiedPascalName } from './typescript-names.js'
 
 function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&')
@@ -43,26 +44,12 @@ interface MutableCheckConstraintLiteralUnionFact {
 
 const defaultSchemas = ['public']
 
-function camelCaseIdentifier(identifier: string): string {
-  return identifier.replaceAll(/_([a-z0-9])/gu, (_match, letter: string) => letter.toUpperCase())
-}
-
-function pascalCaseIdentifier(identifier: string): string {
-  const camel = camelCaseIdentifier(identifier)
-  return `${camel.slice(0, 1).toUpperCase()}${camel.slice(1)}`
-}
-
-function relationTypeName(schema: string, relname: string): string {
-  const name = pascalCaseIdentifier(relname)
-  return schema === 'public' ? name : `${pascalCaseIdentifier(schema)}${name}`
-}
-
 export function checkConstraintLiteralUnionTypeName(row: {
   readonly attname: string
   readonly relname: string
   readonly schema: string
 }): string {
-  return `${relationTypeName(row.schema, row.relname)}${pascalCaseIdentifier(row.attname)}`
+  return `${schemaQualifiedPascalName(row.schema, row.relname)}${pascalCaseIdentifier(row.attname)}`
 }
 
 export function checkConstraintLiteralUnionCatalogKey(row: {

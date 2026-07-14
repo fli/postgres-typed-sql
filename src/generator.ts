@@ -15,6 +15,14 @@ import { resolveConfig, type PostgresTypedSqlConfig } from './config.js'
 import type { PostgresQueryable } from './database.js'
 import { createAnalysisDatabase } from './engine.js'
 import { compileNamedParameters, parseTypedSqlSource } from './sql-source.js'
+import {
+  assertTypeScriptBindingIdentifier,
+  assertUniqueTypeScriptBindings,
+  pascalCaseIdentifier,
+  quotePropertyName,
+  schemaQualifiedPascalName,
+  type TypeScriptBinding,
+} from './typescript-names.js'
 
 let activeConfig: ResolvedPostgresTypedSqlConfig | undefined
 let generationInProgress = false
@@ -110,6 +118,7 @@ type TypedSqlAccess = 'read' | 'write'
 
 interface ResolvedTypedSql {
   readonly access: TypedSqlAccess
+  readonly catalogTypeImports: readonly string[]
   readonly cardinality: TypedSqlPostgresIrRowCardinality
   readonly columns: readonly ResolvedSqlColumn[]
   readonly command: TypedSqlCommand
@@ -120,9 +129,15 @@ interface ResolvedTypedSql {
   readonly parameterNames: readonly string[]
   readonly parameterTypes: readonly string[]
   readonly rowBounds: TypedSqlPostgresIrRowBounds
+  readonly scalarTypeImports: readonly string[]
   readonly sourceFile: string
   readonly sourcePath: string
   readonly sql: string
+}
+
+interface TypeScriptImports {
+  readonly catalog: Set<string>
+  readonly scalar: Set<string>
 }
 
 const pgTypeToTsType = new Map<string, string>([
@@ -196,18 +211,13 @@ const dbScalarTypes = new Set(
   ].map(([type]) => type)
 )
 
-function camelCaseIdentifier(identifier: string): string {
-  return identifier.replaceAll(/_([a-z0-9])/gu, (_match, letter: string) => letter.toUpperCase())
-}
-
-function pascalCaseIdentifier(identifier: string): string {
-  const camelCase = camelCaseIdentifier(identifier)
-  return `${camelCase.slice(0, 1).toUpperCase()}${camelCase.slice(1)}`
-}
-
 function requireSqlName(value: string, sourceFile: string): string {
   if (!/^[a-z][A-Za-z0-9]*$/u.test(value)) {
     throw new Error(`${sourceFile}: @name must be a lower camel-case identifier.`)
+  }
+  assertTypeScriptBindingIdentifier(value, `${sourceFile}: @name`)
+  if (value === 'createTypedSqlStatement') {
+    throw new Error(`${sourceFile}: @name createTypedSqlStatement collides with the generated runtime import.`)
   }
 
   return value
@@ -230,10 +240,6 @@ function lowerCamelCaseFromPathBase(base: string): string {
   ].join('')
 
   return requireSqlName(identifier, base)
-}
-
-function quotePropertyName(propertyName: string): string {
-  return /^[A-Za-z_$][\w$]*$/u.test(propertyName) ? propertyName : JSON.stringify(propertyName)
 }
 
 function quoteString(value: string): string {
@@ -275,14 +281,14 @@ function normalizePgTypeName(pgType: string): string {
 }
 
 function postgresArrayElementType(pgType: string, typeName: string): string | null {
-  const normalizedPgType = normalizePgTypeName(pgType)
-  if (normalizedPgType.endsWith('[]')) {
-    return normalizedPgType.slice(0, -2)
-  }
-
   const normalizedTypeName = normalizePgTypeName(typeName)
   if (normalizedTypeName.startsWith('_') && normalizedTypeName.length > 1) {
     return normalizedTypeName.slice(1)
+  }
+
+  const normalizedPgType = normalizePgTypeName(pgType)
+  if (normalizedPgType.endsWith('[]')) {
+    return normalizedPgType.slice(0, -2)
   }
 
   return null
@@ -313,12 +319,12 @@ function tsTypeForPgType(pgType: string, sourceFile: string, typeSchema = 'pg_ca
     const elementType =
       typeSchema === 'pg_catalog'
         ? tsTypeForPgType(arrayElementType, sourceFile)
-        : pascalCaseIdentifier(arrayElementType)
+        : schemaQualifiedPascalName(typeSchema, arrayElementType)
     return `readonly ${elementType}[]`
   }
 
   if (typeSchema !== 'pg_catalog') {
-    return pascalCaseIdentifier(typeName || pgType)
+    return schemaQualifiedPascalName(typeSchema, typeName || pgType)
   }
 
   const tsType = pgTypeToTsType.get(normalizePgTypeName(pgType))
@@ -341,6 +347,56 @@ function parameterTsTypeForPgType(
   }
 
   return tsTypeForPgType(pgType, sourceFile, typeSchema, typeName)
+}
+
+function collectPgTypeImports(
+  imports: TypeScriptImports,
+  pgType: string,
+  typeSchema = 'pg_catalog',
+  typeName = '',
+  usage: 'input' | 'output' = 'output'
+): void {
+  const arrayElementType = postgresArrayElementType(pgType, typeName)
+  if (arrayElementType) {
+    collectPgTypeImports(imports, arrayElementType, typeSchema, arrayElementType, 'output')
+    return
+  }
+
+  if (typeSchema !== 'pg_catalog') {
+    imports.catalog.add(schemaQualifiedPascalName(typeSchema, typeName || pgType))
+    return
+  }
+
+  const normalizedTypeName = normalizePgTypeName(typeName || pgType)
+  const tsType =
+    usage === 'input' && (normalizedTypeName === 'json' || normalizedTypeName === 'jsonb')
+      ? 'DbJsonInput'
+      : pgTypeToTsType.get(normalizePgTypeName(pgType))
+  if (tsType && dbScalarTypes.has(tsType)) {
+    imports.scalar.add(tsType)
+  }
+}
+
+function collectResolvedTypeImports(
+  imports: TypeScriptImports,
+  tsType: string,
+  pgType: string,
+  typeSchema: string,
+  typeName: string,
+  sourceFile: string,
+  usage: 'input' | 'output'
+): void {
+  const defaultType =
+    usage === 'input'
+      ? parameterTsTypeForPgType(pgType, sourceFile, typeSchema, typeName)
+      : tsTypeForPgType(pgType, sourceFile, typeSchema, typeName)
+  if (tsType === defaultType) {
+    collectPgTypeImports(imports, pgType, typeSchema, typeName, usage)
+  } else if (dbScalarTypes.has(tsType)) {
+    imports.scalar.add(tsType)
+  } else {
+    imports.catalog.add(tsType)
+  }
 }
 
 function typedSqlCommandFromPostgres(command: string): TypedSqlCommand {
@@ -430,6 +486,8 @@ async function readTypedSqlConfigs(): Promise<TypedSqlConfig[]> {
     let name = defaultName
     const parameters: SqlParameter[] = []
     const columns: SqlColumn[] = []
+    const firstColumnDirectiveByName = new Map<string, string>()
+    const firstParameterDirectiveByName = new Map<string, string>()
 
     for (const directive of parsedSource.directives) {
       const location = `${sourceFile}:${directive.line}`
@@ -471,11 +529,18 @@ async function readTypedSqlConfigs(): Promise<TypedSqlConfig[]> {
         throw new Error(`${location}: @column does not support ?; PostgreSQL determines result nullability.`)
       }
 
+      const firstDirectiveByName = kind === 'param' ? firstParameterDirectiveByName : firstColumnDirectiveByName
+      const firstLocation = firstDirectiveByName.get(identifier)
+      if (firstLocation) {
+        throw new Error(`${location}: duplicate @${kind} ${identifier}; first declared at ${firstLocation}.`)
+      }
+      firstDirectiveByName.set(identifier, location)
+
       const entry = {
         name: identifier,
         nullable: parsedPgType.nullable,
         pgType,
-        propertyName: camelCaseIdentifier(identifier),
+        propertyName: identifier,
         tsType: pgType ? tsTypeForPgType(pgType, location) : undefined,
       }
 
@@ -522,7 +587,7 @@ function compileTypedSql(config: TypedSqlConfig): CompiledTypedSql {
       parametersByName.get(name) ??
       ({
         name,
-        propertyName: camelCaseIdentifier(name),
+        propertyName: name,
       } satisfies SqlParameter)
 
     parameters.push(parameter)
@@ -562,6 +627,35 @@ interface GeneratedJsonTypeDeclaration {
   readonly name: string
 }
 
+function assertUniquePublicNames(names: readonly string[], kind: string, sourceFile: string): void {
+  const firstIndexByName = new Map<string, number>()
+  for (const [index, name] of names.entries()) {
+    const firstIndex = firstIndexByName.get(name)
+    if (firstIndex !== undefined) {
+      throw new Error(
+        `${sourceFile}: duplicate ${kind} name ${JSON.stringify(name)} at positions ${firstIndex + 1} and ${index + 1}.`
+      )
+    }
+    firstIndexByName.set(name, index)
+  }
+}
+
+function reserveGeneratedTypeBinding(
+  bindings: Map<string, string>,
+  name: string,
+  source: string,
+  sourceFile: string
+): void {
+  assertTypeScriptBindingIdentifier(name, `${sourceFile}: generated type for ${source}`)
+  const firstSource = bindings.get(name)
+  if (firstSource) {
+    throw new Error(
+      `${sourceFile}: generated TypeScript binding ${name} for ${source} collides with ${firstSource}. Alias the SQL field to give it a distinct name.`
+    )
+  }
+  bindings.set(name, source)
+}
+
 function singularTypeName(name: string): string {
   return name.endsWith('Rows')
     ? name.slice(0, -1)
@@ -576,16 +670,20 @@ function singularTypeName(name: string): string {
 
 function scalarTsTypeForJsonShape(
   shape: Extract<TypedSqlPostgresIrJsonShape, { readonly kind: 'scalar' }>,
-  sourceFile: string
+  sourceFile: string,
+  imports: TypeScriptImports
 ): string {
   if (shape.tsType) {
+    imports.catalog.add(shape.tsType)
     return shape.tsType
   }
 
   if (shape.pgType === 'unknown' || shape.pgTypeName === 'unknown' || shape.pgTypeSchema === 'unknown') {
+    imports.scalar.add('DbJsonSelected')
     return 'DbJsonSelected'
   }
 
+  collectPgTypeImports(imports, shape.pgType, shape.pgTypeSchema, shape.pgTypeName)
   return tsTypeForPgType(shape.pgType, sourceFile, shape.pgTypeSchema, shape.pgTypeName)
 }
 
@@ -594,7 +692,8 @@ function tsTypeForJsonShape(
   sourceFile: string,
   suggestedName: string,
   declarations: GeneratedJsonTypeDeclaration[],
-  usedNames: Map<string, number>
+  usedNames: Map<string, string>,
+  imports: TypeScriptImports
 ): string {
   switch (shape.kind) {
     case 'array':
@@ -603,22 +702,28 @@ function tsTypeForJsonShape(
         sourceFile,
         singularTypeName(suggestedName),
         declarations,
-        usedNames
+        usedNames,
+        imports
       )}[]`
     case 'object': {
-      const usedCount = usedNames.get(suggestedName) ?? 0
-      usedNames.set(suggestedName, usedCount + 1)
-      const name = usedCount === 0 ? suggestedName : `${suggestedName}${usedCount + 1}`
+      reserveGeneratedTypeBinding(usedNames, suggestedName, `JSON object ${suggestedName}`, sourceFile)
+      assertUniquePublicNames(
+        shape.fields.map((field) => field.name),
+        `JSON field in ${suggestedName}`,
+        sourceFile
+      )
+      const name = suggestedName
       declarations.push({
         fields: shape.fields.map((field) => ({
           nullable: field.shape.nullable,
-          propertyName: camelCaseIdentifier(field.name),
+          propertyName: field.name,
           tsType: tsTypeForJsonShape(
             field.shape,
             sourceFile,
             `${name}${pascalCaseIdentifier(field.name)}`,
             declarations,
-            usedNames
+            usedNames,
+            imports
           ),
         })),
         name,
@@ -626,18 +731,10 @@ function tsTypeForJsonShape(
       return name
     }
     case 'opaque':
+      imports.scalar.add('DbJsonSelected')
       return 'DbJsonSelected'
     case 'scalar':
-      return scalarTsTypeForJsonShape(shape, sourceFile)
-  }
-}
-
-function collectReferencedTypes(source: string, output: Set<string>): void {
-  for (const match of source.matchAll(/\b[A-Z][A-Za-z0-9_]*\b/gu)) {
-    const [identifier] = match
-    if (identifier) {
-      output.add(identifier)
-    }
+      return scalarTsTypeForJsonShape(shape, sourceFile, imports)
   }
 }
 
@@ -651,38 +748,11 @@ function renderImports(configs: readonly ResolvedTypedSql[]): string {
   const scalarImports = new Set<string>()
   const catalogTypeImports = new Set<string>()
   for (const config of configs) {
-    const localTypeNames = new Set(
-      config.generatedTypeDeclarations.flatMap((declaration) =>
-        [...declaration.matchAll(/export (?:interface|type) ([A-Z][A-Za-z0-9_]*)/gu)].map((match) => match[1] ?? '')
-      )
-    )
-    for (const entry of [...config.parameters, ...config.columns]) {
-      const identifiers = new Set<string>()
-      collectReferencedTypes(entry.tsType, identifiers)
-      for (const identifier of identifiers) {
-        if (localTypeNames.has(identifier)) {
-          continue
-        }
-        if (dbScalarTypes.has(identifier)) {
-          scalarImports.add(identifier)
-        } else {
-          catalogTypeImports.add(identifier)
-        }
-      }
+    for (const identifier of config.scalarTypeImports) {
+      scalarImports.add(identifier)
     }
-    for (const declaration of config.generatedTypeDeclarations) {
-      const identifiers = new Set<string>()
-      collectReferencedTypes(declaration, identifiers)
-      for (const identifier of identifiers) {
-        if (localTypeNames.has(identifier)) {
-          continue
-        }
-        if (dbScalarTypes.has(identifier)) {
-          scalarImports.add(identifier)
-        } else if (!['Record'].includes(identifier)) {
-          catalogTypeImports.add(identifier)
-        }
-      }
+    for (const identifier of config.catalogTypeImports) {
+      catalogTypeImports.add(identifier)
     }
   }
 
@@ -875,11 +945,41 @@ async function resolveTypedSqlWithAnalyzer(
     }
 
     const generatedDeclarations: GeneratedJsonTypeDeclaration[] = []
-    const usedGeneratedTypeNames = new Map<string, number>()
+    const typeImports: TypeScriptImports = {
+      catalog: new Set(),
+      scalar: new Set(),
+    }
+    const statementTypeBindings: TypeScriptBinding[] = [
+      { name: `${pascalCaseIdentifier(config.name)}Params`, source: 'parameter interface' },
+      { name: `${pascalCaseIdentifier(config.name)}Row`, source: 'row interface' },
+    ]
+    assertUniqueTypeScriptBindings(statementTypeBindings, config.sourceFile)
+    const usedGeneratedTypeNames = new Map(statementTypeBindings.map((binding) => [binding.name, binding.source]))
     const columns = ir.resultColumns.map((column, columnIndex): ResolvedSqlColumn => {
       const name = column.name ?? `column_${columnIndex + 1}`
-      const propertyName = camelCaseIdentifier(name)
+      const propertyName = name
       const suggestedJsonTypeName = `${pascalCaseIdentifier(config.name)}${pascalCaseIdentifier(propertyName)}Json`
+      const tsType = column.jsonShape
+        ? tsTypeForJsonShape(
+            column.jsonShape,
+            config.sourceFile,
+            suggestedJsonTypeName,
+            generatedDeclarations,
+            usedGeneratedTypeNames,
+            typeImports
+          )
+        : column.tsType
+      if (!column.jsonShape) {
+        collectResolvedTypeImports(
+          typeImports,
+          tsType,
+          column.pgType,
+          column.pgTypeSchema,
+          column.pgTypeName,
+          config.sourceFile,
+          'output'
+        )
+      }
       return {
         jsonShape: column.jsonShape,
         name,
@@ -889,17 +989,14 @@ async function resolveTypedSqlWithAnalyzer(
         pgTypeSchema: column.pgTypeSchema,
         propertyName,
         source: column.source,
-        tsType: column.jsonShape
-          ? tsTypeForJsonShape(
-              column.jsonShape,
-              config.sourceFile,
-              suggestedJsonTypeName,
-              generatedDeclarations,
-              usedGeneratedTypeNames
-            )
-          : column.tsType,
+        tsType,
       }
     })
+    assertUniquePublicNames(
+      columns.map((column) => column.propertyName),
+      'result column',
+      config.sourceFile
+    )
     assertColumnAssertions(config, columns)
     const parameters = config.parameters.map((parameter, paramIndex): ResolvedSqlParameter => {
       const analyzed = ir.params[paramIndex]
@@ -907,6 +1004,19 @@ async function resolveTypedSqlWithAnalyzer(
         throw new Error(`${config.sourceFile}: analyzer returned no type for parameter ${parameter.name}.`)
       }
 
+      const tsType =
+        analyzed.tsTypeSource === 'checkConstraint'
+          ? analyzed.tsType
+          : parameterTsTypeForPgType(analyzed.pgType, config.sourceFile, analyzed.pgTypeSchema, analyzed.pgTypeName)
+      collectResolvedTypeImports(
+        typeImports,
+        tsType,
+        analyzed.pgType,
+        analyzed.pgTypeSchema,
+        analyzed.pgTypeName,
+        config.sourceFile,
+        'input'
+      )
       return {
         name: parameter.name,
         nullable: parameter.nullable === true ? true : analyzed.nullable,
@@ -914,18 +1024,30 @@ async function resolveTypedSqlWithAnalyzer(
         pgTypeName: analyzed.pgTypeName,
         pgTypeSchema: analyzed.pgTypeSchema,
         propertyName: parameter.propertyName,
-        tsType:
-          analyzed.tsTypeSource === 'checkConstraint'
-            ? analyzed.tsType
-            : parameterTsTypeForPgType(analyzed.pgType, config.sourceFile, analyzed.pgTypeSchema, analyzed.pgTypeName),
+        tsType,
       }
     })
+    assertUniquePublicNames(
+      parameters.map((parameter) => parameter.propertyName),
+      'parameter',
+      config.sourceFile
+    )
+    assertUniqueTypeScriptBindings(
+      [
+        { name: 'Record', source: 'reserved TypeScript utility type' },
+        ...[...usedGeneratedTypeNames].map(([name, source]) => ({ name, source })),
+        ...[...typeImports.catalog].map((name) => ({ name, source: 'catalog type import' })),
+        ...[...typeImports.scalar].map((name) => ({ name, source: 'postgres-typed-sql scalar type import' })),
+      ],
+      config.sourceFile
+    )
 
     resolvedQueries.push({
       columns,
       access:
         config.access ?? (ir.isWrite ? 'write' : typedSqlAccessForCommand(typedSqlCommandFromPostgres(ir.command))),
       cardinality: ir.rowCardinality,
+      catalogTypeImports: [...typeImports.catalog].toSorted(),
       command: typedSqlCommandFromPostgres(ir.command),
       generatedTypeDeclarations: generatedDeclarations.map(renderGeneratedTypeDeclaration),
       name: config.name,
@@ -934,6 +1056,7 @@ async function resolveTypedSqlWithAnalyzer(
       parameterNames: config.parameterNames,
       parameterTypes: parameters.map((parameter) => parameter.pgType),
       rowBounds: ir.rowBounds,
+      scalarTypeImports: [...typeImports.scalar].toSorted(),
       sourceFile: config.sourceFile,
       sourcePath: config.sourcePath,
       sql: config.sql,

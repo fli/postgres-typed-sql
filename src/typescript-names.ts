@@ -1,0 +1,93 @@
+const reservedBindingIdentifiers = new Set([
+  'arguments',
+  'await',
+  'break',
+  'case',
+  'catch',
+  'class',
+  'const',
+  'continue',
+  'debugger',
+  'default',
+  'delete',
+  'do',
+  'else',
+  'enum',
+  'eval',
+  'export',
+  'extends',
+  'false',
+  'finally',
+  'for',
+  'function',
+  'if',
+  'implements',
+  'import',
+  'in',
+  'instanceof',
+  'interface',
+  'let',
+  'new',
+  'null',
+  'package',
+  'private',
+  'protected',
+  'public',
+  'return',
+  'static',
+  'super',
+  'switch',
+  'this',
+  'throw',
+  'true',
+  'try',
+  'typeof',
+  'var',
+  'void',
+  'while',
+  'with',
+  'yield',
+])
+
+export function camelCaseIdentifier(identifier: string): string {
+  return identifier.replaceAll(/_([a-z0-9])/gu, (_match, letter: string) => letter.toUpperCase())
+}
+
+export function pascalCaseIdentifier(identifier: string): string {
+  const camel = camelCaseIdentifier(identifier)
+  return `${camel.slice(0, 1).toUpperCase()}${camel.slice(1)}`
+}
+
+export function schemaQualifiedPascalName(schema: string, identifier: string): string {
+  const name = pascalCaseIdentifier(identifier)
+  return schema === 'public' ? name : `${pascalCaseIdentifier(schema)}${name}`
+}
+
+export function quotePropertyName(propertyName: string): string {
+  return /^[A-Za-z_$][A-Za-z0-9_$]*$/u.test(propertyName) ? propertyName : JSON.stringify(propertyName)
+}
+
+export function assertTypeScriptBindingIdentifier(identifier: string, context: string): void {
+  if (!/^[A-Za-z_$][A-Za-z0-9_$]*$/u.test(identifier) || reservedBindingIdentifiers.has(identifier)) {
+    throw new Error(`${context}: ${JSON.stringify(identifier)} is not a legal non-reserved TypeScript binding.`)
+  }
+}
+
+export interface TypeScriptBinding {
+  readonly name: string
+  readonly source: string
+}
+
+export function assertUniqueTypeScriptBindings(bindings: readonly TypeScriptBinding[], context: string): void {
+  const firstSourceByName = new Map<string, string>()
+  for (const binding of bindings) {
+    assertTypeScriptBindingIdentifier(binding.name, `${context}: generated binding for ${binding.source}`)
+    const firstSource = firstSourceByName.get(binding.name)
+    if (firstSource) {
+      throw new Error(
+        `${context}: generated TypeScript binding ${binding.name} for ${binding.source} collides with ${firstSource}.`
+      )
+    }
+    firstSourceByName.set(binding.name, binding.source)
+  }
+}

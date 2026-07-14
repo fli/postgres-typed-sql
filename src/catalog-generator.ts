@@ -8,6 +8,12 @@ import {
 } from './check-constraint-type-facts.js'
 import type { ResolvedPostgresTypedSqlConfig } from './config.js'
 import type { PostgresQueryable } from './database.js'
+import {
+  assertUniqueTypeScriptBindings,
+  quotePropertyName,
+  schemaQualifiedPascalName,
+  type TypeScriptBinding,
+} from './typescript-names.js'
 
 interface EnumCatalogRow {
   readonly labels: readonly string[]
@@ -103,19 +109,6 @@ const dbScalarTypes = new Set(
   ].toSorted()
 )
 
-function camelCaseIdentifier(identifier: string): string {
-  return identifier.replaceAll(/_([a-z0-9])/gu, (_match, letter: string) => letter.toUpperCase())
-}
-
-function pascalCaseIdentifier(identifier: string): string {
-  const camelCase = camelCaseIdentifier(identifier)
-  return `${camelCase.slice(0, 1).toUpperCase()}${camelCase.slice(1)}`
-}
-
-function quotePropertyName(propertyName: string): string {
-  return /^[A-Za-z_$][\w$]*$/u.test(propertyName) ? propertyName : JSON.stringify(propertyName)
-}
-
 function quoteString(value: string): string {
   return `'${value.replaceAll('\\', '\\\\').replaceAll("'", "\\'")}'`
 }
@@ -150,7 +143,7 @@ function tsTypeForPgType(pgType: string, typeSchema: string, typeName: string): 
   }
 
   if (typeSchema !== 'pg_catalog') {
-    return pascalCaseIdentifier(typeName)
+    return schemaQualifiedPascalName(typeSchema, typeName)
   }
 
   const tsType = pgTypeToTsType.get(normalized)
@@ -161,8 +154,7 @@ function tsTypeForPgType(pgType: string, typeSchema: string, typeName: string): 
 }
 
 function relationTypeName(row: Pick<ColumnCatalogRow, 'relname' | 'schema'>): string {
-  const name = pascalCaseIdentifier(row.relname)
-  return row.schema === 'public' ? name : `${pascalCaseIdentifier(row.schema)}${name}`
+  return schemaQualifiedPascalName(row.schema, row.relname)
 }
 
 async function loadEnums(client: PostgresQueryable): Promise<EnumCatalogRow[]> {
@@ -231,7 +223,7 @@ async function loadColumns(client: PostgresQueryable): Promise<ColumnCatalogRow[
 function renderEnums(enums: readonly EnumCatalogRow[]): string {
   return enums
     .map((row) => {
-      const name = pascalCaseIdentifier(row.type_name)
+      const name = schemaQualifiedPascalName(row.schema, row.type_name)
       return `export type ${name} = ${row.labels.map(quoteString).join(' | ')}`
     })
     .join('\n\n')
@@ -241,7 +233,7 @@ function renderDomains(domains: readonly DomainCatalogRow[]): string {
   return domains
     .map(
       (row) =>
-        `export type ${pascalCaseIdentifier(row.type_name)} = ${tsTypeForPgType(
+        `export type ${schemaQualifiedPascalName(row.schema, row.type_name)} = ${tsTypeForPgType(
           row.base_formatted_type,
           row.base_type_schema,
           row.base_type_name
@@ -258,7 +250,9 @@ function groupColumnsByRelation(columns: readonly ColumnCatalogRow[]): Map<strin
   const byRelation = new Map<string, ColumnCatalogRow[]>()
   for (const row of columns) {
     const key = `${row.schema}.${row.relname}`
-    byRelation.set(key, [...(byRelation.get(key) ?? []), row])
+    const rows = byRelation.get(key) ?? []
+    rows.push(row)
+    byRelation.set(key, rows)
   }
   return byRelation
 }
@@ -294,7 +288,7 @@ function renderRelations(
         `export interface ${name} {`,
         ...rows.map((row) => {
           const tsType = tsTypeForColumn(row, checkConstraintTypes)
-          return `  readonly ${quotePropertyName(camelCaseIdentifier(row.attname))}: ${tsType}${row.attnotnull ? '' : ' | null'}`
+          return `  readonly ${quotePropertyName(row.attname)}: ${tsType}${row.attnotnull ? '' : ' | null'}`
         }),
         '}',
       ].join('\n')
@@ -303,8 +297,7 @@ function renderRelations(
 }
 
 function catalogDbPropertyName(row: Pick<ColumnCatalogRow, 'relname' | 'schema'>): string {
-  const relationName = camelCaseIdentifier(row.relname)
-  return row.schema === 'public' ? relationName : `${row.schema}.${relationName}`
+  return row.schema === 'public' ? row.relname : `${row.schema}.${row.relname}`
 }
 
 function renderCatalogDb(columns: readonly ColumnCatalogRow[]): string {
@@ -319,6 +312,43 @@ function renderCatalogDb(columns: readonly ColumnCatalogRow[]): string {
   return ['export interface CatalogDb {', ...lines, '}'].join('\n')
 }
 
+function validateCatalogBindings(
+  enums: readonly EnumCatalogRow[],
+  domains: readonly DomainCatalogRow[],
+  columns: readonly ColumnCatalogRow[],
+  checkConstraintLiteralUnions: readonly CheckConstraintLiteralUnionFact[]
+): void {
+  const bindings: TypeScriptBinding[] = [
+    { name: 'CatalogDb', source: 'generated catalog root interface' },
+    { name: 'Record', source: 'reserved TypeScript utility type' },
+    ...[...dbScalarTypes].map((name) => ({ name, source: 'reserved postgres-typed-sql scalar type' })),
+    ...enums.map((row) => ({
+      name: schemaQualifiedPascalName(row.schema, row.type_name),
+      source: `enum ${row.schema}.${row.type_name}`,
+    })),
+    ...domains.map((row) => ({
+      name: schemaQualifiedPascalName(row.schema, row.type_name),
+      source: `domain ${row.schema}.${row.type_name}`,
+    })),
+    ...checkConstraintLiteralUnions.map((fact) => ({
+      name: fact.typeName,
+      source: `check-constrained column ${fact.schema}.${fact.relname}.${fact.attname}`,
+    })),
+    ...[...groupColumnsByRelation(columns).values()].flatMap((rows) => {
+      const first = rows[0]
+      return first
+        ? [
+            {
+              name: relationTypeName(first),
+              source: `relation ${first.schema}.${first.relname}`,
+            },
+          ]
+        : []
+    }),
+  ]
+  assertUniqueTypeScriptBindings(bindings, 'catalog generation')
+}
+
 function renderCatalogTypes(
   enums: readonly EnumCatalogRow[],
   domains: readonly DomainCatalogRow[],
@@ -326,6 +356,7 @@ function renderCatalogTypes(
   checkConstraintLiteralUnions: readonly CheckConstraintLiteralUnionFact[],
   packageImport: string
 ): string {
+  validateCatalogBindings(enums, domains, columns, checkConstraintLiteralUnions)
   const scalarImports = new Set<string>()
   const checkConstraintTypes = checkConstraintLiteralUnionByCatalogKey(checkConstraintLiteralUnions)
   for (const domain of domains) {
