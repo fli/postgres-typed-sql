@@ -6,7 +6,8 @@ import {
   type CheckConstraintLiteralUnionFact,
 } from './check-constraint-type-facts.js'
 import type { PostgresQueryable } from './database.js'
-import { pascalCaseIdentifier, quotePropertyName, schemaQualifiedPascalName } from './typescript-names.js'
+import { typeScriptTypeForPostgresType } from './postgres-types.js'
+import { pascalCaseIdentifier, quotePropertyName } from './typescript-names.js'
 
 const ANALYZER_SCHEMA_VERSION = 3
 const ANALYZER_SQL_FUNCTION = 'pg_temp.postgres_typed_sql_analyze'
@@ -55,6 +56,7 @@ export interface TypedSqlPostgresIrColumn {
   readonly pgTypeSchema: string
   readonly source: TypedSqlPostgresIrColumnSource
   readonly tsType: string
+  readonly tsTypeSource?: 'checkConstraint'
 }
 
 export type TypedSqlPostgresIrJsonShape =
@@ -276,135 +278,8 @@ export interface TypedSqlPostgresIrBuildResult {
   readonly queries: readonly TypedSqlPostgresIr[]
 }
 
-const pgTypeToTsType = new Map<string, string>([
-  ['bigint', 'PgInt8String'],
-  ['bit', 'string'],
-  ['bit varying', 'string'],
-  ['boolean', 'boolean'],
-  ['box', 'string'],
-  ['bytea', 'PgByteaHexString'],
-  ['char', 'string'],
-  ['cidr', 'string'],
-  ['circle', 'string'],
-  ['date', 'PgDateString'],
-  ['double precision', 'PgFloat8String'],
-  ['inet', 'string'],
-  ['integer', 'PgInt4String'],
-  ['interval', 'PgIntervalString'],
-  ['json', 'DbJsonSelected'],
-  ['jsonb', 'DbJsonSelected'],
-  ['line', 'string'],
-  ['lseg', 'string'],
-  ['macaddr', 'string'],
-  ['macaddr8', 'string'],
-  ['money', 'string'],
-  ['name', 'string'],
-  ['numeric', 'PgNumericString'],
-  ['oid', 'PgOidString'],
-  ['path', 'string'],
-  ['pg_lsn', 'string'],
-  ['point', 'string'],
-  ['polygon', 'string'],
-  ['real', 'PgFloat4String'],
-  ['smallint', 'PgInt2String'],
-  ['text', 'string'],
-  ['time without time zone', 'PgTimeString'],
-  ['time with time zone', 'PgTimetzString'],
-  ['timestamp without time zone', 'PgTimestampString'],
-  ['timestamp with time zone', 'PgTimestamptzString'],
-  ['timestamptz', 'PgTimestamptzString'],
-  ['tsquery', 'string'],
-  ['tsvector', 'string'],
-  ['unknown', 'unknown'],
-  ['uuid', 'PgUuidString'],
-  ['void', 'unknown'],
-  ['xml', 'string'],
-  ['uuid[]', 'readonly PgUuidString[]'],
-])
-
-for (const rangeType of ['daterange', 'int4range', 'int8range', 'numrange', 'tsrange', 'tstzrange']) {
-  pgTypeToTsType.set(rangeType, 'string')
-}
-
-function normalizePgTypeName(pgType: string): string {
-  if (pgType.startsWith('character varying') || pgType.startsWith('character(') || pgType === 'varchar') {
-    return 'text'
-  }
-  if (pgType.startsWith('numeric(')) {
-    return 'numeric'
-  }
-  if (pgType.startsWith('timestamp(') && pgType.endsWith(' without time zone')) {
-    return 'timestamp without time zone'
-  }
-  if (pgType.startsWith('timestamp(') && pgType.endsWith(' with time zone')) {
-    return 'timestamp with time zone'
-  }
-  if (pgType.startsWith('time(') && pgType.endsWith(' without time zone')) {
-    return 'time without time zone'
-  }
-  if (pgType.startsWith('time(') && pgType.endsWith(' with time zone')) {
-    return 'time with time zone'
-  }
-  return pgType
-}
-
-function postgresArrayElementType(pgType: string, typeName: string): string | null {
-  const normalizedTypeName = normalizePgTypeName(typeName)
-  if (normalizedTypeName.startsWith('_') && normalizedTypeName.length > 1) {
-    return normalizedTypeName.slice(1)
-  }
-
-  const normalizedPgType = normalizePgTypeName(pgType)
-  if (normalizedPgType.endsWith('[]')) {
-    return normalizedPgType.slice(0, -2)
-  }
-
-  return null
-}
-
-function splitSchemaQualifiedPgType(pgType: string): { readonly schema: string; readonly typeName: string } | null {
-  const match = /^([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)(\[\])?$/u.exec(pgType)
-  if (!match?.[1] || !match[2]) {
-    return null
-  }
-
-  return { schema: match[1], typeName: `${match[2]}${match[3] ?? ''}` }
-}
-
 function tsTypeForPgType(typeFact: Pick<TypedSqlPostgresIrColumn, 'pgType' | 'pgTypeName' | 'pgTypeSchema'>): string {
-  const schemaQualifiedType =
-    typeFact.pgTypeSchema === 'pg_catalog' && !typeFact.pgTypeName ? splitSchemaQualifiedPgType(typeFact.pgType) : null
-  if (schemaQualifiedType) {
-    return tsTypeForPgType({
-      pgType: schemaQualifiedType.typeName,
-      pgTypeName: schemaQualifiedType.typeName,
-      pgTypeSchema: schemaQualifiedType.schema,
-    })
-  }
-
-  const arrayElementType = postgresArrayElementType(typeFact.pgType, typeFact.pgTypeName)
-  if (arrayElementType) {
-    const elementType =
-      typeFact.pgTypeSchema === 'pg_catalog'
-        ? tsTypeForPgType({
-            pgType: arrayElementType,
-            pgTypeName: arrayElementType,
-            pgTypeSchema: 'pg_catalog',
-          })
-        : schemaQualifiedPascalName(typeFact.pgTypeSchema, arrayElementType)
-    return `readonly ${elementType}[]`
-  }
-
-  if (typeFact.pgTypeSchema !== 'pg_catalog') {
-    return schemaQualifiedPascalName(typeFact.pgTypeSchema, typeFact.pgTypeName || typeFact.pgType)
-  }
-
-  const tsType = pgTypeToTsType.get(normalizePgTypeName(typeFact.pgType))
-  if (!tsType) {
-    throw new Error(`No TypeScript mapping configured for PostgreSQL type ${typeFact.pgType}.`)
-  }
-
-  return tsType
+  return typeScriptTypeForPostgresType(typeFact)
 }
 
 async function explicitCompiledParamTypeOids(
@@ -1154,15 +1029,6 @@ function checkConstraintTypeForExpr(
   return null
 }
 
-function tsTypeForExpr(
-  catalog: CatalogFacts,
-  query: PgAnalyzerQuery,
-  expr: PgAnalyzerExpr | null | undefined,
-  typeFact: Pick<TypedSqlPostgresIrColumn, 'pgType' | 'pgTypeName' | 'pgTypeSchema'>
-): string {
-  return checkConstraintTypeForExpr(catalog, query, expr) ?? tsTypeForPgType(typeFact)
-}
-
 function checkedColumnParamTypes(
   catalog: CatalogFacts,
   queries: readonly PgAnalyzerQuery[],
@@ -1548,7 +1414,8 @@ function normalizeCompiledIr(catalog: CatalogFacts, analyzed: AnalyzedCompiledCo
   const resultColumns = resultTargets(query).map((target): TypedSqlPostgresIrColumn => {
     const expr = target.expr
     const typeFact = typeFactForOid(catalog, expr?.typeOid, expr?.typeName)
-    const tsType = tsTypeForExpr(catalog, query, expr, typeFact)
+    const checkConstraintTsType = checkConstraintTypeForExpr(catalog, query, expr)
+    const tsType = checkConstraintTsType ?? tsTypeForPgType(typeFact)
     return {
       jsonShape: isJsonType(typeFact.pgTypeName) ? (inferJsonShape(catalog, query, expr) ?? undefined) : undefined,
       name: target.resname ?? null,
@@ -1556,6 +1423,7 @@ function normalizeCompiledIr(catalog: CatalogFacts, analyzed: AnalyzedCompiledCo
       ...typeFact,
       source: sourceForExpr(expr),
       tsType,
+      ...(checkConstraintTsType ? { tsTypeSource: 'checkConstraint' as const } : {}),
     }
   })
 

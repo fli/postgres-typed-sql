@@ -7,6 +7,7 @@ assert.equal(postgresVersion, '18.3')
 const result = await generateTypedSql({
   include: ['.'],
   rootDir: process.cwd(),
+  scalarProfile: 'node-postgres',
   schema: 'schema.sql',
 })
 assert.equal(result.statementCount, 1)
@@ -15,5 +16,7 @@ const output = await readFile('find-widget.typed-sql.ts', 'utf8')
 assert.match(output, /cardinality: 'optional'/u)
 assert.match(output, /readonly label: string \| null/u)
 assert.match(output, /readonly state: AuditWidgetState/u)
+assert.match(output, /readonly search_document: string/u)
 assert.match(output, /readonly URL: string/u)
+assert.match(output, /readonly count: number/u)
 assert.doesNotMatch(output, /import type \{ URL \}/u)

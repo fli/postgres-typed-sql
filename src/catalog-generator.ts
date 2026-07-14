@@ -9,6 +9,11 @@ import {
 import type { ResolvedPostgresTypedSqlConfig } from './config.js'
 import type { PostgresQueryable } from './database.js'
 import {
+  postgresTypeScriptScalarImports as dbScalarTypes,
+  type PostgresScalarProfile,
+  typeScriptTypeForPostgresType,
+} from './postgres-types.js'
+import {
   assertUniqueTypeScriptBindings,
   quotePropertyName,
   schemaQualifiedPascalName,
@@ -40,117 +45,21 @@ interface ColumnCatalogRow {
   readonly type_schema: string
 }
 
-const pgTypeToTsType = new Map<string, string>([
-  ['bigint', 'PgInt8String'],
-  ['bit', 'string'],
-  ['bit varying', 'string'],
-  ['boolean', 'boolean'],
-  ['box', 'string'],
-  ['bytea', 'PgByteaHexString'],
-  ['char', 'string'],
-  ['cidr', 'string'],
-  ['circle', 'string'],
-  ['date', 'PgDateString'],
-  ['double precision', 'PgFloat8String'],
-  ['integer', 'PgInt4String'],
-  ['inet', 'string'],
-  ['int8range', 'string'],
-  ['interval', 'PgIntervalString'],
-  ['json', 'DbJsonSelected'],
-  ['json[]', 'readonly DbJsonSelected[]'],
-  ['jsonb', 'DbJsonSelected'],
-  ['line', 'string'],
-  ['lseg', 'string'],
-  ['macaddr', 'string'],
-  ['macaddr8', 'string'],
-  ['money', 'string'],
-  ['name', 'string'],
-  ['numeric', 'PgNumericString'],
-  ['oid', 'PgOidString'],
-  ['path', 'string'],
-  ['pg_lsn', 'string'],
-  ['point', 'string'],
-  ['polygon', 'string'],
-  ['real', 'PgFloat4String'],
-  ['smallint', 'PgInt2String'],
-  ['text', 'string'],
-  ['text[]', 'readonly string[]'],
-  ['time without time zone', 'PgTimeString'],
-  ['time with time zone', 'PgTimetzString'],
-  ['timestamp without time zone', 'PgTimestampString'],
-  ['timestamp with time zone', 'PgTimestamptzString'],
-  ['tsvector', 'string'],
-  ['uuid', 'PgUuidString'],
-  ['xml', 'string'],
-])
-
-for (const rangeType of ['daterange', 'int4range', 'numrange', 'tsrange', 'tstzrange']) {
-  pgTypeToTsType.set(rangeType, 'string')
-}
-
-const dbScalarTypes = new Set(
-  [
-    'DbJsonSelected',
-    'PgByteaHexString',
-    'PgDateString',
-    'PgFloat4String',
-    'PgFloat8String',
-    'PgInt2String',
-    'PgInt4String',
-    'PgInt8String',
-    'PgIntervalString',
-    'PgNumericString',
-    'PgOidString',
-    'PgTimestampString',
-    'PgTimestamptzString',
-    'PgTimeString',
-    'PgTimetzString',
-    'PgUuidString',
-  ].toSorted()
-)
-
 function quoteString(value: string): string {
-  return `'${value.replaceAll('\\', '\\\\').replaceAll("'", "\\'")}'`
+  return JSON.stringify(value)
 }
 
-function normalizePgTypeName(pgType: string): string {
-  if (pgType.startsWith('character varying') || pgType.startsWith('character(') || pgType === 'varchar') {
-    return 'text'
-  }
-  if (pgType.startsWith('numeric(')) {
-    return 'numeric'
-  }
-  if (pgType.startsWith('timestamp(') && pgType.endsWith(' without time zone')) {
-    return 'timestamp without time zone'
-  }
-  if (pgType.startsWith('timestamp(') && pgType.endsWith(' with time zone')) {
-    return 'timestamp with time zone'
-  }
-  if (pgType.startsWith('time(') && pgType.endsWith(' without time zone')) {
-    return 'time without time zone'
-  }
-  if (pgType.startsWith('time(') && pgType.endsWith(' with time zone')) {
-    return 'time with time zone'
-  }
-  return pgType
-}
-
-function tsTypeForPgType(pgType: string, typeSchema: string, typeName: string): string {
-  const normalized = normalizePgTypeName(pgType)
-  const arrayMatch = /^(.*)\[\]$/u.exec(normalized)
-  if (arrayMatch?.[1]) {
-    return `readonly ${tsTypeForPgType(arrayMatch[1], typeSchema, typeName.replace(/^_/u, ''))}[]`
-  }
-
-  if (typeSchema !== 'pg_catalog') {
-    return schemaQualifiedPascalName(typeSchema, typeName)
-  }
-
-  const tsType = pgTypeToTsType.get(normalized)
-  if (!tsType) {
-    throw new Error(`No TypeScript mapping configured for PostgreSQL type ${pgType}.`)
-  }
-  return tsType
+function tsTypeForPgType(
+  pgType: string,
+  typeSchema: string,
+  typeName: string,
+  scalarProfile: PostgresScalarProfile
+): string {
+  return typeScriptTypeForPostgresType(
+    { pgType, pgTypeName: typeName, pgTypeSchema: typeSchema },
+    undefined,
+    scalarProfile
+  )
 }
 
 function relationTypeName(row: Pick<ColumnCatalogRow, 'relname' | 'schema'>): string {
@@ -229,14 +138,15 @@ function renderEnums(enums: readonly EnumCatalogRow[]): string {
     .join('\n\n')
 }
 
-function renderDomains(domains: readonly DomainCatalogRow[]): string {
+function renderDomains(domains: readonly DomainCatalogRow[], scalarProfile: PostgresScalarProfile): string {
   return domains
     .map(
       (row) =>
         `export type ${schemaQualifiedPascalName(row.schema, row.type_name)} = ${tsTypeForPgType(
           row.base_formatted_type,
           row.base_type_schema,
-          row.base_type_name
+          row.base_type_name,
+          scalarProfile
         )}`
     )
     .join('\n\n')
@@ -265,17 +175,20 @@ function checkConstraintLiteralUnionByCatalogKey(
 
 function tsTypeForColumn(
   row: ColumnCatalogRow,
-  checkConstraintTypes: ReadonlyMap<string, CheckConstraintLiteralUnionFact>
+  checkConstraintTypes: ReadonlyMap<string, CheckConstraintLiteralUnionFact>,
+  scalarProfile: PostgresScalarProfile
 ): string {
   return (
-    checkConstraintTypes.get(checkConstraintLiteralUnionCatalogKey(row))?.typeName ??
-    tsTypeForPgType(row.formatted_type, row.type_schema, row.type_name)
+    (scalarProfile === 'node-postgres'
+      ? checkConstraintTypes.get(checkConstraintLiteralUnionCatalogKey(row))?.typeName
+      : undefined) ?? tsTypeForPgType(row.formatted_type, row.type_schema, row.type_name, scalarProfile)
   )
 }
 
 function renderRelations(
   columns: readonly ColumnCatalogRow[],
-  checkConstraintTypes: ReadonlyMap<string, CheckConstraintLiteralUnionFact>
+  checkConstraintTypes: ReadonlyMap<string, CheckConstraintLiteralUnionFact>,
+  scalarProfile: PostgresScalarProfile
 ): string {
   return [...groupColumnsByRelation(columns).values()]
     .map((rows) => {
@@ -287,7 +200,7 @@ function renderRelations(
       return [
         `export interface ${name} {`,
         ...rows.map((row) => {
-          const tsType = tsTypeForColumn(row, checkConstraintTypes)
+          const tsType = tsTypeForColumn(row, checkConstraintTypes, scalarProfile)
           return `  readonly ${quotePropertyName(row.attname)}: ${tsType}${row.attnotnull ? '' : ' | null'}`
         }),
         '}',
@@ -354,20 +267,26 @@ function renderCatalogTypes(
   domains: readonly DomainCatalogRow[],
   columns: readonly ColumnCatalogRow[],
   checkConstraintLiteralUnions: readonly CheckConstraintLiteralUnionFact[],
-  packageImport: string
+  packageImport: string,
+  scalarProfile: PostgresScalarProfile
 ): string {
   validateCatalogBindings(enums, domains, columns, checkConstraintLiteralUnions)
   const scalarImports = new Set<string>()
   const checkConstraintTypes = checkConstraintLiteralUnionByCatalogKey(checkConstraintLiteralUnions)
   for (const domain of domains) {
-    const tsType = tsTypeForPgType(domain.base_formatted_type, domain.base_type_schema, domain.base_type_name)
+    const tsType = tsTypeForPgType(
+      domain.base_formatted_type,
+      domain.base_type_schema,
+      domain.base_type_name,
+      scalarProfile
+    )
     const baseType = tsType.replace(/^readonly /u, '').replace(/\[\]$/u, '')
     if (dbScalarTypes.has(baseType)) {
       scalarImports.add(baseType)
     }
   }
   for (const row of columns) {
-    const tsType = tsTypeForColumn(row, checkConstraintTypes)
+    const tsType = tsTypeForColumn(row, checkConstraintTypes, scalarProfile)
     const baseType = tsType.replace(/^readonly /u, '').replace(/\[\]$/u, '')
     if (dbScalarTypes.has(baseType)) {
       scalarImports.add(baseType)
@@ -385,11 +304,11 @@ function renderCatalogTypes(
 ${importBlock}
 ${renderEnums(enums)}
 
-${renderDomains(domains)}
+${renderDomains(domains, scalarProfile)}
 
 ${renderCheckConstraintLiteralUnions(checkConstraintLiteralUnions)}
 
-${renderRelations(columns, checkConstraintTypes)}
+${renderRelations(columns, checkConstraintTypes, scalarProfile)}
 
 ${renderCatalogDb(columns)}
 `
@@ -407,6 +326,13 @@ export async function generateCatalogTypes(
   await mkdir(dirname(config.typesOutput), { recursive: true })
   await writeFile(
     config.typesOutput,
-    renderCatalogTypes(enums, domains, columns, checkConstraintLiteralUnions, config.packageImport)
+    renderCatalogTypes(
+      enums,
+      domains,
+      columns,
+      checkConstraintLiteralUnions,
+      config.packageImport,
+      config.scalarProfile
+    )
   )
 }

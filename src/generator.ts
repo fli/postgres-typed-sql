@@ -14,13 +14,19 @@ import type { ResolvedPostgresTypedSqlConfig } from './config.js'
 import { resolveConfig, type PostgresTypedSqlConfig } from './config.js'
 import type { PostgresQueryable } from './database.js'
 import { createAnalysisDatabase } from './engine.js'
+import {
+  normalizePostgresTypeName as normalizePgTypeName,
+  postgresArrayElementType,
+  postgresTypeScriptScalarImports as dbScalarTypes,
+  typeScriptParameterTypeForPostgresType,
+  typeScriptTypeForPostgresType,
+} from './postgres-types.js'
 import { compileNamedParameters, parseTypedSqlSource } from './sql-source.js'
 import {
   assertTypeScriptBindingIdentifier,
   assertUniqueTypeScriptBindings,
   pascalCaseIdentifier,
   quotePropertyName,
-  schemaQualifiedPascalName,
   type TypeScriptBinding,
 } from './typescript-names.js'
 
@@ -56,7 +62,6 @@ interface SqlParameter {
   readonly nullable?: boolean
   readonly pgType?: string
   readonly propertyName: string
-  readonly tsType?: string
 }
 
 interface SqlColumn {
@@ -64,7 +69,6 @@ interface SqlColumn {
   readonly nullable?: boolean
   readonly pgType?: string
   readonly propertyName: string
-  readonly tsType?: string
 }
 
 interface TypedSqlConfig {
@@ -140,76 +144,7 @@ interface TypeScriptImports {
   readonly scalar: Set<string>
 }
 
-const pgTypeToTsType = new Map<string, string>([
-  ['bigint', 'PgInt8String'],
-  ['bit', 'string'],
-  ['bit varying', 'string'],
-  ['boolean', 'boolean'],
-  ['box', 'string'],
-  ['bytea', 'PgByteaHexString'],
-  ['char', 'string'],
-  ['cidr', 'string'],
-  ['circle', 'string'],
-  ['date', 'PgDateString'],
-  ['double precision', 'PgFloat8String'],
-  ['inet', 'string'],
-  ['integer', 'PgInt4String'],
-  ['interval', 'PgIntervalString'],
-  ['line', 'string'],
-  ['lseg', 'string'],
-  ['macaddr', 'string'],
-  ['macaddr8', 'string'],
-  ['money', 'string'],
-  ['name', 'string'],
-  ['json', 'DbJsonSelected'],
-  ['jsonb', 'DbJsonSelected'],
-  ['numeric', 'PgNumericString'],
-  ['oid', 'PgOidString'],
-  ['path', 'string'],
-  ['pg_lsn', 'string'],
-  ['point', 'string'],
-  ['polygon', 'string'],
-  ['real', 'PgFloat4String'],
-  ['smallint', 'PgInt2String'],
-  ['text', 'string'],
-  ['time without time zone', 'PgTimeString'],
-  ['time with time zone', 'PgTimetzString'],
-  ['timestamp without time zone', 'PgTimestampString'],
-  ['timestamp with time zone', 'PgTimestamptzString'],
-  ['timestamptz', 'PgTimestamptzString'],
-  ['tsquery', 'string'],
-  ['tsvector', 'string'],
-  ['unknown', 'unknown'],
-  ['uuid', 'PgUuidString'],
-  ['void', 'unknown'],
-  ['xml', 'string'],
-])
-
-for (const rangeType of ['daterange', 'int4range', 'int8range', 'numrange', 'tsrange', 'tstzrange']) {
-  pgTypeToTsType.set(rangeType, 'string')
-}
-
-const dbScalarTypes = new Set(
-  [
-    ['DbJsonInput', 'db-scalars'],
-    ['DbJsonSelected', 'db-scalars'],
-    ['PgByteaHexString', 'db-scalars'],
-    ['PgDateString', 'db-scalars'],
-    ['PgFloat4String', 'db-scalars'],
-    ['PgFloat8String', 'db-scalars'],
-    ['PgInt2String', 'db-scalars'],
-    ['PgInt4String', 'db-scalars'],
-    ['PgInt8String', 'db-scalars'],
-    ['PgIntervalString', 'db-scalars'],
-    ['PgNumericString', 'db-scalars'],
-    ['PgOidString', 'db-scalars'],
-    ['PgTimestampString', 'db-scalars'],
-    ['PgTimestamptzString', 'db-scalars'],
-    ['PgTimeString', 'db-scalars'],
-    ['PgTimetzString', 'db-scalars'],
-    ['PgUuidString', 'db-scalars'],
-  ].map(([type]) => type)
-)
+const jsonNumberPgTypes = new Set(['bigint', 'double precision', 'integer', 'numeric', 'oid', 'real', 'smallint'])
 
 function requireSqlName(value: string, sourceFile: string): string {
   if (!/^[a-z][A-Za-z0-9]*$/u.test(value)) {
@@ -258,81 +193,12 @@ function relativePath(filePath: string): string {
   return relative(currentConfig().rootDir, filePath)
 }
 
-function normalizePgTypeName(pgType: string): string {
-  if (pgType.startsWith('character varying') || pgType.startsWith('character(') || pgType === 'varchar') {
-    return 'text'
-  }
-  if (pgType.startsWith('numeric(')) {
-    return 'numeric'
-  }
-  if (pgType.startsWith('timestamp(') && pgType.endsWith(' without time zone')) {
-    return 'timestamp without time zone'
-  }
-  if (pgType.startsWith('timestamp(') && pgType.endsWith(' with time zone')) {
-    return 'timestamp with time zone'
-  }
-  if (pgType.startsWith('time(') && pgType.endsWith(' without time zone')) {
-    return 'time without time zone'
-  }
-  if (pgType.startsWith('time(') && pgType.endsWith(' with time zone')) {
-    return 'time with time zone'
-  }
-  return pgType
-}
-
-function postgresArrayElementType(pgType: string, typeName: string): string | null {
-  const normalizedTypeName = normalizePgTypeName(typeName)
-  if (normalizedTypeName.startsWith('_') && normalizedTypeName.length > 1) {
-    return normalizedTypeName.slice(1)
-  }
-
-  const normalizedPgType = normalizePgTypeName(pgType)
-  if (normalizedPgType.endsWith('[]')) {
-    return normalizedPgType.slice(0, -2)
-  }
-
-  return null
-}
-
-function splitSchemaQualifiedPgType(pgType: string): { readonly schema: string; readonly typeName: string } | null {
-  const match = /^([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)(\[\])?$/u.exec(pgType)
-  if (!match?.[1] || !match[2]) {
-    return null
-  }
-
-  return { schema: match[1], typeName: `${match[2]}${match[3] ?? ''}` }
-}
-
 function tsTypeForPgType(pgType: string, sourceFile: string, typeSchema = 'pg_catalog', typeName = ''): string {
-  const schemaQualifiedType = typeSchema === 'pg_catalog' && !typeName ? splitSchemaQualifiedPgType(pgType) : null
-  if (schemaQualifiedType) {
-    return tsTypeForPgType(
-      schemaQualifiedType.typeName,
-      sourceFile,
-      schemaQualifiedType.schema,
-      schemaQualifiedType.typeName
-    )
-  }
-
-  const arrayElementType = postgresArrayElementType(pgType, typeName)
-  if (arrayElementType) {
-    const elementType =
-      typeSchema === 'pg_catalog'
-        ? tsTypeForPgType(arrayElementType, sourceFile)
-        : schemaQualifiedPascalName(typeSchema, arrayElementType)
-    return `readonly ${elementType}[]`
-  }
-
-  if (typeSchema !== 'pg_catalog') {
-    return schemaQualifiedPascalName(typeSchema, typeName || pgType)
-  }
-
-  const tsType = pgTypeToTsType.get(normalizePgTypeName(pgType))
-  if (!tsType) {
-    throw new Error(`${sourceFile}: no TypeScript mapping configured for PostgreSQL type ${pgType}.`)
-  }
-
-  return tsType
+  return typeScriptTypeForPostgresType(
+    { pgType, pgTypeName: typeName, pgTypeSchema: typeSchema },
+    sourceFile,
+    currentConfig().scalarProfile
+  )
 }
 
 function parameterTsTypeForPgType(
@@ -341,12 +207,11 @@ function parameterTsTypeForPgType(
   typeSchema = 'pg_catalog',
   typeName = ''
 ): string {
-  const normalizedTypeName = normalizePgTypeName(typeName || pgType)
-  if ((normalizedTypeName === 'json' || normalizedTypeName === 'jsonb') && typeSchema === 'pg_catalog') {
-    return 'DbJsonInput'
-  }
-
-  return tsTypeForPgType(pgType, sourceFile, typeSchema, typeName)
+  return typeScriptParameterTypeForPostgresType(
+    { pgType, pgTypeName: typeName, pgTypeSchema: typeSchema },
+    sourceFile,
+    currentConfig().scalarProfile
+  )
 }
 
 function collectPgTypeImports(
@@ -358,21 +223,35 @@ function collectPgTypeImports(
 ): void {
   const arrayElementType = postgresArrayElementType(pgType, typeName)
   if (arrayElementType) {
-    collectPgTypeImports(imports, arrayElementType, typeSchema, arrayElementType, 'output')
+    collectPgTypeImports(imports, arrayElementType, typeSchema, arrayElementType, usage)
     return
   }
 
   if (typeSchema !== 'pg_catalog') {
-    imports.catalog.add(schemaQualifiedPascalName(typeSchema, typeName || pgType))
+    const tsType = typeScriptTypeForPostgresType(
+      { pgType, pgTypeName: typeName, pgTypeSchema: typeSchema },
+      undefined,
+      currentConfig().scalarProfile
+    )
+    if (tsType !== 'unknown') {
+      imports.catalog.add(tsType)
+    }
     return
   }
 
-  const normalizedTypeName = normalizePgTypeName(typeName || pgType)
   const tsType =
-    usage === 'input' && (normalizedTypeName === 'json' || normalizedTypeName === 'jsonb')
-      ? 'DbJsonInput'
-      : pgTypeToTsType.get(normalizePgTypeName(pgType))
-  if (tsType && dbScalarTypes.has(tsType)) {
+    usage === 'input'
+      ? typeScriptParameterTypeForPostgresType(
+          { pgType, pgTypeName: typeName, pgTypeSchema: typeSchema },
+          undefined,
+          currentConfig().scalarProfile
+        )
+      : typeScriptTypeForPostgresType(
+          { pgType, pgTypeName: typeName, pgTypeSchema: typeSchema },
+          undefined,
+          currentConfig().scalarProfile
+        )
+  if (dbScalarTypes.has(tsType)) {
     imports.scalar.add(tsType)
   }
 }
@@ -541,7 +420,6 @@ async function readTypedSqlConfigs(): Promise<TypedSqlConfig[]> {
         nullable: parsedPgType.nullable,
         pgType,
         propertyName: identifier,
-        tsType: pgType ? tsTypeForPgType(pgType, location) : undefined,
       }
 
       if (kind === 'param') {
@@ -681,6 +559,19 @@ function scalarTsTypeForJsonShape(
   if (shape.pgType === 'unknown' || shape.pgTypeName === 'unknown' || shape.pgTypeSchema === 'unknown') {
     imports.scalar.add('DbJsonSelected')
     return 'DbJsonSelected'
+  }
+
+  if (shape.pgTypeSchema === 'pg_catalog') {
+    const normalizedTypeName = normalizePgTypeName(shape.pgType)
+    if (normalizedTypeName === 'boolean') {
+      return 'boolean'
+    }
+    if (jsonNumberPgTypes.has(normalizedTypeName)) {
+      return 'number'
+    }
+    if (!postgresArrayElementType(shape.pgType, shape.pgTypeName)) {
+      return 'string'
+    }
   }
 
   collectPgTypeImports(imports, shape.pgType, shape.pgTypeSchema, shape.pgTypeName)
@@ -959,17 +850,21 @@ async function resolveTypedSqlWithAnalyzer(
       const name = column.name ?? `column_${columnIndex + 1}`
       const propertyName = name
       const suggestedJsonTypeName = `${pascalCaseIdentifier(config.name)}${pascalCaseIdentifier(propertyName)}Json`
-      const tsType = column.jsonShape
-        ? tsTypeForJsonShape(
-            column.jsonShape,
-            config.sourceFile,
-            suggestedJsonTypeName,
-            generatedDeclarations,
-            usedGeneratedTypeNames,
-            typeImports
-          )
-        : column.tsType
-      if (!column.jsonShape) {
+      const useStructuredJson = currentConfig().scalarProfile === 'node-postgres' && column.jsonShape !== undefined
+      const tsType =
+        useStructuredJson && column.jsonShape
+          ? tsTypeForJsonShape(
+              column.jsonShape,
+              config.sourceFile,
+              suggestedJsonTypeName,
+              generatedDeclarations,
+              usedGeneratedTypeNames,
+              typeImports
+            )
+          : currentConfig().scalarProfile === 'node-postgres' && column.tsTypeSource === 'checkConstraint'
+            ? column.tsType
+            : tsTypeForPgType(column.pgType, config.sourceFile, column.pgTypeSchema, column.pgTypeName)
+      if (!useStructuredJson) {
         collectResolvedTypeImports(
           typeImports,
           tsType,
@@ -1005,7 +900,7 @@ async function resolveTypedSqlWithAnalyzer(
       }
 
       const tsType =
-        analyzed.tsTypeSource === 'checkConstraint'
+        currentConfig().scalarProfile === 'node-postgres' && analyzed.tsTypeSource === 'checkConstraint'
           ? analyzed.tsType
           : parameterTsTypeForPgType(analyzed.pgType, config.sourceFile, analyzed.pgTypeSchema, analyzed.pgTypeName)
       collectResolvedTypeImports(

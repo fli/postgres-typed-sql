@@ -80,7 +80,7 @@ export interface TypedSqlStatement<
   readonly rowBounds: TypedSqlRowBounds
   readonly text: string
   readonly type?: Row
-  query(params: Params): TypedSqlQueryConfig<Row>
+  query(params: Params): TypedSqlQueryConfig<TypedSqlRawRow>
   values(params: Params): readonly unknown[]
 }
 
@@ -149,7 +149,6 @@ export function createTypedSqlStatement<
       return {
         name: definition.name,
         text: definition.text,
-        type: definition.type,
         values: this.values(params),
       }
     },
@@ -194,6 +193,9 @@ export function mapTypedSqlRows<Params extends TypedSqlParams, Row>(
 
 export function typedSqlRowCount(rowCount: bigint | number | null | undefined): number {
   if (typeof rowCount === 'bigint') {
+    if (rowCount < 0n) {
+      throw new Error(`Typed SQL affected row count ${rowCount.toString()} must be nonnegative.`)
+    }
     if (rowCount > BigInt(Number.MAX_SAFE_INTEGER)) {
       throw new Error(`Typed SQL affected row count ${rowCount.toString()} exceeds Number.MAX_SAFE_INTEGER.`)
     }
@@ -202,6 +204,9 @@ export function typedSqlRowCount(rowCount: bigint | number | null | undefined): 
 
   if (typeof rowCount !== 'number') {
     throw new TypeError('Typed SQL expected the driver to expose an affected row count.')
+  }
+  if (!Number.isSafeInteger(rowCount) || rowCount < 0) {
+    throw new Error(`Typed SQL affected row count ${String(rowCount)} must be a nonnegative safe integer.`)
   }
 
   return rowCount
@@ -278,6 +283,6 @@ export async function executeTypedSqlCommand<Params extends TypedSqlParams, Row>
   statement: TypedSqlStatement<Params, Row>,
   params: Params
 ): Promise<number> {
-  const result = await client.query<Row>(statement.query(params))
+  const result = await client.query<TypedSqlRawRow>(statement.query(params))
   return typedSqlRowCount(result.rowCount)
 }

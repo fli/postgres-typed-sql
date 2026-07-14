@@ -32,6 +32,7 @@ export default defineConfig({
   schema: './db/schema.sql',
   include: ['./src'],
   extensions: ['pgcrypto'],
+  scalarProfile: 'node-postgres',
 })
 ```
 
@@ -67,13 +68,21 @@ Running `npm run generate:sql` creates `find-account-by-email.typed-sql.ts` cont
 - the compiled `$1`, `$2`, … SQL text
 - metadata for runtime row mapping
 
-The generated statement can be used with any driver that accepts PostgreSQL query configuration objects:
+The generated statement can be passed directly to a driver that accepts PostgreSQL query configuration objects:
 
 ```ts
 const result = await client.query(findAccountByEmail.query({ email }))
 ```
 
-The optional runtime helpers under `postgres-typed-sql/runtime` enforce `one`, `optional`, and `many` result shapes.
+Direct driver execution returns raw rows: SQL column names are preserved, but scalar values are typed as `unknown` because `query()` does not control a driver's parsers. The optional runtime helpers under `postgres-typed-sql/runtime` enforce `one`, `optional`, and `many` result shapes and return the generated row type selected by the configured scalar profile.
+
+## Scalar profiles
+
+Drivers choose how PostgreSQL values become JavaScript values, and applications can replace those parsers. Postgres Typed SQL therefore does not claim one universal decoded scalar type.
+
+The default `conservative` profile emits `unknown` for parameter and result scalar values. It is safe when the generator does not know the driver's conversion rules.
+
+Set `scalarProfile: 'node-postgres'` only when execution uses the default `node-postgres` conversion behavior. This profile models documented conversions such as parsed JSON, JavaScript `Date` values for `date`/`timestamp`/`timestamptz`, JavaScript numbers for the built-in integer and floating-point parsers, and strings for `bigint` and `numeric`. Types without a stable modeled default remain `unknown`. If the application installs custom type parsers, use the conservative profile unless those parser results still match the generated contract.
 
 ## Directives
 

@@ -26,7 +26,7 @@ export type DbJsonObjectInput = {
 export type DbJsonArrayInput = readonly DbJsonInput[]
 export type DbJsonInput = DbJsonArrayInput | DbJsonObjectInput | DbJsonPrimitiveInput
 
-export type DbJsonPrimitiveSelected = boolean | string | null
+export type DbJsonPrimitiveSelected = boolean | number | string | null
 export type DbJsonObjectSelected = { readonly [key: string]: DbJsonSelected }
 export type DbJsonArraySelected = readonly DbJsonSelected[]
 export type DbJsonSelected = DbJsonArraySelected | DbJsonObjectSelected | DbJsonPrimitiveSelected

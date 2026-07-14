@@ -20,6 +20,7 @@ test('generates PostgreSQL-derived types, nullability, and cardinality', async (
     extensions: ['pgcrypto'],
     include: ['queries'],
     rootDir: root,
+    scalarProfile: 'node-postgres',
     schema: 'schema.sql',
   })
 
@@ -33,11 +34,30 @@ test('generates PostgreSQL-derived types, nullability, and cardinality', async (
 
   const joined = await readFile(join(root, 'queries/list-accounts-with-posts.typed-sql.ts'), 'utf8')
   assert.match(joined, /readonly title: string \| null/u)
-  assert.match(joined, /readonly published_at: PgTimestamptzString \| null/u)
+  assert.match(joined, /readonly published_at: Date \| null/u)
 
   const catalog = await readFile(join(root, 'postgres-typed-sql.types.ts'), 'utf8')
-  assert.match(catalog, /export type AccountStatus = 'active' \| 'suspended'/u)
-  assert.match(catalog, /export type AccountsRole = 'member' \| 'admin'/u)
+  assert.match(catalog, /export type AccountStatus = "active" \| "suspended"/u)
+  assert.match(catalog, /export type AccountsRole = "member" \| "admin"/u)
+})
+
+test('defaults to conservative unknown driver scalar values', async () => {
+  const root = await copyFixture()
+  await generateTypedSql({
+    include: ['queries'],
+    rootDir: root,
+    schema: 'schema.sql',
+  })
+
+  const account = await readFile(join(root, 'queries/find-account-by-email.typed-sql.ts'), 'utf8')
+  assert.match(account, /readonly email: unknown/u)
+  assert.match(account, /readonly display_name: unknown \| null/u)
+  assert.match(account, /readonly status: unknown/u)
+  assert.doesNotMatch(account, /import type \{ AccountStatus/u)
+
+  const catalog = await readFile(join(root, 'postgres-typed-sql.types.ts'), 'utf8')
+  assert.match(catalog, /readonly id: unknown/u)
+  assert.match(catalog, /readonly status: unknown/u)
 })
 
 test('surfaces native PostgreSQL diagnostics for invalid SQL', async () => {
@@ -48,6 +68,7 @@ test('surfaces native PostgreSQL diagnostics for invalid SQL', async () => {
     generateTypedSql({
       include: ['queries'],
       rootDir: root,
+      scalarProfile: 'node-postgres',
       schema: 'schema.sql',
     }),
     /column "missing_column" does not exist/u
@@ -78,13 +99,14 @@ where account.email = :email
   const result = await generateTypedSql({
     include: ['queries'],
     rootDir: root,
+    scalarProfile: 'node-postgres',
     schema: 'schema.sql',
   })
 
   assert.equal(result.statementCount, 5)
   const output = await readFile(join(root, 'queries/lexical-contexts.typed-sql.ts'), 'utf8')
   assert.match(output, /parameterNames: \['cutoff', 'email'\]/u)
-  assert.match(output, /readonly cutoff: PgTimestamptzString \| null/u)
+  assert.match(output, /readonly cutoff: Date \| string \| null/u)
   assert.match(output, /name: 'cutoff',[\s\S]*?nullable: true/u)
   assert.match(output, /':not_a_parameter'/u)
   assert.match(output, /\$\$:also_not\$\$/u)
@@ -109,6 +131,7 @@ where account.id = :account_id
   const result = await generateTypedSql({
     include: ['queries'],
     rootDir: root,
+    scalarProfile: 'node-postgres',
     schema: 'schema.sql',
   })
 
@@ -116,7 +139,7 @@ where account.id = :account_id
   const output = await readFile(join(root, 'queries/mixed-parameter-oids.typed-sql.ts'), 'utf8')
   assert.match(output, /parameterNames: \['label', 'account_id'\]/u)
   assert.match(output, /readonly label: string/u)
-  assert.match(output, /readonly account_id: PgInt8String/u)
+  assert.match(output, /readonly account_id: bigint \| number \| string/u)
   assert.match(output, /name: 'label',[\s\S]*?pgType: 'text'/u)
   assert.match(output, /name: 'account_id',[\s\S]*?pgType: 'bigint'/u)
 })
@@ -155,6 +178,7 @@ select id from inserted
   const result = await generateTypedSql({
     include: ['queries'],
     rootDir: root,
+    scalarProfile: 'node-postgres',
     schema: 'schema.sql',
   })
 
@@ -185,8 +209,12 @@ select
   :userId::text as "userId",
   jsonb_build_object(
     'snake_key', :json_value::text,
-    'URL', :url_value::text
-  ) as payload_json
+    'URL', :url_value::text,
+    'n', 1,
+    'big', 2::bigint,
+    'ratio', 1.5::numeric
+  ) as payload_json,
+  :json_values::jsonb[] as json_values
 `
   )
 
@@ -197,33 +225,42 @@ select
     `${schema}
 create schema audit;
 create type audit.account_status as enum ('queued', 'complete');
+create type audit.control_label as enum (E'line\\nbreak');
 create table audit.events (
   event_id bigint primary key,
   event_status audit.account_status not null,
-  event_statuses audit.account_status[] not null
+  event_statuses audit.account_status[] not null,
+  search_document tsquery not null
 );
 `
   )
   await writeFile(
     join(root, 'queries/audit-event.typed.sql'),
-    'select event_id, event_status, event_statuses from audit.events where event_id = :event_id\n'
+    'select event_id, event_status, event_statuses, search_document from audit.events where event_id = :event_id\n'
   )
 
   const result = await generateTypedSql({
     include: ['queries'],
     rootDir: root,
+    scalarProfile: 'node-postgres',
     schema: 'schema.sql',
   })
 
   assert.equal(result.statementCount, 6)
   const exact = await readFile(join(root, 'queries/exact-names.typed-sql.ts'), 'utf8')
-  assert.match(exact, /parameterNames: \['user_id', 'userId', 'json_value', 'url_value'\]/u)
+  assert.match(exact, /parameterNames: \['user_id', 'userId', 'json_value', 'url_value', 'json_values'\]/u)
   assert.match(exact, /readonly user_id: string/u)
   assert.match(exact, /readonly userId: string/u)
   assert.match(exact, /readonly json_value: string/u)
   assert.match(exact, /readonly payload_json: ExactNamesPayloadJsonJson/u)
   assert.match(exact, /readonly snake_key: string/u)
   assert.match(exact, /readonly URL: string/u)
+  assert.match(exact, /readonly n: number/u)
+  assert.match(exact, /readonly big: number/u)
+  assert.match(exact, /readonly ratio: number/u)
+  assert.match(exact, /readonly json_values: readonly DbJsonInput\[\]/u)
+  assert.match(exact, /readonly json_values: readonly DbJsonSelected\[\] \| null/u)
+  assert.match(exact, /import type \{ DbJsonInput, DbJsonSelected \}/u)
   assert.doesNotMatch(exact, /import type \{ URL \}/u)
 
   const audit = await readFile(join(root, 'queries/audit-event.typed-sql.ts'), 'utf8')
@@ -231,11 +268,14 @@ create table audit.events (
   assert.match(audit, /readonly event_id: PgInt8String/u)
   assert.match(audit, /readonly event_status: AuditAccountStatus/u)
   assert.match(audit, /readonly event_statuses: readonly AuditAccountStatus\[\]/u)
+  assert.match(audit, /readonly search_document: string/u)
 
   const catalog = await readFile(join(root, 'postgres-typed-sql.types.ts'), 'utf8')
-  assert.match(catalog, /export type AccountStatus = 'active' \| 'suspended'/u)
-  assert.match(catalog, /export type AuditAccountStatus = 'queued' \| 'complete'/u)
+  assert.match(catalog, /export type AccountStatus = "active" \| "suspended"/u)
+  assert.match(catalog, /export type AuditAccountStatus = "queued" \| "complete"/u)
+  assert.match(catalog, /export type AuditControlLabel = "line\\nbreak"/u)
   assert.match(catalog, /export interface AuditEvents \{[\s\S]*?readonly event_id: PgInt8String/u)
+  assert.match(catalog, /readonly search_document: string/u)
   assert.match(catalog, /readonly "audit\.events": AuditEvents/u)
 })
 
@@ -275,6 +315,7 @@ test('rejects duplicate, reserved, and colliding generated names before emission
       generateTypedSql({
         include: ['queries'],
         rootDir: root,
+        scalarProfile: 'node-postgres',
         schema: 'schema.sql',
       }),
       invalid.error
@@ -296,6 +337,7 @@ create type a.status as enum ('schema');
     generateTypedSql({
       include: ['queries'],
       rootDir: root,
+      scalarProfile: 'node-postgres',
       schema: 'schema.sql',
     }),
     /generated TypeScript binding AStatus for enum public\.a_status collides with enum a\.status/u
@@ -318,6 +360,7 @@ create type public.collision_params as enum ('one');
     generateTypedSql({
       include: ['queries'],
       rootDir: importCollisionRoot,
+      scalarProfile: 'node-postgres',
       schema: 'schema.sql',
     }),
     /generated TypeScript binding CollisionParams for catalog type import collides with parameter interface/u
@@ -335,6 +378,7 @@ test('rejects nullable column assertions because PostgreSQL determines result nu
     generateTypedSql({
       include: ['queries'],
       rootDir: root,
+      scalarProfile: 'node-postgres',
       schema: 'schema.sql',
     }),
     /queries\/invalid-column-nullability\.typed\.sql:1: @column does not support \?; PostgreSQL determines result nullability/u
