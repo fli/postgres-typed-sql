@@ -1,20 +1,22 @@
 import {
-  checkConstraintLiteralUnionCatalogKey,
+  checkConstraintLiteralUnionColumnKey,
   loadCheckConstraintLiteralUnionFacts,
   type CheckConstraintLiteralUnionFact,
 } from './check-constraint-type-facts.js'
 import type { ResolvedPostgresTypedSqlConfig } from './config.js'
 import type { PostgresQueryable } from './database.js'
+import { loadPostgresTypeFacts } from './postgres-type-facts.js'
 import {
-  postgresTypeScriptScalarImports as dbScalarTypes,
-  resolveTypeScriptTypeForPostgresType,
+  postgresResultSupportsStringLiteralRefinement,
+  resolveTypeScriptResultTypeForPostgresType,
   type PostgresScalarProfile,
+  type PostgresTypeFact,
   type PostgresTypeScriptResolution,
 } from './postgres-types.js'
 import {
   assertUniqueTypeScriptBindings,
+  postgresNamedTypeBinding,
   quotePropertyName,
-  schemaQualifiedPascalName,
   type TypeScriptBinding,
 } from './typescript-names.js'
 
@@ -24,43 +26,32 @@ interface EnumCatalogRow {
   readonly type_name: string
 }
 
-interface DomainCatalogRow {
-  readonly schema: string
-  readonly type_name: string
-}
-
 interface ColumnCatalogRow {
   readonly attname: string
   readonly attnotnull: boolean
-  readonly formatted_type: string
-  readonly relkind: string
-  readonly relname: string
-  readonly schema: string
-  readonly type_name: string
+  readonly attnum: number
+  readonly relid: number
   readonly type_oid: number
-  readonly type_schema: string
+}
+
+interface RelationCatalogRow {
+  readonly relname: string
+  readonly relid: number
+  readonly relkind: string
+  readonly schema: string
+}
+
+interface ResolvedColumnCatalogRow {
+  readonly resolution: PostgresTypeScriptResolution
+  readonly row: ColumnCatalogRow
 }
 
 function quoteString(value: string): string {
   return JSON.stringify(value)
 }
 
-function resolveTsTypeForPgType(
-  pgType: string,
-  typeSchema: string,
-  typeName: string,
-  typeOid: number,
-  scalarProfile: PostgresScalarProfile
-): PostgresTypeScriptResolution {
-  return resolveTypeScriptTypeForPostgresType(
-    { pgType, pgTypeName: typeName, pgTypeOid: typeOid, pgTypeSchema: typeSchema },
-    undefined,
-    scalarProfile
-  )
-}
-
-function relationTypeName(row: Pick<ColumnCatalogRow, 'relname' | 'schema'>): string {
-  return schemaQualifiedPascalName(row.schema, row.relname)
+function relationTypeName(row: Pick<RelationCatalogRow, 'relname' | 'schema'>): string {
+  return postgresNamedTypeBinding(row.schema, row.relname)
 }
 
 async function loadEnums(client: PostgresQueryable): Promise<EnumCatalogRow[]> {
@@ -80,17 +71,19 @@ async function loadEnums(client: PostgresQueryable): Promise<EnumCatalogRow[]> {
   return result.rows
 }
 
-async function loadDomains(client: PostgresQueryable): Promise<DomainCatalogRow[]> {
-  const result = await client.query<DomainCatalogRow>(`
+async function loadRelations(client: PostgresQueryable): Promise<RelationCatalogRow[]> {
+  const result = await client.query<RelationCatalogRow>(`
     select
-      namespace.nspname as schema,
-      type.typname as type_name
-    from pg_type type
-    join pg_namespace namespace on namespace.oid = type.typnamespace
-    where type.typtype = 'd'
-      and namespace.nspname <> 'information_schema'
-      and namespace.nspname !~ '^pg_'
-    order by namespace.nspname, type.typname
+      c.oid::int as relid,
+      n.nspname as schema,
+      c.relname,
+      c.relkind::text as relkind
+    from pg_class c
+    join pg_namespace n on n.oid = c.relnamespace
+    where n.nspname <> 'information_schema'
+      and n.nspname !~ '^pg_'
+      and c.relkind in ('r', 'p', 'v', 'm', 'c')
+    order by n.nspname, c.relname
   `)
   return result.rows
 }
@@ -98,20 +91,14 @@ async function loadDomains(client: PostgresQueryable): Promise<DomainCatalogRow[
 async function loadColumns(client: PostgresQueryable): Promise<ColumnCatalogRow[]> {
   const result = await client.query<ColumnCatalogRow>(`
     select
-      n.nspname as schema,
-      c.relname,
-      c.relkind::text as relkind,
+      c.oid::int as relid,
+      a.attnum::int as attnum,
       a.attname,
       a.attnotnull,
-      a.atttypid::int as type_oid,
-      format_type(a.atttypid, a.atttypmod) as formatted_type,
-      tn.nspname as type_schema,
-      t.typname as type_name
+      a.atttypid::int as type_oid
     from pg_class c
     join pg_namespace n on n.oid = c.relnamespace
     join pg_attribute a on a.attrelid = c.oid
-    join pg_type t on t.oid = a.atttypid
-    join pg_namespace tn on tn.oid = t.typnamespace
     where n.nspname <> 'information_schema'
       and n.nspname !~ '^pg_'
       and c.relkind in ('r', 'p', 'v', 'm', 'c')
@@ -125,15 +112,9 @@ async function loadColumns(client: PostgresQueryable): Promise<ColumnCatalogRow[
 function renderEnums(enums: readonly EnumCatalogRow[]): string {
   return enums
     .map((row) => {
-      const name = schemaQualifiedPascalName(row.schema, row.type_name)
+      const name = postgresNamedTypeBinding(row.schema, row.type_name)
       return `export type ${name} = ${row.labels.map(quoteString).join(' | ')}`
     })
-    .join('\n\n')
-}
-
-function renderDomains(domains: readonly DomainCatalogRow[]): string {
-  return domains
-    .map((row) => `export type ${schemaQualifiedPascalName(row.schema, row.type_name)} = unknown`)
     .join('\n\n')
 }
 
@@ -141,135 +122,139 @@ function renderCheckConstraintLiteralUnions(facts: readonly CheckConstraintLiter
   return facts.map((fact) => `export type ${fact.typeName} = ${fact.labels.map(quoteString).join(' | ')}`).join('\n\n')
 }
 
-function groupColumnsByRelation(columns: readonly ColumnCatalogRow[]): Map<string, ColumnCatalogRow[]> {
-  const byRelation = new Map<string, ColumnCatalogRow[]>()
-  for (const row of columns) {
-    const key = `${row.schema}.${row.relname}`
-    const rows = byRelation.get(key) ?? []
-    rows.push(row)
-    byRelation.set(key, rows)
-  }
-  return byRelation
-}
-
-function checkConstraintLiteralUnionByCatalogKey(
+function checkConstraintLiteralUnionByColumn(
   facts: readonly CheckConstraintLiteralUnionFact[]
 ): ReadonlyMap<string, CheckConstraintLiteralUnionFact> {
-  return new Map(facts.map((fact) => [checkConstraintLiteralUnionCatalogKey(fact), fact]))
+  return new Map(facts.map((fact) => [checkConstraintLiteralUnionColumnKey(fact), fact]))
 }
 
 function tsTypeForColumn(
   row: ColumnCatalogRow,
+  type: PostgresTypeFact,
   checkConstraintTypes: ReadonlyMap<string, CheckConstraintLiteralUnionFact>,
   scalarProfile: PostgresScalarProfile
 ): PostgresTypeScriptResolution {
-  const checkConstraintType =
-    scalarProfile === 'node-postgres'
-      ? checkConstraintTypes.get(checkConstraintLiteralUnionCatalogKey(row))?.typeName
-      : undefined
+  const resolution = resolveTypeScriptResultTypeForPostgresType(type, scalarProfile)
+  const checkConstraintType = postgresResultSupportsStringLiteralRefinement(type, scalarProfile)
+    ? checkConstraintTypes.get(checkConstraintLiteralUnionColumnKey(row))?.typeName
+    : undefined
   return checkConstraintType
-    ? { catalogImports: [], scalarImports: [], type: checkConstraintType }
-    : resolveTsTypeForPgType(row.formatted_type, row.type_schema, row.type_name, row.type_oid, scalarProfile)
+    ? { ambientBindings: [], catalogImports: [], scalarImports: [], type: checkConstraintType }
+    : resolution
 }
 
 function renderRelations(
-  columns: readonly ColumnCatalogRow[],
-  checkConstraintTypes: ReadonlyMap<string, CheckConstraintLiteralUnionFact>,
-  scalarProfile: PostgresScalarProfile
+  relations: readonly RelationCatalogRow[],
+  columns: readonly ResolvedColumnCatalogRow[]
 ): string {
-  return [...groupColumnsByRelation(columns).values()]
-    .map((rows) => {
-      const first = rows[0]
-      if (!first) {
-        throw new Error('Cannot render an empty relation.')
-      }
-      const name = relationTypeName(first)
-      return [
-        `export interface ${name} {`,
-        ...rows.map((row) => {
-          const tsType = tsTypeForColumn(row, checkConstraintTypes, scalarProfile).type
-          return `  readonly ${quotePropertyName(row.attname)}: ${tsType}${row.attnotnull ? '' : ' | null'}`
-        }),
-        '}',
-      ].join('\n')
+  const rowsByRelation = new Map<number, ResolvedColumnCatalogRow[]>()
+  for (const column of columns) {
+    const rows = rowsByRelation.get(column.row.relid) ?? []
+    rows.push(column)
+    rowsByRelation.set(column.row.relid, rows)
+  }
+
+  return relations
+    .map((relation) => {
+      const name = relationTypeName(relation)
+      const rows = rowsByRelation.get(relation.relid) ?? []
+      return rows.length === 0
+        ? `export type ${name} = { readonly [key: string]: never }`
+        : [
+            `export interface ${name} {`,
+            ...rows.map(
+              ({ resolution, row }) =>
+                `  readonly ${quotePropertyName(row.attname)}: ${resolution.type}${row.attnotnull ? '' : ' | null'}`
+            ),
+            '}',
+          ].join('\n')
     })
     .join('\n\n')
 }
 
-function catalogDbPropertyName(row: Pick<ColumnCatalogRow, 'relname' | 'schema'>): string {
-  return row.schema === 'public' ? row.relname : `${row.schema}.${row.relname}`
+function catalogIdentifierComponent(identifier: string): string {
+  return /^[a-z_][a-z0-9_$]*$/u.test(identifier) ? identifier : `"${identifier.replaceAll('"', '""')}"`
 }
 
-function renderCatalogDb(columns: readonly ColumnCatalogRow[]): string {
-  const lines = [...groupColumnsByRelation(columns).values()].map((rows) => {
-    const first = rows[0]
-    if (!first) {
-      throw new Error('Cannot render an empty relation.')
-    }
-    return `  readonly ${quotePropertyName(catalogDbPropertyName(first))}: ${relationTypeName(first)}`
-  })
+function catalogDbPropertyName(row: Pick<RelationCatalogRow, 'relname' | 'schema'>): string {
+  const relation = catalogIdentifierComponent(row.relname)
+  return row.schema === 'public' ? relation : `${catalogIdentifierComponent(row.schema)}.${relation}`
+}
+
+function renderCatalogDb(relations: readonly RelationCatalogRow[]): string {
+  const lines = relations.map(
+    (relation) => `  readonly ${quotePropertyName(catalogDbPropertyName(relation))}: ${relationTypeName(relation)}`
+  )
 
   return ['export interface CatalogDb {', ...lines, '}'].join('\n')
 }
 
 function validateCatalogBindings(
   enums: readonly EnumCatalogRow[],
-  domains: readonly DomainCatalogRow[],
-  columns: readonly ColumnCatalogRow[],
-  checkConstraintLiteralUnions: readonly CheckConstraintLiteralUnionFact[]
+  relations: readonly RelationCatalogRow[],
+  checkConstraintLiteralUnions: readonly CheckConstraintLiteralUnionFact[],
+  ambientBindings: ReadonlySet<string>,
+  scalarImports: ReadonlySet<string>
 ): void {
   const bindings: TypeScriptBinding[] = [
     { name: 'CatalogDb', source: 'generated catalog root interface' },
-    { name: 'Record', source: 'reserved TypeScript utility type' },
-    ...[...dbScalarTypes].map((name) => ({ name, source: 'reserved postgres-typed-sql scalar type' })),
-    ...enums.map((row) => ({
-      name: schemaQualifiedPascalName(row.schema, row.type_name),
-      source: `enum ${row.schema}.${row.type_name}`,
+    ...[...ambientBindings].map((name) => ({ name, source: 'ambient TypeScript type' })),
+    ...[...scalarImports].map((name) => ({
+      name,
+      source: 'postgres-typed-sql scalar type import',
     })),
-    ...domains.map((row) => ({
-      name: schemaQualifiedPascalName(row.schema, row.type_name),
-      source: `domain ${row.schema}.${row.type_name}`,
+    ...enums.map((row) => ({
+      name: postgresNamedTypeBinding(row.schema, row.type_name),
+      source: `enum ${row.schema}.${row.type_name}`,
     })),
     ...checkConstraintLiteralUnions.map((fact) => ({
       name: fact.typeName,
       source: `check-constrained column ${fact.schema}.${fact.relname}.${fact.attname}`,
     })),
-    ...[...groupColumnsByRelation(columns).values()].flatMap((rows) => {
-      const first = rows[0]
-      return first
-        ? [
-            {
-              name: relationTypeName(first),
-              source: `relation ${first.schema}.${first.relname}`,
-            },
-          ]
-        : []
-    }),
+    ...relations.map((relation) => ({
+      name: relationTypeName(relation),
+      source: `relation ${relation.schema}.${relation.relname}`,
+    })),
   ]
   assertUniqueTypeScriptBindings(bindings, 'catalog generation')
 }
 
 function renderCatalogTypes(
   enums: readonly EnumCatalogRow[],
-  domains: readonly DomainCatalogRow[],
+  relations: readonly RelationCatalogRow[],
   columns: readonly ColumnCatalogRow[],
+  types: ReadonlyMap<number, PostgresTypeFact>,
   checkConstraintLiteralUnions: readonly CheckConstraintLiteralUnionFact[],
   packageImport: string,
   scalarProfile: PostgresScalarProfile
 ): string {
-  validateCatalogBindings(enums, domains, columns, checkConstraintLiteralUnions)
+  const ambientBindings = new Set<string>()
   const scalarImports = new Set<string>()
-  const checkConstraintTypes = checkConstraintLiteralUnionByCatalogKey(checkConstraintLiteralUnions)
-  for (const row of columns) {
-    const resolved = tsTypeForColumn(row, checkConstraintTypes, scalarProfile)
-    for (const scalarImport of resolved.scalarImports) {
+  const checkConstraintTypes = checkConstraintLiteralUnionByColumn(checkConstraintLiteralUnions)
+  const resolvedColumns = columns.map((row): ResolvedColumnCatalogRow => {
+    const type = types.get(row.type_oid) ?? {
+      pgType: `oid:${row.type_oid}`,
+      pgTypeKind: 'unknown' as const,
+      pgTypeName: `oid_${row.type_oid}`,
+      pgTypeOid: row.type_oid,
+      pgTypeSchema: 'unknown',
+    }
+    const resolution = tsTypeForColumn(row, type, checkConstraintTypes, scalarProfile)
+    return { resolution, row }
+  })
+  for (const { resolution } of resolvedColumns) {
+    for (const ambientBinding of resolution.ambientBindings) {
+      ambientBindings.add(ambientBinding)
+    }
+    for (const scalarImport of resolution.scalarImports) {
       scalarImports.add(scalarImport)
     }
   }
+  validateCatalogBindings(enums, relations, checkConstraintLiteralUnions, ambientBindings, scalarImports)
 
   const importBlock =
     scalarImports.size > 0
-      ? `import type { ${[...scalarImports].toSorted().join(', ')} } from '${packageImport}/scalars'\n\n`
+      ? `import type { ${[...scalarImports].toSorted().join(', ')} } from ${quoteString(`${packageImport}/scalars`)}\n\n`
       : ''
 
   return `// This file is auto-generated by postgres-typed-sql
@@ -278,13 +263,11 @@ function renderCatalogTypes(
 ${importBlock}
 ${renderEnums(enums)}
 
-${renderDomains(domains)}
-
 ${renderCheckConstraintLiteralUnions(checkConstraintLiteralUnions)}
 
-${renderRelations(columns, checkConstraintTypes, scalarProfile)}
+${renderRelations(relations, resolvedColumns)}
 
-${renderCatalogDb(columns)}
+${renderCatalogDb(relations)}
 `
 }
 
@@ -293,14 +276,16 @@ export async function buildCatalogTypes(
   config: ResolvedPostgresTypedSqlConfig
 ): Promise<string> {
   const enums = await loadEnums(client)
-  const domains = await loadDomains(client)
+  const relations = await loadRelations(client)
   const columns = await loadColumns(client)
-  const schemas = [...new Set(columns.map((row) => row.schema))]
+  const types = await loadPostgresTypeFacts(client, [...new Set(columns.map((row) => row.type_oid))])
+  const schemas = [...new Set(relations.map((row) => row.schema))]
   const checkConstraintLiteralUnions = await loadCheckConstraintLiteralUnionFacts(client, { schemas })
   return renderCatalogTypes(
     enums,
-    domains,
+    relations,
     columns,
+    types,
     checkConstraintLiteralUnions,
     config.packageImport,
     config.scalarProfile

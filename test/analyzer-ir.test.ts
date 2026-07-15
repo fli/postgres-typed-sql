@@ -31,6 +31,23 @@ test('normalizes PostgreSQL statement, nullability, DML, and cardinality facts c
   try {
     await database.query("create table public.rule_source (value text check (value in ('source_a', 'source_b')))")
     await database.query("create table public.rule_sink (value text not null check (value in ('sink_a', 'sink_b')))")
+    await database.query('create domain public.account_score as integer check (value >= 0)')
+    await database.query('create domain public.account_score_list as integer[]')
+    await database.query('create domain public.required_source_text as text not null')
+    await database.query('create table public.source_domain_probe (value text)')
+    await database.query("create table public.outer_join_probe (value text check (value in ('allowed')))")
+    await database.query('create table public.null_admission_sample (value integer)')
+    await database.query(`create procedure public.accept_null(value integer)
+      language plpgsql
+      as $$ begin null; end $$`)
+    await database.query(`
+      create table public.type_fact_probe (
+        score public.account_score,
+        score_list public.account_score_list,
+        scores public.account_score[],
+        status public.account_status
+      )
+    `)
     await database.query(`
       create rule rule_source_write as
       on insert to public.rule_source do also
@@ -70,7 +87,49 @@ test('normalizes PostgreSQL statement, nullability, DML, and cardinality facts c
       config('scalarSublink', 'select (select account.display_name from public.accounts account limit 1) as value'),
       config('existsSublink', 'select exists(select 1 from public.accounts) as value'),
       config('arraySublink', 'select array(select account.display_name from public.accounts account) as value'),
+      config('unionNullability', 'select value from (select 1 as value union all select null::integer) source'),
+      config('intersectNullability', 'select value from (select null::integer as value intersect all select 1) source'),
+      config('exceptNullability', 'select value from (select 1 as value except all select null::integer) source'),
+      config(
+        'nestedSetNullability',
+        `with source as (
+           (select 1 as value union all select null::integer)
+           intersect all
+           select null::integer
+         )
+         select value from source`
+      ),
+      config(
+        'divergentJsonUnion',
+        `select value
+         from (
+           select jsonb_build_object('a', 1) as value
+           union all
+           select jsonb_build_object('b', 'two')
+         ) source`
+      ),
       config('dynamicLimit', 'select 1 as value limit $1', ['limit']),
+      config(
+        'rejectingWindowFrame',
+        `select sum(value) over (rows between $1 preceding and current row) as total
+         from (values (1), (2)) input(value)`,
+        ['offset']
+      ),
+      config(
+        'acceptingWindowFrame',
+        `select sum(value) over (rows between coalesce($1, 0) preceding and current row) as total
+         from (values (1), (2)) input(value)`,
+        ['offset']
+      ),
+      config('rejectingTableSample', 'select value from public.null_admission_sample tablesample system ($1)', [
+        'percentage',
+      ]),
+      config(
+        'acceptingTableSample',
+        'select value from public.null_admission_sample tablesample system (coalesce($1, 100))',
+        ['percentage']
+      ),
+      config('opaqueCall', 'call public.accept_null($1)', ['value']),
       config('nullLimit', 'select 1 as value limit null'),
       config('allLimit', 'select 1 as value limit all'),
       config('zeroLimit', 'select 1 as value limit 0'),
@@ -93,10 +152,29 @@ test('normalizes PostgreSQL statement, nullability, DML, and cardinality facts c
       config('mixedTargetInsert', 'insert into public.accounts(email, display_name) values ($1, $1) returning id', [
         'value',
       ]),
+      config(
+        'opaqueNullableTargetInsert',
+        `insert into public.accounts(display_name)
+         select $1::text
+         union all
+         select coalesce($1, 'fallback')`,
+        ['display_name']
+      ),
       config('checkedRoleInsert', 'insert into public.accounts(email, role) values ($1, $2) returning id', [
         'email',
         'role',
       ]),
+      config('recursiveTypeFacts', 'select score, score_list, scores, status from public.type_fact_probe'),
+      config('fixedLengthTypeElement', 'select point(1, 2) as value'),
+      config(
+        'jsonScalarTypeFacts',
+        `select jsonb_build_object(
+           'role', role,
+           'status', status,
+           'scores', array[]::public.account_score[]
+         ) as value
+         from public.accounts`
+      ),
       config(
         'modifyingCte',
         `with inserted as (
@@ -107,6 +185,37 @@ test('normalizes PostgreSQL statement, nullability, DML, and cardinality facts c
         ['email', 'display_name']
       ),
       config('rewrittenInsert', 'insert into public.rule_source(value) values ($1) returning value', ['value']),
+      config(
+        'domainTypedSource',
+        'insert into public.source_domain_probe(value) values ($1::public.required_source_text)',
+        ['value']
+      ),
+      config(
+        'rejectingReturningUse',
+        `insert into public.source_domain_probe(value)
+         values ($1::text)
+         returning ($1::text)::public.required_source_text`,
+        ['value']
+      ),
+      config(
+        'nullExtendedInsert',
+        `insert into public.outer_join_probe(value)
+         select candidate.value
+         from (values (1)) guaranteed(marker)
+         left join (values ($1::text)) candidate(value) on false`,
+        ['value']
+      ),
+      config(
+        'nestedRowLock',
+        `select left_account.id
+         from public.accounts left_account
+         join public.accounts right_account on exists (
+           select 1
+           from public.accounts locked_account
+           where locked_account.id = left_account.id
+           for update
+         )`
+      ),
     ])
 
     const byName = new Map(result.queries.map((query) => [query.name, query]))
@@ -125,6 +234,21 @@ test('normalizes PostgreSQL statement, nullability, DML, and cardinality facts c
     assert.equal(query('scalarSublink').resultColumns[0]?.nullable, true)
     assert.equal(query('existsSublink').resultColumns[0]?.nullable, false)
     assert.equal(query('arraySublink').resultColumns[0]?.nullable, false)
+    assert.equal(query('unionNullability').resultColumns[0]?.nullable, true)
+    assert.equal(query('intersectNullability').resultColumns[0]?.nullable, false)
+    assert.equal(query('exceptNullability').resultColumns[0]?.nullable, false)
+    assert.equal(query('nestedSetNullability').resultColumns[0]?.nullable, true)
+
+    const divergentJsonShape = query('divergentJsonUnion').resultColumns[0]?.jsonShape
+    assert.equal(divergentJsonShape?.kind, 'union')
+    if (divergentJsonShape?.kind === 'union') {
+      assert.deepEqual(
+        divergentJsonShape.alternatives.map((alternative) =>
+          alternative.kind === 'object' ? alternative.fields.map((field) => field.name) : alternative.kind
+        ),
+        [['a'], ['b']]
+      )
+    }
 
     assert.deepEqual(query('dynamicLimit').rowBounds, {
       max: 1,
@@ -132,6 +256,15 @@ test('normalizes PostgreSQL statement, nullability, DML, and cardinality facts c
       proof: 'select_without_from+dynamic_limit_can_drop_rows',
     })
     assert.equal(query('dynamicLimit').rowCardinality, 'optional')
+    assert.equal(query('dynamicLimit').params[0]?.nullAdmission, 'unknown')
+    assert.equal(query('rejectingWindowFrame').params[0]?.nullAdmission, 'rejects')
+    assert.equal(query('rejectingWindowFrame').params[0]?.nullable, false)
+    assert.equal(query('acceptingWindowFrame').params[0]?.nullAdmission, 'unknown')
+    assert.equal(query('rejectingTableSample').params[0]?.nullAdmission, 'rejects')
+    assert.equal(query('rejectingTableSample').params[0]?.nullable, false)
+    assert.equal(query('acceptingTableSample').params[0]?.nullAdmission, 'unknown')
+    assert.equal(query('opaqueCall').params[0]?.nullAdmission, 'unknown')
+    assert.equal(query('opaqueCall').params[0]?.nullable, false)
     assert.equal(query('nullLimit').rowCardinality, 'one')
     assert.equal(query('allLimit').rowCardinality, 'one')
     assert.equal(query('zeroLimit').rowCardinality, 'none')
@@ -145,16 +278,64 @@ test('normalizes PostgreSQL statement, nullability, DML, and cardinality facts c
     assert.equal(query('multipliedUniqueLookup').rowCardinality, 'many')
 
     assert.deepEqual(
-      query('multiRowInsert').params.map(({ name, nullable }) => ({ name, nullable })),
+      query('multiRowInsert').params.map(({ name, nullAdmission, nullable }) => ({
+        name,
+        nullAdmission,
+        nullable,
+      })),
       [
-        { name: 'email', nullable: false },
-        { name: 'display_name', nullable: true },
-        { name: 'second_email', nullable: false },
+        { name: 'email', nullAdmission: 'rejects', nullable: false },
+        { name: 'display_name', nullAdmission: 'accepts', nullable: true },
+        { name: 'second_email', nullAdmission: 'rejects', nullable: false },
       ]
     )
     assert.equal(query('mixedTargetInsert').params[0]?.nullable, false)
-    assert.equal(query('checkedRoleInsert').params[1]?.tsType, 'AccountsRole')
-    assert.equal(query('checkedRoleInsert').params[1]?.tsTypeSource, 'checkConstraint')
+    assert.equal(query('mixedTargetInsert').params[0]?.nullAdmission, 'rejects')
+    assert.equal(query('opaqueNullableTargetInsert').params[0]?.nullable, false)
+    assert.equal(query('opaqueNullableTargetInsert').params[0]?.nullAdmission, 'unknown')
+    assert.equal(query('checkedRoleInsert').params[1]?.checkConstraintTypeName, 'Accounts__Role')
+
+    const [domainType, arrayDomainType, domainArrayType, enumType] = query('recursiveTypeFacts').resultColumns
+    assert.equal(domainType?.pgTypeKind, 'domain')
+    assert.equal(domainType?.pgBaseType?.pgTypeKind, 'base')
+    assert.equal(domainType?.pgBaseType?.pgTypeName, 'int4')
+    assert.equal(domainType?.pgBaseType?.pgTypeOid, 23)
+    assert.equal(arrayDomainType?.pgTypeKind, 'domain')
+    assert.equal(arrayDomainType?.pgBaseType?.pgTypeKind, 'array')
+    assert.equal(arrayDomainType?.pgBaseType?.pgTypeOid, 1007)
+    assert.equal(arrayDomainType?.pgBaseType?.pgArrayElementType?.pgTypeName, 'int4')
+    assert.equal(domainArrayType?.pgTypeKind, 'array')
+    assert.equal(domainArrayType?.pgArrayElementType?.pgTypeKind, 'domain')
+    assert.equal(domainArrayType?.pgArrayElementType?.pgBaseType?.pgTypeKind, 'base')
+    assert.equal(domainArrayType?.pgArrayElementType?.pgBaseType?.pgTypeName, 'int4')
+    assert.equal(enumType?.pgTypeKind, 'enum')
+    assert.equal(query('fixedLengthTypeElement').resultColumns[0]?.pgTypeKind, 'base')
+    assert.equal(query('fixedLengthTypeElement').resultColumns[0]?.pgArrayElementType, undefined)
+
+    const jsonShape = query('jsonScalarTypeFacts').resultColumns[0]?.jsonShape
+    assert.equal(jsonShape?.kind, 'object')
+    if (jsonShape?.kind === 'object') {
+      const jsonFields = new Map(jsonShape.fields.map((field) => [field.name, field.shape]))
+      const roleShape = jsonFields.get('role')
+      const scoresShape = jsonFields.get('scores')
+      const statusShape = jsonFields.get('status')
+      assert.equal(roleShape?.kind, 'scalar')
+      if (roleShape?.kind === 'scalar') {
+        assert.equal(roleShape.pgTypeKind, 'base')
+        assert.equal(roleShape.checkConstraintTypeName, 'Accounts__Role')
+      }
+      assert.equal(scoresShape?.kind, 'scalar')
+      if (scoresShape?.kind === 'scalar') {
+        assert.equal(scoresShape.pgTypeKind, 'array')
+        assert.equal(scoresShape.pgArrayElementType?.pgTypeKind, 'domain')
+        assert.equal(scoresShape.pgArrayElementType?.pgBaseType?.pgTypeName, 'int4')
+      }
+      assert.equal(statusShape?.kind, 'scalar')
+      if (statusShape?.kind === 'scalar') {
+        assert.equal(statusShape.pgTypeKind, 'enum')
+        assert.equal(statusShape.pgTypeName, 'account_status')
+      }
+    }
     assert.equal(query('modifyingCte').command, 'SELECT')
     assert.equal(query('modifyingCte').hasDataModifyingCte, true)
     assert.equal(query('modifyingCte').isWrite, true)
@@ -170,13 +351,145 @@ test('normalizes PostgreSQL statement, nullability, DML, and cardinality facts c
     assert.equal(query('rewrittenInsert').resultColumns[0]?.name, 'value')
     assert.equal(query('rewrittenInsert').isWrite, true)
     assert.equal(query('rewrittenInsert').params[0]?.nullable, false)
-    assert.equal(query('rewrittenInsert').params[0]?.tsType, 'string')
-    assert.equal(query('rewrittenInsert').params[0]?.tsTypeSource, undefined)
+    assert.equal(query('rewrittenInsert').params[0]?.nullAdmission, 'rejects')
+    assert.equal(query('rewrittenInsert').params[0]?.checkConstraintTypeName, undefined)
+
+    assert.equal(query('domainTypedSource').params[0]?.nullAdmission, 'rejects')
+    assert.equal(query('domainTypedSource').params[0]?.nullable, false)
+    assert.equal(query('rejectingReturningUse').params[0]?.nullAdmission, 'rejects')
+    assert.equal(query('rejectingReturningUse').params[0]?.nullable, false)
+    assert.equal(query('nullExtendedInsert').params[0]?.nullAdmission, 'accepts')
+    assert.equal(query('nullExtendedInsert').params[0]?.nullable, true)
+    assert.equal(query('nullExtendedInsert').params[0]?.checkConstraintTypeName, undefined)
+    assert.equal(query('nestedRowLock').isWrite, true)
+    await assert.rejects(
+      database.query('insert into public.source_domain_probe(value) values ($1::public.required_source_text)', [null]),
+      /does not allow null/u
+    )
+    await assert.rejects(
+      database.query(
+        `insert into public.source_domain_probe(value)
+         values ($1::text)
+         returning ($1::text)::public.required_source_text`,
+        [null]
+      ),
+      /does not allow null/u
+    )
+    await database.query(
+      `insert into public.outer_join_probe(value)
+       select candidate.value
+       from (values (1)) guaranteed(marker)
+       left join (values ($1::text)) candidate(value) on false`,
+      ['outside-check-union']
+    )
+    const nullExtendedRows = await database.query<{ readonly value: string | null }>(
+      'select value from public.outer_join_probe'
+    )
+    assert.deepEqual(nullExtendedRows.rows, [{ value: null }])
 
     await assert.rejects(
       buildTypedSqlPostgresIrFromCompiledConfigs(database, [config('multipleStatements', 'select 1; select 2')]),
       /typed SQL must contain exactly one PostgreSQL statement; received 2/u
     )
+  } finally {
+    await database.close()
+  }
+})
+
+test('uses exact PostgreSQL proof objects for uniqueness, inheritance, checks, and expression completeness', async () => {
+  const database = await createAnalysisDatabase({ schemaFiles: [schemaFile] })
+  try {
+    for (const sql of [
+      'create table public.operator_unique (id integer primary key, payload text)',
+      "insert into public.operator_unique values (1, 'first'), (2, 'second')",
+      'create unique index operator_unique_id_include on public.operator_unique(id) include (payload)',
+      `create table public.deferred_unique (
+         id integer,
+         constraint deferred_unique_id unique (id) deferrable initially deferred
+       )`,
+      'create table public.parent_unique (id integer primary key)',
+      'create table public.child_unique () inherits (public.parent_unique)',
+      'insert into public.parent_unique values (1)',
+      'insert into public.child_unique values (1)',
+      `create table public.parent_check (
+         status text constraint parent_status check (status in ('parent')) no inherit
+       )`,
+      'create table public.child_check () inherits (public.parent_check)',
+      "insert into public.parent_check values ('parent')",
+      "insert into public.child_check values ('child')",
+      `create table public.inherited_check (
+         status text constraint inherited_status check (status in ('shared'))
+       )`,
+      'create table public.empty_rows ()',
+      'insert into public.empty_rows select from generate_series(1, 2)',
+      'create table public.tie_rows (sort_key integer, payload text)',
+      "insert into public.tie_rows values (1, 'first'), (1, 'second'), (2, 'third')",
+      `create function public.always_equal(integer, integer)
+       returns boolean language sql immutable
+       as $$ select true $$`,
+      `create operator public.= (
+         leftarg = integer,
+         rightarg = integer,
+         function = public.always_equal
+       )`,
+    ]) {
+      await database.query(sql)
+    }
+
+    const result = await buildTypedSqlPostgresIrFromCompiledConfigs(database, [
+      config('customEquality', 'select id from public.operator_unique where id operator(public.=) $1', ['id']),
+      config('ordinaryEquality', 'select id from public.operator_unique where id = $1', ['id']),
+      config('includeKey', 'select id from public.operator_unique where id = $1', ['id']),
+      config('includePayload', 'select id from public.operator_unique where payload = $1', ['payload']),
+      config('deferredEquality', 'select id from public.deferred_unique where id = $1', ['id']),
+      config('inheritedParent', 'select id from public.parent_unique where id = $1', ['id']),
+      config('onlyParent', 'select id from only public.parent_unique where id = $1', ['id']),
+      config('noInheritCheck', 'select status from public.parent_check'),
+      config('inheritedCheck', 'select status from public.inherited_check'),
+      config('emptyRows', 'select from public.empty_rows'),
+      config('withTies', 'select payload from public.tie_rows order by sort_key fetch first 1 row with ties'),
+      config('withoutTies', 'select payload from public.tie_rows order by sort_key fetch first 1 row only'),
+      config('truncatedNull', `select null::text::integer::text::integer::text::integer::text::integer::text as value`),
+    ])
+    const queries = new Map(result.queries.map((query) => [query.name, query]))
+    const query = (name: string): TypedSqlPostgresIr => {
+      const value = queries.get(name)
+      assert.ok(value, `missing normalized query ${name}`)
+      return value
+    }
+
+    assert.equal(query('customEquality').rowCardinality, 'many')
+    assert.equal(query('ordinaryEquality').rowCardinality, 'optional')
+    assert.equal(query('includeKey').rowCardinality, 'optional')
+    assert.equal(query('includePayload').rowCardinality, 'many')
+    assert.equal(query('deferredEquality').rowCardinality, 'many')
+    assert.equal(query('inheritedParent').rowCardinality, 'many')
+    assert.equal(query('onlyParent').rowCardinality, 'optional')
+    assert.equal(query('noInheritCheck').resultColumns[0]?.checkConstraintTypeName, undefined)
+    assert.equal(query('inheritedCheck').resultColumns[0]?.checkConstraintTypeName, 'InheritedCheck__Status')
+    assert.equal(query('emptyRows').resultColumns.length, 0)
+    assert.equal(query('emptyRows').rowCardinality, 'many')
+    assert.equal(query('withTies').rowCardinality, 'many')
+    assert.equal(query('withoutTies').rowCardinality, 'optional')
+    assert.equal(query('truncatedNull').resultColumns[0]?.nullable, true)
+
+    const customRows = await database.query('select id from public.operator_unique where id operator(public.=) $1', [1])
+    assert.equal(customRows.rows.length, 2)
+    const emptyRows = await database.query('select from public.empty_rows')
+    assert.equal(emptyRows.rows.length, 2)
+    const tiedRows = await database.query(
+      'select payload from public.tie_rows order by sort_key fetch first 1 row with ties'
+    )
+    assert.equal(tiedRows.rows.length, 2)
+
+    await database.query('begin')
+    try {
+      await database.query('insert into public.deferred_unique values (1), (1)')
+      const deferredRows = await database.query('select id from public.deferred_unique where id = 1')
+      assert.equal(deferredRows.rows.length, 2)
+    } finally {
+      await database.query('rollback')
+    }
   } finally {
     await database.close()
   }

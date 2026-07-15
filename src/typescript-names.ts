@@ -63,6 +63,32 @@ export function schemaQualifiedPascalName(schema: string, identifier: string): s
   return schema === 'public' ? name : `${pascalCaseIdentifier(schema)}${name}`
 }
 
+const conventionalPostgresIdentifier = /^[a-z][a-z0-9]*(?:_[a-z][a-z0-9]*)*$/u
+
+export function postgresIdentifierTypeSegment(identifier: string): string {
+  if (conventionalPostgresIdentifier.test(identifier)) {
+    return identifier
+      .split('_')
+      .map((word) => `${word[0]?.toUpperCase()}${word.slice(1)}`)
+      .join('')
+  }
+
+  let encoded = '$Q'
+  for (const character of identifier) {
+    encoded += /^[A-Za-z0-9]$/u.test(character) ? character : `$${character.codePointAt(0)?.toString(16)}$`
+  }
+  return encoded
+}
+
+export function postgresNamedTypeBinding(schema: string, identifier: string): string {
+  const encodedIdentifier = postgresIdentifierTypeSegment(identifier)
+  return schema === 'public' ? encodedIdentifier : `${postgresIdentifierTypeSegment(schema)}_${encodedIdentifier}`
+}
+
+export function postgresCheckConstraintTypeBinding(schema: string, relation: string, column: string): string {
+  return `${postgresNamedTypeBinding(schema, relation)}__${postgresIdentifierTypeSegment(column)}`
+}
+
 export function quotePropertyName(propertyName: string): string {
   return /^[A-Za-z_$][A-Za-z0-9_$]*$/u.test(propertyName) ? propertyName : JSON.stringify(propertyName)
 }

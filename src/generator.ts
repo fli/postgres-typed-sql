@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import { readFileSync } from 'node:fs'
-import { mkdir, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises'
+import { lstat, mkdir, readFile, readdir, realpath, rename, rm, writeFile } from 'node:fs/promises'
 import { basename, dirname, join, relative } from 'node:path'
 
 import {
@@ -16,12 +16,13 @@ import { resolveConfig, type PostgresTypedSqlConfig } from './config.js'
 import type { PostgresQueryable } from './database.js'
 import { createAnalysisDatabase } from './engine.js'
 import {
-  normalizePostgresTypeName as normalizePgTypeName,
-  postgresArrayElementType,
-  postgresTypeScriptScalarImports as dbScalarTypes,
+  postgresJsonSupportsStringLiteralRefinement,
+  postgresParameterSupportsStringLiteralRefinement,
+  postgresResultSupportsStringLiteralRefinement,
+  resolveTypeScriptJsonScalarTypeForPostgresType,
   resolveTypeScriptParameterTypeForPostgresType,
-  resolveTypeScriptTypeForPostgresType,
-  type PostgresScalarProfile,
+  resolveTypeScriptResultTypeForPostgresType,
+  type PostgresTypeScriptResolution,
 } from './postgres-types.js'
 import { compileNamedParameters, parseTypedSqlSource } from './sql-source.js'
 import {
@@ -106,6 +107,7 @@ interface ResolvedSqlColumn {
   readonly nullable: boolean
   readonly pgType: string
   readonly pgTypeName: string
+  readonly pgTypeOid: number
   readonly pgTypeSchema: string
   readonly propertyName: string
   readonly source: TypedSqlPostgresIrColumnSource | null
@@ -134,12 +136,11 @@ interface ResolvedTypedSql {
   readonly sql: string
 }
 
-interface TypeScriptImports {
+interface TypeScriptDependencies {
+  readonly ambient: Set<string>
   readonly catalog: Set<string>
   readonly scalar: Set<string>
 }
-
-const jsonNumberPgTypes = new Set(['bigint', 'double precision', 'integer', 'numeric', 'oid', 'real', 'smallint'])
 
 function requireSqlName(value: string, sourceFile: string): string {
   if (!/^[a-z][A-Za-z0-9]*$/u.test(value)) {
@@ -188,86 +189,27 @@ function relativePath(config: ResolvedPostgresTypedSqlConfig, filePath: string):
   return relative(config.rootDir, filePath)
 }
 
-function tsTypeForPgType(
-  pgType: string,
-  sourceFile: string,
-  scalarProfile: PostgresScalarProfile,
-  typeSchema = 'pg_catalog',
-  typeName = '',
-  typeOid = 0
-): string {
-  return resolveTypeScriptTypeForPostgresType(
-    { pgType, pgTypeName: typeName, pgTypeOid: typeOid, pgTypeSchema: typeSchema },
-    sourceFile,
-    scalarProfile
-  ).type
-}
-
-function parameterTsTypeForPgType(
-  pgType: string,
-  sourceFile: string,
-  scalarProfile: PostgresScalarProfile,
-  typeSchema = 'pg_catalog',
-  typeName = '',
-  typeOid = 0
-): string {
-  return resolveTypeScriptParameterTypeForPostgresType(
-    { pgType, pgTypeName: typeName, pgTypeOid: typeOid, pgTypeSchema: typeSchema },
-    sourceFile,
-    scalarProfile
-  ).type
-}
-
-function collectPgTypeImports(
-  imports: TypeScriptImports,
-  pgType: string,
-  typeSchema = 'pg_catalog',
-  typeName = '',
-  typeOid = 0,
-  usage: 'input' | 'output' = 'output',
-  scalarProfile: PostgresScalarProfile = 'node-postgres'
+function collectTypeResolutionDependencies(
+  dependencies: TypeScriptDependencies,
+  resolution: PostgresTypeScriptResolution
 ): void {
-  const resolved =
-    usage === 'input'
-      ? resolveTypeScriptParameterTypeForPostgresType(
-          { pgType, pgTypeName: typeName, pgTypeOid: typeOid, pgTypeSchema: typeSchema },
-          undefined,
-          scalarProfile
-        )
-      : resolveTypeScriptTypeForPostgresType(
-          { pgType, pgTypeName: typeName, pgTypeOid: typeOid, pgTypeSchema: typeSchema },
-          undefined,
-          scalarProfile
-        )
-  for (const catalogImport of resolved.catalogImports) {
-    imports.catalog.add(catalogImport)
+  for (const ambientBinding of resolution.ambientBindings) {
+    dependencies.ambient.add(ambientBinding)
   }
-  for (const scalarImport of resolved.scalarImports) {
-    imports.scalar.add(scalarImport)
+  for (const catalogImport of resolution.catalogImports) {
+    dependencies.catalog.add(catalogImport)
+  }
+  for (const scalarImport of resolution.scalarImports) {
+    dependencies.scalar.add(scalarImport)
   }
 }
 
-function collectResolvedTypeImports(
-  imports: TypeScriptImports,
-  tsType: string,
-  pgType: string,
-  typeSchema: string,
-  typeName: string,
-  typeOid: number,
-  sourceFile: string,
-  usage: 'input' | 'output',
-  scalarProfile: PostgresScalarProfile
-): void {
-  const defaultType =
-    usage === 'input'
-      ? parameterTsTypeForPgType(pgType, sourceFile, scalarProfile, typeSchema, typeName, typeOid)
-      : tsTypeForPgType(pgType, sourceFile, scalarProfile, typeSchema, typeName, typeOid)
-  if (tsType === defaultType) {
-    collectPgTypeImports(imports, pgType, typeSchema, typeName, typeOid, usage, scalarProfile)
-  } else if (dbScalarTypes.has(tsType)) {
-    imports.scalar.add(tsType)
-  } else {
-    imports.catalog.add(tsType)
+function catalogTypeResolution(type: string): PostgresTypeScriptResolution {
+  return {
+    ambientBindings: [],
+    catalogImports: [type],
+    scalarImports: [],
+    type,
   }
 }
 
@@ -330,15 +272,25 @@ async function walkTypedSqlFiles(directory: string, output: string[]): Promise<v
 }
 
 async function findTypedSqlSourceFiles(config: ResolvedPostgresTypedSqlConfig): Promise<string[]> {
-  const sourceFiles = new Set<string>()
+  const sourceFiles = new Map<string, string>()
+  const includeRoots = new Map<string, string>()
   for (const includeRoot of config.include) {
+    const canonical = await realpath(includeRoot)
+    if (!includeRoots.has(canonical)) {
+      includeRoots.set(canonical, includeRoot)
+    }
+  }
+  for (const includeRoot of includeRoots.values()) {
     const entries: string[] = []
     await walkTypedSqlFiles(includeRoot, entries)
     for (const entry of entries) {
-      sourceFiles.add(entry)
+      const canonical = await realpath(entry)
+      if (!sourceFiles.has(canonical)) {
+        sourceFiles.set(canonical, entry)
+      }
     }
   }
-  return [...sourceFiles].toSorted((left, right) =>
+  return [...sourceFiles.values()].toSorted((left, right) =>
     relativePath(config, left).localeCompare(relativePath(config, right))
   )
 }
@@ -360,6 +312,8 @@ async function readTypedSqlConfigs(generatorConfig: ResolvedPostgresTypedSqlConf
     let name = defaultName
     const parameters: SqlParameter[] = []
     const columns: SqlColumn[] = []
+    let firstAccessLocation: string | undefined
+    let firstNameLocation: string | undefined
     const firstColumnDirectiveByName = new Map<string, string>()
     const firstParameterDirectiveByName = new Map<string, string>()
 
@@ -376,6 +330,10 @@ async function readTypedSqlConfigs(generatorConfig: ResolvedPostgresTypedSqlConf
           throw new Error(`${location}: @name requires exactly one identifier.`)
         }
 
+        if (firstNameLocation) {
+          throw new Error(`${location}: duplicate @name; first declared at ${firstNameLocation}.`)
+        }
+        firstNameLocation = location
         name = requireSqlName(identifier, location)
         continue
       }
@@ -385,6 +343,10 @@ async function readTypedSqlConfigs(generatorConfig: ResolvedPostgresTypedSqlConf
           throw new Error(`${location}: @access requires exactly read or write.`)
         }
 
+        if (firstAccessLocation) {
+          throw new Error(`${location}: duplicate @access; first declared at ${firstAccessLocation}.`)
+        }
+        firstAccessLocation = location
         access = identifier
         continue
       }
@@ -529,57 +491,27 @@ function reserveGeneratedTypeBinding(
   bindings.set(name, source)
 }
 
-function singularTypeName(name: string): string {
-  return name.endsWith('Rows')
-    ? name.slice(0, -1)
-    : name.endsWith('ies')
-      ? `${name.slice(0, -3)}y`
-      : name.endsWith('ses')
-        ? name.slice(0, -2)
-        : name.endsWith('s') && name.length > 1
-          ? name.slice(0, -1)
-          : name
+function encodedTypeNameSegment(value: string): string {
+  let encoded = ''
+  for (const character of value) {
+    encoded += /^[A-Za-z0-9_]$/u.test(character) ? character : `$${character.codePointAt(0)?.toString(16) ?? ''}$`
+  }
+  return `J${encoded.length}_${encoded}`
 }
 
 function scalarTsTypeForJsonShape(
   shape: Extract<TypedSqlPostgresIrJsonShape, { readonly kind: 'scalar' }>,
-  sourceFile: string,
-  imports: TypeScriptImports
+  dependencies: TypeScriptDependencies
 ): string {
-  if (shape.tsType) {
-    imports.catalog.add(shape.tsType)
-    return shape.tsType
+  if (shape.checkConstraintTypeName && postgresJsonSupportsStringLiteralRefinement(shape)) {
+    const resolved = catalogTypeResolution(shape.checkConstraintTypeName)
+    collectTypeResolutionDependencies(dependencies, resolved)
+    return resolved.type
   }
 
-  if (shape.pgType === 'unknown' || shape.pgTypeName === 'unknown' || shape.pgTypeSchema === 'unknown') {
-    imports.scalar.add('DbJsonSelected')
-    return 'DbJsonSelected'
-  }
-
-  if (shape.pgTypeSchema === 'pg_catalog') {
-    const normalizedTypeName = normalizePgTypeName(shape.pgType)
-    if (normalizedTypeName === 'boolean') {
-      return 'boolean'
-    }
-    if (jsonNumberPgTypes.has(normalizedTypeName)) {
-      return 'number'
-    }
-    if (postgresArrayElementType(shape.pgType, shape.pgTypeName)) {
-      imports.scalar.add('DbJsonSelected')
-      return 'DbJsonSelected'
-    }
-    return 'string'
-  }
-
-  collectPgTypeImports(imports, shape.pgType, shape.pgTypeSchema, shape.pgTypeName, shape.pgTypeOid)
-  return tsTypeForPgType(
-    shape.pgType,
-    sourceFile,
-    'node-postgres',
-    shape.pgTypeSchema,
-    shape.pgTypeName,
-    shape.pgTypeOid
-  )
+  const resolved = resolveTypeScriptJsonScalarTypeForPostgresType(shape)
+  collectTypeResolutionDependencies(dependencies, resolved)
+  return resolved.type
 }
 
 function tsTypeForJsonShape(
@@ -588,18 +520,18 @@ function tsTypeForJsonShape(
   suggestedName: string,
   declarations: GeneratedJsonTypeDeclaration[],
   usedNames: Map<string, string>,
-  imports: TypeScriptImports
+  dependencies: TypeScriptDependencies
 ): string {
   switch (shape.kind) {
     case 'array':
-      return `readonly ${tsTypeForJsonShape(
+      return `readonly (${tsTypeForJsonShape(
         shape.element,
         sourceFile,
-        singularTypeName(suggestedName),
+        `${suggestedName}${encodedTypeNameSegment('element')}`,
         declarations,
         usedNames,
-        imports
-      )}[]`
+        dependencies
+      )}${shape.element.nullable ? ' | null' : ''})[]`
     case 'object': {
       reserveGeneratedTypeBinding(usedNames, suggestedName, `JSON object ${suggestedName}`, sourceFile)
       assertUniquePublicNames(
@@ -615,10 +547,10 @@ function tsTypeForJsonShape(
           tsType: tsTypeForJsonShape(
             field.shape,
             sourceFile,
-            `${name}${pascalCaseIdentifier(field.name)}`,
+            `${name}${encodedTypeNameSegment(field.name)}`,
             declarations,
             usedNames,
-            imports
+            dependencies
           ),
         })),
         name,
@@ -626,10 +558,23 @@ function tsTypeForJsonShape(
       return name
     }
     case 'opaque':
-      imports.scalar.add('DbJsonSelected')
+      dependencies.scalar.add('DbJsonSelected')
       return 'DbJsonSelected'
+    case 'union':
+      return shape.alternatives
+        .map((alternative, index) =>
+          tsTypeForJsonShape(
+            alternative,
+            sourceFile,
+            `${suggestedName}${encodedTypeNameSegment(`alternative${index + 1}`)}`,
+            declarations,
+            usedNames,
+            dependencies
+          )
+        )
+        .join(' | ')
     case 'scalar':
-      return scalarTsTypeForJsonShape(shape, sourceFile, imports)
+      return scalarTsTypeForJsonShape(shape, dependencies)
   }
 }
 
@@ -654,7 +599,7 @@ function renderImports(configs: readonly ResolvedTypedSql[], generatorConfig: Re
   const lines: string[] = []
   if (scalarImports.size > 0) {
     lines.push(
-      `import type { ${[...scalarImports].toSorted().join(', ')} } from '${generatorConfig.packageImport}/scalars'`
+      `import type { ${[...scalarImports].toSorted().join(', ')} } from ${quoteString(`${generatorConfig.packageImport}/scalars`)}`
     )
   }
   if (catalogTypeImports.size > 0) {
@@ -663,10 +608,10 @@ function renderImports(configs: readonly ResolvedTypedSql[], generatorConfig: Re
       throw new Error('Cannot render catalog imports without a source path.')
     }
     lines.push(
-      `import type { ${[...catalogTypeImports].toSorted().join(', ')} } from '${moduleSpecifier(dirname(sourcePath), generatorConfig.typesOutput)}'`
+      `import type { ${[...catalogTypeImports].toSorted().join(', ')} } from ${quoteString(moduleSpecifier(dirname(sourcePath), generatorConfig.typesOutput))}`
     )
   }
-  lines.push(`import { createTypedSqlStatement } from '${generatorConfig.packageImport}/runtime'`)
+  lines.push(`import { createTypedSqlStatement } from ${quoteString(`${generatorConfig.packageImport}/runtime`)}`)
 
   return lines.join('\n')
 }
@@ -797,19 +742,48 @@ ${renderStatement(config)}
 `
 }
 
-function assertColumnAssertions(config: CompiledTypedSql, resolvedColumns: readonly ResolvedSqlColumn[]): void {
+async function assertColumnAssertions(
+  client: PostgresQueryable,
+  config: CompiledTypedSql,
+  resolvedColumns: readonly ResolvedSqlColumn[]
+): Promise<void> {
   if (config.columns.length === 0) {
     return
   }
 
   const resolvedByName = new Map(resolvedColumns.map((column) => [column.name, column]))
+  const typedAssertions: { readonly assertion: SqlColumn; readonly resolved: ResolvedSqlColumn }[] = []
   for (const assertion of config.columns) {
     const resolved = resolvedByName.get(assertion.name)
     if (!resolved) {
       throw new Error(`${config.sourceFile}: @column ${assertion.name} does not exist in the PostgreSQL result.`)
     }
 
-    if (assertion.pgType && normalizePgTypeName(assertion.pgType) !== normalizePgTypeName(resolved.pgType)) {
+    if (assertion.pgType) {
+      typedAssertions.push({ assertion, resolved })
+    }
+  }
+
+  if (typedAssertions.length === 0) {
+    return
+  }
+
+  const result = await client.query<{ readonly oid: number | null; readonly ordinal: number }>(
+    `
+      select
+        asserted.ordinality::int as ordinal,
+        to_regtype(asserted.pg_type)::oid::int as oid
+      from unnest($1::text[]) with ordinality as asserted(pg_type, ordinality)
+    `,
+    [typedAssertions.map(({ assertion }) => assertion.pgType)]
+  )
+  const oidByOrdinal = new Map(result.rows.map((row) => [row.ordinal, row.oid]))
+  for (const [index, { assertion, resolved }] of typedAssertions.entries()) {
+    const assertedOid = oidByOrdinal.get(index + 1)
+    if (!assertedOid) {
+      throw new Error(`${config.sourceFile}: unknown @column type ${assertion.pgType} for ${assertion.name}.`)
+    }
+    if (assertedOid !== resolved.pgTypeOid) {
       throw new Error(
         `${config.sourceFile}: result column ${assertion.name} type drift. Expected ${assertion.pgType}, PostgreSQL inferred ${resolved.pgType}.`
       )
@@ -841,7 +815,8 @@ async function resolveTypedSqlWithAnalyzer(
     }
 
     const generatedDeclarations: GeneratedJsonTypeDeclaration[] = []
-    const typeImports: TypeScriptImports = {
+    const typeDependencies: TypeScriptDependencies = {
+      ambient: new Set(),
       catalog: new Set(),
       scalar: new Set(),
     }
@@ -854,40 +829,26 @@ async function resolveTypedSqlWithAnalyzer(
     const columns = ir.resultColumns.map((column, columnIndex): ResolvedSqlColumn => {
       const name = column.name ?? `column_${columnIndex + 1}`
       const propertyName = name
-      const suggestedJsonTypeName = `${pascalCaseIdentifier(config.name)}${pascalCaseIdentifier(propertyName)}Json`
+      const suggestedJsonTypeName = `${pascalCaseIdentifier(config.name)}${encodedTypeNameSegment(propertyName)}Json`
       const useStructuredJson = generatorConfig.scalarProfile === 'node-postgres' && column.jsonShape !== undefined
-      const tsType =
-        useStructuredJson && column.jsonShape
-          ? tsTypeForJsonShape(
-              column.jsonShape,
-              config.sourceFile,
-              suggestedJsonTypeName,
-              generatedDeclarations,
-              usedGeneratedTypeNames,
-              typeImports
-            )
-          : generatorConfig.scalarProfile === 'node-postgres' && column.tsTypeSource === 'checkConstraint'
-            ? column.tsType
-            : tsTypeForPgType(
-                column.pgType,
-                config.sourceFile,
-                generatorConfig.scalarProfile,
-                column.pgTypeSchema,
-                column.pgTypeName,
-                column.pgTypeOid
-              )
-      if (!useStructuredJson) {
-        collectResolvedTypeImports(
-          typeImports,
-          tsType,
-          column.pgType,
-          column.pgTypeSchema,
-          column.pgTypeName,
-          column.pgTypeOid,
+      let tsType: string
+      if (useStructuredJson && column.jsonShape) {
+        tsType = tsTypeForJsonShape(
+          column.jsonShape,
           config.sourceFile,
-          'output',
-          generatorConfig.scalarProfile
+          suggestedJsonTypeName,
+          generatedDeclarations,
+          usedGeneratedTypeNames,
+          typeDependencies
         )
+      } else {
+        const resolution =
+          column.checkConstraintTypeName &&
+          postgresResultSupportsStringLiteralRefinement(column, generatorConfig.scalarProfile)
+            ? catalogTypeResolution(column.checkConstraintTypeName)
+            : resolveTypeScriptResultTypeForPostgresType(column, generatorConfig.scalarProfile)
+        collectTypeResolutionDependencies(typeDependencies, resolution)
+        tsType = resolution.type
       }
       return {
         jsonShape: column.jsonShape,
@@ -895,6 +856,7 @@ async function resolveTypedSqlWithAnalyzer(
         nullable: column.nullable,
         pgType: column.pgType,
         pgTypeName: column.pgTypeName,
+        pgTypeOid: column.pgTypeOid,
         pgTypeSchema: column.pgTypeSchema,
         propertyName,
         source: column.source,
@@ -906,43 +868,32 @@ async function resolveTypedSqlWithAnalyzer(
       'result column',
       config.sourceFile
     )
-    assertColumnAssertions(config, columns)
+    await assertColumnAssertions(client, config, columns)
     const parameters = config.parameters.map((parameter, paramIndex): ResolvedSqlParameter => {
       const analyzed = ir.params[paramIndex]
       if (!analyzed) {
         throw new Error(`${config.sourceFile}: analyzer returned no type for parameter ${parameter.name}.`)
       }
 
-      const tsType =
-        generatorConfig.scalarProfile === 'node-postgres' && analyzed.tsTypeSource === 'checkConstraint'
-          ? analyzed.tsType
-          : parameterTsTypeForPgType(
-              analyzed.pgType,
-              config.sourceFile,
-              generatorConfig.scalarProfile,
-              analyzed.pgTypeSchema,
-              analyzed.pgTypeName,
-              analyzed.pgTypeOid
-            )
-      collectResolvedTypeImports(
-        typeImports,
-        tsType,
-        analyzed.pgType,
-        analyzed.pgTypeSchema,
-        analyzed.pgTypeName,
-        analyzed.pgTypeOid,
-        config.sourceFile,
-        'input',
-        generatorConfig.scalarProfile
-      )
+      const resolution =
+        analyzed.checkConstraintTypeName &&
+        postgresParameterSupportsStringLiteralRefinement(analyzed, generatorConfig.scalarProfile)
+          ? catalogTypeResolution(analyzed.checkConstraintTypeName)
+          : resolveTypeScriptParameterTypeForPostgresType(analyzed, generatorConfig.scalarProfile)
+      collectTypeResolutionDependencies(typeDependencies, resolution)
+      if (parameter.nullable === true && analyzed.nullAdmission === 'rejects') {
+        throw new Error(
+          `${config.sourceFile}: @param ${parameter.name} cannot be nullable because PostgreSQL proves that one of its uses rejects NULL.`
+        )
+      }
       return {
         name: parameter.name,
-        nullable: parameter.nullable === true ? true : analyzed.nullable,
+        nullable: analyzed.nullAdmission === 'accepts' || parameter.nullable === true,
         pgType: analyzed.pgType,
         pgTypeName: analyzed.pgTypeName,
         pgTypeSchema: analyzed.pgTypeSchema,
         propertyName: parameter.propertyName,
-        tsType,
+        tsType: resolution.type,
       }
     })
     assertUniquePublicNames(
@@ -950,12 +901,20 @@ async function resolveTypedSqlWithAnalyzer(
       'parameter',
       config.sourceFile
     )
+    const usesRecordUtilityType =
+      parameters.length === 0 || columns.length === 0 || generatedDeclarations.some(({ fields }) => fields.length === 0)
     assertUniqueTypeScriptBindings(
       [
-        { name: 'Record', source: 'reserved TypeScript utility type' },
+        ...(usesRecordUtilityType
+          ? [{ name: 'Record', source: 'TypeScript utility type used by an empty generated object' }]
+          : []),
         ...[...usedGeneratedTypeNames].map(([name, source]) => ({ name, source })),
-        ...[...typeImports.catalog].map((name) => ({ name, source: 'catalog type import' })),
-        ...[...typeImports.scalar].map((name) => ({ name, source: 'postgres-typed-sql scalar type import' })),
+        ...[...typeDependencies.ambient].map((name) => ({ name, source: 'ambient TypeScript type' })),
+        ...[...typeDependencies.catalog].map((name) => ({ name, source: 'catalog type import' })),
+        ...[...typeDependencies.scalar].map((name) => ({
+          name,
+          source: 'postgres-typed-sql scalar type import',
+        })),
       ],
       config.sourceFile
     )
@@ -969,7 +928,7 @@ async function resolveTypedSqlWithAnalyzer(
       columns,
       access: config.access ?? inferredAccess,
       cardinality: ir.rowCardinality,
-      catalogTypeImports: [...typeImports.catalog].toSorted(),
+      catalogTypeImports: [...typeDependencies.catalog].toSorted(),
       command: typedSqlCommandFromPostgres(ir.command),
       generatedTypeDeclarations: generatedDeclarations.map(renderGeneratedTypeDeclaration),
       name: config.name,
@@ -978,7 +937,7 @@ async function resolveTypedSqlWithAnalyzer(
       parameterNames: config.parameterNames,
       parameterTypes: parameters.map((parameter) => parameter.pgType),
       rowBounds: ir.rowBounds,
-      scalarTypeImports: [...typeImports.scalar].toSorted(),
+      scalarTypeImports: [...typeDependencies.scalar].toSorted(),
       sourceFile: config.sourceFile,
       sourcePath: config.sourcePath,
       sql: config.sql,
@@ -989,7 +948,7 @@ async function resolveTypedSqlWithAnalyzer(
 }
 
 async function findGeneratedTypedSqlFiles(config: ResolvedPostgresTypedSqlConfig): Promise<string[]> {
-  const generatedFiles = new Set<string>()
+  const generatedFiles = new Map<string, string>()
   async function walk(directory: string): Promise<void> {
     const entries = await readdir(directory, { withFileTypes: true })
     for (const entry of entries) {
@@ -1006,25 +965,39 @@ async function findGeneratedTypedSqlFiles(config: ResolvedPostgresTypedSqlConfig
         (entry.name.endsWith(typedSqlOutputSuffix) ||
           legacyTypedSqlOutputSuffixes.some((suffix) => entry.name.endsWith(suffix)))
       ) {
-        generatedFiles.add(entryPath)
+        const canonical = await realpath(entryPath)
+        if (!generatedFiles.has(canonical)) {
+          generatedFiles.set(canonical, entryPath)
+        }
       }
     }
   }
 
+  const includeRoots = new Map<string, string>()
   for (const includeRoot of config.include) {
+    const canonical = await realpath(includeRoot)
+    if (!includeRoots.has(canonical)) {
+      includeRoots.set(canonical, includeRoot)
+    }
+  }
+  for (const includeRoot of includeRoots.values()) {
     await walk(includeRoot)
   }
-  return [...generatedFiles].toSorted()
+  return [...generatedFiles.values()].toSorted()
 }
 
-async function removeStaleGeneratedFiles(
+async function findStaleGeneratedFiles(
   configs: readonly ResolvedTypedSql[],
   generatorConfig: ResolvedPostgresTypedSqlConfig
-): Promise<number> {
-  const expectedOutputPaths = new Set(configs.map((config) => config.outputPath))
-  let removed = 0
+): Promise<readonly string[]> {
+  const expectedOutputPaths = new Set(
+    await Promise.all(
+      [generatorConfig.typesOutput, ...configs.map((config) => config.outputPath)].map(filesystemPathIdentity)
+    )
+  )
+  const stale: string[] = []
   for (const generatedPath of await findGeneratedTypedSqlFiles(generatorConfig)) {
-    if (expectedOutputPaths.has(generatedPath)) {
+    if (expectedOutputPaths.has(await filesystemPathIdentity(generatedPath))) {
       continue
     }
 
@@ -1037,10 +1010,9 @@ async function removeStaleGeneratedFiles(
       continue
     }
 
-    await rm(generatedPath)
-    removed += 1
+    stale.push(generatedPath)
   }
-  return removed
+  return stale
 }
 
 interface GeneratedOutput {
@@ -1054,8 +1026,17 @@ interface StagedGeneratedOutput extends GeneratedOutput {
   readonly stagedPath: string
 }
 
+interface StagedGeneratedDeletion {
+  readonly backupPath: string
+  readonly outputPath: string
+}
+
 function isMissingFileError(error: unknown): boolean {
   return error instanceof Error && 'code' in error && error.code === 'ENOENT'
+}
+
+function isAlreadyExistsError(error: unknown): boolean {
+  return error instanceof Error && 'code' in error && error.code === 'EEXIST'
 }
 
 async function existingContents(outputPath: string): Promise<string | null> {
@@ -1069,15 +1050,63 @@ async function existingContents(outputPath: string): Promise<string | null> {
   }
 }
 
-async function cleanStagingFiles(staged: readonly StagedGeneratedOutput[]): Promise<void> {
+async function assertOutputIsNotSymbolicLink(outputPath: string): Promise<void> {
+  try {
+    const output = await lstat(outputPath)
+    if (output.isSymbolicLink()) {
+      throw new Error(`Generated output path ${outputPath} must not be a symbolic link.`)
+    }
+  } catch (error) {
+    if (!isMissingFileError(error)) {
+      throw error
+    }
+  }
+}
+
+async function canonicalFilesystemPath(path: string): Promise<string> {
+  const missingSegments: string[] = []
+  let existingAncestor = path
+
+  while (true) {
+    try {
+      return join(await realpath(existingAncestor), ...missingSegments)
+    } catch (error) {
+      if (!isMissingFileError(error)) {
+        throw error
+      }
+      const parent = dirname(existingAncestor)
+      if (parent === existingAncestor) {
+        throw error
+      }
+      missingSegments.unshift(basename(existingAncestor))
+      existingAncestor = parent
+    }
+  }
+}
+
+async function filesystemPathIdentity(path: string): Promise<string> {
+  return canonicalFilesystemPath(path)
+}
+
+async function cleanStagingFiles(
+  staged: readonly StagedGeneratedOutput[],
+  deletions: readonly StagedGeneratedDeletion[] = []
+): Promise<void> {
   await Promise.allSettled(
-    staged.flatMap((entry) => [rm(entry.stagedPath, { force: true }), rm(entry.backupPath, { force: true })])
+    [
+      ...staged.flatMap((entry) => [entry.stagedPath, entry.backupPath]),
+      ...deletions.map((entry) => entry.backupPath),
+    ].map((path) => rm(path, { force: true }))
   )
+}
+
+async function cleanStagedWrites(staged: readonly StagedGeneratedOutput[]): Promise<void> {
+  await Promise.allSettled(staged.map((entry) => rm(entry.stagedPath, { force: true })))
 }
 
 async function rollbackGeneratedOutputs(
   installed: readonly StagedGeneratedOutput[],
-  backedUp: readonly StagedGeneratedOutput[]
+  backedUp: readonly (StagedGeneratedDeletion | StagedGeneratedOutput)[]
 ): Promise<unknown[]> {
   const errors: unknown[] = []
   for (const entry of installed.toReversed()) {
@@ -1097,41 +1126,89 @@ async function rollbackGeneratedOutputs(
   return errors
 }
 
-async function commitGeneratedOutputs(outputs: readonly GeneratedOutput[]): Promise<void> {
+async function commitGeneratedOutputs(
+  outputs: readonly GeneratedOutput[],
+  stalePaths: readonly string[]
+): Promise<void> {
   const outputByPath = new Map<string, GeneratedOutput>()
   for (const output of outputs) {
-    const first = outputByPath.get(output.outputPath)
+    const identity = await filesystemPathIdentity(output.outputPath)
+    const first = outputByPath.get(identity)
     if (first) {
-      throw new Error(`Generated output path ${output.outputPath} is claimed more than once.`)
+      throw new Error(
+        `Generated output paths ${first.outputPath} and ${output.outputPath} refer to the same filesystem destination, which is claimed more than once.`
+      )
     }
-    outputByPath.set(output.outputPath, output)
+    outputByPath.set(identity, output)
+  }
+
+  const orderedOutputs = [...outputByPath.values()].toSorted((left, right) =>
+    left.outputPath.localeCompare(right.outputPath)
+  )
+  const staleByPath = new Map<string, string>()
+  for (const stalePath of stalePaths) {
+    const identity = await filesystemPathIdentity(stalePath)
+    if (outputByPath.has(identity)) {
+      throw new Error(`Generated output path ${stalePath} cannot be both installed and removed.`)
+    }
+    if (!staleByPath.has(identity)) {
+      staleByPath.set(identity, stalePath)
+    }
+  }
+  const orderedStalePaths = [...staleByPath.values()].toSorted()
+  for (const output of orderedOutputs) {
+    await assertOutputIsNotSymbolicLink(output.outputPath)
+  }
+  for (const stalePath of orderedStalePaths) {
+    await assertOutputIsNotSymbolicLink(stalePath)
   }
 
   const staged: StagedGeneratedOutput[] = []
+  const stagedByPath = new Map<string, StagedGeneratedOutput>()
+  const batchNonce = `${process.pid}-${randomUUID()}`
+  const deletions: StagedGeneratedDeletion[] = orderedStalePaths.map((outputPath) => ({
+    backupPath: join(dirname(outputPath), `.${basename(outputPath)}.${process.pid}-${randomUUID()}.backup`),
+    outputPath,
+  }))
   try {
-    for (const output of [...outputByPath.values()].toSorted((left, right) =>
-      left.outputPath.localeCompare(right.outputPath)
-    )) {
+    for (const output of orderedOutputs) {
       const previous = await existingContents(output.outputPath)
       if (previous === output.contents) {
         continue
       }
 
       await mkdir(dirname(output.outputPath), { recursive: true })
-      const nonce = `${process.pid}-${randomUUID()}`
-      const stagedPath = join(dirname(output.outputPath), `.${basename(output.outputPath)}.${nonce}.staged`)
-      const backupPath = join(dirname(output.outputPath), `.${basename(output.outputPath)}.${nonce}.backup`)
-      await writeFile(stagedPath, output.contents, { flag: 'wx' })
-      staged.push({ ...output, backupPath, existed: previous !== null, stagedPath })
+      const stagedPath = join(dirname(output.outputPath), `.${basename(output.outputPath)}.${batchNonce}.staged`)
+      const backupPath = join(dirname(output.outputPath), `.${basename(output.outputPath)}.${batchNonce}.backup`)
+      try {
+        await writeFile(stagedPath, output.contents, { flag: 'wx' })
+      } catch (error) {
+        if (isAlreadyExistsError(error)) {
+          const first = stagedByPath.get(await filesystemPathIdentity(stagedPath))
+          if (first) {
+            throw new Error(
+              `Generated output paths ${first.outputPath} and ${output.outputPath} refer to the same filesystem destination, which is claimed more than once.`
+            )
+          }
+        }
+        throw error
+      }
+      const entry = { ...output, backupPath, existed: previous !== null, stagedPath }
+      staged.push(entry)
+      stagedByPath.set(await filesystemPathIdentity(stagedPath), entry)
     }
   } catch (error) {
-    await cleanStagingFiles(staged)
+    await cleanStagingFiles(staged, deletions)
     throw error
   }
 
-  const backedUp: StagedGeneratedOutput[] = []
+  const backedUp: (StagedGeneratedDeletion | StagedGeneratedOutput)[] = []
   const installed: StagedGeneratedOutput[] = []
   try {
+    for (const entry of deletions) {
+      await rename(entry.outputPath, entry.backupPath)
+      backedUp.push(entry)
+    }
     for (const entry of staged) {
       if (entry.existed) {
         await rename(entry.outputPath, entry.backupPath)
@@ -1144,17 +1221,18 @@ async function commitGeneratedOutputs(outputs: readonly GeneratedOutput[]): Prom
     }
   } catch (error) {
     const rollbackErrors = await rollbackGeneratedOutputs(installed, backedUp)
-    await cleanStagingFiles(staged)
+    await cleanStagedWrites(staged)
     if (rollbackErrors.length > 0) {
       throw new AggregateError(
         [error, ...rollbackErrors],
         'Generated output commit failed and rollback was incomplete.'
       )
     }
+    await cleanStagingFiles(staged, deletions)
     throw error
   }
 
-  await cleanStagingFiles(staged)
+  await cleanStagingFiles(staged, deletions)
 }
 
 export interface GenerateTypedSqlResult {
@@ -1169,10 +1247,10 @@ export async function generateTypedSql(config: PostgresTypedSqlConfig): Promise<
   }
 
   generationInProgress = true
-  const resolvedConfig = resolveConfig(config)
   let database: Awaited<ReturnType<typeof createAnalysisDatabase>> | undefined
 
   try {
+    const resolvedConfig = resolveConfig(config)
     database = await createAnalysisDatabase({
       extensions: resolvedConfig.extensions,
       schemaFiles: resolvedConfig.schemaFiles,
@@ -1183,21 +1261,27 @@ export async function generateTypedSql(config: PostgresTypedSqlConfig): Promise<
     const configs = rawConfigs.map(compileTypedSql)
     const resolvedConfigs = await resolveTypedSqlWithAnalyzer(configs, database, resolvedConfig)
 
-    await commitGeneratedOutputs([
-      { contents: catalogContents, outputPath: resolvedConfig.typesOutput },
-      ...resolvedConfigs.map((entry) => ({
-        contents: renderTypedSql(entry, resolvedConfig),
-        outputPath: entry.outputPath,
-      })),
-    ])
-    const removedFiles = await removeStaleGeneratedFiles(resolvedConfigs, resolvedConfig)
+    const staleFiles = await findStaleGeneratedFiles(resolvedConfigs, resolvedConfig)
+    await commitGeneratedOutputs(
+      [
+        { contents: catalogContents, outputPath: resolvedConfig.typesOutput },
+        ...resolvedConfigs.map((entry) => ({
+          contents: renderTypedSql(entry, resolvedConfig),
+          outputPath: entry.outputPath,
+        })),
+      ],
+      staleFiles
+    )
     return {
       generatedFiles: resolvedConfigs.map((entry) => entry.outputPath),
-      removedFiles,
+      removedFiles: staleFiles.length,
       statementCount: configs.length,
     }
   } finally {
-    await database?.close()
-    generationInProgress = false
+    try {
+      await database?.close()
+    } finally {
+      generationInProgress = false
+    }
   }
 }

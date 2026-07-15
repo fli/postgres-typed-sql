@@ -2,64 +2,448 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { getTypeParser, type TypeId } from 'pg-types'
 
-import { typeScriptParameterTypeForPostgresType, typeScriptTypeForPostgresType } from '../src/postgres-types.js'
+import {
+  resolveTypeScriptJsonScalarTypeForPostgresType,
+  resolveTypeScriptParameterTypeForPostgresType,
+  resolveTypeScriptResultTypeForPostgresType,
+  type PostgresScalarProfile,
+  type PostgresTypeFact,
+} from '../src/postgres-types.js'
 
-test('central PostgreSQL type rules honor explicit scalar profiles and exact driver array OIDs', () => {
-  const pgCatalog = (pgType: string, pgTypeName = pgType, pgTypeOid = 0) => ({
-    pgType,
-    pgTypeName,
-    pgTypeOid,
-    pgTypeSchema: 'pg_catalog',
+const pgCatalog = (
+  pgType: string,
+  pgTypeName: string,
+  pgTypeOid = 0,
+  facts: Partial<PostgresTypeFact> = {}
+): PostgresTypeFact => ({
+  pgType,
+  pgTypeName,
+  pgTypeOid,
+  pgTypeSchema: 'pg_catalog',
+  pgTypeKind: 'base',
+  ...facts,
+})
+
+const resultType = (fact: PostgresTypeFact, profile?: PostgresScalarProfile): string =>
+  resolveTypeScriptResultTypeForPostgresType(fact, profile).type
+
+const parameterType = (fact: PostgresTypeFact, profile?: PostgresScalarProfile): string =>
+  resolveTypeScriptParameterTypeForPostgresType(fact, profile).type
+
+test('result resolution follows the exact pg-types 2.2.0 text-decoder registrations', () => {
+  assert.equal(resultType(pgCatalog('integer', 'int4', 23)), 'number')
+  assert.equal(resultType(pgCatalog('bigint', 'int8', 20)), 'PgInt8String')
+  assert.equal(resultType(pgCatalog('numeric', 'numeric', 1700)), 'PgNumericString')
+  assert.equal(resultType(pgCatalog('time without time zone', 'time', 1083)), 'PgTimeString')
+  assert.equal(resultType(pgCatalog('time with time zone', 'timetz', 1266)), 'PgTimetzString')
+  assert.equal(resultType(pgCatalog('uuid', 'uuid', 2950)), 'PgUuidString')
+  assert.deepEqual(
+    resolveTypeScriptResultTypeForPostgresType(pgCatalog('timestamp with time zone', 'timestamptz', 1184)),
+    {
+      ambientBindings: ['Date'],
+      catalogImports: [],
+      scalarImports: [],
+      type: 'Date | number',
+    }
+  )
+  assert.deepEqual(resolveTypeScriptResultTypeForPostgresType(pgCatalog('bytea', 'bytea', 17)), {
+    ambientBindings: ['Uint8Array'],
+    catalogImports: [],
+    scalarImports: [],
+    type: 'Uint8Array',
   })
+  assert.equal(resultType(pgCatalog('tsquery', 'tsquery', 3615)), 'string')
+  assert.equal(resultType(pgCatalog('point', 'point', 600)), 'PgPoint')
+  assert.equal(resultType(pgCatalog('circle', 'circle', 718)), 'PgCircle')
+  assert.equal(resultType(pgCatalog('interval', 'interval', 1186)), 'PgInterval')
 
-  assert.equal(typeScriptTypeForPostgresType(pgCatalog('integer', 'int4')), 'number')
-  assert.equal(typeScriptTypeForPostgresType(pgCatalog('bigint', 'int8')), 'PgInt8String')
   assert.equal(
-    typeScriptTypeForPostgresType(pgCatalog('timestamp with time zone', 'timestamptz', 1184)),
-    'Date | number'
-  )
-  assert.equal(typeScriptTypeForPostgresType(pgCatalog('tsquery')), 'string')
-  assert.equal(
-    typeScriptTypeForPostgresType({
-      pgType: 'audit.account_status[]',
-      pgTypeName: '_account_status',
-      pgTypeOid: 16_384,
-      pgTypeSchema: 'audit',
-    }),
-    'unknown'
-  )
-  assert.equal(typeScriptTypeForPostgresType(pgCatalog('numeric[]', '_numeric', 1231)), 'PgArray<number>')
-  assert.equal(typeScriptTypeForPostgresType(pgCatalog('bigint[]', '_int8', 1016)), 'PgArray<PgInt8String>')
-  assert.equal(typeScriptTypeForPostgresType(pgCatalog('date[]', '_date', 1182)), 'PgArray<Date | number>')
-  assert.equal(typeScriptTypeForPostgresType(pgCatalog('tsquery[]', '_tsquery', 3645)), 'unknown')
-
-  assert.equal(typeScriptParameterTypeForPostgresType(pgCatalog('jsonb[]', '_jsonb', 3807)), 'PgArray<DbJsonInput>')
-  assert.equal(
-    typeScriptParameterTypeForPostgresType(pgCatalog('bigint[]', '_int8', 1016)),
-    'PgArray<bigint | number | string>'
-  )
-  assert.equal(
-    typeScriptParameterTypeForPostgresType({
-      pgType: 'audit.account_status[]',
-      pgTypeName: '_account_status',
-      pgTypeOid: 16_384,
-      pgTypeSchema: 'audit',
-    }),
-    'PgArray<AuditAccountStatus>'
-  )
-
-  assert.equal(typeScriptTypeForPostgresType(pgCatalog('integer', 'int4'), undefined, 'conservative'), 'unknown')
-  assert.equal(
-    typeScriptTypeForPostgresType(
-      { pgType: 'account_status', pgTypeName: 'account_status', pgTypeSchema: 'public' },
-      undefined,
-      'conservative'
+    resultType(
+      pgCatalog('numeric[]', '_numeric', 1231, {
+        pgTypeKind: 'array',
+        pgArrayElementType: pgCatalog('numeric', 'numeric', 1700),
+      })
     ),
-    'unknown'
+    'PgArray<number>'
+  )
+  assert.equal(
+    resultType(
+      pgCatalog('bigint[]', '_int8', 1016, {
+        pgTypeKind: 'array',
+        pgArrayElementType: pgCatalog('bigint', 'int8', 20),
+      })
+    ),
+    'PgArray<PgInt8String>'
+  )
+  assert.equal(
+    resultType(
+      pgCatalog('date[]', '_date', 1182, {
+        pgTypeKind: 'array',
+        pgArrayElementType: pgCatalog('date', 'date', 1082),
+      })
+    ),
+    'PgArray<Date | number>'
+  )
+  assert.equal(
+    resultType(
+      pgCatalog('point[]', '_point', 1017, {
+        pgTypeKind: 'array',
+        pgArrayElementType: pgCatalog('point', 'point', 600),
+      })
+    ),
+    'PgArray<PgPoint>'
+  )
+  assert.equal(
+    resultType(
+      pgCatalog('interval[]', '_interval', 1187, {
+        pgTypeKind: 'array',
+        pgArrayElementType: pgCatalog('interval', 'interval', 1186),
+      })
+    ),
+    'PgArray<PgInterval>'
+  )
+  assert.deepEqual(
+    resolveTypeScriptResultTypeForPostgresType(
+      pgCatalog('date[]', '_date', 1182, {
+        pgTypeKind: 'array',
+        pgArrayElementType: pgCatalog('date', 'date', 1082),
+      })
+    ),
+    {
+      ambientBindings: ['Date'],
+      catalogImports: [],
+      scalarImports: ['PgArray'],
+      type: 'PgArray<Date | number>',
+    }
+  )
+  assert.equal(
+    resultType(
+      pgCatalog('tsquery[]', '_tsquery', 3645, {
+        pgTypeKind: 'array',
+        pgArrayElementType: pgCatalog('tsquery', 'tsquery', 3615),
+      })
+    ),
+    'string'
+  )
+  assert.equal(
+    resultType({
+      pgType: 'audit.account_status[]',
+      pgTypeName: '_account_status',
+      pgTypeOid: 16_384,
+      pgTypeSchema: 'audit',
+      pgTypeKind: 'array',
+      pgArrayElementType: {
+        pgType: 'audit.account_status',
+        pgTypeName: 'account_status',
+        pgTypeOid: 16_383,
+        pgTypeSchema: 'audit',
+        pgTypeKind: 'enum',
+      },
+    }),
+    'string'
+  )
+
+  assert.equal(resultType(pgCatalog('integer', 'int4')), 'unknown')
+  assert.equal(resultType(pgCatalog('integer', 'int4', 23), 'conservative'), 'unknown')
+})
+
+test('result resolution peels domains and refines enum facts to generated catalog aliases', () => {
+  const enumFact: PostgresTypeFact = {
+    pgType: 'audit.account_status',
+    pgTypeName: 'account_status',
+    pgTypeOid: 16_383,
+    pgTypeSchema: 'audit',
+    pgTypeKind: 'enum',
+  }
+  const domainFact: PostgresTypeFact = {
+    pgType: 'audit.event_id',
+    pgTypeName: 'event_id',
+    pgTypeOid: 16_385,
+    pgTypeSchema: 'audit',
+    pgTypeKind: 'domain',
+    pgBaseType: pgCatalog('bigint', 'int8', 20),
+  }
+
+  assert.deepEqual(resolveTypeScriptResultTypeForPostgresType(enumFact), {
+    ambientBindings: [],
+    catalogImports: ['Audit_AccountStatus'],
+    scalarImports: [],
+    type: 'Audit_AccountStatus',
+  })
+  assert.deepEqual(resolveTypeScriptResultTypeForPostgresType(domainFact), {
+    ambientBindings: [],
+    catalogImports: [],
+    scalarImports: ['PgInt8String'],
+    type: 'PgInt8String',
+  })
+  assert.equal(
+    resultType({ ...domainFact, pgBaseType: undefined }),
+    'unknown',
+    'a domain without a base fact must not fall through to its unregistered domain OID'
   )
 })
 
-test('node-postgres parser fixtures match the modeled array, fallback, and infinity behavior', () => {
+test('parameter resolution is independent of result decoding and recursively uses type facts', () => {
+  const enumFact: PostgresTypeFact = {
+    pgType: 'audit.account_status',
+    pgTypeName: 'account_status',
+    pgTypeOid: 16_383,
+    pgTypeSchema: 'audit',
+    pgTypeKind: 'enum',
+  }
+  const enumArray: PostgresTypeFact = {
+    pgType: 'audit.account_status[]',
+    pgTypeName: '_account_status',
+    pgTypeOid: 16_384,
+    pgTypeSchema: 'audit',
+    pgTypeKind: 'array',
+    pgArrayDelimiter: ',',
+    pgArrayElementType: enumFact,
+  }
+
+  assert.equal(
+    parameterType(
+      pgCatalog('jsonb[]', '_jsonb', 3807, {
+        pgTypeKind: 'array',
+        pgArrayDelimiter: ',',
+        pgArrayElementType: pgCatalog('jsonb', 'jsonb', 3802),
+      })
+    ),
+    'PgArray<DbJsonParameter>'
+  )
+  assert.equal(
+    parameterType(
+      pgCatalog('bigint[]', '_int8', 1016, {
+        pgTypeKind: 'array',
+        pgArrayDelimiter: ',',
+        pgArrayElementType: pgCatalog('bigint', 'int8', 20),
+      })
+    ),
+    'PgArray<bigint | number | string>'
+  )
+  assert.deepEqual(resolveTypeScriptParameterTypeForPostgresType(enumArray), {
+    ambientBindings: [],
+    catalogImports: ['Audit_AccountStatus'],
+    scalarImports: ['PgArray'],
+    type: 'PgArray<Audit_AccountStatus>',
+  })
+  assert.equal(
+    parameterType({
+      pgType: 'audit.int_list[]',
+      pgTypeName: '_int_list',
+      pgTypeOid: 16_390,
+      pgTypeSchema: 'audit',
+      pgTypeKind: 'array',
+      pgArrayDelimiter: ',',
+      pgArrayElementType: {
+        pgType: 'audit.int_list',
+        pgTypeName: 'int_list',
+        pgTypeOid: 16_389,
+        pgTypeSchema: 'audit',
+        pgTypeKind: 'domain',
+        pgBaseType: pgCatalog('integer[]', '_int4', 1007, {
+          pgTypeKind: 'array',
+          pgArrayDelimiter: ',',
+          pgArrayElementType: pgCatalog('integer', 'int4', 23),
+        }),
+      },
+    }),
+    'PgArray<string>'
+  )
+  assert.equal(
+    parameterType({
+      pgType: 'audit.email_address',
+      pgTypeName: 'email_address',
+      pgTypeOid: 16_386,
+      pgTypeSchema: 'audit',
+      pgTypeKind: 'domain',
+      pgBaseType: pgCatalog('text', 'text', 25),
+    }),
+    'string'
+  )
+  assert.equal(parameterType(pgCatalog('date', 'date', 1082)), 'Date | number | string')
+  assert.equal(parameterType(pgCatalog('oid', 'oid', 26)), 'bigint | number | string')
+  assert.equal(
+    parameterType({
+      pgType: 'audit.object_id',
+      pgTypeName: 'object_id',
+      pgTypeOid: 16_389,
+      pgTypeSchema: 'audit',
+      pgTypeKind: 'domain',
+      pgBaseType: pgCatalog('oid', 'oid', 26),
+    }),
+    'bigint | number | string'
+  )
+  assert.equal(
+    parameterType(
+      pgCatalog('oid[]', '_oid', 1028, {
+        pgTypeKind: 'array',
+        pgArrayDelimiter: ',',
+        pgArrayElementType: pgCatalog('oid', 'oid', 26),
+      })
+    ),
+    'PgArray<bigint | number | string>'
+  )
+  assert.equal(parameterType(pgCatalog('bytea', 'bytea', 17)), 'PgByteaHexString | Uint8Array')
+  assert.equal(
+    parameterType(
+      pgCatalog('bytea[]', '_bytea', 1001, {
+        pgTypeKind: 'array',
+        pgArrayDelimiter: ',',
+        pgArrayElementType: pgCatalog('bytea', 'bytea', 17),
+      })
+    ),
+    'PgArray<PgByteaHexString>'
+  )
+  assert.equal(parameterType(pgCatalog('interval', 'interval', 1186)), 'PgInterval | string')
+  assert.equal(
+    parameterType(
+      pgCatalog('interval[]', '_interval', 1187, {
+        pgTypeKind: 'array',
+        pgArrayDelimiter: ',',
+        pgArrayElementType: pgCatalog('interval', 'interval', 1186),
+      })
+    ),
+    'PgArray<PgInterval | string>'
+  )
+  assert.equal(
+    parameterType(
+      pgCatalog('date[]', '_date', 1182, {
+        pgTypeKind: 'array',
+        pgArrayDelimiter: ',',
+        pgArrayElementType: pgCatalog('date', 'date', 1082),
+      })
+    ),
+    'PgArray<Date | number | string>'
+  )
+  assert.equal(
+    parameterType(
+      pgCatalog('box[]', '_box', 1020, {
+        pgTypeKind: 'array',
+        pgArrayDelimiter: ';',
+        pgArrayElementType: pgCatalog('box', 'box', 603),
+      })
+    ),
+    'string'
+  )
+  assert.deepEqual(resolveTypeScriptParameterTypeForPostgresType(pgCatalog('date', 'date', 1082)), {
+    ambientBindings: ['Date'],
+    catalogImports: [],
+    scalarImports: [],
+    type: 'Date | number | string',
+  })
+  assert.equal(parameterType(pgCatalog('circle', 'circle', 718)), 'string')
+  assert.equal(
+    parameterType({
+      pgType: 'audit.event_payload',
+      pgTypeName: 'event_payload',
+      pgTypeOid: 16_387,
+      pgTypeSchema: 'audit',
+      pgTypeKind: 'composite',
+    }),
+    'string'
+  )
+  assert.equal(
+    parameterType({
+      pgType: 'audit.event_window',
+      pgTypeName: 'event_window',
+      pgTypeOid: 16_388,
+      pgTypeSchema: 'audit',
+      pgTypeKind: 'range',
+    }),
+    'string'
+  )
+  assert.deepEqual(resolveTypeScriptParameterTypeForPostgresType(pgCatalog('integer', 'int4', 23), 'conservative'), {
+    ambientBindings: ['NonNullable'],
+    catalogImports: [],
+    scalarImports: [],
+    type: 'NonNullable<unknown>',
+  })
+})
+
+test('nested-JSON resolution follows PostgreSQL conversion rather than node-postgres parsers', () => {
+  const domainOfNumeric: PostgresTypeFact = {
+    pgType: 'audit.amount',
+    pgTypeName: 'amount',
+    pgTypeOid: 16_390,
+    pgTypeSchema: 'audit',
+    pgTypeKind: 'domain',
+    pgBaseType: pgCatalog('numeric', 'numeric', 1700),
+  }
+
+  assert.equal(
+    resolveTypeScriptJsonScalarTypeForPostgresType(pgCatalog('numeric', 'numeric', 1700)).type,
+    'number | string'
+  )
+  assert.equal(resolveTypeScriptJsonScalarTypeForPostgresType(domainOfNumeric).type, 'number | string')
+  assert.equal(
+    resolveTypeScriptJsonScalarTypeForPostgresType(pgCatalog('double precision', 'float8', 701)).type,
+    'number | string'
+  )
+  assert.equal(resolveTypeScriptJsonScalarTypeForPostgresType(pgCatalog('boolean', 'bool', 16)).type, 'boolean')
+  assert.equal(resolveTypeScriptResultTypeForPostgresType(pgCatalog('oid', 'oid', 26)).type, 'number')
+  assert.equal(resolveTypeScriptJsonScalarTypeForPostgresType(pgCatalog('oid', 'oid', 26)).type, 'string')
+  assert.equal(
+    resolveTypeScriptJsonScalarTypeForPostgresType({
+      pgType: 'audit.object_id',
+      pgTypeName: 'object_id',
+      pgTypeOid: 16_389,
+      pgTypeSchema: 'audit',
+      pgTypeKind: 'domain',
+      pgBaseType: pgCatalog('oid', 'oid', 26),
+    }).type,
+    'string'
+  )
+  assert.equal(resolveTypeScriptJsonScalarTypeForPostgresType(pgCatalog('date', 'date', 1082)).type, 'string')
+  assert.equal(
+    resolveTypeScriptJsonScalarTypeForPostgresType({
+      pgType: 'audit.custom_json_value',
+      pgTypeKind: 'enum',
+      pgTypeName: 'custom_json_value',
+      pgTypeOid: 16_392,
+      pgTypeSchema: 'audit',
+      pgCastsToJson: true,
+    }).type,
+    'DbJsonSelected'
+  )
+  assert.deepEqual(
+    resolveTypeScriptJsonScalarTypeForPostgresType({
+      pgType: 'audit.account_status',
+      pgTypeName: 'account_status',
+      pgTypeOid: 16_383,
+      pgTypeSchema: 'audit',
+      pgTypeKind: 'enum',
+    }),
+    {
+      ambientBindings: [],
+      catalogImports: ['Audit_AccountStatus'],
+      scalarImports: [],
+      type: 'Audit_AccountStatus',
+    }
+  )
+  assert.equal(resolveTypeScriptJsonScalarTypeForPostgresType(pgCatalog('jsonb', 'jsonb', 3802)).type, 'DbJsonSelected')
+  assert.equal(
+    resolveTypeScriptJsonScalarTypeForPostgresType(
+      pgCatalog('integer[]', '_int4', 1007, {
+        pgTypeKind: 'array',
+        pgArrayElementType: pgCatalog('integer', 'int4', 23),
+      })
+    ).type,
+    'DbJsonSelected'
+  )
+  assert.equal(
+    resolveTypeScriptJsonScalarTypeForPostgresType({
+      pgType: 'audit.event_payload',
+      pgTypeName: 'event_payload',
+      pgTypeOid: 16_387,
+      pgTypeSchema: 'audit',
+      pgTypeKind: 'composite',
+    }).type,
+    'DbJsonSelected'
+  )
+})
+
+test('pg-types 2.2.0 parser fixtures match arrays, identity fallback, and infinity behavior', () => {
   const parseNumericArray = getTypeParser(1231 as TypeId)
   assert.deepEqual(parseNumericArray('{{1.5,NULL},{-2,3}}'), [
     [1.5, null],
@@ -70,13 +454,78 @@ test('node-postgres parser fixtures match the modeled array, fallback, and infin
   assert.equal(rawDynamicType('{queued,complete}'), '{queued,complete}')
   assert.equal(rawDynamicType('42'), '42')
 
-  const parseDate = getTypeParser(1082 as TypeId)
-  const parseDateArray = getTypeParser(1182 as TypeId)
-  const parseTimestamp = getTypeParser(1184 as TypeId)
-  assert.equal(parseDate('infinity'), Infinity)
-  const dateArray = parseDateArray('{infinity,2026-07-15}') as unknown[]
-  assert.equal(dateArray[0], Infinity)
-  assert.ok(dateArray[1] instanceof Date)
-  assert.equal(parseTimestamp('-infinity'), -Infinity)
-  assert.ok(parseTimestamp('2026-07-15 12:00:00+09:30') instanceof Date)
+  const parseOidArray = getTypeParser(1028 as TypeId)
+  assert.deepEqual(parseOidArray('{{1,NULL},{42,4294967295}}'), [
+    [1, null],
+    [42, 4_294_967_295],
+  ])
+  assert.equal(
+    getTypeParser(1006 as TypeId)('{{1 2,NULL},{3 4,5 6}}'),
+    '{{1 2,NULL},{3 4,5 6}}',
+    'an unregistered built-in array OID uses the identity parser even when PostgreSQL catalogs it as an array'
+  )
+
+  assert.deepEqual(getTypeParser(600 as TypeId)('(1.5,-2)'), { x: 1.5, y: -2 })
+  assert.deepEqual(getTypeParser(718 as TypeId)('<(1.5,-2),3.25>'), { radius: 3.25, x: 1.5, y: -2 })
+  assert.deepEqual(getTypeParser(1017 as TypeId)('{"(1.5,-2)",NULL,"(0,4)"}'), [
+    { x: 1.5, y: -2 },
+    null,
+    { x: 0, y: 4 },
+  ])
+  const interval = getTypeParser(1186 as TypeId)('1 year 2 mons 3 days 04:05:06.75') as {
+    readonly days?: number
+    readonly hours?: number
+    readonly milliseconds?: number
+    readonly minutes?: number
+    readonly months?: number
+    readonly seconds?: number
+    readonly years?: number
+    toISO(): string
+    toISOString(): string
+    toPostgres(): string
+  }
+  assert.deepEqual(
+    {
+      days: interval.days,
+      hours: interval.hours,
+      milliseconds: interval.milliseconds,
+      minutes: interval.minutes,
+      months: interval.months,
+      seconds: interval.seconds,
+      years: interval.years,
+    },
+    { days: 3, hours: 4, milliseconds: 750, minutes: 5, months: 2, seconds: 6, years: 1 }
+  )
+  assert.equal(interval.toISO(), 'P1Y2M3DT4H5M6.75S')
+  assert.equal(interval.toISOString(), 'P1Y2M3DT4H5M6.75S')
+  assert.equal(interval.toPostgres(), '6.75 seconds 5 minutes 4 hours 3 days 2 months 1 years')
+  const intervalArray = getTypeParser(1187 as TypeId)('{"1 day",NULL,"-02:03:04.5"}') as readonly (null | {
+    readonly days?: number
+    readonly hours?: number
+    readonly minutes?: number
+    readonly seconds?: number
+  })[]
+  assert.equal(intervalArray[0]?.days, 1)
+  assert.equal(intervalArray[1], null)
+  assert.deepEqual(
+    {
+      hours: intervalArray[2]?.hours,
+      minutes: intervalArray[2]?.minutes,
+      seconds: intervalArray[2]?.seconds,
+    },
+    { hours: -2, minutes: -3, seconds: -4 }
+  )
+
+  for (const oid of [1082, 1114, 1184]) {
+    const parseTemporal = getTypeParser(oid as TypeId)
+    assert.equal(parseTemporal('infinity'), Infinity)
+    assert.equal(parseTemporal('-infinity'), -Infinity)
+  }
+  for (const oid of [1115, 1182, 1185]) {
+    const parseTemporalArray = getTypeParser(oid as TypeId)
+    assert.deepEqual(parseTemporalArray('{infinity,-infinity}'), [Infinity, -Infinity])
+  }
+  assert.ok(getTypeParser(1082 as TypeId)('2026-07-15') instanceof Date)
+  assert.ok(getTypeParser(1114 as TypeId)('2026-07-15 12:00:00') instanceof Date)
+  assert.ok(getTypeParser(1184 as TypeId)('2026-07-15 12:00:00+09:30') instanceof Date)
 })

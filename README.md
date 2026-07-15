@@ -74,7 +74,7 @@ The generated statement can be passed directly to a driver that accepts PostgreS
 const result = await client.query(findAccountByEmail.query({ email }))
 ```
 
-Direct driver execution returns raw rows: SQL column names are preserved, but scalar values are typed as `unknown` because `query()` does not control a driver's parsers. The optional runtime helpers under `postgres-typed-sql/runtime` enforce `one`, `optional`, and `many` result shapes and return the generated row type selected by the configured scalar profile.
+Direct driver execution returns driver-defined raw rows whose scalar values are typed as `unknown`, because `query()` controls neither row construction nor scalar parsers. The optional runtime helpers under `postgres-typed-sql/runtime` request array rows, map them by result-column position, enforce `one`, `optional`, and `many` result shapes, and return the generated row type selected by the configured scalar profile. Positional mapping preserves every PostgreSQL result name safely, including names such as `__proto__` that object-row construction cannot represent reliably.
 
 ## Scalar profiles
 
@@ -82,7 +82,7 @@ Drivers choose how PostgreSQL values become JavaScript values, and applications 
 
 The default `conservative` profile emits `unknown` for parameter and result scalar values. It is safe when the generator does not know the driver's conversion rules.
 
-Set `scalarProfile: 'node-postgres'` only when execution uses the default text parsers from node-postgres 8.x (`pg-types` 2.2.0). This profile models parsed JSON, JavaScript numbers for the built-in integer and floating-point parsers, strings for `bigint` and `numeric`, and `Date | number` for `date`/`timestamp`/`timestamptz` because PostgreSQL infinity values decode to numeric infinities. Built-in arrays are modeled only when that exact array OID has a registered parser; their recursive `PgArray<T>` type includes multidimensional arrays and SQL `NULL` elements. Unregistered arrays—including user-defined enum and domain arrays—and user-defined domain results remain `unknown`. If the application installs custom type parsers, uses binary result mode, or moves to a node-postgres version with a different default parser table, use the conservative profile unless those parser results still match the generated contract.
+Set `scalarProfile: 'node-postgres'` only when execution uses the `pg-types` 2.2.0 default text-parser contract used by the supported node-postgres 8.x releases. This profile models parsed JSON, JavaScript numbers for the built-in integer and floating-point parsers, structural objects for `point`, `circle`, and `interval`, strings for `bigint` and `numeric`, and `Date | number` for `date`/`timestamp`/`timestamptz` because PostgreSQL infinity values decode to numeric infinities. Registered built-in arrays use a recursive `PgArray<T>` type that includes multidimensional arrays and SQL `NULL` elements. Unregistered result OIDs—including user-defined enum and domain arrays, composites, and ranges—use node-postgres's raw-string fallback; scalar enums are narrowed to their database labels. PostgreSQL reports scalar domains using their recursively resolved base result type, so a domain over `integer` is a number while a domain over `integer[]` uses the registered array parser. Array parameters use `PgArray<T>` only when node-postgres's comma-delimited serializer matches the PostgreSQL array type; non-comma-delimited arrays use serialized strings, domains over arrays use one serialized string per outer element, and `bytea[]` elements use `PgByteaHexString` for compatibility across supported node-postgres 8.x releases. Interval objects and temporal infinity numbers can be passed back as parameters. Root `json`/`jsonb` parameters follow node-postgres serialization: objects are JSON-stringified, while JSON arrays, JSON strings, and JSON null should be supplied as serialized JSON text because root JavaScript arrays and `null` mean PostgreSQL arrays and SQL `NULL`. If the application installs custom type parsers, uses binary result mode, or uses a node-postgres release with a different default parser table, use the conservative profile unless those parser results still match the generated contract.
 
 ## Directives
 
@@ -98,7 +98,7 @@ Directives are SQL comments at the beginning of a `.typed.sql` file:
 
 - `@name` overrides the lower-camel-case name derived from the filename.
 - `@access` can explicitly declare `read` or `write`.
-- `@param` provides a PostgreSQL type when PostgreSQL cannot infer one. A trailing `?` marks a nullable input.
+- `@param` provides a PostgreSQL type when PostgreSQL cannot infer one. A trailing `?` permits a nullable input when NULL admission is otherwise unknown; generation rejects it when PostgreSQL proves that the parameter type, an evaluated use, or a DML target rejects NULL.
 - `@column` asserts that a result column exists and optionally asserts its PostgreSQL type.
 
 PostgreSQL still performs the authoritative parse, name resolution, type inference, rewriting, function/operator resolution, and catalog lookup.

@@ -1,13 +1,41 @@
-import { schemaQualifiedPascalName } from './typescript-names.js'
+import { postgresNamedTypeBinding } from './typescript-names.js'
+
+/**
+ * The PostgreSQL type classes that affect TypeScript resolution.
+ *
+ * `array` is called out separately even though PostgreSQL represents arrays as
+ * base types in pg_type. That distinction is useful here because parameter and
+ * nested-JSON conversion recurse through the element type.
+ */
+export type PostgresTypeKind =
+  | 'array'
+  | 'base'
+  | 'composite'
+  | 'domain'
+  | 'enum'
+  | 'multirange'
+  | 'pseudo'
+  | 'range'
+  | 'unknown'
 
 export interface PostgresTypeFact {
   readonly pgType: string
-  readonly pgTypeName?: string
-  readonly pgTypeOid?: number
-  readonly pgTypeSchema?: string
+  readonly pgTypeKind: PostgresTypeKind
+  readonly pgTypeName: string
+  readonly pgTypeOid: number
+  readonly pgTypeSchema: string
+  /** PostgreSQL's JSON conversion invokes a user-defined function cast from this type to json. */
+  readonly pgCastsToJson?: boolean
+  /** The immediate base type of a domain. Nested domains are intentionally recursive. */
+  readonly pgBaseType?: PostgresTypeFact
+  /** The immediate element type of an array. Nested arrays are intentionally recursive. */
+  readonly pgArrayElementType?: PostgresTypeFact
+  /** PostgreSQL's delimiter for the array element type. */
+  readonly pgArrayDelimiter?: string
 }
 
 export interface PostgresTypeScriptResolution {
+  readonly ambientBindings: readonly string[]
   readonly catalogImports: readonly string[]
   readonly scalarImports: readonly string[]
   readonly type: string
@@ -17,22 +45,14 @@ export type PostgresScalarProfile = 'conservative' | 'node-postgres'
 
 export const defaultPostgresScalarProfile: PostgresScalarProfile = 'conservative'
 
-export const postgresTypeScriptScalarImports = new Set([
-  'DbJsonInput',
+const scalarImportNames = new Set([
+  'DbJsonParameter',
   'DbJsonSelected',
-  'PgArray',
-  'PgByteaHexString',
-  'PgDateString',
-  'PgFloat4String',
-  'PgFloat8String',
-  'PgInt2String',
-  'PgInt4String',
+  'PgCircle',
   'PgInt8String',
-  'PgIntervalString',
+  'PgInterval',
   'PgNumericString',
-  'PgOidString',
-  'PgTimestampString',
-  'PgTimestamptzString',
+  'PgPoint',
   'PgTimeString',
   'PgTimetzString',
   'PgUuidString',
@@ -43,106 +63,128 @@ const emptyImports: readonly string[] = []
 function resolution(
   type: string,
   options: {
+    readonly ambientBindings?: readonly string[]
     readonly catalogImports?: readonly string[]
     readonly scalarImports?: readonly string[]
   } = {}
 ): PostgresTypeScriptResolution {
   return {
+    ambientBindings: options.ambientBindings ?? emptyImports,
     catalogImports: options.catalogImports ?? emptyImports,
-    scalarImports: options.scalarImports ?? (postgresTypeScriptScalarImports.has(type) ? [type] : emptyImports),
+    scalarImports: options.scalarImports ?? (scalarImportNames.has(type) ? [type] : emptyImports),
     type,
   }
 }
 
 const unknownResolution = resolution('unknown')
+const unknownParameterResolution = resolution('NonNullable<unknown>', {
+  ambientBindings: ['NonNullable'],
+})
+const stringResolution = resolution('string')
 
-const nodePostgresOutputType = new Map<string, PostgresTypeScriptResolution>([
-  ['bigint', resolution('PgInt8String')],
-  ['bit', resolution('string')],
-  ['bit varying', resolution('string')],
-  ['boolean', resolution('boolean')],
-  ['box', resolution('string')],
-  ['bytea', resolution('Uint8Array')],
-  ['char', resolution('string')],
-  ['cidr', resolution('string')],
-  ['circle', unknownResolution],
-  ['date', resolution('Date | number')],
-  ['double precision', resolution('number')],
-  ['inet', resolution('string')],
-  ['integer', resolution('number')],
-  ['interval', unknownResolution],
-  ['json', resolution('DbJsonSelected')],
-  ['jsonb', resolution('DbJsonSelected')],
-  ['line', resolution('string')],
-  ['lseg', resolution('string')],
-  ['macaddr', resolution('string')],
-  ['macaddr8', resolution('string')],
-  ['money', resolution('string')],
-  ['name', resolution('string')],
-  ['numeric', resolution('PgNumericString')],
-  ['oid', resolution('number')],
-  ['path', resolution('string')],
-  ['pg_lsn', resolution('string')],
-  ['point', unknownResolution],
-  ['polygon', resolution('string')],
-  ['real', resolution('number')],
-  ['smallint', resolution('number')],
-  ['text', resolution('string')],
-  ['time without time zone', resolution('PgTimeString')],
-  ['time with time zone', resolution('PgTimetzString')],
-  ['timestamp without time zone', resolution('Date | number')],
-  ['timestamp with time zone', resolution('Date | number')],
-  ['timestamptz', resolution('Date | number')],
-  ['tsquery', resolution('string')],
-  ['tsvector', resolution('string')],
-  ['unknown', unknownResolution],
-  ['uuid', resolution('PgUuidString')],
-  ['void', unknownResolution],
-  ['xml', resolution('string')],
-])
-
-for (const rangeType of ['daterange', 'int4range', 'int8range', 'numrange', 'tsrange', 'tstzrange']) {
-  nodePostgresOutputType.set(rangeType, resolution('string'))
+function uniqueImports(imports: readonly string[]): readonly string[] {
+  return [...new Set(imports)]
 }
 
-function pgArrayResolution(elementType: string, scalarImports: readonly string[] = []): PostgresTypeScriptResolution {
-  return resolution(`PgArray<${elementType}>`, {
-    scalarImports: ['PgArray', ...scalarImports],
+function pgArrayResolution(element: PostgresTypeScriptResolution): PostgresTypeScriptResolution {
+  return resolution(`PgArray<${element.type}>`, {
+    ambientBindings: element.ambientBindings,
+    catalogImports: element.catalogImports,
+    scalarImports: uniqueImports(['PgArray', ...element.scalarImports]),
   })
 }
 
-// node-postgres 8.x pins pg-types 2.2.0. Its text parsers are registered for
-// these exact built-in array OIDs; it does not recursively apply a scalar
-// parser to arbitrary PostgreSQL array types.
-const nodePostgresArrayOutputTypeByOid = new Map<number, PostgresTypeScriptResolution>([
-  [199, pgArrayResolution('DbJsonSelected', ['DbJsonSelected'])], // json[]
-  [651, pgArrayResolution('string')], // cidr[]
-  [791, pgArrayResolution('string')], // money[]
-  [1000, pgArrayResolution('boolean')], // bool[]
-  [1001, pgArrayResolution('Uint8Array')], // bytea[]
-  [1005, pgArrayResolution('number')], // int2[]
-  [1007, pgArrayResolution('number')], // int4[]
-  [1008, pgArrayResolution('string')], // regproc[]
-  [1009, pgArrayResolution('string')], // text[]
-  [1014, pgArrayResolution('string')], // bpchar[]
-  [1015, pgArrayResolution('string')], // varchar[]
-  [1016, pgArrayResolution('PgInt8String', ['PgInt8String'])], // int8[]
-  [1017, pgArrayResolution('unknown')], // point[]
-  [1021, pgArrayResolution('number')], // float4[]
-  [1022, pgArrayResolution('number')], // float8[]
-  [1028, pgArrayResolution('number')], // oid[]
-  [1040, pgArrayResolution('string')], // macaddr[]
-  [1041, pgArrayResolution('string')], // inet[]
-  [1115, pgArrayResolution('Date | number')], // timestamp[]
-  [1182, pgArrayResolution('Date | number')], // date[]
-  [1183, pgArrayResolution('PgTimeString', ['PgTimeString'])], // time[]
-  [1185, pgArrayResolution('Date | number')], // timestamptz[]
-  [1187, pgArrayResolution('unknown')], // interval[]
-  [1231, pgArrayResolution('number')], // numeric[]
-  [1270, pgArrayResolution('PgTimetzString', ['PgTimetzString'])], // timetz[]
-  [2951, pgArrayResolution('PgUuidString', ['PgUuidString'])], // uuid[]
-  [3807, pgArrayResolution('DbJsonSelected', ['DbJsonSelected'])], // jsonb[]
-  [3907, pgArrayResolution('string')], // numrange[]
+const byteaResolution = resolution('Uint8Array', { ambientBindings: ['Uint8Array'] })
+const byteaParameterResolution = resolution('PgByteaHexString | Uint8Array', {
+  ambientBindings: ['Uint8Array'],
+  scalarImports: ['PgByteaHexString'],
+})
+const dateResultResolution = resolution('Date | number', { ambientBindings: ['Date'] })
+const dateParameterResolution = resolution('Date | number | string', { ambientBindings: ['Date'] })
+const intervalParameterResolution = resolution('PgInterval | string', { scalarImports: ['PgInterval'] })
+
+function resolveArrayElementParameterType(
+  typeFact: PostgresTypeFact,
+  scalarProfile: PostgresScalarProfile
+): PostgresTypeScriptResolution {
+  if (typeFact.pgTypeSchema === 'pg_catalog' && typeFact.pgTypeName === 'bytea') {
+    return resolution('PgByteaHexString')
+  }
+  if (typeFact.pgTypeKind !== 'domain') {
+    return resolveTypeScriptParameterTypeForPostgresType(typeFact, scalarProfile)
+  }
+  if (!typeFact.pgBaseType) {
+    return unknownParameterResolution
+  }
+
+  // A JavaScript array here would be serialized as another dimension of the
+  // outer array. A domain whose scalar value is itself an array therefore has
+  // to be supplied as one serialized array-literal string per outer element.
+  return typeFact.pgBaseType.pgTypeKind === 'array'
+    ? stringResolution
+    : resolveArrayElementParameterType(typeFact.pgBaseType, scalarProfile)
+}
+
+/**
+ * Default text-decoder results in pg-types 2.2.0, which is the version pinned
+ * by node-postgres 8.x and by this package's parser fixtures.
+ *
+ * An OID absent from this table uses pg-types' identity text parser. Known
+ * identity-decoded built-ins whose wire distinctions are useful retain nominal
+ * string types. Point, circle, and interval use the stable structural object
+ * contracts returned by pg-types' pinned parser dependencies.
+ * Array entries retain PgArray because pg-types preserves dimensions and SQL
+ * NULL elements.
+ */
+const nodePostgresTextResolutionByOid = new Map<number, PostgresTypeScriptResolution>([
+  [16, resolution('boolean')], // bool
+  [17, byteaResolution], // bytea
+  [20, resolution('PgInt8String')], // int8
+  [21, resolution('number')], // int2
+  [23, resolution('number')], // int4
+  [26, resolution('number')], // oid
+  [114, resolution('DbJsonSelected')], // json
+  [199, pgArrayResolution(resolution('DbJsonSelected'))], // json[]
+  [600, resolution('PgPoint')], // point
+  [651, pgArrayResolution(stringResolution)], // cidr[]
+  [700, resolution('number')], // float4
+  [701, resolution('number')], // float8
+  [718, resolution('PgCircle')], // circle
+  [791, pgArrayResolution(stringResolution)], // money[]
+  [1000, pgArrayResolution(resolution('boolean'))], // bool[]
+  [1001, pgArrayResolution(byteaResolution)], // bytea[]
+  [1005, pgArrayResolution(resolution('number'))], // int2[]
+  [1007, pgArrayResolution(resolution('number'))], // int4[]
+  [1008, pgArrayResolution(stringResolution)], // regproc[]
+  [1009, pgArrayResolution(stringResolution)], // text[]
+  [1014, pgArrayResolution(stringResolution)], // bpchar[]
+  [1015, pgArrayResolution(stringResolution)], // varchar[]
+  [1016, pgArrayResolution(resolution('PgInt8String'))], // int8[]
+  [1017, pgArrayResolution(resolution('PgPoint'))], // point[]
+  [1021, pgArrayResolution(resolution('number'))], // float4[]
+  [1022, pgArrayResolution(resolution('number'))], // float8[]
+  [1028, pgArrayResolution(resolution('number'))], // oid[]
+  [1040, pgArrayResolution(stringResolution)], // macaddr[]
+  [1041, pgArrayResolution(stringResolution)], // inet[]
+  [1082, dateResultResolution], // date (number is +/-infinity)
+  [1083, resolution('PgTimeString')], // time (identity text parser)
+  [1114, dateResultResolution], // timestamp (number is +/-infinity)
+  [1115, pgArrayResolution(dateResultResolution)], // timestamp[]
+  [1182, pgArrayResolution(dateResultResolution)], // date[]
+  [1183, pgArrayResolution(resolution('PgTimeString'))], // time[]
+  [1184, dateResultResolution], // timestamptz (number is +/-infinity)
+  [1185, pgArrayResolution(dateResultResolution)], // timestamptz[]
+  [1186, resolution('PgInterval')], // interval
+  [1187, pgArrayResolution(resolution('PgInterval'))], // interval[]
+  [1231, pgArrayResolution(resolution('number'))], // numeric[]
+  [1266, resolution('PgTimetzString')], // timetz (identity text parser)
+  [1270, pgArrayResolution(resolution('PgTimetzString'))], // timetz[]
+  [1700, resolution('PgNumericString')], // numeric (identity text parser)
+  [2950, resolution('PgUuidString')], // uuid (identity text parser)
+  [2951, pgArrayResolution(resolution('PgUuidString'))], // uuid[]
+  [3802, resolution('DbJsonSelected')], // jsonb
+  [3807, pgArrayResolution(resolution('DbJsonSelected'))], // jsonb[]
+  [3907, pgArrayResolution(stringResolution)], // numrange[]
 ])
 
 const pgCatalogTypeAliases = new Map([
@@ -182,132 +224,189 @@ export function normalizePostgresTypeName(pgType: string): string {
   return pgCatalogTypeAliases.get(pgType) ?? pgType
 }
 
-export function postgresArrayElementType(pgType: string, typeName = ''): string | null {
-  const normalizedTypeName = normalizePostgresTypeName(typeName)
-  if (normalizedTypeName.startsWith('_') && normalizedTypeName.length > 1) {
-    return normalizedTypeName.slice(1)
+function catalogTypeResolution(typeFact: PostgresTypeFact): PostgresTypeScriptResolution {
+  if (typeFact.pgTypeSchema === 'pg_catalog') {
+    return stringResolution
   }
-
-  const normalizedPgType = normalizePostgresTypeName(pgType)
-  if (normalizedPgType.endsWith('[]')) {
-    return normalizedPgType.slice(0, -2)
-  }
-
-  return null
+  const catalogType = postgresNamedTypeBinding(typeFact.pgTypeSchema, typeFact.pgTypeName)
+  return resolution(catalogType, { catalogImports: [catalogType] })
 }
 
-function splitSchemaQualifiedPgType(pgType: string): { readonly schema: string; readonly typeName: string } | null {
-  const match = /^([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)(\[\])?$/u.exec(pgType)
-  if (!match?.[1] || !match[2]) {
-    return null
-  }
-
-  return { schema: match[1], typeName: `${match[2]}${match[3] ?? ''}` }
-}
-
-export function resolveTypeScriptTypeForPostgresType(
+/** Resolve a query result decoded through node-postgres' text protocol. */
+export function resolveTypeScriptResultTypeForPostgresType(
   typeFact: PostgresTypeFact,
-  context?: string,
   scalarProfile: PostgresScalarProfile = 'node-postgres'
 ): PostgresTypeScriptResolution {
   if (scalarProfile === 'conservative') {
     return unknownResolution
   }
 
-  const typeSchema = typeFact.pgTypeSchema ?? 'pg_catalog'
-  const typeName = typeFact.pgTypeName ?? ''
-  const schemaQualifiedType =
-    typeSchema === 'pg_catalog' && !typeName ? splitSchemaQualifiedPgType(typeFact.pgType) : null
-  if (schemaQualifiedType) {
-    return resolveTypeScriptTypeForPostgresType(
-      {
-        pgType: schemaQualifiedType.typeName,
-        pgTypeName: schemaQualifiedType.typeName,
-        pgTypeSchema: schemaQualifiedType.schema,
-      },
-      context,
-      scalarProfile
-    )
+  if (typeFact.pgTypeKind === 'domain') {
+    return typeFact.pgBaseType
+      ? resolveTypeScriptResultTypeForPostgresType(typeFact.pgBaseType, scalarProfile)
+      : unknownResolution
+  }
+  if (typeFact.pgTypeKind === 'enum') {
+    return catalogTypeResolution(typeFact)
   }
 
-  if (postgresArrayElementType(typeFact.pgType, typeName)) {
-    return nodePostgresArrayOutputTypeByOid.get(typeFact.pgTypeOid ?? 0) ?? unknownResolution
+  if (typeFact.pgTypeOid === 0) {
+    return unknownResolution
   }
-
-  if (typeSchema !== 'pg_catalog') {
-    const catalogType = schemaQualifiedPascalName(typeSchema, typeName || typeFact.pgType)
-    return resolution(catalogType, { catalogImports: [catalogType] })
-  }
-
-  const tsType = nodePostgresOutputType.get(normalizePostgresTypeName(typeFact.pgType))
-  if (!tsType) {
-    throw new Error(
-      `${context ? `${context}: ` : ''}No TypeScript mapping configured for PostgreSQL type ${typeFact.pgType}.`
-    )
-  }
-  return tsType
+  return nodePostgresTextResolutionByOid.get(typeFact.pgTypeOid) ?? stringResolution
 }
 
-export function typeScriptTypeForPostgresType(
-  typeFact: PostgresTypeFact,
-  context?: string,
-  scalarProfile: PostgresScalarProfile = 'node-postgres'
-): string {
-  return resolveTypeScriptTypeForPostgresType(typeFact, context, scalarProfile).type
-}
+const numericParameterTypes = new Set(['bigint', 'double precision', 'integer', 'numeric', 'oid', 'real', 'smallint'])
+const dateParameterTypes = new Set(['date', 'timestamp without time zone', 'timestamp with time zone', 'timestamptz'])
 
+/** Resolve a value serialized as a node-postgres query parameter. */
 export function resolveTypeScriptParameterTypeForPostgresType(
   typeFact: PostgresTypeFact,
-  context?: string,
   scalarProfile: PostgresScalarProfile = 'node-postgres'
 ): PostgresTypeScriptResolution {
   if (scalarProfile === 'conservative') {
-    return unknownResolution
+    return unknownParameterResolution
   }
 
-  const typeSchema = typeFact.pgTypeSchema ?? 'pg_catalog'
-  const arrayElementType = postgresArrayElementType(typeFact.pgType, typeFact.pgTypeName)
-  if (arrayElementType) {
-    const element = resolveTypeScriptParameterTypeForPostgresType(
-      {
-        pgType: arrayElementType,
-        pgTypeName: arrayElementType,
-        pgTypeSchema: typeSchema,
-      },
-      context,
-      scalarProfile
-    )
-    return resolution(`PgArray<${element.type}>`, {
-      catalogImports: element.catalogImports,
-      scalarImports: ['PgArray', ...element.scalarImports],
-    })
+  if (typeFact.pgTypeKind === 'domain') {
+    return typeFact.pgBaseType
+      ? resolveTypeScriptParameterTypeForPostgresType(typeFact.pgBaseType, scalarProfile)
+      : unknownParameterResolution
   }
 
-  const normalizedTypeName = normalizePostgresTypeName(typeFact.pgTypeName || typeFact.pgType)
-  if ((normalizedTypeName === 'json' || normalizedTypeName === 'jsonb') && typeSchema === 'pg_catalog') {
-    return resolution('DbJsonInput')
-  }
-  if (typeSchema !== 'pg_catalog') {
-    return resolveTypeScriptTypeForPostgresType(typeFact, context, scalarProfile)
+  if (typeFact.pgTypeKind === 'array') {
+    if (typeFact.pgArrayDelimiter !== ',') {
+      return stringResolution
+    }
+    return typeFact.pgArrayElementType
+      ? pgArrayResolution(resolveArrayElementParameterType(typeFact.pgArrayElementType, scalarProfile))
+      : unknownParameterResolution
   }
 
-  const normalizedPgType = normalizePostgresTypeName(typeFact.pgType)
-  if (['bigint', 'double precision', 'integer', 'numeric', 'oid', 'real', 'smallint'].includes(normalizedPgType)) {
+  if (typeFact.pgTypeKind === 'enum') {
+    return catalogTypeResolution(typeFact)
+  }
+
+  const normalizedType = normalizePostgresTypeName(typeFact.pgTypeName)
+  if (typeFact.pgTypeSchema === 'pg_catalog' && (normalizedType === 'json' || normalizedType === 'jsonb')) {
+    return resolution('DbJsonParameter')
+  }
+  if (typeFact.pgTypeSchema === 'pg_catalog' && numericParameterTypes.has(normalizedType)) {
     return resolution('bigint | number | string')
   }
-  if (['date', 'timestamp without time zone', 'timestamp with time zone', 'timestamptz'].includes(normalizedPgType)) {
-    return resolution('Date | string')
+  if (typeFact.pgTypeSchema === 'pg_catalog' && dateParameterTypes.has(normalizedType)) {
+    return dateParameterResolution
   }
-  if (normalizedPgType === 'bytea') {
-    return resolution('Uint8Array')
+  if (typeFact.pgTypeSchema === 'pg_catalog' && normalizedType === 'interval') {
+    return intervalParameterResolution
   }
-  return resolveTypeScriptTypeForPostgresType(typeFact, context, scalarProfile)
+  if (typeFact.pgTypeSchema === 'pg_catalog' && normalizedType === 'bytea') {
+    return byteaParameterResolution
+  }
+  if (typeFact.pgTypeSchema === 'pg_catalog' && normalizedType === 'boolean') {
+    return resolution('boolean')
+  }
+
+  // node-postgres' generic parameter path serializes these values as text. In
+  // particular, do not reuse result-parser types for composites, ranges,
+  // extension types, or other unregistered PostgreSQL types.
+  return stringResolution
 }
 
-export function typeScriptParameterTypeForPostgresType(
+const checkLiteralCompatiblePgCatalogTypes = new Set(['name', 'text', 'uuid', 'varchar'])
+
+function postgresTypeSupportsCheckLiteralRefinement(typeFact: PostgresTypeFact): boolean {
+  if (typeFact.pgTypeKind === 'domain' && typeFact.pgBaseType) {
+    return postgresTypeSupportsCheckLiteralRefinement(typeFact.pgBaseType)
+  }
+  if (typeFact.pgTypeKind === 'enum') {
+    return true
+  }
+  return typeFact.pgTypeSchema === 'pg_catalog' && checkLiteralCompatiblePgCatalogTypes.has(typeFact.pgTypeName)
+}
+
+/** Whether a CHECK-derived textual literal union can safely refine this decoded result. */
+export function postgresResultSupportsStringLiteralRefinement(
   typeFact: PostgresTypeFact,
-  context?: string,
-  scalarProfile: PostgresScalarProfile = 'node-postgres'
-): string {
-  return resolveTypeScriptParameterTypeForPostgresType(typeFact, context, scalarProfile).type
+  scalarProfile: PostgresScalarProfile
+): boolean {
+  if (scalarProfile !== 'node-postgres') {
+    return false
+  }
+  return postgresTypeSupportsCheckLiteralRefinement(typeFact)
+}
+
+/** Whether a CHECK-derived textual literal union can safely refine this serialized parameter. */
+export function postgresParameterSupportsStringLiteralRefinement(
+  typeFact: PostgresTypeFact,
+  scalarProfile: PostgresScalarProfile
+): boolean {
+  if (scalarProfile !== 'node-postgres') {
+    return false
+  }
+  return postgresTypeSupportsCheckLiteralRefinement(typeFact)
+}
+
+const jsonNumberTypes = new Set(['bigint', 'integer', 'smallint'])
+const jsonNumberOrSpecialStringTypes = new Set(['double precision', 'numeric', 'real'])
+
+/**
+ * Resolve a PostgreSQL value after PostgreSQL itself converts it into a nested
+ * json/jsonb value (for example inside json_build_object or json_agg).
+ */
+export function resolveTypeScriptJsonScalarTypeForPostgresType(
+  typeFact: PostgresTypeFact
+): PostgresTypeScriptResolution {
+  if (typeFact.pgTypeKind === 'domain') {
+    return typeFact.pgBaseType
+      ? resolveTypeScriptJsonScalarTypeForPostgresType(typeFact.pgBaseType)
+      : resolution('DbJsonSelected')
+  }
+
+  if (typeFact.pgTypeKind === 'array' || typeFact.pgTypeKind === 'composite' || typeFact.pgArrayElementType) {
+    return resolution('DbJsonSelected')
+  }
+  if (typeFact.pgCastsToJson === true) {
+    return resolution('DbJsonSelected')
+  }
+  if (typeFact.pgTypeKind === 'enum') {
+    return catalogTypeResolution(typeFact)
+  }
+
+  const normalizedType = normalizePostgresTypeName(typeFact.pgTypeName)
+  if (normalizedType === 'unknown') {
+    return resolution('DbJsonSelected')
+  }
+  if (typeFact.pgTypeSchema === 'pg_catalog' && (normalizedType === 'json' || normalizedType === 'jsonb')) {
+    return resolution('DbJsonSelected')
+  }
+  if (typeFact.pgTypeSchema === 'pg_catalog' && normalizedType === 'boolean') {
+    return resolution('boolean')
+  }
+  if (typeFact.pgTypeSchema === 'pg_catalog' && jsonNumberTypes.has(normalizedType)) {
+    return resolution('number')
+  }
+  if (typeFact.pgTypeSchema === 'pg_catalog' && jsonNumberOrSpecialStringTypes.has(normalizedType)) {
+    return resolution('number | string')
+  }
+
+  // PostgreSQL renders textual, temporal, enum, range, and custom scalar
+  // output through JSON strings rather than exposing node-postgres parsers.
+  return stringResolution
+}
+
+/** Whether a CHECK-derived textual literal union matches PostgreSQL's nested-JSON representation. */
+export function postgresJsonSupportsStringLiteralRefinement(typeFact: PostgresTypeFact): boolean {
+  if (
+    typeFact.pgTypeKind === 'array' ||
+    typeFact.pgTypeKind === 'composite' ||
+    typeFact.pgArrayElementType ||
+    typeFact.pgCastsToJson === true
+  ) {
+    return false
+  }
+  if (typeFact.pgTypeKind === 'domain' && typeFact.pgBaseType) {
+    return postgresJsonSupportsStringLiteralRefinement(typeFact.pgBaseType)
+  }
+  return postgresTypeSupportsCheckLiteralRefinement(typeFact)
 }

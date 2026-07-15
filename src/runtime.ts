@@ -13,12 +13,18 @@ export interface TypedSqlRowBounds {
 
 export interface TypedSqlQueryConfig<Row = unknown> {
   readonly name?: string
+  readonly rowMode?: 'array'
   readonly text: string
   readonly type?: Row
   readonly values: readonly unknown[]
 }
 
 export type TypedSqlRawRow = Readonly<Record<string, unknown>>
+export type TypedSqlArrayRow = readonly unknown[]
+
+function isTypedSqlArrayRow(row: TypedSqlArrayRow | TypedSqlRawRow): row is TypedSqlArrayRow {
+  return Array.isArray(row)
+}
 
 export type TypedSqlRowNameSource = 'property' | 'sql'
 
@@ -153,30 +159,47 @@ export function createTypedSqlStatement<
       }
     },
     values(params) {
-      return definition.parameterNames.map((parameterName) => params[parameterName])
+      return definition.parameterNames.map((parameterName) => {
+        if (!Object.hasOwn(params, parameterName)) {
+          throw new Error(
+            `Typed SQL statement ${definition.name} expected an own parameter property ${JSON.stringify(parameterName)}.`
+          )
+        }
+        return params[parameterName]
+      })
     },
   }
 }
 
 export function mapTypedSqlRow<Params extends TypedSqlParams, Row>(
   statement: TypedSqlStatement<Params, Row>,
-  row: TypedSqlRawRow,
+  row: TypedSqlArrayRow | TypedSqlRawRow,
   rowNameSource: TypedSqlRowNameSource = 'sql'
 ): Row {
   if (statement.columns.length === 0) {
-    // oxlint-disable-next-line typescript/no-unsafe-type-assertion -- A rowless command should not call this path; preserving the raw row is the least surprising behavior for custom statements without column metadata.
-    return row as Row
+    // oxlint-disable-next-line typescript/no-unsafe-type-assertion -- A generated zero-column SELECT row is represented by an empty array and maps to the generated empty-record row type. Custom object-row statements retain their raw row.
+    return (isTypedSqlArrayRow(row) ? {} : row) as Row
   }
 
   const mapped: Record<string, unknown> = {}
-  for (const column of statement.columns) {
+  for (const [columnIndex, column] of statement.columns.entries()) {
     const rowKey = rowNameSource === 'sql' ? column.name : column.propertyName
-    if (!(rowKey in row)) {
+    if (!isTypedSqlArrayRow(row) && !Object.hasOwn(row, rowKey)) {
       throw new Error(
         `Typed SQL statement ${statement.name} expected result column ${JSON.stringify(rowKey)} from ${rowNameSource} row names.`
       )
     }
-    mapped[column.propertyName] = row[rowKey]
+    if (isTypedSqlArrayRow(row) && columnIndex >= row.length) {
+      throw new Error(
+        `Typed SQL statement ${statement.name} expected result column ${columnIndex + 1} from an array row.`
+      )
+    }
+    Object.defineProperty(mapped, column.propertyName, {
+      configurable: true,
+      enumerable: true,
+      value: isTypedSqlArrayRow(row) ? row[columnIndex] : row[rowKey],
+      writable: true,
+    })
   }
 
   // oxlint-disable-next-line typescript/no-unsafe-type-assertion -- Generated statement metadata maps each SQL result column to the generated Row property.
@@ -185,7 +208,7 @@ export function mapTypedSqlRow<Params extends TypedSqlParams, Row>(
 
 export function mapTypedSqlRows<Params extends TypedSqlParams, Row>(
   statement: TypedSqlStatement<Params, Row>,
-  rows: readonly TypedSqlRawRow[],
+  rows: readonly (TypedSqlArrayRow | TypedSqlRawRow)[],
   rowNameSource: TypedSqlRowNameSource = 'sql'
 ): Row[] {
   return rows.map((row) => mapTypedSqlRow(statement, row, rowNameSource))
@@ -246,8 +269,9 @@ export async function executeTypedSql<Params extends TypedSqlParams, Row>(
   statement: TypedSqlStatement<Params, Row>,
   params: Params
 ): Promise<Row[]> {
-  const result = await client.query<TypedSqlRawRow>({
+  const result = await client.query<TypedSqlArrayRow>({
     name: statement.name,
+    rowMode: 'array',
     text: statement.text,
     values: statement.values(params),
   })

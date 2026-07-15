@@ -8,6 +8,8 @@ const schemaFile = resolve(import.meta.dirname, 'fixtures/schema.sql')
 
 interface NativeAnalysis {
   readonly paramTypeOids: readonly number[]
+  readonly paramTypeNullAdmissions: readonly ('accepts' | 'rejects' | 'unknown')[]
+  readonly paramUsageNullAdmissions: readonly ('accepts' | 'rejects' | 'unknown')[]
   readonly postgresVersionNum: number
   readonly rawStatementCount: number
   readonly schemaVersion: number
@@ -25,6 +27,9 @@ interface NativeQuery {
   readonly cteList: readonly NativeCte[]
   readonly dmlParameterTargets: readonly NativeDmlParameterTarget[]
   readonly hasLimitCount: boolean
+  readonly hasRowMarks: boolean
+  readonly limitWithTies: boolean
+  readonly hasVolatileFunctions: boolean
   readonly rtable: readonly { readonly kind: string; readonly subquery?: NativeQuery }[]
   readonly targetList: readonly { readonly expr: NativeExpr }[]
 }
@@ -35,10 +40,12 @@ interface NativeCte {
 }
 
 interface NativeDmlParameterTarget {
+  readonly directAssignment: boolean
   readonly paramId: number
   readonly source: string
   readonly targetAttname: string
   readonly targetAttnum: number
+  readonly targetNullAdmission: 'accepts' | 'rejects' | 'unknown'
   readonly targetNullable: boolean
   readonly targetRelid: number
   readonly targetTypeName: string
@@ -81,10 +88,12 @@ test('native analyzer exposes the versioned PostgreSQL query envelope', async ()
       [20]
     )
 
-    assert.equal(analysis.schemaVersion, 3)
+    assert.equal(analysis.schemaVersion, 6)
     assert.equal(analysis.postgresVersionNum, 180003)
     assert.equal(analysis.rawStatementCount, 1)
     assert.deepEqual(analysis.paramTypeOids, [20])
+    assert.deepEqual(analysis.paramTypeNullAdmissions, ['accepts'])
+    assert.deepEqual(analysis.paramUsageNullAdmissions, ['accepts'])
     assert.equal(analysis.statements.length, 1)
     assert.equal(analysis.statements[0]?.rewrittenQueryCount, 1)
 
@@ -93,6 +102,7 @@ test('native analyzer exposes the versioned PostgreSQL query envelope', async ()
     assert.equal(query.canSetTag, true)
     assert.equal(query.commandType, 'SELECT')
     assert.equal(query.hasLimitCount, true)
+    assert.equal(query.limitWithTies, false)
     assert.deepEqual(
       query.rtable.map((entry) => entry.kind),
       ['FUNCTION', 'SUBQUERY', 'JOIN']
@@ -111,6 +121,91 @@ test('native analyzer preserves explicit parameter OIDs while inferring zero slo
     const analysis = await analyze(database, 'select $1::text, $2 + 1', [25, 0])
 
     assert.deepEqual(analysis.paramTypeOids, [25, 23])
+    assert.deepEqual(analysis.paramTypeNullAdmissions, ['accepts', 'accepts'])
+    assert.deepEqual(analysis.paramUsageNullAdmissions, ['accepts', 'accepts'])
+  })
+})
+
+test('native analyzer classifies NULL admission at PostgreSQL expression contexts', async () => {
+  await withDatabase(async (database) => {
+    await database.query('create table public.null_admission_sample (value integer)')
+    await database.query('insert into public.null_admission_sample(value) values (1), (2)')
+    await database.query(`create procedure public.reject_null(value integer)
+      language plpgsql
+      as $$
+      begin
+        if value is null then
+          raise exception 'procedure rejected null';
+        end if;
+      end
+      $$`)
+
+    const rejectingFrameSql = `select
+        sum(value) over (rows between $1 preceding and $2 following) as total
+      from (values (1), (2)) input(value)`
+    const rejectingFrame = await analyze(database, rejectingFrameSql, [])
+    assert.deepEqual(rejectingFrame.paramUsageNullAdmissions, ['rejects', 'rejects'])
+    await assert.rejects(database.query(rejectingFrameSql, [null, 0]), /frame starting offset must not be null/u)
+    await assert.rejects(database.query(rejectingFrameSql, [0, null]), /frame ending offset must not be null/u)
+
+    const acceptingFrameSql = `select
+        sum(value) over (
+          rows between coalesce($1, 0) preceding and coalesce($2, 0) following
+        ) as total
+      from (values (1), (2)) input(value)`
+    const acceptingFrame = await analyze(database, acceptingFrameSql, [20, 20])
+    assert.deepEqual(acceptingFrame.paramUsageNullAdmissions, ['unknown', 'unknown'])
+    assert.equal((await database.query(acceptingFrameSql, [null, null])).rows.length, 2)
+
+    const rejectingSampleSql = `select value
+      from public.null_admission_sample tablesample system ($1) repeatable ($2)`
+    const rejectingSample = await analyze(database, rejectingSampleSql, [])
+    assert.deepEqual(rejectingSample.paramUsageNullAdmissions, ['rejects', 'rejects'])
+    await assert.rejects(database.query(rejectingSampleSql, [null, 0]), /TABLESAMPLE parameter cannot be null/u)
+    await assert.rejects(
+      database.query(rejectingSampleSql, [100, null]),
+      /TABLESAMPLE REPEATABLE parameter cannot be null/u
+    )
+
+    const acceptingSampleSql = `select value
+      from public.null_admission_sample
+      tablesample system (coalesce($1, 100)) repeatable (coalesce($2, 0))`
+    const acceptingSample = await analyze(database, acceptingSampleSql, [700, 701])
+    assert.deepEqual(acceptingSample.paramUsageNullAdmissions, ['unknown', 'unknown'])
+    assert.equal((await database.query(acceptingSampleSql, [null, null])).rows.length, 2)
+
+    const mixedUse = await analyze(
+      database,
+      `select $1::bigint,
+         sum(value) over (rows between $1 preceding and current row)
+       from (values (1), (2)) input(value)
+       group by value`,
+      []
+    )
+    assert.deepEqual(mixedUse.paramUsageNullAdmissions, ['rejects'])
+
+    const utility = await analyze(database, 'call public.reject_null($1)', [])
+    assert.deepEqual(utility.paramUsageNullAdmissions, ['unknown'])
+    await assert.rejects(database.query('call public.reject_null($1)', [null]), /procedure rejected null/u)
+  })
+})
+
+test('native analyzer reports row locks recursively through join predicates', async () => {
+  await withDatabase(async (database) => {
+    const analysis = await analyze(
+      database,
+      `select left_account.id
+       from public.accounts left_account
+       join public.accounts right_account on exists (
+         select 1
+         from public.accounts locked_account
+         where locked_account.id = left_account.id
+         for update
+       )`,
+      []
+    )
+
+    assert.equal(analysis.statements[0]?.queries[0]?.hasRowMarks, true)
   })
 })
 
@@ -275,15 +370,561 @@ test('native analyzer maps direct DML parameters to PostgreSQL target columns', 
        select coalesce($1, 'fallback')`,
       []
     )
-    assert.deepEqual(setOperation.statements[0]?.queries[0]?.dmlParameterTargets, [])
+    assert.deepEqual(
+      setOperation.statements[0]?.queries[0]?.dmlParameterTargets.map(
+        ({ directAssignment, paramId, targetNullAdmission }) => ({
+          directAssignment,
+          paramId,
+          targetNullAdmission,
+        })
+      ),
+      [
+        { directAssignment: true, paramId: 1, targetNullAdmission: 'rejects' },
+        { directAssignment: false, paramId: 1, targetNullAdmission: 'unknown' },
+      ]
+    )
 
+    const opaqueSetOperationPath = await analyze(
+      database,
+      `insert into public.accounts(display_name)
+       select $1::text
+       union all
+       select coalesce($1, 'fallback')`,
+      []
+    )
+    assert.deepEqual(
+      opaqueSetOperationPath.statements[0]?.queries[0]?.dmlParameterTargets.map(({ paramId, targetNullAdmission }) => ({
+        paramId,
+        targetNullAdmission,
+      })),
+      [
+        { paramId: 1, targetNullAdmission: 'accepts' },
+        { paramId: 1, targetNullAdmission: 'unknown' },
+      ]
+    )
+    assert.deepEqual(
+      opaqueSetOperationPath.statements[0]?.queries[0]?.dmlParameterTargets.map(
+        ({ directAssignment }) => directAssignment
+      ),
+      [true, false]
+    )
+
+    const opaqueNotNullTarget = await analyze(
+      database,
+      `insert into public.accounts(email)
+       values (coalesce($1::text, 'fallback@example.com'))`,
+      []
+    )
+    assert.deepEqual(
+      opaqueNotNullTarget.statements[0]?.queries[0]?.dmlParameterTargets.map(
+        ({ directAssignment, targetNullAdmission }) => ({ directAssignment, targetNullAdmission })
+      ),
+      [{ directAssignment: false, targetNullAdmission: 'unknown' }]
+    )
+
+    const exceptFilter = await analyze(
+      database,
+      `insert into public.accounts(email)
+       select 'fixed@example.com'::text
+       except
+       select $1::text`,
+      []
+    )
+    assert.deepEqual(exceptFilter.statements[0]?.queries[0]?.dmlParameterTargets, [])
+
+    const intersectFilter = await analyze(
+      database,
+      `insert into public.accounts(email)
+       select $1::text
+       intersect
+       select 'fixed@example.com'::text`,
+      []
+    )
+    assert.deepEqual(
+      intersectFilter.statements[0]?.queries[0]?.dmlParameterTargets.map(
+        ({ directAssignment, paramId, targetNullAdmission }) => ({
+          directAssignment,
+          paramId,
+          targetNullAdmission,
+        })
+      ),
+      [{ directAssignment: false, paramId: 1, targetNullAdmission: 'unknown' }]
+    )
+
+    const filteredProjection = await analyze(
+      database,
+      `insert into public.accounts(email)
+       select $1::text where false`,
+      []
+    )
+    assert.deepEqual(
+      filteredProjection.statements[0]?.queries[0]?.dmlParameterTargets.map(
+        ({ directAssignment, paramId, targetNullAdmission }) => ({
+          directAssignment,
+          paramId,
+          targetNullAdmission,
+        })
+      ),
+      [{ directAssignment: false, paramId: 1, targetNullAdmission: 'unknown' }]
+    )
+
+    const nullableFilteredProjection = await analyze(
+      database,
+      `insert into public.accounts(display_name)
+       select $1::text where false`,
+      []
+    )
+    assert.deepEqual(
+      nullableFilteredProjection.statements[0]?.queries[0]?.dmlParameterTargets.map(
+        ({ directAssignment, paramId, targetNullAdmission }) => ({
+          directAssignment,
+          paramId,
+          targetNullAdmission,
+        })
+      ),
+      [{ directAssignment: false, paramId: 1, targetNullAdmission: 'accepts' }]
+    )
+
+    const limitedSetOperation = await analyze(
+      database,
+      `insert into public.accounts(email)
+       (select $1::text union all select 'fixed@example.com'::text)
+       limit 0`,
+      []
+    )
+    assert.deepEqual(
+      limitedSetOperation.statements[0]?.queries[0]?.dmlParameterTargets.map(
+        ({ directAssignment, paramId, targetNullAdmission }) => ({
+          directAssignment,
+          paramId,
+          targetNullAdmission,
+        })
+      ),
+      [{ directAssignment: false, paramId: 1, targetNullAdmission: 'unknown' }]
+    )
+
+    const allSetOperationBranches = await analyze(
+      database,
+      `insert into public.accounts(display_name)
+       select $1::text
+       union all
+       select $2::text
+       union
+       select $3::text`,
+      []
+    )
+    assert.deepEqual(
+      allSetOperationBranches.statements[0]?.queries[0]?.dmlParameterTargets
+        .map(({ paramId }) => paramId)
+        .toSorted((left, right) => left - right),
+      [1, 2, 3]
+    )
+
+    const longCteNames = Array.from({ length: 20 }, (_, index) => `lineage_${index}`)
+    const longCteSql = longCteNames
+      .map((name, index) =>
+        index === 0
+          ? `${name}(value) as (select $1::text)`
+          : `${name}(value) as (select value from ${longCteNames[index - 1]})`
+      )
+      .join(',\n')
+    const longLineage = await analyze(
+      database,
+      `with ${longCteSql}
+       insert into public.accounts(display_name)
+       select value from ${longCteNames.at(-1)}`,
+      []
+    )
+    assert.deepEqual(
+      longLineage.statements[0]?.queries[0]?.dmlParameterTargets.map(({ paramId }) => paramId),
+      [1]
+    )
+
+    const recursiveLineage = await analyze(
+      database,
+      `with recursive source(value) as (
+         select $1::text
+         union all
+         select value from source where false
+       )
+       insert into public.accounts(display_name)
+       select value from source`,
+      []
+    )
+    assert.deepEqual(
+      recursiveLineage.statements[0]?.queries[0]?.dmlParameterTargets.map(({ paramId }) => paramId),
+      [1]
+    )
+
+    const joinAliasLineage = await analyze(
+      database,
+      `insert into public.accounts(display_name)
+       select joined.value
+       from ((values ($1::text)) source(value) cross join (values (1)) marker(n)) joined`,
+      []
+    )
+    assert.deepEqual(
+      joinAliasLineage.statements[0]?.queries[0]?.dmlParameterTargets.map(({ paramId }) => paramId),
+      [1]
+    )
+
+    await database.query(`create table public.outer_join_probe (
+      value text check (value in ('allowed'))
+    )`)
+    const nullExtendedLineage = await analyze(
+      database,
+      `insert into public.outer_join_probe(value)
+       select candidate.value
+       from (values (1)) guaranteed(marker)
+       left join (values ($1::text)) candidate(value) on false`,
+      []
+    )
+    assert.deepEqual(
+      nullExtendedLineage.statements[0]?.queries[0]?.dmlParameterTargets.map(
+        ({ directAssignment, paramId, targetNullAdmission }) => ({ directAssignment, paramId, targetNullAdmission })
+      ),
+      [{ directAssignment: false, paramId: 1, targetNullAdmission: 'accepts' }]
+    )
+
+    const repeatedValues = Array.from({ length: 256 }, () => '($1::text)').join(', ')
+    const manyDuplicates = await analyze(
+      database,
+      `insert into public.accounts(display_name) values ${repeatedValues}`,
+      []
+    )
+    assert.equal(manyDuplicates.statements[0]?.queries[0]?.dmlParameterTargets.length, 1)
+
+    const deeplyNestedParameters = Array.from({ length: 256 }, (_, index) => `$${index + 1}::integer`).join(' + ')
+    const nestedUsage = await analyze(database, `select ${deeplyNestedParameters}`, [])
+    assert.equal(nestedUsage.paramUsageNullAdmissions.length, 256)
+    assert.ok(nestedUsage.paramUsageNullAdmissions.every((admission) => admission === 'accepts'))
+
+    await database.query('create table public.view_values (value text)')
+    await database.query(`create view public.non_null_view as
+      select value from public.view_values where value is not null
+      with local check option`)
+    await database.query(`create table public.partitioned_values (bucket integer, value text)
+      partition by list (bucket)`)
+    await database.query(`create table public.partitioned_values_one
+      partition of public.partitioned_values for values in (1)`)
+    await database.query('alter table public.partitioned_values_one alter column value set not null')
+    const checkedView = await analyze(database, 'insert into public.non_null_view(value) values ($1)', [])
+    assert.deepEqual(
+      checkedView.statements[0]?.queries[0]?.dmlParameterTargets.map(({ paramId, targetNullAdmission }) => ({
+        paramId,
+        targetNullAdmission,
+      })),
+      [{ paramId: 1, targetNullAdmission: 'unknown' }]
+    )
+    const partitionedTarget = await analyze(
+      database,
+      'insert into public.partitioned_values(bucket, value) values (1, $1)',
+      []
+    )
+    assert.deepEqual(
+      partitionedTarget.statements[0]?.queries[0]?.dmlParameterTargets.map(({ paramId, targetNullAdmission }) => ({
+        paramId,
+        targetNullAdmission,
+      })),
+      [{ paramId: 1, targetNullAdmission: 'unknown' }]
+    )
+
+    await database.query('create domain public.maybe_text as text')
+    await database.query("create domain public.checked_text as text check (value <> '')")
+    await database.query('create domain public.null_accepting_text as text check (value is null)')
+    await database.query('create domain public.null_rejecting_text as text check (value is not null)')
+    await database.query("create domain public.null_unknown_text as text check (concat(value, '') <> '')")
     await database.query('create domain public.non_null_text as text not null')
-    await database.query('create table public.domain_probe (value text)')
-    const domainCoercion = await analyze(
+    await database.query('create domain public.nested_non_null_text as public.non_null_text')
+    await database.query(`
+      create table public.domain_probe (
+        value text,
+        maybe_value public.maybe_text,
+        checked_value public.checked_text,
+        accepting_value public.null_accepting_text,
+        rejecting_value public.null_rejecting_text,
+        unknown_value public.null_unknown_text,
+        required_value public.non_null_text,
+        nested_required_value public.nested_non_null_text
+      )
+    `)
+
+    const domainTypedSource = await analyze(
+      database,
+      'insert into public.domain_probe(value) values ($1::public.non_null_text)',
+      []
+    )
+    assert.deepEqual(domainTypedSource.paramTypeNullAdmissions, ['rejects'])
+    assert.equal(domainTypedSource.statements[0]?.queries[0]?.dmlParameterTargets[0]?.targetNullAdmission, 'accepts')
+
+    const rejectingReturningUse = await analyze(
+      database,
+      `insert into public.domain_probe(value)
+       values ($1::text)
+       returning ($1::text)::public.non_null_text`,
+      []
+    )
+    assert.deepEqual(rejectingReturningUse.paramTypeNullAdmissions, ['accepts'])
+    assert.deepEqual(rejectingReturningUse.paramUsageNullAdmissions, ['rejects'])
+
+    const domainTargets = await analyze(
+      database,
+      `insert into public.domain_probe(maybe_value, checked_value, required_value, nested_required_value)
+       values ($1, $2, $3, $4)`,
+      []
+    )
+    assert.deepEqual(
+      domainTargets.statements[0]?.queries[0]?.dmlParameterTargets.map(
+        ({ paramId, targetAttname, targetNullable }) => ({ paramId, targetAttname, targetNullable })
+      ),
+      [
+        { paramId: 1, targetAttname: 'maybe_value', targetNullable: true },
+        { paramId: 2, targetAttname: 'checked_value', targetNullable: true },
+        { paramId: 3, targetAttname: 'required_value', targetNullable: false },
+        { paramId: 4, targetAttname: 'nested_required_value', targetNullable: false },
+      ]
+    )
+
+    const domainCheckAdmissions = await analyze(
+      database,
+      `insert into public.domain_probe(accepting_value, rejecting_value, unknown_value)
+       values ($1, $2, $3)`,
+      []
+    )
+    assert.deepEqual(
+      domainCheckAdmissions.statements[0]?.queries[0]?.dmlParameterTargets.map(
+        ({ paramId, targetNullAdmission, targetNullable }) => ({
+          paramId,
+          targetNullAdmission,
+          targetNullable,
+        })
+      ),
+      [
+        { paramId: 1, targetNullAdmission: 'accepts', targetNullable: true },
+        { paramId: 2, targetNullAdmission: 'rejects', targetNullable: false },
+        { paramId: 3, targetNullAdmission: 'unknown', targetNullable: false },
+      ]
+    )
+
+    await database.query(`
+      create table public.table_check_probe (
+        accepting_value text check (accepting_value is null),
+        rejecting_value text check (rejecting_value is not null),
+        other_value text,
+        unknown_value text check (unknown_value is null or other_value is not null)
+      )
+    `)
+    const tableCheckAdmissions = await analyze(
+      database,
+      `insert into public.table_check_probe(accepting_value, rejecting_value, unknown_value)
+       values ($1, $2, $3)`,
+      []
+    )
+    assert.deepEqual(
+      tableCheckAdmissions.statements[0]?.queries[0]?.dmlParameterTargets.map(({ paramId, targetNullAdmission }) => ({
+        paramId,
+        targetNullAdmission,
+      })),
+      [
+        { paramId: 1, targetNullAdmission: 'accepts' },
+        { paramId: 2, targetNullAdmission: 'rejects' },
+        { paramId: 3, targetNullAdmission: 'accepts' },
+      ]
+    )
+
+    await database.query(`create table public.foreign_key_parent (
+      left_key integer,
+      right_key integer,
+      primary key (left_key, right_key)
+    )`)
+    await database.query(`create table public.match_full_child (
+      left_key integer,
+      right_key integer,
+      payload text,
+      foreign key (left_key, right_key)
+        references public.foreign_key_parent (left_key, right_key) match full
+    )`)
+    await database.query(`create table public.match_simple_child (
+      left_key integer,
+      right_key integer,
+      foreign key (left_key, right_key)
+        references public.foreign_key_parent (left_key, right_key) match simple
+    )`)
+
+    const matchFullMixed = await analyze(
+      database,
+      'insert into public.match_full_child(left_key, right_key) values ($1, 2)',
+      []
+    )
+    assert.equal(matchFullMixed.statements[0]?.queries[0]?.dmlParameterTargets[0]?.targetNullAdmission, 'rejects')
+    await assert.rejects(
+      database.query('insert into public.match_full_child(left_key, right_key) values ($1, 2)', [null]),
+      /match_full_child_left_key_right_key_fkey/u
+    )
+
+    const matchFullAllNull = await analyze(
+      database,
+      'insert into public.match_full_child(left_key, right_key) values ($1, null)',
+      []
+    )
+    assert.equal(matchFullAllNull.statements[0]?.queries[0]?.dmlParameterTargets[0]?.targetNullAdmission, 'accepts')
+    await database.query('insert into public.match_full_child(left_key, right_key) values ($1, null)', [null])
+
+    const matchFullSameParameter = await analyze(
+      database,
+      'insert into public.match_full_child(left_key, right_key) values ($1, $1)',
+      []
+    )
+    assert.ok(
+      matchFullSameParameter.statements[0]?.queries[0]?.dmlParameterTargets.every(
+        ({ targetNullAdmission }) => targetNullAdmission === 'accepts'
+      )
+    )
+    await database.query('insert into public.match_full_child(left_key, right_key) values ($1, $1)', [null])
+
+    const matchFullUnknownPeer = await analyze(
+      database,
+      'insert into public.match_full_child(left_key, right_key) values ($1, $2)',
+      []
+    )
+    assert.ok(
+      matchFullUnknownPeer.statements[0]?.queries[0]?.dmlParameterTargets.every(
+        ({ targetNullAdmission }) => targetNullAdmission === 'unknown'
+      )
+    )
+
+    const matchSimpleMixed = await analyze(
+      database,
+      'insert into public.match_simple_child(left_key, right_key) values ($1, 2)',
+      []
+    )
+    assert.equal(matchSimpleMixed.statements[0]?.queries[0]?.dmlParameterTargets[0]?.targetNullAdmission, 'accepts')
+    await database.query('insert into public.match_simple_child(left_key, right_key) values ($1, 2)', [null])
+
+    const matchFullUnrelatedColumn = await analyze(
+      database,
+      'insert into public.match_full_child(left_key, right_key, payload) values (null, null, $1)',
+      []
+    )
+    assert.equal(
+      matchFullUnrelatedColumn.statements[0]?.queries[0]?.dmlParameterTargets[0]?.targetNullAdmission,
+      'accepts'
+    )
+
+    await database.query(`create table public.any_empty_probe (
+      value integer check (value = any (array[array[]::integer[]]))
+    )`)
+    const emptyNestedArrayCheck = await analyze(database, 'insert into public.any_empty_probe(value) values ($1)', [])
+    assert.equal(
+      emptyNestedArrayCheck.statements[0]?.queries[0]?.dmlParameterTargets[0]?.targetNullAdmission,
+      'rejects'
+    )
+
+    await database.query(`create table public.generated_probe (
+      input text,
+      derived text generated always as (input) stored not null
+    )`)
+    const generatedTarget = await analyze(database, 'insert into public.generated_probe(input) values ($1)', [])
+    assert.equal(generatedTarget.statements[0]?.queries[0]?.dmlParameterTargets[0]?.targetNullAdmission, 'unknown')
+
+    await database.query('create foreign data wrapper dummy no handler')
+    await database.query('create server dummy_server foreign data wrapper dummy')
+    await database.query('create foreign table public.foreign_probe(value text) server dummy_server')
+    const foreignTarget = await analyze(database, 'insert into public.foreign_probe(value) values ($1)', [])
+    assert.equal(foreignTarget.statements[0]?.queries[0]?.dmlParameterTargets[0]?.targetNullAdmission, 'unknown')
+
+    const explicitNonNullDomainCoercion = await analyze(
       database,
       'insert into public.domain_probe(value) values (($1::text)::public.non_null_text)',
       []
     )
-    assert.deepEqual(domainCoercion.statements[0]?.queries[0]?.dmlParameterTargets, [])
+    assert.deepEqual(
+      explicitNonNullDomainCoercion.statements[0]?.queries[0]?.dmlParameterTargets.map(
+        ({ paramId, targetAttname, targetNullable }) => ({ paramId, targetAttname, targetNullable })
+      ),
+      [{ paramId: 1, targetAttname: 'value', targetNullable: false }]
+    )
+
+    const mixedDomainPaths = await analyze(
+      database,
+      `insert into public.domain_probe(value)
+       values ($1), (($1::text)::public.non_null_text)`,
+      []
+    )
+    assert.deepEqual(
+      mixedDomainPaths.statements[0]?.queries[0]?.dmlParameterTargets.map(
+        ({ paramId, targetAttname, targetNullable }) => ({ paramId, targetAttname, targetNullable })
+      ),
+      [
+        { paramId: 1, targetAttname: 'value', targetNullable: true },
+        { paramId: 1, targetAttname: 'value', targetNullable: false },
+      ]
+    )
+
+    const cteDomainCoercion = await analyze(
+      database,
+      `with source(value) as (
+         select ($1::text)::public.non_null_text
+       )
+       insert into public.domain_probe(value)
+       select value from source`,
+      []
+    )
+    assert.deepEqual(
+      cteDomainCoercion.statements[0]?.queries[0]?.dmlParameterTargets.map(
+        ({ paramId, targetAttname, targetNullable }) => ({ paramId, targetAttname, targetNullable })
+      ),
+      [{ paramId: 1, targetAttname: 'value', targetNullable: false }]
+    )
+
+    await database.query('create sequence public.domain_side_effect_sequence')
+    await database.query(`create domain public.volatile_text as text
+      check (nextval('public.domain_side_effect_sequence') > 0)`)
+    const volatileDomain = await analyze(database, 'select $1::public.volatile_text', [])
+    assert.equal(volatileDomain.statements[0]?.queries[0]?.hasVolatileFunctions, true)
+
+    await database.query('create table public.trigger_probe (value text)')
+    await database.query(`create function public.reject_null_trigger() returns trigger
+      language plpgsql as $$
+      begin
+        if new.value is null then
+          raise exception 'value must not be null';
+        end if;
+        return new;
+      end
+      $$`)
+    await database.query(`create trigger reject_null before insert on public.trigger_probe
+      for each row execute function public.reject_null_trigger()`)
+    const triggerTarget = await analyze(database, 'insert into public.trigger_probe(value) values ($1)', [])
+    assert.equal(triggerTarget.statements[0]?.queries[0]?.dmlParameterTargets[0]?.targetNullAdmission, 'unknown')
+
+    await database.query('create table public.rls_probe (value text)')
+    await database.query('alter table public.rls_probe enable row level security')
+    await database.query(`create policy require_value on public.rls_probe
+      for insert with check (value is not null)`)
+    const rlsTarget = await analyze(database, 'insert into public.rls_probe(value) values ($1)', [])
+    assert.equal(rlsTarget.statements[0]?.queries[0]?.dmlParameterTargets[0]?.targetNullAdmission, 'unknown')
+
+    await database.query('create table public.conditional_rule_source (value text)')
+    await database.query('create table public.conditional_rule_sink (value text not null)')
+    await database.query(`create rule conditional_rule as
+      on insert to public.conditional_rule_source
+      where new.value is not null
+      do also insert into public.conditional_rule_sink(value) values (new.value)`)
+    const conditionalRule = await analyze(database, 'insert into public.conditional_rule_source(value) values ($1)', [])
+    assert.deepEqual(
+      conditionalRule.statements[0]?.queries
+        .flatMap((query) => query.dmlParameterTargets)
+        .map(({ directAssignment, targetNullAdmission, targetNullable }) => ({
+          directAssignment,
+          targetNullAdmission,
+          targetNullable,
+        }))
+        .toSorted((left, right) => Number(left.targetNullable) - Number(right.targetNullable)),
+      [
+        { directAssignment: false, targetNullAdmission: 'unknown', targetNullable: false },
+        { directAssignment: true, targetNullAdmission: 'accepts', targetNullable: true },
+      ]
+    )
   })
 })
