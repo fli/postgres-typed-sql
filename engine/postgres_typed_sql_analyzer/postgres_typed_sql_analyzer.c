@@ -33,10 +33,12 @@ PG_MODULE_MAGIC;
 
 PG_FUNCTION_INFO_V1(postgres_typed_sql_analyze);
 
-static void append_expr_node(StringInfo out, const Query *query, const Node *expr, int depth);
-static void append_query_summary(StringInfo out, const Query *query, int depth);
-static void append_from_node(StringInfo out, const Query *query, const Node *node, int depth);
-static void append_rtable(StringInfo out, const Query *query, int depth);
+typedef struct QueryScope QueryScope;
+
+static void append_expr_node(StringInfo out, const QueryScope *scope, const Node *expr, int depth);
+static void append_query_summary(StringInfo out, const Query *query, const QueryScope *parent_scope, int depth);
+static void append_from_node(StringInfo out, const QueryScope *scope, const Node *node, int depth);
+static void append_rtable(StringInfo out, const QueryScope *scope, int depth);
 static void append_set_operation(StringInfo out, const Node *node);
 static const char *command_type_name(CmdType command_type);
 static void append_json_string(StringInfo out, const char *value);
@@ -76,11 +78,11 @@ json_text_is_empty_array(const char *value)
   return *cursor == '\0';
 }
 
-typedef struct QueryScope
+struct QueryScope
 {
   const Query *query;
   const struct QueryScope *parent;
-} QueryScope;
+};
 
 typedef enum NullProof
 {
@@ -2611,7 +2613,7 @@ append_expr_type_fields(StringInfo out, const Node *expr)
 }
 
 static void
-append_expr_list(StringInfo out, const Query *query, const char *name, const List *exprs, int depth)
+append_expr_list(StringInfo out, const QueryScope *scope, const char *name, const List *exprs, int depth)
 {
   ListCell *cell;
   bool first = true;
@@ -2624,13 +2626,13 @@ append_expr_list(StringInfo out, const Query *query, const char *name, const Lis
       appendStringInfoChar(out, ',');
     }
     first = false;
-    append_expr_node(out, query, (const Node *) lfirst(cell), depth - 1);
+    append_expr_node(out, scope, (const Node *) lfirst(cell), depth - 1);
   }
   appendStringInfoChar(out, ']');
 }
 
 static void
-append_target_expr_list(StringInfo out, const Query *query, const char *name, const List *targets, int depth)
+append_target_expr_list(StringInfo out, const QueryScope *scope, const char *name, const List *targets, int depth)
 {
   ListCell *cell;
   bool first = true;
@@ -2646,14 +2648,14 @@ append_target_expr_list(StringInfo out, const Query *query, const char *name, co
     }
     first = false;
     appendStringInfo(out, "{\"resno\":%d,\"resjunk\":%s,\"expr\":", target->resno, target->resjunk ? "true" : "false");
-    append_expr_node(out, query, (const Node *) target->expr, depth - 1);
+    append_expr_node(out, scope, (const Node *) target->expr, depth - 1);
     appendStringInfoChar(out, '}');
   }
   appendStringInfoChar(out, ']');
 }
 
 static void
-append_expr_specific_fields(StringInfo out, const Query *query, const Node *expr)
+append_expr_specific_fields(StringInfo out, const QueryScope *scope, const Node *expr)
 {
   if (expr == NULL)
   {
@@ -2665,13 +2667,15 @@ append_expr_specific_fields(StringInfo out, const Query *query, const Node *expr
     case T_Var:
     {
       const Var *var = (const Var *) expr;
+      const QueryScope *owner_scope = query_scope_at_level(scope, var->varlevelsup);
       appendStringInfo(out, ",\"varno\":%u,\"varattno\":%d,\"varlevelsup\":%u",
                        var->varno, var->varattno, var->varlevelsup);
       append_bitmapset_field(out, "varnullingrels", var->varnullingrels);
 
-      if (var->varno > 0 && var->varno <= list_length(query->rtable))
+      if (owner_scope != NULL && var->varno > 0 &&
+          var->varno <= list_length(owner_scope->query->rtable))
       {
-        const RangeTblEntry *rte = rt_fetch(var->varno, query->rtable);
+        const RangeTblEntry *rte = rt_fetch(var->varno, owner_scope->query->rtable);
         appendStringInfoString(out, ",\"rteKind\":");
         append_json_string(out, rte_kind_name(rte->rtekind));
         append_oid_field(out, "relid", rte->relid);
@@ -2767,7 +2771,7 @@ append_expr_specific_fields(StringInfo out, const Query *query, const Node *expr
 }
 
 static void
-append_expr_node(StringInfo out, const Query *query, const Node *expr, int depth)
+append_expr_node(StringInfo out, const QueryScope *scope, const Node *expr, int depth)
 {
   if (expr == NULL)
   {
@@ -2787,7 +2791,7 @@ append_expr_node(StringInfo out, const Query *query, const Node *expr, int depth
   }
 
   append_expr_type_fields(out, expr);
-  append_expr_specific_fields(out, query, expr);
+  append_expr_specific_fields(out, scope, expr);
 
   switch (nodeTag(expr))
   {
@@ -2806,13 +2810,13 @@ append_expr_node(StringInfo out, const Query *query, const Node *expr, int depth
     case T_FuncExpr:
     {
       const FuncExpr *func = (const FuncExpr *) expr;
-      append_expr_list(out, query, "args", func->args, depth);
+      append_expr_list(out, scope, "args", func->args, depth);
       break;
     }
     case T_OpExpr:
     {
       const OpExpr *op = (const OpExpr *) expr;
-      append_expr_list(out, query, "args", op->args, depth);
+      append_expr_list(out, scope, "args", op->args, depth);
       break;
     }
     case T_ScalarArrayOpExpr:
@@ -2823,7 +2827,7 @@ append_expr_node(StringInfo out, const Query *query, const Node *expr, int depth
       append_oid_field(out, "opfuncid", op->opfuncid);
       append_optional_name_field(out, "opfuncname", OidIsValid(op->opfuncid) ? get_func_name(op->opfuncid) : NULL);
       append_bool_field(out, "useOr", op->useOr);
-      append_expr_list(out, query, "args", op->args, depth);
+      append_expr_list(out, scope, "args", op->args, depth);
       break;
     }
     case T_BoolExpr:
@@ -2831,19 +2835,19 @@ append_expr_node(StringInfo out, const Query *query, const Node *expr, int depth
       const BoolExpr *bool_expr = (const BoolExpr *) expr;
       appendStringInfoString(out, ",\"boolOp\":");
       append_json_string(out, bool_expr_type_name(bool_expr->boolop));
-      append_expr_list(out, query, "args", bool_expr->args, depth);
+      append_expr_list(out, scope, "args", bool_expr->args, depth);
       break;
     }
     case T_Aggref:
     {
       const Aggref *agg = (const Aggref *) expr;
-      append_target_expr_list(out, query, "args", agg->args, depth);
+      append_target_expr_list(out, scope, "args", agg->args, depth);
       break;
     }
     case T_CoalesceExpr:
     {
       const CoalesceExpr *coalesce = (const CoalesceExpr *) expr;
-      append_expr_list(out, query, "args", coalesce->args, depth);
+      append_expr_list(out, scope, "args", coalesce->args, depth);
       break;
     }
     case T_NullTest:
@@ -2853,7 +2857,7 @@ append_expr_node(StringInfo out, const Query *query, const Node *expr, int depth
       append_json_string(out, null_test_type_name(null_test->nulltesttype));
       append_bool_field(out, "argIsRow", null_test->argisrow);
       appendStringInfoString(out, ",\"arg\":");
-      append_expr_node(out, query, (const Node *) null_test->arg, depth - 1);
+      append_expr_node(out, scope, (const Node *) null_test->arg, depth - 1);
       break;
     }
     case T_BooleanTest:
@@ -2862,47 +2866,47 @@ append_expr_node(StringInfo out, const Query *query, const Node *expr, int depth
       appendStringInfoString(out, ",\"boolTestType\":");
       append_json_string(out, bool_test_type_name(boolean_test->booltesttype));
       appendStringInfoString(out, ",\"arg\":");
-      append_expr_node(out, query, (const Node *) boolean_test->arg, depth - 1);
+      append_expr_node(out, scope, (const Node *) boolean_test->arg, depth - 1);
       break;
     }
     case T_RelabelType:
     {
       const RelabelType *relabel = (const RelabelType *) expr;
       appendStringInfoString(out, ",\"arg\":");
-      append_expr_node(out, query, (const Node *) relabel->arg, depth - 1);
+      append_expr_node(out, scope, (const Node *) relabel->arg, depth - 1);
       break;
     }
     case T_CoerceViaIO:
     {
       const CoerceViaIO *coerce = (const CoerceViaIO *) expr;
       appendStringInfoString(out, ",\"arg\":");
-      append_expr_node(out, query, (const Node *) coerce->arg, depth - 1);
+      append_expr_node(out, scope, (const Node *) coerce->arg, depth - 1);
       break;
     }
     case T_CoerceToDomain:
     {
       const CoerceToDomain *coerce = (const CoerceToDomain *) expr;
       appendStringInfoString(out, ",\"arg\":");
-      append_expr_node(out, query, (const Node *) coerce->arg, depth - 1);
+      append_expr_node(out, scope, (const Node *) coerce->arg, depth - 1);
       break;
     }
     case T_CaseExpr:
     {
       const CaseExpr *case_expr = (const CaseExpr *) expr;
       appendStringInfoString(out, ",\"arg\":");
-      append_expr_node(out, query, (const Node *) case_expr->arg, depth - 1);
-      append_expr_list(out, query, "whenClauses", case_expr->args, depth);
+      append_expr_node(out, scope, (const Node *) case_expr->arg, depth - 1);
+      append_expr_list(out, scope, "whenClauses", case_expr->args, depth);
       appendStringInfoString(out, ",\"defresult\":");
-      append_expr_node(out, query, (const Node *) case_expr->defresult, depth - 1);
+      append_expr_node(out, scope, (const Node *) case_expr->defresult, depth - 1);
       break;
     }
     case T_CaseWhen:
     {
       const CaseWhen *case_when = (const CaseWhen *) expr;
       appendStringInfoString(out, ",\"condition\":");
-      append_expr_node(out, query, (const Node *) case_when->expr, depth - 1);
+      append_expr_node(out, scope, (const Node *) case_when->expr, depth - 1);
       appendStringInfoString(out, ",\"result\":");
-      append_expr_node(out, query, (const Node *) case_when->result, depth - 1);
+      append_expr_node(out, scope, (const Node *) case_when->result, depth - 1);
       break;
     }
     case T_ArrayExpr:
@@ -2911,7 +2915,7 @@ append_expr_node(StringInfo out, const Query *query, const Node *expr, int depth
       append_oid_field(out, "elementTypeOid", array_expr->element_typeid);
       append_optional_name_field(out, "elementTypeName", OidIsValid(array_expr->element_typeid) ? format_type_extended(array_expr->element_typeid, -1, FORMAT_TYPE_TYPEMOD_GIVEN) : NULL);
       append_bool_field(out, "multidims", array_expr->multidims);
-      append_expr_list(out, query, "elements", array_expr->elements, depth);
+      append_expr_list(out, scope, "elements", array_expr->elements, depth);
       break;
     }
     case T_SubLink:
@@ -2921,11 +2925,11 @@ append_expr_node(StringInfo out, const Query *query, const Node *expr, int depth
       append_json_string(out, sublink_type_name(sublink->subLinkType));
       appendStringInfo(out, ",\"subLinkId\":%d", sublink->subLinkId);
       appendStringInfoString(out, ",\"testExpr\":");
-      append_expr_node(out, query, sublink->testexpr, depth - 1);
+      append_expr_node(out, scope, sublink->testexpr, depth - 1);
       if (sublink->subselect != NULL && IsA(sublink->subselect, Query))
       {
         appendStringInfoString(out, ",\"subquery\":");
-        append_query_summary(out, (const Query *) sublink->subselect, depth - 1);
+        append_query_summary(out, (const Query *) sublink->subselect, scope, depth - 1);
       }
       else
       {
@@ -2941,8 +2945,9 @@ append_expr_node(StringInfo out, const Query *query, const Node *expr, int depth
 }
 
 static void
-append_cte_list(StringInfo out, const Query *query, int depth)
+append_cte_list(StringInfo out, const QueryScope *scope, int depth)
 {
+  const Query *query = scope->query;
   ListCell *cell;
   bool first = true;
 
@@ -2969,7 +2974,7 @@ append_cte_list(StringInfo out, const Query *query, int depth)
       appendStringInfoString(out, ",\"commandType\":");
       append_json_string(out, command_type_name(cte_query->commandType));
       appendStringInfoString(out, ",\"query\":");
-      append_query_summary(out, cte_query, depth - 1);
+      append_query_summary(out, cte_query, scope, depth - 1);
     }
     appendStringInfoChar(out, '}');
   }
@@ -2977,8 +2982,9 @@ append_cte_list(StringInfo out, const Query *query, int depth)
 }
 
 static void
-append_target_list(StringInfo out, const Query *query)
+append_target_list(StringInfo out, const QueryScope *scope)
 {
+  const Query *query = scope->query;
   ListCell *cell;
   bool first = true;
 
@@ -3008,9 +3014,9 @@ append_target_list(StringInfo out, const Query *query)
     append_optional_name_field(out, "typeName", type_name);
     appendStringInfo(out, ",\"typmod\":%d", typmod);
     append_oid_field(out, "collationOid", collation_oid);
-    append_expr_specific_fields(out, query, expr);
+    append_expr_specific_fields(out, scope, expr);
     appendStringInfoString(out, ",\"expr\":");
-    append_expr_node(out, query, expr, 8);
+    append_expr_node(out, scope, expr, 8);
     appendStringInfoChar(out, '}');
   }
   appendStringInfoChar(out, ']');
@@ -3069,8 +3075,9 @@ append_set_operation(StringInfo out, const Node *node)
 }
 
 static void
-append_returning_list(StringInfo out, const Query *query)
+append_returning_list(StringInfo out, const QueryScope *scope)
 {
+  const Query *query = scope->query;
   ListCell *cell;
   bool first = true;
 
@@ -3090,15 +3097,16 @@ append_returning_list(StringInfo out, const Query *query)
                      target->resno, target->resjunk ? "true" : "false");
     append_json_string(out, target->resname);
     appendStringInfoString(out, ",\"expr\":");
-    append_expr_node(out, query, expr, 8);
+    append_expr_node(out, scope, expr, 8);
     appendStringInfoChar(out, '}');
   }
   appendStringInfoChar(out, ']');
 }
 
 static void
-append_rtable(StringInfo out, const Query *query, int depth)
+append_rtable(StringInfo out, const QueryScope *scope, int depth)
 {
+  const Query *query = scope->query;
   ListCell *cell;
   bool first = true;
   int index = 1;
@@ -3139,7 +3147,7 @@ append_rtable(StringInfo out, const Query *query, int depth)
     if (rte->rtekind == RTE_SUBQUERY && rte->subquery != NULL && depth > 0)
     {
       appendStringInfoString(out, ",\"subquery\":");
-      append_query_summary(out, rte->subquery, depth - 1);
+      append_query_summary(out, rte->subquery, scope, depth - 1);
     }
     appendStringInfoChar(out, '}');
     index++;
@@ -3148,7 +3156,7 @@ append_rtable(StringInfo out, const Query *query, int depth)
 }
 
 static void
-append_from_list(StringInfo out, const Query *query, const char *name, const List *nodes, int depth)
+append_from_list(StringInfo out, const QueryScope *scope, const char *name, const List *nodes, int depth)
 {
   ListCell *cell;
   bool first = true;
@@ -3161,14 +3169,15 @@ append_from_list(StringInfo out, const Query *query, const char *name, const Lis
       appendStringInfoChar(out, ',');
     }
     first = false;
-    append_from_node(out, query, (const Node *) lfirst(cell), depth - 1);
+    append_from_node(out, scope, (const Node *) lfirst(cell), depth - 1);
   }
   appendStringInfoChar(out, ']');
 }
 
 static void
-append_from_node(StringInfo out, const Query *query, const Node *node, int depth)
+append_from_node(StringInfo out, const QueryScope *scope, const Node *node, int depth)
 {
+  const Query *query = scope->query;
   if (node == NULL)
   {
     appendStringInfoString(out, "null");
@@ -3210,19 +3219,19 @@ append_from_node(StringInfo out, const Query *query, const Node *node, int depth
       append_bool_field(out, "isNatural", join->isNatural);
       appendStringInfo(out, ",\"rtindex\":%d", join->rtindex);
       appendStringInfoString(out, ",\"left\":");
-      append_from_node(out, query, join->larg, depth - 1);
+      append_from_node(out, scope, join->larg, depth - 1);
       appendStringInfoString(out, ",\"right\":");
-      append_from_node(out, query, join->rarg, depth - 1);
+      append_from_node(out, scope, join->rarg, depth - 1);
       appendStringInfoString(out, ",\"quals\":");
-      append_expr_node(out, query, join->quals, depth - 1);
+      append_expr_node(out, scope, join->quals, depth - 1);
       break;
     }
     case T_FromExpr:
     {
       const FromExpr *from = (const FromExpr *) node;
-      append_from_list(out, query, "fromlist", from->fromlist, depth);
+      append_from_list(out, scope, "fromlist", from->fromlist, depth);
       appendStringInfoString(out, ",\"quals\":");
-      append_expr_node(out, query, from->quals, depth - 1);
+      append_expr_node(out, scope, from->quals, depth - 1);
       break;
     }
     default:
@@ -3446,8 +3455,10 @@ query_contains_row_marks(const Query *query)
 }
 
 static void
-append_query_summary(StringInfo out, const Query *query, int depth)
+append_query_summary(StringInfo out, const Query *query, const QueryScope *parent_scope, int depth)
 {
+  QueryScope *scope = make_query_scope(query, parent_scope);
+
   appendStringInfoString(out, "{\"commandType\":");
   append_json_string(out, command_type_name(query->commandType));
   appendStringInfo(out, ",\"querySource\":%d,\"canSetTag\":%s",
@@ -3472,15 +3483,15 @@ append_query_summary(StringInfo out, const Query *query, int depth)
   appendStringInfoString(out, ",\"setOperation\":");
   append_set_operation(out, query->setOperations);
   appendStringInfoString(out, ",\"limitCount\":");
-  append_expr_node(out, query, query->limitCount, depth);
+  append_expr_node(out, scope, query->limitCount, depth);
   appendStringInfoChar(out, ',');
-  append_target_list(out, query);
-  append_returning_list(out, query);
+  append_target_list(out, scope);
+  append_returning_list(out, scope);
   append_dml_parameter_targets(out, query);
-  append_cte_list(out, query, depth);
-  append_rtable(out, query, depth);
+  append_cte_list(out, scope, depth);
+  append_rtable(out, scope, depth);
   appendStringInfoString(out, ",\"fromTree\":");
-  append_from_node(out, query, (const Node *) query->jointree, depth);
+  append_from_node(out, scope, (const Node *) query->jointree, depth);
   appendStringInfoString(out, ",\"whereQual\":");
   if (query->jointree == NULL)
   {
@@ -3488,7 +3499,7 @@ append_query_summary(StringInfo out, const Query *query, int depth)
   }
   else
   {
-    append_expr_node(out, query, query->jointree->quals, depth);
+    append_expr_node(out, scope, query->jointree->quals, depth);
   }
   appendStringInfoChar(out, '}');
 }
@@ -3663,7 +3674,7 @@ postgres_typed_sql_analyze(PG_FUNCTION_ARGS)
       }
       first_query = false;
 
-      append_query_summary(&out, query, 10);
+      append_query_summary(&out, query, NULL, 10);
     }
 
     appendStringInfoString(&out, "]}");

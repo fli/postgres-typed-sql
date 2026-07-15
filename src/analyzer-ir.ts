@@ -45,12 +45,22 @@ export interface TypedSqlPostgresIrParam extends PostgresTypeFact {
 export type TypedSqlPostgresIrParamNullAdmission = 'accepts' | 'rejects' | 'unknown'
 
 export interface TypedSqlPostgresIrColumn extends PostgresTypeFact {
-  readonly checkConstraintTypeName?: string
+  readonly checkConstraintType?: TypedSqlPostgresIrCheckConstraintTypeExpression
   readonly jsonShape?: TypedSqlPostgresIrJsonShape
   readonly name: string | null
   readonly nullable: boolean
   readonly source: TypedSqlPostgresIrColumnSource
 }
+
+export type TypedSqlPostgresIrCheckConstraintTypeExpression =
+  | {
+      readonly kind: 'named'
+      readonly name: string
+    }
+  | {
+      readonly kind: 'intersection' | 'union'
+      readonly members: readonly TypedSqlPostgresIrCheckConstraintTypeExpression[]
+    }
 
 export type TypedSqlPostgresIrJsonShape =
   | {
@@ -1174,23 +1184,71 @@ function cteByName(query: PgAnalyzerQuery, name: string | undefined): PgAnalyzer
   return name ? (query.cteList ?? []).find((cte) => cte.name === name) : undefined
 }
 
+function checkConstraintTypeForQueryOutput(
+  catalog: CatalogFacts,
+  query: PgAnalyzerQuery,
+  outputIndex: number,
+  seen: ReadonlySet<string>,
+  queryScope: string
+): TypedSqlPostgresIrCheckConstraintTypeExpression | null {
+  return foldQueryOutput<TypedSqlPostgresIrCheckConstraintTypeExpression | null>(
+    query,
+    outputIndex,
+    {
+      except: (left) => left,
+      intersect: (left, right) =>
+        left && right ? combineCheckConstraintTypes('intersection', left, right) : (left ?? right),
+      target: (leafQuery, target, scope) =>
+        checkConstraintTypeForExpr(catalog, leafQuery, target.expr, new Set(seen), scope),
+      union: (left, right) => (left && right ? combineCheckConstraintTypes('union', left, right) : null),
+      unknown: () => null,
+    },
+    queryScope
+  )
+}
+
+function checkConstraintTypeKey(type: TypedSqlPostgresIrCheckConstraintTypeExpression): string {
+  return type.kind === 'named'
+    ? `named:${type.name}`
+    : `${type.kind}(${type.members.map(checkConstraintTypeKey).join(',')})`
+}
+
+function combineCheckConstraintTypes(
+  kind: 'intersection' | 'union',
+  left: TypedSqlPostgresIrCheckConstraintTypeExpression,
+  right: TypedSqlPostgresIrCheckConstraintTypeExpression
+): TypedSqlPostgresIrCheckConstraintTypeExpression {
+  if (checkConstraintTypeKey(left) === checkConstraintTypeKey(right)) {
+    return left
+  }
+
+  const candidates = [left, right].flatMap((type) => (type.kind === kind ? type.members : [type]))
+  const members = candidates.filter(
+    (type, index) =>
+      candidates.findIndex((candidate) => checkConstraintTypeKey(candidate) === checkConstraintTypeKey(type)) === index
+  )
+  return members.length === 1 ? (members[0] as TypedSqlPostgresIrCheckConstraintTypeExpression) : { kind, members }
+}
+
 function checkConstraintTypeForExpr(
   catalog: CatalogFacts,
   query: PgAnalyzerQuery,
   expr: PgAnalyzerExpr | null | undefined,
-  seen = new Set<string>()
-): string | null {
+  seen: Set<string>,
+  queryScope: string
+): TypedSqlPostgresIrCheckConstraintTypeExpression | null {
   const unwrapped = unwrapValuePreservingExpr(expr)
   if (!unwrapped || unwrapped.tag !== 'Var') {
     return null
   }
 
   const key = exprKey(unwrapped)
-  if (key && seen.has(key)) {
+  const scopedKey = key ? `${queryScope}:${key}` : null
+  if (scopedKey && seen.has(scopedKey)) {
     return null
   }
-  if (key) {
-    seen.add(key)
+  if (scopedKey) {
+    seen.add(scopedKey)
   }
 
   if (unwrapped.relid && unwrapped.varattno) {
@@ -1201,7 +1259,7 @@ function checkConstraintTypeForExpr(
       })
     )
     if (fact) {
-      return fact.typeName
+      return { kind: 'named', name: fact.typeName }
     }
   }
 
@@ -1209,15 +1267,37 @@ function checkConstraintTypeForExpr(
   if (rte?.kind === 'CTE') {
     const cte = cteByName(query, rte.cteName)
     const cteQuery = cte?.query
-    const source = cteQuery ? resultTargets(cteQuery)[(unwrapped.varattno ?? 1) - 1] : undefined
-    return source && cteQuery ? checkConstraintTypeForExpr(catalog, cteQuery, source.expr, seen) : null
+    return cteQuery
+      ? checkConstraintTypeForQueryOutput(
+          catalog,
+          cteQuery,
+          (unwrapped.varattno ?? 1) - 1,
+          seen,
+          `${queryScope}/cte:${rte.cteName ?? 'unknown'}`
+        )
+      : null
   }
   if (rte?.kind === 'SUBQUERY' && rte.subquery) {
-    const source = resultTargets(rte.subquery)[(unwrapped.varattno ?? 1) - 1]
-    return source ? checkConstraintTypeForExpr(catalog, rte.subquery, source.expr, seen) : null
+    return checkConstraintTypeForQueryOutput(
+      catalog,
+      rte.subquery,
+      (unwrapped.varattno ?? 1) - 1,
+      seen,
+      `${queryScope}/subquery:${key ?? 'var'}`
+    )
   }
 
   return null
+}
+
+function namedCheckConstraintTypeForExpr(
+  catalog: CatalogFacts,
+  query: PgAnalyzerQuery,
+  expr: PgAnalyzerExpr | null | undefined,
+  queryScope: string
+): string | null {
+  const type = checkConstraintTypeForExpr(catalog, query, expr, new Set(), queryScope)
+  return type?.kind === 'named' ? type.name : null
 }
 
 function checkedColumnParamTypes(
@@ -1480,7 +1560,7 @@ function scalarJsonShapeForExpr(
     }
   }
 
-  const checkConstraintType = checkConstraintTypeForExpr(catalog, query, expr)
+  const checkConstraintType = namedCheckConstraintTypeForExpr(catalog, query, expr, 'json-scalar')
   return {
     kind: 'scalar',
     nullable: expressionNullable(catalog, query, expr, refinements),
@@ -1652,7 +1732,7 @@ function normalizeCompiledIr(catalog: CatalogFacts, analyzed: AnalyzedCompiledCo
   const resultColumns = resultTargets(query).map((target, outputIndex): TypedSqlPostgresIrColumn => {
     const expr = target.expr
     const typeFact = typeFactForOid(catalog, expr?.typeOid, expr?.typeName)
-    const checkConstraintTypeName = checkConstraintTypeForExpr(catalog, query, expr)
+    const checkConstraintType = checkConstraintTypeForQueryOutput(catalog, query, outputIndex, new Set(), 'result')
     return {
       jsonShape: isJsonType(typeFact.pgTypeName)
         ? inferQueryOutputJsonShape(catalog, query, outputIndex, new Set(), 'root')
@@ -1661,7 +1741,7 @@ function normalizeCompiledIr(catalog: CatalogFacts, analyzed: AnalyzedCompiledCo
       nullable: queryOutputNullable(catalog, query, outputIndex),
       ...typeFact,
       source: sourceForExpr(expr),
-      ...(checkConstraintTypeName ? { checkConstraintTypeName } : {}),
+      ...(checkConstraintType ? { checkConstraintType } : {}),
     }
   })
 

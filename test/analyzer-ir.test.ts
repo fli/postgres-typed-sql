@@ -396,6 +396,145 @@ test('normalizes PostgreSQL statement, nullability, DML, and cardinality facts c
   }
 })
 
+test('preserves correlated CHECK metadata and folds CHECK result types through set operations', async () => {
+  const database = await createAnalysisDatabase({ schemaFiles: [schemaFile] })
+  try {
+    for (const sql of [
+      `create table public.outer_correlation (
+         value text check (value in ('outer_only'))
+       )`,
+      `create table public.inner_correlation (
+         value text not null check (value in ('inner_only'))
+       )`,
+      "insert into public.outer_correlation(value) values (null), ('outer_only')",
+      "insert into public.inner_correlation(value) values ('inner_only')",
+      `create table public.check_left (
+         value text check (value in ('left_only', 'shared'))
+       )`,
+      `create table public.check_right (
+         value text check (value in ('right_only', 'shared'))
+       )`,
+      'create table public.check_unknown (value text)',
+      "insert into public.check_left(value) values ('left_only'), ('shared')",
+      "insert into public.check_right(value) values ('right_only'), ('shared')",
+      "insert into public.check_unknown(value) values ('unknown')",
+    ]) {
+      await database.query(sql)
+    }
+
+    const result = await buildTypedSqlPostgresIrFromCompiledConfigs(database, [
+      config(
+        'correlatedLateral',
+        `select lateral_value.value
+         from public.outer_correlation outer_row
+         cross join lateral (
+           select outer_row.value
+           from public.inner_correlation inner_row
+         ) lateral_value`
+      ),
+      config(
+        'constrainedUnion',
+        `select value from public.check_left
+         union
+         select value from public.check_right`
+      ),
+      config(
+        'constrainedUnknownUnion',
+        `select value from public.check_left
+         union all
+         select value from public.check_unknown`
+      ),
+      config(
+        'unknownConstrainedUnion',
+        `select value from public.check_unknown
+         union
+         select value from public.check_left`
+      ),
+      config(
+        'constrainedIntersect',
+        `select value from public.check_left
+         intersect all
+         select value from public.check_right`
+      ),
+      config(
+        'constrainedUnknownIntersect',
+        `select value from public.check_left
+         intersect
+         select value from public.check_unknown`
+      ),
+      config(
+        'unknownConstrainedIntersect',
+        `select value from public.check_unknown
+         intersect all
+         select value from public.check_left`
+      ),
+      config(
+        'constrainedExcept',
+        `select value from public.check_left
+         except all
+         select value from public.check_right`
+      ),
+      config(
+        'sameVarnoLeaves',
+        `select left_value.value from public.check_left left_value
+         union all
+         select right_value.value from public.check_right right_value`
+      ),
+      config(
+        'nestedSetCheck',
+        `(select value from public.check_left
+          union
+          select value from public.check_right)
+         intersect
+         select value from public.check_left`
+      ),
+    ])
+    const queries = new Map(result.queries.map((query) => [query.name, query]))
+    const refinement = (name: string) => queries.get(name)?.resultColumns[0]?.checkConstraintType
+    const left = { kind: 'named', name: 'CheckLeft__Value' } as const
+    const right = { kind: 'named', name: 'CheckRight__Value' } as const
+
+    assert.equal(queries.get('correlatedLateral')?.resultColumns[0]?.nullable, true)
+    assert.deepEqual(refinement('correlatedLateral'), {
+      kind: 'named',
+      name: 'OuterCorrelation__Value',
+    })
+    assert.deepEqual(refinement('constrainedUnion'), { kind: 'union', members: [left, right] })
+    assert.equal(refinement('constrainedUnknownUnion'), undefined)
+    assert.equal(refinement('unknownConstrainedUnion'), undefined)
+    assert.deepEqual(refinement('constrainedIntersect'), { kind: 'intersection', members: [left, right] })
+    assert.deepEqual(refinement('constrainedUnknownIntersect'), left)
+    assert.deepEqual(refinement('unknownConstrainedIntersect'), left)
+    assert.deepEqual(refinement('constrainedExcept'), left)
+    assert.deepEqual(refinement('sameVarnoLeaves'), { kind: 'union', members: [left, right] })
+    assert.deepEqual(refinement('nestedSetCheck'), {
+      kind: 'intersection',
+      members: [{ kind: 'union', members: [left, right] }, left],
+    })
+
+    const correlatedRows = await database.query<{ readonly value: string | null }>(
+      `select lateral_value.value
+       from public.outer_correlation outer_row
+       cross join lateral (
+         select outer_row.value
+         from public.inner_correlation inner_row
+       ) lateral_value
+       order by lateral_value.value nulls first`
+    )
+    assert.deepEqual(correlatedRows.rows, [{ value: null }, { value: 'outer_only' }])
+
+    const unionRows = await database.query<{ readonly value: string }>(
+      `select value from public.check_left
+       union
+       select value from public.check_right
+       order by value`
+    )
+    assert.deepEqual(unionRows.rows, [{ value: 'left_only' }, { value: 'right_only' }, { value: 'shared' }])
+  } finally {
+    await database.close()
+  }
+})
+
 test('uses exact PostgreSQL proof objects for uniqueness, inheritance, checks, and expression completeness', async () => {
   const database = await createAnalysisDatabase({ schemaFiles: [schemaFile] })
   try {
@@ -465,8 +604,11 @@ test('uses exact PostgreSQL proof objects for uniqueness, inheritance, checks, a
     assert.equal(query('deferredEquality').rowCardinality, 'many')
     assert.equal(query('inheritedParent').rowCardinality, 'many')
     assert.equal(query('onlyParent').rowCardinality, 'optional')
-    assert.equal(query('noInheritCheck').resultColumns[0]?.checkConstraintTypeName, undefined)
-    assert.equal(query('inheritedCheck').resultColumns[0]?.checkConstraintTypeName, 'InheritedCheck__Status')
+    assert.equal(query('noInheritCheck').resultColumns[0]?.checkConstraintType, undefined)
+    assert.deepEqual(query('inheritedCheck').resultColumns[0]?.checkConstraintType, {
+      kind: 'named',
+      name: 'InheritedCheck__Status',
+    })
     assert.equal(query('emptyRows').resultColumns.length, 0)
     assert.equal(query('emptyRows').rowCardinality, 'many')
     assert.equal(query('withTies').rowCardinality, 'many')

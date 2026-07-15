@@ -31,7 +31,17 @@ interface NativeQuery {
   readonly limitWithTies: boolean
   readonly hasVolatileFunctions: boolean
   readonly rtable: readonly { readonly kind: string; readonly subquery?: NativeQuery }[]
-  readonly targetList: readonly { readonly expr: NativeExpr }[]
+  readonly targetList: readonly NativeTarget[]
+}
+
+interface NativeTarget {
+  readonly attname?: string | null
+  readonly expr: NativeExpr
+  readonly relname?: string | null
+  readonly rteKind?: string
+  readonly varattno?: number
+  readonly varlevelsup?: number
+  readonly varno?: number
 }
 
 interface NativeCte {
@@ -53,8 +63,15 @@ interface NativeDmlParameterTarget {
 }
 
 interface NativeExpr {
+  readonly attname?: string | null
+  readonly relname?: string | null
+  readonly rteKind?: string
   readonly subLinkType?: string
+  readonly subquery?: NativeQuery
   readonly tag: string
+  readonly varattno?: number
+  readonly varlevelsup?: number
+  readonly varno?: number
 }
 
 async function analyze(
@@ -113,6 +130,92 @@ test('native analyzer exposes the versioned PostgreSQL query envelope', async ()
     )
     assert.equal(query.targetList[0]?.expr.tag, 'SubLink')
     assert.equal(query.targetList[0]?.expr.subLinkType, 'EXISTS')
+  })
+})
+
+test('native analyzer resolves correlated Var metadata through one and two ancestor query scopes', async () => {
+  await withDatabase(async (database) => {
+    await database.query('create table public.correlation_outer (value text)')
+    await database.query('create table public.correlation_inner_one (value text not null)')
+    await database.query('create table public.correlation_inner_two (value text not null)')
+
+    const lateral = await analyze(
+      database,
+      `select nested.value
+       from public.correlation_outer outer_row
+       cross join lateral (
+         select outer_row.value
+         from public.correlation_inner_one inner_row
+       ) nested`,
+      []
+    )
+    const lateralQuery = lateral.statements[0]?.queries[0]
+    const lateralSubquery = lateralQuery?.rtable.find((rte) => rte.kind === 'SUBQUERY')?.subquery
+    const levelOneTarget = lateralSubquery?.targetList[0]
+    assert.ok(levelOneTarget)
+    assert.deepEqual(
+      {
+        attname: levelOneTarget.attname,
+        relname: levelOneTarget.relname,
+        rteKind: levelOneTarget.rteKind,
+        varattno: levelOneTarget.varattno,
+        varlevelsup: levelOneTarget.varlevelsup,
+        varno: levelOneTarget.varno,
+      },
+      {
+        attname: 'value',
+        relname: 'correlation_outer',
+        rteKind: 'RELATION',
+        varattno: 1,
+        varlevelsup: 1,
+        varno: 1,
+      }
+    )
+    assert.deepEqual(
+      {
+        attname: levelOneTarget.expr.attname,
+        relname: levelOneTarget.expr.relname,
+        rteKind: levelOneTarget.expr.rteKind,
+        varattno: levelOneTarget.expr.varattno,
+        varlevelsup: levelOneTarget.expr.varlevelsup,
+        varno: levelOneTarget.expr.varno,
+      },
+      {
+        attname: 'value',
+        relname: 'correlation_outer',
+        rteKind: 'RELATION',
+        varattno: 1,
+        varlevelsup: 1,
+        varno: 1,
+      }
+    )
+
+    const doublyNested = await analyze(
+      database,
+      `select (
+         select (
+           select outer_row.value
+           from public.correlation_inner_two inner_two
+           limit 1
+         )
+         from public.correlation_inner_one inner_one
+         limit 1
+       )
+       from public.correlation_outer outer_row`,
+      []
+    )
+    const firstSubquery = doublyNested.statements[0]?.queries[0]?.targetList[0]?.expr.subquery
+    const secondSubquery = firstSubquery?.targetList[0]?.expr.subquery
+    const levelTwoTarget = secondSubquery?.targetList[0]
+    assert.ok(levelTwoTarget)
+    assert.equal(levelTwoTarget.varlevelsup, 2)
+    assert.equal(levelTwoTarget.relname, 'correlation_outer')
+    assert.equal(levelTwoTarget.attname, 'value')
+    assert.equal(levelTwoTarget.rteKind, 'RELATION')
+    assert.equal(levelTwoTarget.expr.varlevelsup, 2)
+    assert.equal(levelTwoTarget.expr.relname, 'correlation_outer')
+    assert.equal(levelTwoTarget.expr.attname, 'value')
+    assert.equal(levelTwoTarget.expr.rteKind, 'RELATION')
   })
 })
 

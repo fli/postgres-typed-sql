@@ -1119,6 +1119,103 @@ from public.json_values
   assert.doesNotMatch(output, /readonly object_values: DbJsonSelected/u)
 })
 
+test('generates correlated and set-operation CHECK result refinements soundly', async () => {
+  const root = await createMinimalFixture(
+    `create table public.outer_correlation (
+  value text check (value in ('outer_only'))
+);
+create table public.inner_correlation (
+  value text not null check (value in ('inner_only'))
+);
+create table public.check_left (
+  value text check (value in ('left_only', 'shared'))
+);
+create table public.check_right (
+  value text check (value in ('right_only', 'shared'))
+);
+create table public.check_unknown (value text);
+`,
+    `select lateral_value.value
+from public.outer_correlation outer_row
+cross join lateral (
+  select outer_row.value
+  from public.inner_correlation inner_row
+) lateral_value
+`
+  )
+  const config = {
+    include: ['queries'],
+    rootDir: root,
+    scalarProfile: 'node-postgres' as const,
+    schema: 'schema.sql',
+  }
+  const queryFile = join(root, 'queries/query.typed.sql')
+  const outputFile = join(root, 'queries/query.typed-sql.ts')
+  const generate = async (sql: string): Promise<string> => {
+    await writeFile(queryFile, `${sql}\n`)
+    await generateTypedSql(config)
+    return readFile(outputFile, 'utf8')
+  }
+
+  await generateTypedSql(config)
+  let output = await readFile(outputFile, 'utf8')
+  assert.match(output, /readonly value: OuterCorrelation__Value \| null/u)
+  assert.doesNotMatch(output, /readonly value: InnerCorrelation__Value/u)
+
+  output = await generate(`select value from public.check_left
+union
+select value from public.check_right`)
+  assert.match(output, /readonly value: CheckLeft__Value \| CheckRight__Value \| null/u)
+  assert.match(output, /import type \{ CheckLeft__Value, CheckRight__Value \}/u)
+
+  for (const sql of [
+    `select value from public.check_left
+union all
+select value from public.check_unknown`,
+    `select value from public.check_unknown
+union
+select value from public.check_left`,
+  ]) {
+    output = await generate(sql)
+    assert.match(output, /readonly value: string \| null/u)
+    assert.doesNotMatch(output, /CheckLeft__Value/u)
+  }
+
+  output = await generate(`select value from public.check_left
+intersect all
+select value from public.check_right`)
+  assert.match(output, /readonly value: CheckLeft__Value & CheckRight__Value \| null/u)
+
+  for (const sql of [
+    `select value from public.check_left
+intersect
+select value from public.check_unknown`,
+    `select value from public.check_unknown
+intersect all
+select value from public.check_left`,
+  ]) {
+    output = await generate(sql)
+    assert.match(output, /readonly value: CheckLeft__Value \| null/u)
+  }
+
+  output = await generate(`select value from public.check_left
+except all
+select value from public.check_right`)
+  assert.match(output, /readonly value: CheckLeft__Value \| null/u)
+
+  output = await generate(`select left_value.value from public.check_left left_value
+union all
+select right_value.value from public.check_right right_value`)
+  assert.match(output, /readonly value: CheckLeft__Value \| CheckRight__Value \| null/u)
+
+  output = await generate(`(select value from public.check_left
+ union
+ select value from public.check_right)
+intersect
+select value from public.check_left`)
+  assert.match(output, /readonly value: \(CheckLeft__Value \| CheckRight__Value\) & CheckLeft__Value \| null/u)
+})
+
 test('renders every inferable JSON object alternative from set-operation outputs', async () => {
   const root = await createMinimalFixture(
     'select 1;\n',

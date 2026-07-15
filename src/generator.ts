@@ -5,6 +5,7 @@ import { basename, dirname, join, relative } from 'node:path'
 
 import {
   buildTypedSqlPostgresIrFromCompiledConfigs,
+  type TypedSqlPostgresIrCheckConstraintTypeExpression,
   type TypedSqlPostgresIrColumnSource,
   type TypedSqlPostgresIrJsonShape,
   type TypedSqlPostgresIrRowBounds,
@@ -211,6 +212,22 @@ function catalogTypeResolution(type: string): PostgresTypeScriptResolution {
     scalarImports: [],
     type,
   }
+}
+
+function tsTypeForCheckConstraintType(
+  type: TypedSqlPostgresIrCheckConstraintTypeExpression,
+  dependencies: TypeScriptDependencies,
+  nested = false
+): string {
+  if (type.kind === 'named') {
+    const resolution = catalogTypeResolution(type.name)
+    collectTypeResolutionDependencies(dependencies, resolution)
+    return resolution.type
+  }
+
+  const operator = type.kind === 'union' ? ' | ' : ' & '
+  const rendered = type.members.map((member) => tsTypeForCheckConstraintType(member, dependencies, true)).join(operator)
+  return nested ? `(${rendered})` : rendered
 }
 
 function typedSqlCommandFromPostgres(command: string): TypedSqlCommand {
@@ -842,13 +859,16 @@ async function resolveTypedSqlWithAnalyzer(
           typeDependencies
         )
       } else {
-        const resolution =
-          column.checkConstraintTypeName &&
+        if (
+          column.checkConstraintType &&
           postgresResultSupportsStringLiteralRefinement(column, generatorConfig.scalarProfile)
-            ? catalogTypeResolution(column.checkConstraintTypeName)
-            : resolveTypeScriptResultTypeForPostgresType(column, generatorConfig.scalarProfile)
-        collectTypeResolutionDependencies(typeDependencies, resolution)
-        tsType = resolution.type
+        ) {
+          tsType = tsTypeForCheckConstraintType(column.checkConstraintType, typeDependencies)
+        } else {
+          const resolution = resolveTypeScriptResultTypeForPostgresType(column, generatorConfig.scalarProfile)
+          collectTypeResolutionDependencies(typeDependencies, resolution)
+          tsType = resolution.type
+        }
       }
       return {
         jsonShape: column.jsonShape,
