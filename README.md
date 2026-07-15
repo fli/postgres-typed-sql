@@ -82,7 +82,7 @@ Drivers choose how PostgreSQL values become JavaScript values, and applications 
 
 The default `conservative` profile emits `unknown` for parameter and result scalar values. It is safe when the generator does not know the driver's conversion rules.
 
-Set `scalarProfile: 'node-postgres'` only when execution uses the default `node-postgres` conversion behavior. This profile models documented conversions such as parsed JSON, JavaScript `Date` values for `date`/`timestamp`/`timestamptz`, JavaScript numbers for the built-in integer and floating-point parsers, and strings for `bigint` and `numeric`. Types without a stable modeled default remain `unknown`. If the application installs custom type parsers, use the conservative profile unless those parser results still match the generated contract.
+Set `scalarProfile: 'node-postgres'` only when execution uses the default text parsers from node-postgres 8.x (`pg-types` 2.2.0). This profile models parsed JSON, JavaScript numbers for the built-in integer and floating-point parsers, strings for `bigint` and `numeric`, and `Date | number` for `date`/`timestamp`/`timestamptz` because PostgreSQL infinity values decode to numeric infinities. Built-in arrays are modeled only when that exact array OID has a registered parser; their recursive `PgArray<T>` type includes multidimensional arrays and SQL `NULL` elements. Unregistered arrays—including user-defined enum and domain arrays—and user-defined domain results remain `unknown`. If the application installs custom type parsers, uses binary result mode, or moves to a node-postgres version with a different default parser table, use the conservative profile unless those parser results still match the generated contract.
 
 ## Directives
 

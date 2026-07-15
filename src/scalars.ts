@@ -3,6 +3,9 @@ export type PgScalarString<PgType extends string> = string & {
   readonly __postgresTypedSqlScalar: PgType
 }
 
+/** PostgreSQL arrays may be multidimensional and may contain SQL NULL elements. */
+export type PgArray<Element> = readonly (Element | null | PgArray<Element>)[]
+
 export type PgInt2String = PgScalarString<'int2'>
 export type PgInt4String = PgScalarString<'int4'>
 export type PgInt8String = PgScalarString<'int8'>

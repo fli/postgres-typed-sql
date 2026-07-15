@@ -7,8 +7,9 @@ import type { ResolvedPostgresTypedSqlConfig } from './config.js'
 import type { PostgresQueryable } from './database.js'
 import {
   postgresTypeScriptScalarImports as dbScalarTypes,
+  resolveTypeScriptTypeForPostgresType,
   type PostgresScalarProfile,
-  typeScriptTypeForPostgresType,
+  type PostgresTypeScriptResolution,
 } from './postgres-types.js'
 import {
   assertUniqueTypeScriptBindings,
@@ -24,9 +25,6 @@ interface EnumCatalogRow {
 }
 
 interface DomainCatalogRow {
-  readonly base_formatted_type: string
-  readonly base_type_name: string
-  readonly base_type_schema: string
   readonly schema: string
   readonly type_name: string
 }
@@ -39,6 +37,7 @@ interface ColumnCatalogRow {
   readonly relname: string
   readonly schema: string
   readonly type_name: string
+  readonly type_oid: number
   readonly type_schema: string
 }
 
@@ -46,14 +45,15 @@ function quoteString(value: string): string {
   return JSON.stringify(value)
 }
 
-function tsTypeForPgType(
+function resolveTsTypeForPgType(
   pgType: string,
   typeSchema: string,
   typeName: string,
+  typeOid: number,
   scalarProfile: PostgresScalarProfile
-): string {
-  return typeScriptTypeForPostgresType(
-    { pgType, pgTypeName: typeName, pgTypeSchema: typeSchema },
+): PostgresTypeScriptResolution {
+  return resolveTypeScriptTypeForPostgresType(
+    { pgType, pgTypeName: typeName, pgTypeOid: typeOid, pgTypeSchema: typeSchema },
     undefined,
     scalarProfile
   )
@@ -84,14 +84,9 @@ async function loadDomains(client: PostgresQueryable): Promise<DomainCatalogRow[
   const result = await client.query<DomainCatalogRow>(`
     select
       namespace.nspname as schema,
-      type.typname as type_name,
-      format_type(type.typbasetype, type.typtypmod) as base_formatted_type,
-      base_namespace.nspname as base_type_schema,
-      base_type.typname as base_type_name
+      type.typname as type_name
     from pg_type type
     join pg_namespace namespace on namespace.oid = type.typnamespace
-    join pg_type base_type on base_type.oid = type.typbasetype
-    join pg_namespace base_namespace on base_namespace.oid = base_type.typnamespace
     where type.typtype = 'd'
       and namespace.nspname <> 'information_schema'
       and namespace.nspname !~ '^pg_'
@@ -108,6 +103,7 @@ async function loadColumns(client: PostgresQueryable): Promise<ColumnCatalogRow[
       c.relkind::text as relkind,
       a.attname,
       a.attnotnull,
+      a.atttypid::int as type_oid,
       format_type(a.atttypid, a.atttypmod) as formatted_type,
       tn.nspname as type_schema,
       t.typname as type_name
@@ -135,17 +131,9 @@ function renderEnums(enums: readonly EnumCatalogRow[]): string {
     .join('\n\n')
 }
 
-function renderDomains(domains: readonly DomainCatalogRow[], scalarProfile: PostgresScalarProfile): string {
+function renderDomains(domains: readonly DomainCatalogRow[]): string {
   return domains
-    .map(
-      (row) =>
-        `export type ${schemaQualifiedPascalName(row.schema, row.type_name)} = ${tsTypeForPgType(
-          row.base_formatted_type,
-          row.base_type_schema,
-          row.base_type_name,
-          scalarProfile
-        )}`
-    )
+    .map((row) => `export type ${schemaQualifiedPascalName(row.schema, row.type_name)} = unknown`)
     .join('\n\n')
 }
 
@@ -174,12 +162,14 @@ function tsTypeForColumn(
   row: ColumnCatalogRow,
   checkConstraintTypes: ReadonlyMap<string, CheckConstraintLiteralUnionFact>,
   scalarProfile: PostgresScalarProfile
-): string {
-  return (
-    (scalarProfile === 'node-postgres'
+): PostgresTypeScriptResolution {
+  const checkConstraintType =
+    scalarProfile === 'node-postgres'
       ? checkConstraintTypes.get(checkConstraintLiteralUnionCatalogKey(row))?.typeName
-      : undefined) ?? tsTypeForPgType(row.formatted_type, row.type_schema, row.type_name, scalarProfile)
-  )
+      : undefined
+  return checkConstraintType
+    ? { catalogImports: [], scalarImports: [], type: checkConstraintType }
+    : resolveTsTypeForPgType(row.formatted_type, row.type_schema, row.type_name, row.type_oid, scalarProfile)
 }
 
 function renderRelations(
@@ -197,7 +187,7 @@ function renderRelations(
       return [
         `export interface ${name} {`,
         ...rows.map((row) => {
-          const tsType = tsTypeForColumn(row, checkConstraintTypes, scalarProfile)
+          const tsType = tsTypeForColumn(row, checkConstraintTypes, scalarProfile).type
           return `  readonly ${quotePropertyName(row.attname)}: ${tsType}${row.attnotnull ? '' : ' | null'}`
         }),
         '}',
@@ -270,23 +260,10 @@ function renderCatalogTypes(
   validateCatalogBindings(enums, domains, columns, checkConstraintLiteralUnions)
   const scalarImports = new Set<string>()
   const checkConstraintTypes = checkConstraintLiteralUnionByCatalogKey(checkConstraintLiteralUnions)
-  for (const domain of domains) {
-    const tsType = tsTypeForPgType(
-      domain.base_formatted_type,
-      domain.base_type_schema,
-      domain.base_type_name,
-      scalarProfile
-    )
-    const baseType = tsType.replace(/^readonly /u, '').replace(/\[\]$/u, '')
-    if (dbScalarTypes.has(baseType)) {
-      scalarImports.add(baseType)
-    }
-  }
   for (const row of columns) {
-    const tsType = tsTypeForColumn(row, checkConstraintTypes, scalarProfile)
-    const baseType = tsType.replace(/^readonly /u, '').replace(/\[\]$/u, '')
-    if (dbScalarTypes.has(baseType)) {
-      scalarImports.add(baseType)
+    const resolved = tsTypeForColumn(row, checkConstraintTypes, scalarProfile)
+    for (const scalarImport of resolved.scalarImports) {
+      scalarImports.add(scalarImport)
     }
   }
 
@@ -301,7 +278,7 @@ function renderCatalogTypes(
 ${importBlock}
 ${renderEnums(enums)}
 
-${renderDomains(domains, scalarProfile)}
+${renderDomains(domains)}
 
 ${renderCheckConstraintLiteralUnions(checkConstraintLiteralUnions)}
 

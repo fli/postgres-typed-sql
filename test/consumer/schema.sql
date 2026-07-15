@@ -8,5 +8,6 @@ create table public.widgets (
   code text not null unique,
   label text,
   state audit.widget_state not null default 'active',
+  metrics numeric[] not null default '{}',
   search_document tsquery not null default ''::tsquery
 );

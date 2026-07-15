@@ -19,9 +19,9 @@ import {
   normalizePostgresTypeName as normalizePgTypeName,
   postgresArrayElementType,
   postgresTypeScriptScalarImports as dbScalarTypes,
+  resolveTypeScriptParameterTypeForPostgresType,
+  resolveTypeScriptTypeForPostgresType,
   type PostgresScalarProfile,
-  typeScriptParameterTypeForPostgresType,
-  typeScriptTypeForPostgresType,
 } from './postgres-types.js'
 import { compileNamedParameters, parseTypedSqlSource } from './sql-source.js'
 import {
@@ -193,13 +193,14 @@ function tsTypeForPgType(
   sourceFile: string,
   scalarProfile: PostgresScalarProfile,
   typeSchema = 'pg_catalog',
-  typeName = ''
+  typeName = '',
+  typeOid = 0
 ): string {
-  return typeScriptTypeForPostgresType(
-    { pgType, pgTypeName: typeName, pgTypeSchema: typeSchema },
+  return resolveTypeScriptTypeForPostgresType(
+    { pgType, pgTypeName: typeName, pgTypeOid: typeOid, pgTypeSchema: typeSchema },
     sourceFile,
     scalarProfile
-  )
+  ).type
 }
 
 function parameterTsTypeForPgType(
@@ -207,13 +208,14 @@ function parameterTsTypeForPgType(
   sourceFile: string,
   scalarProfile: PostgresScalarProfile,
   typeSchema = 'pg_catalog',
-  typeName = ''
+  typeName = '',
+  typeOid = 0
 ): string {
-  return typeScriptParameterTypeForPostgresType(
-    { pgType, pgTypeName: typeName, pgTypeSchema: typeSchema },
+  return resolveTypeScriptParameterTypeForPostgresType(
+    { pgType, pgTypeName: typeName, pgTypeOid: typeOid, pgTypeSchema: typeSchema },
     sourceFile,
     scalarProfile
-  )
+  ).type
 }
 
 function collectPgTypeImports(
@@ -221,41 +223,27 @@ function collectPgTypeImports(
   pgType: string,
   typeSchema = 'pg_catalog',
   typeName = '',
+  typeOid = 0,
   usage: 'input' | 'output' = 'output',
   scalarProfile: PostgresScalarProfile = 'node-postgres'
 ): void {
-  const arrayElementType = postgresArrayElementType(pgType, typeName)
-  if (arrayElementType) {
-    collectPgTypeImports(imports, arrayElementType, typeSchema, arrayElementType, usage, scalarProfile)
-    return
-  }
-
-  if (typeSchema !== 'pg_catalog') {
-    const tsType = typeScriptTypeForPostgresType(
-      { pgType, pgTypeName: typeName, pgTypeSchema: typeSchema },
-      undefined,
-      scalarProfile
-    )
-    if (tsType !== 'unknown') {
-      imports.catalog.add(tsType)
-    }
-    return
-  }
-
-  const tsType =
+  const resolved =
     usage === 'input'
-      ? typeScriptParameterTypeForPostgresType(
-          { pgType, pgTypeName: typeName, pgTypeSchema: typeSchema },
+      ? resolveTypeScriptParameterTypeForPostgresType(
+          { pgType, pgTypeName: typeName, pgTypeOid: typeOid, pgTypeSchema: typeSchema },
           undefined,
           scalarProfile
         )
-      : typeScriptTypeForPostgresType(
-          { pgType, pgTypeName: typeName, pgTypeSchema: typeSchema },
+      : resolveTypeScriptTypeForPostgresType(
+          { pgType, pgTypeName: typeName, pgTypeOid: typeOid, pgTypeSchema: typeSchema },
           undefined,
           scalarProfile
         )
-  if (dbScalarTypes.has(tsType)) {
-    imports.scalar.add(tsType)
+  for (const catalogImport of resolved.catalogImports) {
+    imports.catalog.add(catalogImport)
+  }
+  for (const scalarImport of resolved.scalarImports) {
+    imports.scalar.add(scalarImport)
   }
 }
 
@@ -265,16 +253,17 @@ function collectResolvedTypeImports(
   pgType: string,
   typeSchema: string,
   typeName: string,
+  typeOid: number,
   sourceFile: string,
   usage: 'input' | 'output',
   scalarProfile: PostgresScalarProfile
 ): void {
   const defaultType =
     usage === 'input'
-      ? parameterTsTypeForPgType(pgType, sourceFile, scalarProfile, typeSchema, typeName)
-      : tsTypeForPgType(pgType, sourceFile, scalarProfile, typeSchema, typeName)
+      ? parameterTsTypeForPgType(pgType, sourceFile, scalarProfile, typeSchema, typeName, typeOid)
+      : tsTypeForPgType(pgType, sourceFile, scalarProfile, typeSchema, typeName, typeOid)
   if (tsType === defaultType) {
-    collectPgTypeImports(imports, pgType, typeSchema, typeName, usage, scalarProfile)
+    collectPgTypeImports(imports, pgType, typeSchema, typeName, typeOid, usage, scalarProfile)
   } else if (dbScalarTypes.has(tsType)) {
     imports.scalar.add(tsType)
   } else {
@@ -575,13 +564,22 @@ function scalarTsTypeForJsonShape(
     if (jsonNumberPgTypes.has(normalizedTypeName)) {
       return 'number'
     }
-    if (!postgresArrayElementType(shape.pgType, shape.pgTypeName)) {
-      return 'string'
+    if (postgresArrayElementType(shape.pgType, shape.pgTypeName)) {
+      imports.scalar.add('DbJsonSelected')
+      return 'DbJsonSelected'
     }
+    return 'string'
   }
 
-  collectPgTypeImports(imports, shape.pgType, shape.pgTypeSchema, shape.pgTypeName)
-  return tsTypeForPgType(shape.pgType, sourceFile, 'node-postgres', shape.pgTypeSchema, shape.pgTypeName)
+  collectPgTypeImports(imports, shape.pgType, shape.pgTypeSchema, shape.pgTypeName, shape.pgTypeOid)
+  return tsTypeForPgType(
+    shape.pgType,
+    sourceFile,
+    'node-postgres',
+    shape.pgTypeSchema,
+    shape.pgTypeName,
+    shape.pgTypeOid
+  )
 }
 
 function tsTypeForJsonShape(
@@ -875,7 +873,8 @@ async function resolveTypedSqlWithAnalyzer(
                 config.sourceFile,
                 generatorConfig.scalarProfile,
                 column.pgTypeSchema,
-                column.pgTypeName
+                column.pgTypeName,
+                column.pgTypeOid
               )
       if (!useStructuredJson) {
         collectResolvedTypeImports(
@@ -884,6 +883,7 @@ async function resolveTypedSqlWithAnalyzer(
           column.pgType,
           column.pgTypeSchema,
           column.pgTypeName,
+          column.pgTypeOid,
           config.sourceFile,
           'output',
           generatorConfig.scalarProfile
@@ -921,7 +921,8 @@ async function resolveTypedSqlWithAnalyzer(
               config.sourceFile,
               generatorConfig.scalarProfile,
               analyzed.pgTypeSchema,
-              analyzed.pgTypeName
+              analyzed.pgTypeName,
+              analyzed.pgTypeOid
             )
       collectResolvedTypeImports(
         typeImports,
@@ -929,6 +930,7 @@ async function resolveTypedSqlWithAnalyzer(
         analyzed.pgType,
         analyzed.pgTypeSchema,
         analyzed.pgTypeName,
+        analyzed.pgTypeOid,
         config.sourceFile,
         'input',
         generatorConfig.scalarProfile

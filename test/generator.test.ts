@@ -34,7 +34,7 @@ test('generates PostgreSQL-derived types, nullability, and cardinality', async (
 
   const joined = await readFile(join(root, 'queries/list-accounts-with-posts.typed-sql.ts'), 'utf8')
   assert.match(joined, /readonly title: string \| null/u)
-  assert.match(joined, /readonly published_at: Date \| null/u)
+  assert.match(joined, /readonly published_at: Date \| number \| null/u)
 
   const catalog = await readFile(join(root, 'postgres-typed-sql.types.ts'), 'utf8')
   assert.match(catalog, /export type AccountStatus = "active" \| "suspended"/u)
@@ -249,7 +249,8 @@ select
     'URL', :url_value::text,
     'n', 1,
     'big', 2::bigint,
-    'ratio', 1.5::numeric
+    'ratio', 1.5::numeric,
+    'numbers', :json_numbers::numeric[]
   ) as payload_json,
   :json_values::jsonb[] as json_values
 `
@@ -263,17 +264,22 @@ select
 create schema audit;
 create type audit.account_status as enum ('queued', 'complete');
 create type audit.control_label as enum (E'line\\nbreak');
+create domain audit.score as integer check (value >= 0);
 create table audit.events (
   event_id bigint primary key,
   event_status audit.account_status not null,
   event_statuses audit.account_status[] not null,
+  numeric_values numeric[] not null,
+  occurred_at timestamp with time zone not null,
+  score audit.score not null,
+  score_history audit.score[] not null,
   search_document tsquery not null
 );
 `
   )
   await writeFile(
     join(root, 'queries/audit-event.typed.sql'),
-    'select event_id, event_status, event_statuses, search_document from audit.events where event_id = :event_id\n'
+    'select event_id, event_status, event_statuses, numeric_values, occurred_at, score, score_history, search_document from audit.events where event_id = :event_id\n'
   )
 
   const result = await generateTypedSql({
@@ -285,7 +291,10 @@ create table audit.events (
 
   assert.equal(result.statementCount, 6)
   const exact = await readFile(join(root, 'queries/exact-names.typed-sql.ts'), 'utf8')
-  assert.match(exact, /parameterNames: \['user_id', 'userId', 'json_value', 'url_value', 'json_values'\]/u)
+  assert.match(
+    exact,
+    /parameterNames: \['user_id', 'userId', 'json_value', 'url_value', 'json_numbers', 'json_values'\]/u
+  )
   assert.match(exact, /readonly user_id: string/u)
   assert.match(exact, /readonly userId: string/u)
   assert.match(exact, /readonly json_value: string/u)
@@ -295,23 +304,35 @@ create table audit.events (
   assert.match(exact, /readonly n: number/u)
   assert.match(exact, /readonly big: number/u)
   assert.match(exact, /readonly ratio: number/u)
-  assert.match(exact, /readonly json_values: readonly DbJsonInput\[\]/u)
-  assert.match(exact, /readonly json_values: readonly DbJsonSelected\[\] \| null/u)
-  assert.match(exact, /import type \{ DbJsonInput, DbJsonSelected \}/u)
+  assert.match(exact, /readonly numbers: DbJsonSelected/u)
+  assert.match(exact, /readonly json_numbers: PgArray<bigint \| number \| string>/u)
+  assert.match(exact, /readonly json_values: PgArray<DbJsonInput>/u)
+  assert.match(exact, /readonly json_values: PgArray<DbJsonSelected> \| null/u)
+  assert.match(exact, /import type \{ DbJsonInput, DbJsonSelected, PgArray \}/u)
   assert.doesNotMatch(exact, /import type \{ URL \}/u)
 
   const audit = await readFile(join(root, 'queries/audit-event.typed-sql.ts'), 'utf8')
-  assert.match(audit, /import type \{ AuditAccountStatus \}/u)
+  assert.match(audit, /import type \{ AuditAccountStatus, AuditScore \}/u)
   assert.match(audit, /readonly event_id: PgInt8String/u)
   assert.match(audit, /readonly event_status: AuditAccountStatus/u)
-  assert.match(audit, /readonly event_statuses: readonly AuditAccountStatus\[\]/u)
+  assert.match(audit, /readonly event_statuses: unknown/u)
+  assert.match(audit, /readonly numeric_values: PgArray<number>/u)
+  assert.match(audit, /readonly occurred_at: Date \| number/u)
+  assert.match(audit, /readonly score: AuditScore/u)
+  assert.match(audit, /readonly score_history: unknown/u)
   assert.match(audit, /readonly search_document: string/u)
 
   const catalog = await readFile(join(root, 'postgres-typed-sql.types.ts'), 'utf8')
   assert.match(catalog, /export type AccountStatus = "active" \| "suspended"/u)
   assert.match(catalog, /export type AuditAccountStatus = "queued" \| "complete"/u)
   assert.match(catalog, /export type AuditControlLabel = "line\\nbreak"/u)
+  assert.match(catalog, /export type AuditScore = unknown/u)
   assert.match(catalog, /export interface AuditEvents \{[\s\S]*?readonly event_id: PgInt8String/u)
+  assert.match(catalog, /readonly event_statuses: unknown/u)
+  assert.match(catalog, /readonly numeric_values: PgArray<number>/u)
+  assert.match(catalog, /readonly occurred_at: Date \| number/u)
+  assert.match(catalog, /readonly score: AuditScore/u)
+  assert.match(catalog, /readonly score_history: unknown/u)
   assert.match(catalog, /readonly search_document: string/u)
   assert.match(catalog, /readonly "audit\.events": AuditEvents/u)
 })

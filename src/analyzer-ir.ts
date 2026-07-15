@@ -41,6 +41,7 @@ export interface TypedSqlPostgresIrParam {
   readonly nullable: boolean
   readonly pgType: string
   readonly pgTypeName: string
+  readonly pgTypeOid: number
   readonly pgTypeSchema: string
   readonly propertyName: string
   readonly tsType: string
@@ -53,6 +54,7 @@ export interface TypedSqlPostgresIrColumn {
   readonly nullable: boolean
   readonly pgType: string
   readonly pgTypeName: string
+  readonly pgTypeOid: number
   readonly pgTypeSchema: string
   readonly source: TypedSqlPostgresIrColumnSource
   readonly tsType: string
@@ -79,6 +81,7 @@ export type TypedSqlPostgresIrJsonShape =
       readonly nullable: boolean
       readonly pgType: string
       readonly pgTypeName: string
+      readonly pgTypeOid: number
       readonly pgTypeSchema: string
       readonly tsType?: string
     }
@@ -278,7 +281,9 @@ export interface TypedSqlPostgresIrBuildResult {
   readonly queries: readonly TypedSqlPostgresIr[]
 }
 
-function tsTypeForPgType(typeFact: Pick<TypedSqlPostgresIrColumn, 'pgType' | 'pgTypeName' | 'pgTypeSchema'>): string {
+function tsTypeForPgType(
+  typeFact: Pick<TypedSqlPostgresIrColumn, 'pgType' | 'pgTypeName' | 'pgTypeOid' | 'pgTypeSchema'>
+): string {
   return typeScriptTypeForPostgresType(typeFact)
 }
 
@@ -925,19 +930,21 @@ function typeFactForOid(
   catalog: CatalogFacts,
   oid: number | undefined,
   fallback: string | undefined
-): Pick<TypedSqlPostgresIrColumn, 'pgType' | 'pgTypeName' | 'pgTypeSchema'> {
+): Pick<TypedSqlPostgresIrColumn, 'pgType' | 'pgTypeName' | 'pgTypeOid' | 'pgTypeSchema'> {
   if (oid) {
     const type = catalog.types.get(oid)
     if (type) {
       return {
         pgType: type.formatted_type,
         pgTypeName: type.typname,
+        pgTypeOid: oid,
         pgTypeSchema: type.type_schema,
       }
     }
     return {
       pgType: fallback ?? `oid:${oid}`,
       pgTypeName: `oid_${oid}`,
+      pgTypeOid: oid,
       pgTypeSchema: 'unknown',
     }
   }
@@ -945,6 +952,7 @@ function typeFactForOid(
   return {
     pgType: fallback ?? 'unknown',
     pgTypeName: fallback ?? 'unknown',
+    pgTypeOid: 0,
     pgTypeSchema: 'unknown',
   }
 }
