@@ -1,6 +1,7 @@
 #include "postgres.h"
 
 #include "access/table.h"
+#include "catalog/pg_aggregate.h"
 #include "catalog/pg_attribute.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_constraint.h"
@@ -3250,6 +3251,43 @@ function_is_volatile(Oid function_oid)
 }
 
 static bool
+aggregate_invokes_volatile_function(Oid aggregate_oid)
+{
+  HeapTuple tuple;
+  Form_pg_aggregate aggregate;
+  Oid support_function_oids[8];
+  int index;
+
+  tuple = SearchSysCache1(AGGFNOID, ObjectIdGetDatum(aggregate_oid));
+  if (!HeapTupleIsValid(tuple))
+  {
+    elog(ERROR, "cache lookup failed for aggregate %u", aggregate_oid);
+  }
+
+  aggregate = (Form_pg_aggregate) GETSTRUCT(tuple);
+  support_function_oids[0] = aggregate->aggtransfn;
+  support_function_oids[1] = aggregate->aggfinalfn;
+  support_function_oids[2] = aggregate->aggcombinefn;
+  support_function_oids[3] = aggregate->aggserialfn;
+  support_function_oids[4] = aggregate->aggdeserialfn;
+  support_function_oids[5] = aggregate->aggmtransfn;
+  support_function_oids[6] = aggregate->aggminvtransfn;
+  support_function_oids[7] = aggregate->aggmfinalfn;
+  ReleaseSysCache(tuple);
+
+  for (index = 0; index < lengthof(support_function_oids); index++)
+  {
+    Oid function_oid = support_function_oids[index];
+
+    if (OidIsValid(function_oid) && function_is_volatile(function_oid))
+    {
+      return true;
+    }
+  }
+  return false;
+}
+
+static bool
 domain_constraints_invoke_volatile_function(Oid type_oid)
 {
   DomainConstraintRef *constraint_ref;
@@ -3278,9 +3316,15 @@ node_invokes_volatile_function(Node *node)
   switch (nodeTag(node))
   {
     case T_Aggref:
-      return function_is_volatile(((Aggref *) node)->aggfnoid);
+      return aggregate_invokes_volatile_function(((Aggref *) node)->aggfnoid);
     case T_WindowFunc:
-      return function_is_volatile(((WindowFunc *) node)->winfnoid);
+    {
+      WindowFunc *function = (WindowFunc *) node;
+
+      return function->winagg
+               ? aggregate_invokes_volatile_function(function->winfnoid)
+               : function_is_volatile(function->winfnoid);
+    }
     case T_FuncExpr:
       return function_is_volatile(((FuncExpr *) node)->funcid);
     case T_Param:

@@ -209,6 +209,45 @@ test('native analyzer reports row locks recursively through join predicates', as
   })
 })
 
+test('native analyzer treats volatile aggregate support functions as writes', async () => {
+  await withDatabase(async (database) => {
+    await database.query('create table public.aggregate_side_effects (value integer)')
+    await database.query(`create function public.volatile_sum_transition(state integer, value integer)
+      returns integer
+      language plpgsql volatile
+      as $$
+      begin
+        insert into public.aggregate_side_effects(value) values (value);
+        return coalesce(state, 0) + value;
+      end
+      $$`)
+    await database.query(`create aggregate public.volatile_sum(integer) (
+      sfunc = public.volatile_sum_transition,
+      stype = integer,
+      initcond = '0'
+    )`)
+
+    const aggregateSql = 'select public.volatile_sum(value) from (values (1), (2), (3)) input(value)'
+    const aggregate = await analyze(database, aggregateSql, [])
+    assert.equal(aggregate.statements[0]?.queries[0]?.hasVolatileFunctions, true)
+    assert.equal((await database.query(aggregateSql)).rows.length, 1)
+    const aggregateSideEffects = await database.query<{ value: number }>(
+      'select value from public.aggregate_side_effects order by value'
+    )
+    assert.deepEqual(aggregateSideEffects.rows, [{ value: 1 }, { value: 2 }, { value: 3 }])
+
+    await database.query('truncate public.aggregate_side_effects')
+    const windowSql = 'select public.volatile_sum(value) over () from (values (1), (2), (3)) input(value)'
+    const window = await analyze(database, windowSql, [])
+    assert.equal(window.statements[0]?.queries[0]?.hasVolatileFunctions, true)
+    assert.equal((await database.query(windowSql)).rows.length, 3)
+    const windowSideEffects = await database.query<{ value: number }>(
+      'select value from public.aggregate_side_effects order by value'
+    )
+    assert.deepEqual(windowSideEffects.rows, [{ value: 1 }, { value: 2 }, { value: 3 }])
+  })
+})
+
 test('native analyzer maps direct DML parameters to PostgreSQL target columns', async () => {
   await withDatabase(async (database) => {
     const insert = await analyze(

@@ -48,6 +48,7 @@ export const defaultPostgresScalarProfile: PostgresScalarProfile = 'conservative
 const scalarImportNames = new Set([
   'DbJsonParameter',
   'DbJsonSelected',
+  'PgByteaHexString',
   'PgCircle',
   'PgInt8String',
   'PgInterval',

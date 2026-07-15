@@ -285,15 +285,20 @@ test('parameter resolution is independent of result decoding and recursively use
     'PgArray<bigint | number | string>'
   )
   assert.equal(parameterType(pgCatalog('bytea', 'bytea', 17)), 'PgByteaHexString | Uint8Array')
-  assert.equal(
-    parameterType(
+  assert.deepEqual(
+    resolveTypeScriptParameterTypeForPostgresType(
       pgCatalog('bytea[]', '_bytea', 1001, {
         pgTypeKind: 'array',
         pgArrayDelimiter: ',',
         pgArrayElementType: pgCatalog('bytea', 'bytea', 17),
       })
     ),
-    'PgArray<PgByteaHexString>'
+    {
+      ambientBindings: [],
+      catalogImports: [],
+      scalarImports: ['PgArray', 'PgByteaHexString'],
+      type: 'PgArray<PgByteaHexString>',
+    }
   )
   assert.equal(parameterType(pgCatalog('interval', 'interval', 1186)), 'PgInterval | string')
   assert.equal(

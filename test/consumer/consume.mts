@@ -1,3 +1,4 @@
+import { echoBytes } from './echo-bytes.typed-sql.js'
 import { findWidget } from './find-widget.typed-sql.js'
 import { insertWidget } from './insert-widget.typed-sql.js'
 
@@ -5,6 +6,8 @@ const query = findWidget.query({ code: 'widget-code' })
 const values: readonly unknown[] = query.values
 
 void values
+
+echoBytes.query({ payloads: [] })
 
 insertWidget.query({ code: 'widget-code', label: null })
 

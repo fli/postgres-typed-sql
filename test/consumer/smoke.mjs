@@ -10,7 +10,7 @@ const result = await generateTypedSql({
   scalarProfile: 'node-postgres',
   schema: 'schema.sql',
 })
-assert.equal(result.statementCount, 2)
+assert.equal(result.statementCount, 3)
 
 const output = await readFile('find-widget.typed-sql.ts', 'utf8')
 assert.match(output, /cardinality: 'optional'/u)
@@ -22,13 +22,24 @@ assert.match(output, /readonly URL: string/u)
 assert.match(output, /readonly count: number/u)
 assert.doesNotMatch(output, /import type \{ URL \}/u)
 
+const echoBytes = await readFile('echo-bytes.typed-sql.ts', 'utf8')
+assert.match(echoBytes, /import type \{ PgArray, PgByteaHexString \}/u)
+assert.match(echoBytes, /readonly payloads: PgArray<PgByteaHexString>/u)
+
 const conservativeResult = await generateTypedSql({
   include: ['.'],
   rootDir: process.cwd(),
   schema: 'schema.sql',
 })
-assert.equal(conservativeResult.statementCount, 2)
+assert.equal(conservativeResult.statementCount, 3)
 
 const conservativeInsert = await readFile('insert-widget.typed-sql.ts', 'utf8')
 assert.match(conservativeInsert, /readonly code: NonNullable<unknown>/u)
 assert.match(conservativeInsert, /readonly label: NonNullable<unknown> \| null/u)
+
+await generateTypedSql({
+  include: ['.'],
+  rootDir: process.cwd(),
+  scalarProfile: 'node-postgres',
+  schema: 'schema.sql',
+})

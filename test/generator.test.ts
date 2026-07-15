@@ -97,6 +97,24 @@ test('requires serialized strings for PostgreSQL arrays whose element delimiter 
   assert.doesNotMatch(output, /readonly lists: PgArray<PgArray/u)
 })
 
+test('imports every scalar dependency used by bytea array parameters', async () => {
+  const root = await createMinimalFixture(
+    'select 1;\n',
+    `select :payloads::bytea[] as payloads
+`
+  )
+  await generateTypedSql({
+    include: ['queries'],
+    rootDir: root,
+    scalarProfile: 'node-postgres',
+    schema: 'schema.sql',
+  })
+
+  const output = await readFile(join(root, 'queries/query.typed-sql.ts'), 'utf8')
+  assert.match(output, /import type \{ PgArray, PgByteaHexString \} from 'postgres-typed-sql\/scalars'/u)
+  assert.match(output, /readonly payloads: PgArray<PgByteaHexString>/u)
+})
+
 test('surfaces native PostgreSQL diagnostics for invalid SQL', async () => {
   const root = await copyFixture()
   await writeFile(join(root, 'queries/invalid.typed.sql'), 'select missing_column from public.accounts\n')
@@ -166,7 +184,23 @@ test('does not allow directives to downgrade PostgreSQL write access', async () 
 
 test('classifies volatile PostgreSQL function calls conservatively as writes', async () => {
   const root = await createMinimalFixture(
-    'create sequence public.event_sequence; create table public.lock_values (value integer);\n',
+    `create sequence public.event_sequence;
+create table public.lock_values (value integer);
+create function public.volatile_sum_transition(state integer, value integer)
+returns integer
+language plpgsql volatile
+as $$
+begin
+  insert into public.lock_values(value) values (value);
+  return coalesce(state, 0) + value;
+end
+$$;
+create aggregate public.volatile_sum(integer) (
+  sfunc = public.volatile_sum_transition,
+  stype = integer,
+  initcond = '0'
+);
+`,
     `-- @access read
 select 1 as value limit nextval('public.event_sequence')
 `
@@ -177,6 +211,14 @@ select 1 as value limit nextval('public.event_sequence')
     scalarProfile: 'node-postgres' as const,
     schema: 'schema.sql',
   }
+  await assert.rejects(generateTypedSql(config), /@access read conflicts with PostgreSQL's write classification/u)
+
+  await writeFile(
+    join(root, 'queries/query.typed.sql'),
+    `-- @access read
+select public.volatile_sum(value) from (values (1), (2), (3)) input(value)
+`
+  )
   await assert.rejects(generateTypedSql(config), /@access read conflicts with PostgreSQL's write classification/u)
 
   await writeFile(
