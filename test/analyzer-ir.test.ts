@@ -535,6 +535,115 @@ test('preserves correlated CHECK metadata and folds CHECK result types through s
   }
 })
 
+test('resolves correlated derived provenance from the Var owner query scope', async () => {
+  const database = await createAnalysisDatabase({ schemaFiles: [schemaFile] })
+  try {
+    for (const sql of [
+      `create table public.scope_outer_left (
+         value text check (value in ('outer_left'))
+       )`,
+      `create table public.scope_outer_right (
+         value text check (value in ('outer_right'))
+       )`,
+      `create table public.scope_inner (
+         value text not null check (value in ('inner'))
+       )`,
+      "insert into public.scope_outer_left(value) values ('outer_left')",
+      "insert into public.scope_outer_right(value) values ('outer_right')",
+      "insert into public.scope_inner(value) values ('inner')",
+    ]) {
+      await database.query(sql)
+    }
+
+    const outerDerivedSql = `select lateral_value.value, lateral_value.nullable_value, lateral_value.payload
+      from (
+        select
+          value,
+          null::text as nullable_value,
+          jsonb_build_object('outer_left', value) as payload
+        from public.scope_outer_left
+        union all
+        select
+          value,
+          'present'::text as nullable_value,
+          jsonb_build_object('outer_right', value) as payload
+        from public.scope_outer_right
+      ) outer_row
+      cross join lateral (
+        select outer_row.value, outer_row.nullable_value, outer_row.payload
+        from (
+          select
+            value,
+            'inner-not-null'::text as nullable_value,
+            jsonb_build_object('inner', value) as payload
+          from public.scope_inner
+        ) unrelated_inner
+      ) lateral_value`
+    const levelTwoSql = `select level_one.value
+      from (
+        select value from public.scope_outer_left
+        union all
+        select value from public.scope_outer_right
+      ) outer_row
+      cross join lateral (
+        select level_two.value
+        from (select value from public.scope_inner) unrelated_one
+        cross join lateral (
+          select outer_row.value
+          from (select value from public.scope_inner) unrelated_two
+        ) level_two
+      ) level_one`
+
+    const result = await buildTypedSqlPostgresIrFromCompiledConfigs(database, [
+      config('outerDerivedScope', outerDerivedSql),
+      config('levelTwoScope', levelTwoSql),
+    ])
+    const queries = new Map(result.queries.map((query) => [query.name, query]))
+    const outerDerived = queries.get('outerDerivedScope')
+    const levelTwo = queries.get('levelTwoScope')
+    const left = { kind: 'named', name: 'ScopeOuterLeft__Value' } as const
+    const right = { kind: 'named', name: 'ScopeOuterRight__Value' } as const
+
+    assert.deepEqual(outerDerived?.resultColumns[0]?.checkConstraintType, {
+      kind: 'union',
+      members: [left, right],
+    })
+    assert.notDeepEqual(outerDerived?.resultColumns[0]?.checkConstraintType, {
+      kind: 'named',
+      name: 'ScopeInner__Value',
+    })
+    assert.equal(outerDerived?.resultColumns[1]?.nullable, true)
+
+    const jsonShape = outerDerived?.resultColumns[2]?.jsonShape
+    assert.equal(jsonShape?.kind, 'union')
+    if (jsonShape?.kind === 'union') {
+      assert.deepEqual(
+        jsonShape.alternatives.map((alternative) =>
+          alternative.kind === 'object' ? alternative.fields.map((field) => field.name) : alternative.kind
+        ),
+        [['outer_left'], ['outer_right']]
+      )
+    }
+
+    assert.deepEqual(levelTwo?.resultColumns[0]?.checkConstraintType, {
+      kind: 'union',
+      members: [left, right],
+    })
+
+    const executed = await database.query<{
+      readonly nullable_value: string | null
+      readonly payload: unknown
+      readonly value: string
+    }>(`${outerDerivedSql} order by value`)
+    assert.deepEqual(executed.rows, [
+      { nullable_value: null, payload: { outer_left: 'outer_left' }, value: 'outer_left' },
+      { nullable_value: 'present', payload: { outer_right: 'outer_right' }, value: 'outer_right' },
+    ])
+  } finally {
+    await database.close()
+  }
+})
+
 test('uses exact PostgreSQL proof objects for uniqueness, inheritance, checks, and expression completeness', async () => {
   const database = await createAnalysisDatabase({ schemaFiles: [schemaFile] })
   try {

@@ -209,6 +209,7 @@ interface PgAnalyzerCte {
 
 interface PgAnalyzerRte {
   readonly cteName?: string
+  readonly cteLevelSup?: number
   readonly inh?: boolean
   readonly kind: string
   readonly relid?: number | null
@@ -387,30 +388,64 @@ function resultTargets(query: PgAnalyzerQuery): readonly PgAnalyzerTarget[] {
   return targets.filter((target) => target.resjunk !== true)
 }
 
+interface QueryScope {
+  readonly parent: QueryScope | null
+  readonly query: PgAnalyzerQuery
+}
+
+function queryScope(query: PgAnalyzerQuery, parent: QueryScope | null = null): QueryScope {
+  return { parent, query }
+}
+
+function queryScopeAtLevel(scope: QueryScope, levelsUp: number): QueryScope | null {
+  let owner: QueryScope | null = scope
+  for (let level = 0; owner && level < levelsUp; level += 1) {
+    owner = owner.parent
+  }
+  return owner
+}
+
+function queryScopeForRteOutput(ownerScope: QueryScope, rte: PgAnalyzerRte): QueryScope | null {
+  if (rte.kind === 'SUBQUERY' && rte.subquery) {
+    return queryScope(rte.subquery, ownerScope)
+  }
+  if (rte.kind !== 'CTE') {
+    return null
+  }
+
+  const cteOwnerScope = queryScopeAtLevel(ownerScope, rte.cteLevelSup ?? 0)
+  const cteQuery = cteOwnerScope ? cteByName(cteOwnerScope.query, rte.cteName)?.query : undefined
+  return cteQuery && cteOwnerScope ? queryScope(cteQuery, cteOwnerScope) : null
+}
+
+function varOwnerRte(scope: QueryScope, expr: PgAnalyzerExpr): readonly [QueryScope, PgAnalyzerRte] | null {
+  if (expr.tag !== 'Var' || !expr.varno) {
+    return null
+  }
+
+  const ownerScope = queryScopeAtLevel(scope, expr.varlevelsup ?? 0)
+  const rte = ownerScope?.query.rtable?.[expr.varno - 1]
+  return ownerScope && rte ? [ownerScope, rte] : null
+}
+
 interface QueryOutputSemantics<T> {
   readonly except: (left: T, right: T) => T
   readonly intersect: (left: T, right: T) => T
-  readonly target: (query: PgAnalyzerQuery, target: PgAnalyzerTarget, scope: string) => T
+  readonly target: (scope: QueryScope, target: PgAnalyzerTarget) => T
   readonly union: (left: T, right: T) => T
   readonly unknown: () => T
 }
 
-function foldQueryOutput<T>(
-  query: PgAnalyzerQuery,
-  outputIndex: number,
-  semantics: QueryOutputSemantics<T>,
-  scope: string
-): T {
-  const foldSetOperation = (operation: PgAnalyzerSetOperation, operationScope: string): T => {
+function foldQueryOutput<T>(scope: QueryScope, outputIndex: number, semantics: QueryOutputSemantics<T>): T {
+  const { query } = scope
+  const foldSetOperation = (operation: PgAnalyzerSetOperation): T => {
     if (operation.kind === 'leaf') {
       const leafQuery = query.rtable?.[operation.rtindex - 1]?.subquery
-      return leafQuery
-        ? foldQueryOutput(leafQuery, outputIndex, semantics, `${operationScope}/leaf:${operation.rtindex}`)
-        : semantics.unknown()
+      return leafQuery ? foldQueryOutput(queryScope(leafQuery, scope), outputIndex, semantics) : semantics.unknown()
     }
 
-    const left = foldSetOperation(operation.left, `${operationScope}/left`)
-    const right = foldSetOperation(operation.right, `${operationScope}/right`)
+    const left = foldSetOperation(operation.left)
+    const right = foldSetOperation(operation.right)
     switch (operation.operation) {
       case 'UNION':
         return semantics.union(left, right)
@@ -422,11 +457,11 @@ function foldQueryOutput<T>(
   }
 
   if (query.setOperation) {
-    return foldSetOperation(query.setOperation, `${scope}/set`)
+    return foldSetOperation(query.setOperation)
   }
 
   const target = resultTargets(query)[outputIndex]
-  return target ? semantics.target(query, target, scope) : semantics.unknown()
+  return target ? semantics.target(scope, target) : semantics.unknown()
 }
 
 function rowCardinalityFromBounds(bounds: TypedSqlPostgresIrRowBounds): TypedSqlPostgresIrRowCardinality {
@@ -1157,6 +1192,19 @@ function exprKey(expr: PgAnalyzerExpr | null | undefined): string | null {
   return `${expr.varno}:${expr.varattno}:${expr.varlevelsup ?? 0}`
 }
 
+interface VisitedVar {
+  readonly key: string
+  readonly query: PgAnalyzerQuery
+}
+
+function visitVar(seen: readonly VisitedVar[], scope: QueryScope, expr: PgAnalyzerExpr): readonly VisitedVar[] | null {
+  const key = exprKey(expr)
+  if (!key || seen.some((visited) => visited.query === scope.query && visited.key === key)) {
+    return null
+  }
+  return [...seen, { key, query: scope.query }]
+}
+
 function collectNonNullVarKeys(expr: PgAnalyzerExpr | null | undefined): ReadonlySet<string> {
   if (expr?.tag === 'NullTest' && expr.nullTestType === 'IS_NOT_NULL') {
     const key = exprKey(expr.arg)
@@ -1186,25 +1234,18 @@ function cteByName(query: PgAnalyzerQuery, name: string | undefined): PgAnalyzer
 
 function checkConstraintTypeForQueryOutput(
   catalog: CatalogFacts,
-  query: PgAnalyzerQuery,
+  scope: QueryScope,
   outputIndex: number,
-  seen: ReadonlySet<string>,
-  queryScope: string
+  seen: readonly VisitedVar[]
 ): TypedSqlPostgresIrCheckConstraintTypeExpression | null {
-  return foldQueryOutput<TypedSqlPostgresIrCheckConstraintTypeExpression | null>(
-    query,
-    outputIndex,
-    {
-      except: (left) => left,
-      intersect: (left, right) =>
-        left && right ? combineCheckConstraintTypes('intersection', left, right) : (left ?? right),
-      target: (leafQuery, target, scope) =>
-        checkConstraintTypeForExpr(catalog, leafQuery, target.expr, new Set(seen), scope),
-      union: (left, right) => (left && right ? combineCheckConstraintTypes('union', left, right) : null),
-      unknown: () => null,
-    },
-    queryScope
-  )
+  return foldQueryOutput<TypedSqlPostgresIrCheckConstraintTypeExpression | null>(scope, outputIndex, {
+    except: (left) => left,
+    intersect: (left, right) =>
+      left && right ? combineCheckConstraintTypes('intersection', left, right) : (left ?? right),
+    target: (targetScope, target) => checkConstraintTypeForExpr(catalog, targetScope, target.expr, seen),
+    union: (left, right) => (left && right ? combineCheckConstraintTypes('union', left, right) : null),
+    unknown: () => null,
+  })
 }
 
 function checkConstraintTypeKey(type: TypedSqlPostgresIrCheckConstraintTypeExpression): string {
@@ -1232,23 +1273,18 @@ function combineCheckConstraintTypes(
 
 function checkConstraintTypeForExpr(
   catalog: CatalogFacts,
-  query: PgAnalyzerQuery,
+  scope: QueryScope,
   expr: PgAnalyzerExpr | null | undefined,
-  seen: Set<string>,
-  queryScope: string
+  seen: readonly VisitedVar[]
 ): TypedSqlPostgresIrCheckConstraintTypeExpression | null {
   const unwrapped = unwrapValuePreservingExpr(expr)
   if (!unwrapped || unwrapped.tag !== 'Var') {
     return null
   }
 
-  const key = exprKey(unwrapped)
-  const scopedKey = key ? `${queryScope}:${key}` : null
-  if (scopedKey && seen.has(scopedKey)) {
+  const nestedSeen = visitVar(seen, scope, unwrapped)
+  if (!nestedSeen) {
     return null
-  }
-  if (scopedKey) {
-    seen.add(scopedKey)
   }
 
   if (unwrapped.relid && unwrapped.varattno) {
@@ -1263,40 +1299,19 @@ function checkConstraintTypeForExpr(
     }
   }
 
-  const rte = unwrapped.varno ? query.rtable?.[unwrapped.varno - 1] : undefined
-  if (rte?.kind === 'CTE') {
-    const cte = cteByName(query, rte.cteName)
-    const cteQuery = cte?.query
-    return cteQuery
-      ? checkConstraintTypeForQueryOutput(
-          catalog,
-          cteQuery,
-          (unwrapped.varattno ?? 1) - 1,
-          seen,
-          `${queryScope}/cte:${rte.cteName ?? 'unknown'}`
-        )
-      : null
-  }
-  if (rte?.kind === 'SUBQUERY' && rte.subquery) {
-    return checkConstraintTypeForQueryOutput(
-      catalog,
-      rte.subquery,
-      (unwrapped.varattno ?? 1) - 1,
-      seen,
-      `${queryScope}/subquery:${key ?? 'var'}`
-    )
-  }
-
-  return null
+  const ownerRte = varOwnerRte(scope, unwrapped)
+  const outputScope = ownerRte ? queryScopeForRteOutput(...ownerRte) : null
+  return outputScope
+    ? checkConstraintTypeForQueryOutput(catalog, outputScope, (unwrapped.varattno ?? 1) - 1, nestedSeen)
+    : null
 }
 
 function namedCheckConstraintTypeForExpr(
   catalog: CatalogFacts,
-  query: PgAnalyzerQuery,
-  expr: PgAnalyzerExpr | null | undefined,
-  queryScope: string
+  scope: QueryScope,
+  expr: PgAnalyzerExpr | null | undefined
 ): string | null {
-  const type = checkConstraintTypeForExpr(catalog, query, expr, new Set(), queryScope)
+  const type = checkConstraintTypeForExpr(catalog, scope, expr, [])
   return type?.kind === 'named' ? type.name : null
 }
 
@@ -1345,26 +1360,21 @@ function checkedColumnParamTypes(
   return resolved
 }
 
-function queryOutputNullable(catalog: CatalogFacts, query: PgAnalyzerQuery, outputIndex: number): boolean {
-  return foldQueryOutput<boolean>(
-    query,
-    outputIndex,
-    {
-      except: (left) => left,
-      intersect: (left, right) => left && right,
-      target: (leafQuery, target) => expressionNullable(catalog, leafQuery, target.expr),
-      union: (left, right) => left || right,
-      unknown: () => true,
-    },
-    'nullability'
-  )
+function queryOutputNullable(catalog: CatalogFacts, scope: QueryScope, outputIndex: number): boolean {
+  return foldQueryOutput<boolean>(scope, outputIndex, {
+    except: (left) => left,
+    intersect: (left, right) => left && right,
+    target: (targetScope, target) => expressionNullable(catalog, targetScope, target.expr),
+    union: (left, right) => left || right,
+    unknown: () => true,
+  })
 }
 
 function expressionNullable(
   catalog: CatalogFacts,
-  query: PgAnalyzerQuery,
+  scope: QueryScope,
   expr: PgAnalyzerExpr | null | undefined,
-  refinements = collectNonNullVarKeys(query.whereQual)
+  refinements = collectNonNullVarKeys(scope.query.whereQual)
 ): boolean {
   if (!expr || expr.truncated === true) {
     return true
@@ -1384,16 +1394,9 @@ function expressionNullable(
       }
     }
 
-    const rte = expr.varno ? query.rtable?.[expr.varno - 1] : undefined
-    if (rte?.kind === 'CTE') {
-      const cte = cteByName(query, rte.cteName)
-      const cteQuery = cte?.query
-      return cteQuery ? queryOutputNullable(catalog, cteQuery, (expr.varattno ?? 1) - 1) : true
-    }
-    if (rte?.kind === 'SUBQUERY' && rte.subquery) {
-      return queryOutputNullable(catalog, rte.subquery, (expr.varattno ?? 1) - 1)
-    }
-    return true
+    const ownerRte = varOwnerRte(scope, expr)
+    const outputScope = ownerRte ? queryScopeForRteOutput(...ownerRte) : null
+    return outputScope ? queryOutputNullable(catalog, outputScope, (expr.varattno ?? 1) - 1) : true
   }
 
   if (expr.tag === 'Const') {
@@ -1412,16 +1415,16 @@ function expressionNullable(
     return !isBuiltinPgProcNamed(catalog, expr.aggfnoid, 'count')
   }
   if (expr.tag === 'CoalesceExpr') {
-    return !exprChildren(expr).some((child) => !expressionNullable(catalog, query, child, refinements))
+    return !exprChildren(expr).some((child) => !expressionNullable(catalog, scope, child, refinements))
   }
   if (expr.tag === 'CaseExpr') {
     const results = [...(expr.whenClauses ?? []).map((whenClause) => whenClause.result), expr.defresult].filter(
       (child): child is PgAnalyzerExpr => Boolean(child)
     )
-    return results.length === 0 || results.some((result) => expressionNullable(catalog, query, result, refinements))
+    return results.length === 0 || results.some((result) => expressionNullable(catalog, scope, result, refinements))
   }
   if (expr.tag === 'BoolExpr') {
-    return exprChildren(expr).some((child) => expressionNullable(catalog, query, child, refinements))
+    return exprChildren(expr).some((child) => expressionNullable(catalog, scope, child, refinements))
   }
   if (expr.tag === 'FuncExpr') {
     if (
@@ -1432,7 +1435,7 @@ function expressionNullable(
     }
   }
   if (expr.tag === 'RelabelType' || expr.tag === 'CoerceViaIO') {
-    return expressionNullable(catalog, query, expr.arg, refinements)
+    return expressionNullable(catalog, scope, expr.arg, refinements)
   }
 
   return true
@@ -1548,7 +1551,7 @@ function combineJsonShapes(
 
 function scalarJsonShapeForExpr(
   catalog: CatalogFacts,
-  query: PgAnalyzerQuery,
+  scope: QueryScope,
   expr: PgAnalyzerExpr,
   refinements: ReadonlySet<string>
 ): TypedSqlPostgresIrJsonShape {
@@ -1556,14 +1559,14 @@ function scalarJsonShapeForExpr(
   if (isJsonType(typeFact.pgTypeName)) {
     return {
       kind: 'opaque',
-      nullable: expressionNullable(catalog, query, expr, refinements),
+      nullable: expressionNullable(catalog, scope, expr, refinements),
     }
   }
 
-  const checkConstraintType = namedCheckConstraintTypeForExpr(catalog, query, expr, 'json-scalar')
+  const checkConstraintType = namedCheckConstraintTypeForExpr(catalog, scope, expr)
   return {
     kind: 'scalar',
-    nullable: expressionNullable(catalog, query, expr, refinements),
+    nullable: expressionNullable(catalog, scope, expr, refinements),
     ...typeFact,
     ...(checkConstraintType ? { checkConstraintTypeName: checkConstraintType } : {}),
   }
@@ -1571,36 +1574,29 @@ function scalarJsonShapeForExpr(
 
 function inferQueryOutputJsonShape(
   catalog: CatalogFacts,
-  query: PgAnalyzerQuery,
+  scope: QueryScope,
   outputIndex: number,
-  seen: ReadonlySet<string>,
-  queryScope: string
+  seen: readonly VisitedVar[]
 ): TypedSqlPostgresIrJsonShape {
-  return foldQueryOutput<TypedSqlPostgresIrJsonShape>(
-    query,
-    outputIndex,
-    {
-      except: (left) => left,
-      intersect: (left, right) => combineJsonShapes(left, right, left.nullable && right.nullable, 'INTERSECT'),
-      target: (leafQuery, target, scope) =>
-        inferJsonShape(catalog, leafQuery, target.expr, undefined, new Set(seen), scope) ?? {
-          kind: 'opaque',
-          nullable: expressionNullable(catalog, leafQuery, target.expr),
-        },
-      union: (left, right) => combineJsonShapes(left, right, left.nullable || right.nullable, 'UNION'),
-      unknown: () => ({ kind: 'opaque', nullable: true }),
-    },
-    queryScope
-  )
+  return foldQueryOutput<TypedSqlPostgresIrJsonShape>(scope, outputIndex, {
+    except: (left) => left,
+    intersect: (left, right) => combineJsonShapes(left, right, left.nullable && right.nullable, 'INTERSECT'),
+    target: (targetScope, target) =>
+      inferJsonShape(catalog, targetScope, target.expr, undefined, seen) ?? {
+        kind: 'opaque',
+        nullable: expressionNullable(catalog, targetScope, target.expr),
+      },
+    union: (left, right) => combineJsonShapes(left, right, left.nullable || right.nullable, 'UNION'),
+    unknown: () => ({ kind: 'opaque', nullable: true }),
+  })
 }
 
 function inferJsonShape(
   catalog: CatalogFacts,
-  query: PgAnalyzerQuery,
+  scope: QueryScope,
   expr: PgAnalyzerExpr | null | undefined,
-  refinements = collectNonNullVarKeys(query.whereQual),
-  seen = new Set<string>(),
-  queryScope = 'root'
+  refinements = collectNonNullVarKeys(scope.query.whereQual),
+  seen: readonly VisitedVar[] = []
 ): TypedSqlPostgresIrJsonShape | null {
   const unwrapped = unwrapTransparentExpr(expr)
   if (!unwrapped || unwrapped.truncated === true) {
@@ -1609,7 +1605,7 @@ function inferJsonShape(
 
   if (unwrapped.tag === 'CoalesceExpr') {
     const children = exprChildren(unwrapped)
-    const firstShape = inferJsonShape(catalog, query, children[0], refinements, seen, queryScope)
+    const firstShape = inferJsonShape(catalog, scope, children[0], refinements, seen)
     if (!firstShape) {
       return null
     }
@@ -1620,7 +1616,7 @@ function inferJsonShape(
 
     return {
       kind: 'opaque',
-      nullable: expressionNullable(catalog, query, unwrapped, refinements),
+      nullable: expressionNullable(catalog, scope, unwrapped, refinements),
     }
   }
 
@@ -1639,22 +1635,22 @@ function inferJsonShape(
       if (key === null || !value) {
         return {
           kind: 'opaque',
-          nullable: expressionNullable(catalog, query, unwrapped, refinements),
+          nullable: expressionNullable(catalog, scope, unwrapped, refinements),
         }
       }
 
       fields.set(key, {
         name: key,
         shape:
-          inferJsonShape(catalog, query, value, refinements, seen, queryScope) ??
-          scalarJsonShapeForExpr(catalog, query, value, refinements),
+          inferJsonShape(catalog, scope, value, refinements, seen) ??
+          scalarJsonShapeForExpr(catalog, scope, value, refinements),
       })
     }
 
     return {
       fields: [...fields.values()],
       kind: 'object',
-      nullable: expressionNullable(catalog, query, unwrapped, refinements),
+      nullable: expressionNullable(catalog, scope, unwrapped, refinements),
     }
   }
 
@@ -1670,56 +1666,31 @@ function inferJsonShape(
 
     return {
       element:
-        inferJsonShape(catalog, query, valueExpr, refinements, seen, queryScope) ??
-        scalarJsonShapeForExpr(catalog, query, valueExpr, refinements),
+        inferJsonShape(catalog, scope, valueExpr, refinements, seen) ??
+        scalarJsonShapeForExpr(catalog, scope, valueExpr, refinements),
       kind: 'array',
-      nullable: expressionNullable(catalog, query, unwrapped, refinements),
+      nullable: expressionNullable(catalog, scope, unwrapped, refinements),
     }
   }
 
   if (unwrapped.tag === 'Var') {
-    const key = exprKey(unwrapped)
-    const scopedKey = key ? `${queryScope}:${key}` : null
-    if (scopedKey && seen.has(scopedKey)) {
+    const nestedSeen = visitVar(seen, scope, unwrapped)
+    if (!nestedSeen) {
       return null
     }
-    const nestedSeen = scopedKey ? new Set(seen) : seen
-    if (scopedKey) {
-      nestedSeen.add(scopedKey)
-    }
 
-    const rte = unwrapped.varno ? query.rtable?.[unwrapped.varno - 1] : undefined
-    if (rte?.kind === 'CTE') {
-      const cte = cteByName(query, rte.cteName)
-      const cteQuery = cte?.query
-      const shape = cteQuery
-        ? inferQueryOutputJsonShape(
-            catalog,
-            cteQuery,
-            (unwrapped.varattno ?? 1) - 1,
-            nestedSeen,
-            `${queryScope}/cte:${rte.cteName}`
-          )
-        : null
-      return shape ? jsonShapeWithNullability(shape, expressionNullable(catalog, query, unwrapped, refinements)) : null
-    }
-
-    if (rte?.kind === 'SUBQUERY' && rte.subquery) {
-      const shape = inferQueryOutputJsonShape(
-        catalog,
-        rte.subquery,
-        (unwrapped.varattno ?? 1) - 1,
-        nestedSeen,
-        `${queryScope}/subquery:${key ?? 'var'}`
-      )
-      return shape ? jsonShapeWithNullability(shape, expressionNullable(catalog, query, unwrapped, refinements)) : null
-    }
+    const ownerRte = varOwnerRte(scope, unwrapped)
+    const outputScope = ownerRte ? queryScopeForRteOutput(...ownerRte) : null
+    const shape = outputScope
+      ? inferQueryOutputJsonShape(catalog, outputScope, (unwrapped.varattno ?? 1) - 1, nestedSeen)
+      : null
+    return shape ? jsonShapeWithNullability(shape, expressionNullable(catalog, scope, unwrapped, refinements)) : null
   }
 
   if (isJsonType(unwrapped.typeName)) {
     return {
       kind: 'opaque',
-      nullable: expressionNullable(catalog, query, unwrapped, refinements),
+      nullable: expressionNullable(catalog, scope, unwrapped, refinements),
     }
   }
 
@@ -1728,17 +1699,18 @@ function inferJsonShape(
 
 function normalizeCompiledIr(catalog: CatalogFacts, analyzed: AnalyzedCompiledConfig): TypedSqlPostgresIr {
   const { analysis, config, primaryQuery: query, rewrittenQueries } = analyzed
+  const rootScope = queryScope(query)
 
   const resultColumns = resultTargets(query).map((target, outputIndex): TypedSqlPostgresIrColumn => {
     const expr = target.expr
     const typeFact = typeFactForOid(catalog, expr?.typeOid, expr?.typeName)
-    const checkConstraintType = checkConstraintTypeForQueryOutput(catalog, query, outputIndex, new Set(), 'result')
+    const checkConstraintType = checkConstraintTypeForQueryOutput(catalog, rootScope, outputIndex, [])
     return {
       jsonShape: isJsonType(typeFact.pgTypeName)
-        ? inferQueryOutputJsonShape(catalog, query, outputIndex, new Set(), 'root')
+        ? inferQueryOutputJsonShape(catalog, rootScope, outputIndex, [])
         : undefined,
       name: target.resname ?? null,
-      nullable: queryOutputNullable(catalog, query, outputIndex),
+      nullable: queryOutputNullable(catalog, rootScope, outputIndex),
       ...typeFact,
       source: sourceForExpr(expr),
       ...(checkConstraintType ? { checkConstraintType } : {}),

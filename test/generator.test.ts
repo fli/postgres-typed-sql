@@ -1214,6 +1214,37 @@ select right_value.value from public.check_right right_value`)
 intersect
 select value from public.check_left`)
   assert.match(output, /readonly value: \(CheckLeft__Value \| CheckRight__Value\) & CheckLeft__Value \| null/u)
+
+  output = await generate(`select lateral_value.value, lateral_value.nullable_value, lateral_value.payload
+from (
+  select
+    value,
+    null::text as nullable_value,
+    jsonb_build_object('outer_left', value) as payload
+  from public.check_left
+  union all
+  select
+    value,
+    'present'::text as nullable_value,
+    jsonb_build_object('outer_right', value) as payload
+  from public.check_right
+) outer_row
+cross join lateral (
+  select outer_row.value, outer_row.nullable_value, outer_row.payload
+  from (
+    select
+      value,
+      'inner-not-null'::text as nullable_value,
+      jsonb_build_object('inner', value) as payload
+    from public.inner_correlation
+  ) unrelated_inner
+) lateral_value`)
+  assert.match(output, /readonly value: CheckLeft__Value \| CheckRight__Value \| null/u)
+  assert.doesNotMatch(output, /readonly value: InnerCorrelation__Value/u)
+  assert.match(output, /readonly nullable_value: string \| null/u)
+  assert.match(output, /interface QueryJ7_payloadJsonJ12_alternative1 \{[\s\S]*readonly outer_left:/u)
+  assert.match(output, /interface QueryJ7_payloadJsonJ12_alternative2 \{[\s\S]*readonly outer_right:/u)
+  assert.doesNotMatch(output, /readonly inner:/u)
 })
 
 test('renders every inferable JSON object alternative from set-operation outputs', async () => {
