@@ -293,6 +293,112 @@ test('native analyzer classifies NULL admission at PostgreSQL expression context
   })
 })
 
+test('native analyzer requires CHECK expressions to be safe when proving NULL admission', async () => {
+  await withDatabase(async (database) => {
+    await database.query(`create function public.reject_null_arg(value integer)
+      returns integer
+      language plpgsql
+      immutable
+      as $$
+      begin
+        if value is null then
+          raise exception 'reject_null_arg rejected null';
+        end if;
+        return value;
+      end
+      $$`)
+    await database.query(`create function public.strict_pair(left_value integer, right_value integer)
+      returns boolean
+      language plpgsql
+      immutable
+      strict
+      as $$
+      begin
+        return true;
+      end
+      $$`)
+    await database.query(`create function public.reject_null_bool(value integer)
+      returns boolean
+      language plpgsql
+      immutable
+      as $$
+      begin
+        if value is null then
+          raise exception 'reject_null_bool rejected null';
+        end if;
+        return true;
+      end
+      $$`)
+    await database.query(`create table public.unsafe_check_probe (
+      operation_value integer check (operation_value = public.reject_null_arg(operation_value)),
+      function_value integer check (public.strict_pair(function_value, public.reject_null_arg(function_value))),
+      scalar_array_value integer check (
+        scalar_array_value = any (array[public.reject_null_arg(scalar_array_value)])
+      ),
+      boolean_value integer check (public.reject_null_bool(boolean_value) or boolean_value is null)
+    )`)
+    await database.query(`create domain public.unsafe_check_domain as integer
+      check (value = public.reject_null_arg(value))`)
+    await database.query('create table public.unsafe_domain_probe (value public.unsafe_check_domain)')
+
+    const unsafeCases = [
+      {
+        error: /reject_null_arg rejected null/u,
+        sql: `insert into public.unsafe_check_probe(
+          operation_value, function_value, scalar_array_value, boolean_value
+        ) select $1, 1, 1, 1`,
+      },
+      {
+        error: /reject_null_arg rejected null/u,
+        sql: `insert into public.unsafe_check_probe(
+          operation_value, function_value, scalar_array_value, boolean_value
+        ) select 1, $1, 1, 1`,
+      },
+      {
+        error: /reject_null_arg rejected null/u,
+        sql: `insert into public.unsafe_check_probe(
+          operation_value, function_value, scalar_array_value, boolean_value
+        ) select 1, 1, $1, 1`,
+      },
+      {
+        error: /reject_null_bool rejected null/u,
+        sql: `insert into public.unsafe_check_probe(
+          operation_value, function_value, scalar_array_value, boolean_value
+        ) select 1, 1, 1, $1`,
+      },
+      {
+        error: /reject_null_arg rejected null/u,
+        sql: 'insert into public.unsafe_domain_probe(value) select $1',
+      },
+    ] as const
+
+    for (const unsafeCase of unsafeCases) {
+      const analysis = await analyze(database, unsafeCase.sql, [])
+      assert.equal(
+        analysis.statements[0]?.queries[0]?.dmlParameterTargets[0]?.targetNullAdmission,
+        'unknown',
+        unsafeCase.sql
+      )
+      await assert.rejects(database.query(unsafeCase.sql, [null]), unsafeCase.error)
+    }
+
+    await database.query(`create table public.safe_check_probe (
+      direct_value text check (direct_value = 'allowed'),
+      scalar_array_value text check (scalar_array_value = any (array['one', 'two'])),
+      boolean_value text check (boolean_value is null or boolean_value = 'allowed')
+    )`)
+    const safeSql = `insert into public.safe_check_probe(direct_value, scalar_array_value, boolean_value)
+      select $1, $2, $3`
+    const safeAnalysis = await analyze(database, safeSql, [])
+    assert.ok(
+      safeAnalysis.statements[0]?.queries[0]?.dmlParameterTargets.every(
+        ({ targetNullAdmission }) => targetNullAdmission === 'accepts'
+      )
+    )
+    await database.query(safeSql, [null, null, null])
+  })
+})
+
 test('native analyzer reports row locks recursively through join predicates', async () => {
   await withDatabase(async (database) => {
     const analysis = await analyze(

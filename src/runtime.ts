@@ -83,6 +83,7 @@ export interface TypedSqlStatement<
   readonly name: string
   readonly parameterNames: readonly (keyof Params & string)[]
   readonly parameters: readonly TypedSqlParameterMetadata[]
+  readonly resultRowMode?: 'array'
   readonly rowBounds: TypedSqlRowBounds
   readonly text: string
   readonly type?: Row
@@ -144,6 +145,7 @@ export function createTypedSqlStatement<
     name: definition.name,
     parameterNames: definition.parameterNames,
     parameters: definition.parameters ?? [],
+    resultRowMode: definition.columns !== undefined ? 'array' : undefined,
     rowBounds: definition.rowBounds ?? {
       max: null,
       min: 0,
@@ -269,13 +271,23 @@ export async function executeTypedSql<Params extends TypedSqlParams, Row>(
   statement: TypedSqlStatement<Params, Row>,
   params: Params
 ): Promise<Row[]> {
-  const result = await client.query<TypedSqlArrayRow>({
+  if (statement.resultRowMode === 'array') {
+    const result = await client.query<TypedSqlArrayRow>({
+      name: statement.name,
+      rowMode: 'array',
+      text: statement.text,
+      values: statement.values(params),
+    })
+    return mapTypedSqlRows(statement, result.rows)
+  }
+
+  const result = await client.query<TypedSqlRawRow>({
     name: statement.name,
-    rowMode: 'array',
     text: statement.text,
     values: statement.values(params),
   })
-  return mapTypedSqlRows(statement, result.rows)
+  // oxlint-disable-next-line typescript/no-unsafe-type-assertion -- A custom statement without result-column metadata retains the driver's object-row shape as its declared Row type.
+  return result.rows as Row[]
 }
 
 export async function executeTypedSqlOptional<Params extends TypedSqlParams, Row>(

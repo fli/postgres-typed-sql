@@ -93,6 +93,13 @@ typedef enum NullProof
   NULL_PROOF_UNKNOWN
 } NullProof;
 
+typedef struct NullEvaluation
+{
+  NullProof proof;
+  bool evaluation_safe;
+  bool depends_on_subject;
+} NullEvaluation;
+
 typedef enum TypeNullAdmission
 {
   TYPE_NULL_ADMITS,
@@ -267,7 +274,7 @@ typedef struct ParameterNodeKey
 typedef struct ParameterNodeAnalysisEntry
 {
   ParameterNodeKey key;
-  NullProof proof;
+  NullEvaluation null_evaluation;
   bool proof_known;
   bool mentions_parameter;
   bool mention_known;
@@ -293,35 +300,45 @@ typedef struct ParameterUsageContext
   HTAB *node_analysis;
 } ParameterUsageContext;
 
-static NullProof
-invert_null_proof(NullProof proof)
+static NullEvaluation
+make_null_evaluation(NullProof proof, bool evaluation_safe,
+                     bool depends_on_subject)
 {
-  if (proof == NULL_PROOF_TRUE)
-  {
-    return NULL_PROOF_FALSE;
-  }
-  if (proof == NULL_PROOF_FALSE)
-  {
-    return NULL_PROOF_TRUE;
-  }
-  return proof;
+  NullEvaluation evaluation = {proof, evaluation_safe, depends_on_subject};
+
+  return evaluation;
 }
 
-static NullProof
-check_null_proof_for_subject_uncached(const Node *expr,
-                                      const NullProofSubject *subject);
+static NullEvaluation
+invert_null_evaluation(NullEvaluation evaluation)
+{
+  if (evaluation.proof == NULL_PROOF_TRUE)
+  {
+    evaluation.proof = NULL_PROOF_FALSE;
+  }
+  else if (evaluation.proof == NULL_PROOF_FALSE)
+  {
+    evaluation.proof = NULL_PROOF_TRUE;
+  }
+  return evaluation;
+}
 
-static NullProof
-check_null_proof_for_subject(const Node *expr, const NullProofSubject *subject)
+static NullEvaluation
+check_null_evaluation_for_subject_uncached(const Node *expr,
+                                           const NullProofSubject *subject);
+
+static NullEvaluation
+check_null_evaluation_for_subject(const Node *expr,
+                                  const NullProofSubject *subject)
 {
   ParameterNodeKey key;
   ParameterNodeAnalysisEntry *entry;
-  NullProof proof;
+  NullEvaluation evaluation;
   bool found;
 
   if (expr == NULL || subject->node_analysis == NULL || subject->param_id <= 0)
   {
-    return check_null_proof_for_subject_uncached(expr, subject);
+    return check_null_evaluation_for_subject_uncached(expr, subject);
   }
 
   memset(&key, 0, sizeof(key));
@@ -330,41 +347,45 @@ check_null_proof_for_subject(const Node *expr, const NullProofSubject *subject)
   entry = hash_search(subject->node_analysis, &key, HASH_FIND, &found);
   if (found && entry->proof_known)
   {
-    return entry->proof;
+    return entry->null_evaluation;
   }
 
-  proof = check_null_proof_for_subject_uncached(expr, subject);
+  evaluation = check_null_evaluation_for_subject_uncached(expr, subject);
   entry = hash_search(subject->node_analysis, &key, HASH_ENTER, &found);
   if (!found)
   {
     entry->mention_known = false;
   }
-  entry->proof = proof;
+  entry->null_evaluation = evaluation;
   entry->proof_known = true;
-  return proof;
+  return evaluation;
 }
 
-static NullProof
-check_null_proof_for_subject_uncached(const Node *expr,
-                                      const NullProofSubject *subject)
+static NullEvaluation
+check_null_evaluation_for_subject_uncached(const Node *expr,
+                                           const NullProofSubject *subject)
 {
   if (expr == NULL)
   {
-    return NULL_PROOF_UNKNOWN;
+    return make_null_evaluation(NULL_PROOF_UNKNOWN, false, true);
   }
 
   switch (nodeTag(expr))
   {
     case T_CoerceToDomainValue:
-      return NULL_PROOF_NULL;
+      return make_null_evaluation(NULL_PROOF_NULL, true, true);
     case T_Param:
     {
       const Param *parameter = (const Param *) expr;
 
-      return subject->param_id > 0 && parameter->paramkind == PARAM_EXTERN &&
-             parameter->paramid == subject->param_id
-               ? NULL_PROOF_NULL
-               : NULL_PROOF_UNKNOWN;
+      return make_null_evaluation(
+        subject->param_id > 0 && parameter->paramkind == PARAM_EXTERN &&
+            parameter->paramid == subject->param_id
+          ? NULL_PROOF_NULL
+          : NULL_PROOF_UNKNOWN,
+        true,
+        subject->param_id > 0 && parameter->paramkind == PARAM_EXTERN &&
+          parameter->paramid == subject->param_id);
     }
     case T_Var:
     {
@@ -373,9 +394,9 @@ check_null_proof_for_subject_uncached(const Node *expr,
       if (subject->target_attnum > 0 && variable->varlevelsup == 0 && variable->varno == 1 &&
           variable->varattno == subject->target_attnum)
       {
-        return NULL_PROOF_NULL;
+        return make_null_evaluation(NULL_PROOF_NULL, true, true);
       }
-      return NULL_PROOF_UNKNOWN;
+      return make_null_evaluation(NULL_PROOF_UNKNOWN, true, false);
     }
     case T_Const:
     {
@@ -383,69 +404,114 @@ check_null_proof_for_subject_uncached(const Node *expr,
 
       if (constant->constisnull)
       {
-        return NULL_PROOF_NULL;
+        return make_null_evaluation(NULL_PROOF_NULL, true, false);
       }
       if (constant->consttype == BOOLOID)
       {
-        return DatumGetBool(constant->constvalue) ? NULL_PROOF_TRUE : NULL_PROOF_FALSE;
+        return make_null_evaluation(
+          DatumGetBool(constant->constvalue) ? NULL_PROOF_TRUE : NULL_PROOF_FALSE,
+          true, false);
       }
-      return NULL_PROOF_NONNULL;
+      return make_null_evaluation(NULL_PROOF_NONNULL, true, false);
     }
     case T_RelabelType:
-      return check_null_proof_for_subject((const Node *) ((const RelabelType *) expr)->arg,
-                                          subject);
+      return check_null_evaluation_for_subject(
+        (const Node *) ((const RelabelType *) expr)->arg, subject);
     case T_CollateExpr:
-      return check_null_proof_for_subject((const Node *) ((const CollateExpr *) expr)->arg,
-                                          subject);
+      return check_null_evaluation_for_subject(
+        (const Node *) ((const CollateExpr *) expr)->arg, subject);
     case T_CoerceViaIO:
-      return check_null_proof_for_subject((const Node *) ((const CoerceViaIO *) expr)->arg,
-                                          subject);
+    {
+      NullEvaluation argument = check_null_evaluation_for_subject(
+        (const Node *) ((const CoerceViaIO *) expr)->arg, subject);
+
+      return make_null_evaluation(argument.proof,
+                                  argument.evaluation_safe &&
+                                    argument.proof == NULL_PROOF_NULL,
+                                  argument.depends_on_subject);
+    }
     case T_ArrayCoerceExpr:
-      return check_null_proof_for_subject((const Node *) ((const ArrayCoerceExpr *) expr)->arg,
-                                          subject);
+    {
+      NullEvaluation argument = check_null_evaluation_for_subject(
+        (const Node *) ((const ArrayCoerceExpr *) expr)->arg, subject);
+
+      return make_null_evaluation(argument.proof,
+                                  argument.evaluation_safe &&
+                                    argument.proof == NULL_PROOF_NULL,
+                                  argument.depends_on_subject);
+    }
     case T_ConvertRowtypeExpr:
-      return check_null_proof_for_subject((const Node *) ((const ConvertRowtypeExpr *) expr)->arg,
-                                          subject);
+    {
+      NullEvaluation argument = check_null_evaluation_for_subject(
+        (const Node *) ((const ConvertRowtypeExpr *) expr)->arg, subject);
+
+      return make_null_evaluation(argument.proof,
+                                  argument.evaluation_safe &&
+                                    argument.proof == NULL_PROOF_NULL,
+                                  argument.depends_on_subject);
+    }
     case T_NullTest:
     {
       const NullTest *test = (const NullTest *) expr;
-      NullProof argument = check_null_proof_for_subject((const Node *) test->arg, subject);
+      NullEvaluation argument = check_null_evaluation_for_subject(
+        (const Node *) test->arg, subject);
 
-      if (test->argisrow || argument == NULL_PROOF_UNKNOWN)
+      if (test->argisrow || argument.proof == NULL_PROOF_UNKNOWN)
       {
-        return NULL_PROOF_UNKNOWN;
+        return make_null_evaluation(NULL_PROOF_UNKNOWN,
+                                    argument.evaluation_safe,
+                                    argument.depends_on_subject);
       }
-      if (argument == NULL_PROOF_NULL)
+      if (argument.proof == NULL_PROOF_NULL)
       {
-        return test->nulltesttype == IS_NULL ? NULL_PROOF_TRUE : NULL_PROOF_FALSE;
+        return make_null_evaluation(
+          test->nulltesttype == IS_NULL ? NULL_PROOF_TRUE : NULL_PROOF_FALSE,
+          argument.evaluation_safe, argument.depends_on_subject);
       }
-      return test->nulltesttype == IS_NULL ? NULL_PROOF_FALSE : NULL_PROOF_TRUE;
+      return make_null_evaluation(
+        test->nulltesttype == IS_NULL ? NULL_PROOF_FALSE : NULL_PROOF_TRUE,
+        argument.evaluation_safe, argument.depends_on_subject);
     }
     case T_BooleanTest:
     {
       const BooleanTest *test = (const BooleanTest *) expr;
-      NullProof argument = check_null_proof_for_subject((const Node *) test->arg, subject);
+      NullEvaluation argument = check_null_evaluation_for_subject(
+        (const Node *) test->arg, subject);
+      NullProof proof;
 
-      if (argument == NULL_PROOF_UNKNOWN || argument == NULL_PROOF_NONNULL)
+      if (argument.proof == NULL_PROOF_UNKNOWN ||
+          argument.proof == NULL_PROOF_NONNULL)
       {
-        return NULL_PROOF_UNKNOWN;
+        return make_null_evaluation(NULL_PROOF_UNKNOWN,
+                                    argument.evaluation_safe,
+                                    argument.depends_on_subject);
       }
       switch (test->booltesttype)
       {
         case IS_TRUE:
-          return argument == NULL_PROOF_TRUE ? NULL_PROOF_TRUE : NULL_PROOF_FALSE;
+          proof = argument.proof == NULL_PROOF_TRUE ? NULL_PROOF_TRUE : NULL_PROOF_FALSE;
+          break;
         case IS_NOT_TRUE:
-          return argument == NULL_PROOF_TRUE ? NULL_PROOF_FALSE : NULL_PROOF_TRUE;
+          proof = argument.proof == NULL_PROOF_TRUE ? NULL_PROOF_FALSE : NULL_PROOF_TRUE;
+          break;
         case IS_FALSE:
-          return argument == NULL_PROOF_FALSE ? NULL_PROOF_TRUE : NULL_PROOF_FALSE;
+          proof = argument.proof == NULL_PROOF_FALSE ? NULL_PROOF_TRUE : NULL_PROOF_FALSE;
+          break;
         case IS_NOT_FALSE:
-          return argument == NULL_PROOF_FALSE ? NULL_PROOF_FALSE : NULL_PROOF_TRUE;
+          proof = argument.proof == NULL_PROOF_FALSE ? NULL_PROOF_FALSE : NULL_PROOF_TRUE;
+          break;
         case IS_UNKNOWN:
-          return argument == NULL_PROOF_NULL ? NULL_PROOF_TRUE : NULL_PROOF_FALSE;
+          proof = argument.proof == NULL_PROOF_NULL ? NULL_PROOF_TRUE : NULL_PROOF_FALSE;
+          break;
         case IS_NOT_UNKNOWN:
-          return argument == NULL_PROOF_NULL ? NULL_PROOF_FALSE : NULL_PROOF_TRUE;
+          proof = argument.proof == NULL_PROOF_NULL ? NULL_PROOF_FALSE : NULL_PROOF_TRUE;
+          break;
+        default:
+          proof = NULL_PROOF_UNKNOWN;
+          break;
       }
-      return NULL_PROOF_UNKNOWN;
+      return make_null_evaluation(proof, argument.evaluation_safe,
+                                  argument.depends_on_subject);
     }
     case T_BoolExpr:
     {
@@ -453,97 +519,184 @@ check_null_proof_for_subject_uncached(const Node *expr,
       ListCell *cell;
       bool saw_null = false;
       bool saw_unknown = false;
+      bool saw_decisive = false;
+      bool evaluation_safe = true;
+      bool depends_on_subject = false;
 
       if (boolean->boolop == NOT_EXPR && list_length(boolean->args) == 1)
       {
-        return invert_null_proof(
-          check_null_proof_for_subject((const Node *) linitial(boolean->args), subject));
+        return invert_null_evaluation(check_null_evaluation_for_subject(
+          (const Node *) linitial(boolean->args), subject));
       }
 
       foreach(cell, boolean->args)
       {
-        NullProof argument = check_null_proof_for_subject((const Node *) lfirst(cell), subject);
+        NullEvaluation argument = check_null_evaluation_for_subject(
+          (const Node *) lfirst(cell), subject);
 
-        if (boolean->boolop == AND_EXPR && argument == NULL_PROOF_FALSE)
+        evaluation_safe = evaluation_safe && argument.evaluation_safe;
+        depends_on_subject = depends_on_subject ||
+                             argument.depends_on_subject;
+        if ((boolean->boolop == AND_EXPR && argument.proof == NULL_PROOF_FALSE) ||
+            (boolean->boolop == OR_EXPR && argument.proof == NULL_PROOF_TRUE))
         {
-          return NULL_PROOF_FALSE;
+          saw_decisive = true;
         }
-        if (boolean->boolop == OR_EXPR && argument == NULL_PROOF_TRUE)
-        {
-          return NULL_PROOF_TRUE;
-        }
-        if (argument == NULL_PROOF_NULL)
+        else if (argument.proof == NULL_PROOF_NULL)
         {
           saw_null = true;
         }
-        else if (argument == NULL_PROOF_UNKNOWN || argument == NULL_PROOF_NONNULL)
+        else if (argument.proof == NULL_PROOF_UNKNOWN ||
+                 argument.proof == NULL_PROOF_NONNULL)
         {
           saw_unknown = true;
         }
       }
 
+      if (saw_decisive)
+      {
+        return make_null_evaluation(
+          boolean->boolop == AND_EXPR ? NULL_PROOF_FALSE : NULL_PROOF_TRUE,
+          evaluation_safe, depends_on_subject);
+      }
       if (saw_unknown)
       {
-        return NULL_PROOF_UNKNOWN;
+        return make_null_evaluation(NULL_PROOF_UNKNOWN, evaluation_safe,
+                                    depends_on_subject);
       }
       if (saw_null)
       {
-        return NULL_PROOF_NULL;
+        return make_null_evaluation(NULL_PROOF_NULL, evaluation_safe,
+                                    depends_on_subject);
       }
-      return boolean->boolop == AND_EXPR ? NULL_PROOF_TRUE : NULL_PROOF_FALSE;
+      return make_null_evaluation(
+        boolean->boolop == AND_EXPR ? NULL_PROOF_TRUE : NULL_PROOF_FALSE,
+        evaluation_safe, depends_on_subject);
     }
     case T_CoalesceExpr:
     {
       const CoalesceExpr *coalesce = (const CoalesceExpr *) expr;
       ListCell *cell;
+      bool saw_unknown = false;
+      bool evaluation_safe = true;
+      bool depends_on_subject = false;
 
       foreach(cell, coalesce->args)
       {
-        NullProof argument = check_null_proof_for_subject((const Node *) lfirst(cell), subject);
+        NullEvaluation argument = check_null_evaluation_for_subject(
+          (const Node *) lfirst(cell), subject);
 
-        if (argument == NULL_PROOF_NULL)
+        evaluation_safe = evaluation_safe && argument.evaluation_safe;
+        depends_on_subject = depends_on_subject ||
+                             argument.depends_on_subject;
+        if (saw_unknown)
         {
           continue;
         }
-        return argument;
+        if (argument.proof == NULL_PROOF_NULL)
+        {
+          continue;
+        }
+        if (argument.proof == NULL_PROOF_UNKNOWN)
+        {
+          saw_unknown = true;
+          continue;
+        }
+        return make_null_evaluation(argument.proof, evaluation_safe,
+                                    depends_on_subject);
       }
-      return NULL_PROOF_NULL;
+      return make_null_evaluation(
+        saw_unknown ? NULL_PROOF_UNKNOWN : NULL_PROOF_NULL,
+        evaluation_safe, depends_on_subject);
     }
     case T_FuncExpr:
     {
       const FuncExpr *function = (const FuncExpr *) expr;
       ListCell *cell;
+      bool all_arguments_safe = true;
+      bool saw_safely_null_argument = false;
+      bool depends_on_subject = false;
 
-      if (!func_strict(function->funcid))
-      {
-        return NULL_PROOF_UNKNOWN;
-      }
       foreach(cell, function->args)
       {
-        if (check_null_proof_for_subject((const Node *) lfirst(cell), subject) == NULL_PROOF_NULL)
-        {
-          return NULL_PROOF_NULL;
-        }
+        NullEvaluation argument = check_null_evaluation_for_subject(
+          (const Node *) lfirst(cell), subject);
+
+        all_arguments_safe = all_arguments_safe && argument.evaluation_safe;
+        depends_on_subject = depends_on_subject ||
+                             argument.depends_on_subject;
+        saw_safely_null_argument = saw_safely_null_argument ||
+                                   (argument.evaluation_safe &&
+                                    argument.proof == NULL_PROOF_NULL);
       }
-      return NULL_PROOF_UNKNOWN;
+      if (!func_strict(function->funcid))
+      {
+        return make_null_evaluation(NULL_PROOF_UNKNOWN,
+                                    all_arguments_safe &&
+                                      !depends_on_subject,
+                                    depends_on_subject);
+      }
+      return all_arguments_safe && saw_safely_null_argument
+               ? make_null_evaluation(NULL_PROOF_NULL, true,
+                                      depends_on_subject)
+               : make_null_evaluation(NULL_PROOF_UNKNOWN,
+                                      all_arguments_safe &&
+                                        !depends_on_subject,
+                                      depends_on_subject);
     }
     case T_OpExpr:
     {
       const OpExpr *operation = (const OpExpr *) expr;
       ListCell *cell;
+      bool all_arguments_safe = true;
+      bool saw_safely_null_argument = false;
+      bool depends_on_subject = false;
 
-      if (!op_strict(operation->opno))
-      {
-        return NULL_PROOF_UNKNOWN;
-      }
       foreach(cell, operation->args)
       {
-        if (check_null_proof_for_subject((const Node *) lfirst(cell), subject) == NULL_PROOF_NULL)
-        {
-          return NULL_PROOF_NULL;
-        }
+        NullEvaluation argument = check_null_evaluation_for_subject(
+          (const Node *) lfirst(cell), subject);
+
+        all_arguments_safe = all_arguments_safe && argument.evaluation_safe;
+        depends_on_subject = depends_on_subject ||
+                             argument.depends_on_subject;
+        saw_safely_null_argument = saw_safely_null_argument ||
+                                   (argument.evaluation_safe &&
+                                    argument.proof == NULL_PROOF_NULL);
       }
-      return NULL_PROOF_UNKNOWN;
+      if (!op_strict(operation->opno))
+      {
+        return make_null_evaluation(NULL_PROOF_UNKNOWN,
+                                    all_arguments_safe &&
+                                      !depends_on_subject,
+                                    depends_on_subject);
+      }
+      return all_arguments_safe && saw_safely_null_argument
+               ? make_null_evaluation(NULL_PROOF_NULL, true,
+                                      depends_on_subject)
+               : make_null_evaluation(NULL_PROOF_UNKNOWN,
+                                      all_arguments_safe &&
+                                        !depends_on_subject,
+                                      depends_on_subject);
+    }
+    case T_ArrayExpr:
+    {
+      const ArrayExpr *array = (const ArrayExpr *) expr;
+      ListCell *cell;
+      bool evaluation_safe = true;
+      bool depends_on_subject = false;
+
+      foreach(cell, array->elements)
+      {
+        NullEvaluation element = check_null_evaluation_for_subject(
+          (const Node *) lfirst(cell), subject);
+
+        evaluation_safe = evaluation_safe && element.evaluation_safe;
+        depends_on_subject = depends_on_subject ||
+                             element.depends_on_subject;
+      }
+      return make_null_evaluation(NULL_PROOF_NONNULL, evaluation_safe,
+                                  depends_on_subject);
     }
     case T_ScalarArrayOpExpr:
     {
@@ -551,45 +704,76 @@ check_null_proof_for_subject_uncached(const Node *expr,
       const Node *scalar;
       const Node *array;
       ArrayCardinalityProof cardinality;
+      NullEvaluation scalar_evaluation;
+      NullEvaluation array_evaluation;
+      bool evaluation_safe;
+      bool depends_on_subject;
 
       if (!op_strict(operation->opno) || list_length(operation->args) != 2)
       {
-        return NULL_PROOF_UNKNOWN;
+        return make_null_evaluation(NULL_PROOF_UNKNOWN, false, true);
       }
       scalar = (const Node *) linitial(operation->args);
       array = (const Node *) lsecond(operation->args);
+      scalar_evaluation = check_null_evaluation_for_subject(scalar, subject);
+      array_evaluation = check_null_evaluation_for_subject(array, subject);
+      evaluation_safe = scalar_evaluation.evaluation_safe &&
+                        array_evaluation.evaluation_safe;
+      depends_on_subject = scalar_evaluation.depends_on_subject ||
+                           array_evaluation.depends_on_subject;
       cardinality = array_cardinality_proof(array);
       if (cardinality == ARRAY_CARDINALITY_EMPTY)
       {
-        return operation->useOr ? NULL_PROOF_FALSE : NULL_PROOF_TRUE;
+        return make_null_evaluation(
+          operation->useOr ? NULL_PROOF_FALSE : NULL_PROOF_TRUE,
+          evaluation_safe, depends_on_subject);
       }
       if (cardinality == ARRAY_CARDINALITY_NONEMPTY &&
-          check_null_proof_for_subject(scalar, subject) == NULL_PROOF_NULL)
+          scalar_evaluation.proof == NULL_PROOF_NULL)
       {
-        return NULL_PROOF_NULL;
+        return make_null_evaluation(NULL_PROOF_NULL, evaluation_safe,
+                                    depends_on_subject);
       }
-      return NULL_PROOF_UNKNOWN;
+      return make_null_evaluation(NULL_PROOF_UNKNOWN,
+                                  evaluation_safe && !depends_on_subject,
+                                  depends_on_subject);
     }
     default:
-      return NULL_PROOF_UNKNOWN;
+      return make_null_evaluation(NULL_PROOF_UNKNOWN, false, true);
   }
 }
 
-static NullProof
-check_null_proof(const Node *expr, AttrNumber target_attnum)
+static NullEvaluation
+check_null_evaluation(const Node *expr, AttrNumber target_attnum)
 {
   const NullProofSubject subject = {target_attnum, 0, NULL};
 
-  return check_null_proof_for_subject(expr, &subject);
+  return check_null_evaluation_for_subject(expr, &subject);
 }
 
-static NullProof
-check_parameter_null_proof(const Node *expr, int param_id,
-                           HTAB *node_analysis)
+static NullEvaluation
+check_parameter_null_evaluation(const Node *expr, int param_id,
+                                HTAB *node_analysis)
 {
   const NullProofSubject subject = {0, param_id, node_analysis};
 
-  return check_null_proof_for_subject(expr, &subject);
+  return check_null_evaluation_for_subject(expr, &subject);
+}
+
+static TypeNullAdmission
+null_evaluation_admission(NullEvaluation evaluation)
+{
+  if (evaluation.proof == NULL_PROOF_FALSE)
+  {
+    return TYPE_NULL_REJECTS;
+  }
+  if (evaluation.evaluation_safe &&
+      (evaluation.proof == NULL_PROOF_TRUE ||
+       evaluation.proof == NULL_PROOF_NULL))
+  {
+    return TYPE_NULL_ADMITS;
+  }
+  return TYPE_NULL_UNKNOWN;
 }
 
 static TypeNullAdmission
@@ -635,14 +819,15 @@ type_null_admission(HTAB *cache, Oid type_oid)
       }
       if (constraint->constrainttype == DOM_CONSTRAINT_CHECK)
       {
-        NullProof proof = check_null_proof((const Node *) constraint->check_expr, 0);
+        TypeNullAdmission check_admission = null_evaluation_admission(
+          check_null_evaluation((const Node *) constraint->check_expr, 0));
 
-        if (proof == NULL_PROOF_FALSE)
+        if (check_admission == TYPE_NULL_REJECTS)
         {
           admission = TYPE_NULL_REJECTS;
           break;
         }
-        if (proof != NULL_PROOF_TRUE && proof != NULL_PROOF_NULL)
+        if (check_admission == TYPE_NULL_UNKNOWN)
         {
           admission = TYPE_NULL_UNKNOWN;
         }
@@ -692,7 +877,7 @@ collect_column_mentions_walker(Node *node, void *walker_context)
 
 static void
 update_column_null_admission(HTAB *cache, Oid relid, AttrNumber attnum,
-                             NullProof proof)
+                             NullEvaluation evaluation)
 {
   ColumnNullAdmissionKey key;
   ColumnNullAdmissionEntry *entry;
@@ -706,11 +891,11 @@ update_column_null_admission(HTAB *cache, Oid relid, AttrNumber attnum,
   {
     return;
   }
-  if (proof == NULL_PROOF_FALSE)
+  if (null_evaluation_admission(evaluation) == TYPE_NULL_REJECTS)
   {
     entry->admission = TYPE_NULL_REJECTS;
   }
-  else if (proof != NULL_PROOF_TRUE && proof != NULL_PROOF_NULL)
+  else if (null_evaluation_admission(evaluation) == TYPE_NULL_UNKNOWN)
   {
     entry->admission = TYPE_NULL_UNKNOWN;
   }
@@ -833,20 +1018,21 @@ mark_required_nonnull_parameter_usage(ParameterUsageContext *context,
     context->param_id,
     context->node_analysis
   };
-  NullProof proof;
+  NullEvaluation evaluation;
 
   if (!node_mentions_external_parameter(expr, &mention_context))
   {
     return;
   }
 
-  proof = check_parameter_null_proof(expr, context->param_id,
-                                     context->node_analysis);
-  if (proof == NULL_PROOF_NULL)
+  evaluation = check_parameter_null_evaluation(expr, context->param_id,
+                                               context->node_analysis);
+  if (evaluation.proof == NULL_PROOF_NULL && evaluation.evaluation_safe)
   {
     mark_parameter_usage(context, TYPE_NULL_REJECTS);
   }
-  else if (proof == NULL_PROOF_UNKNOWN)
+  else if (evaluation.proof == NULL_PROOF_UNKNOWN ||
+           !evaluation.evaluation_safe)
   {
     mark_parameter_usage(context, TYPE_NULL_UNKNOWN);
   }
@@ -893,13 +1079,13 @@ parameter_usage_null_admission_walker(Node *node, void *walker_context)
     case T_CoerceToDomain:
     {
       const CoerceToDomain *coerce = (const CoerceToDomain *) node;
-      NullProof argument = check_parameter_null_proof((const Node *) coerce->arg,
-                                                      context->param_id,
-                                                      context->node_analysis);
+      NullEvaluation argument = check_parameter_null_evaluation(
+        (const Node *) coerce->arg, context->param_id,
+        context->node_analysis);
 
       mark_parameter_usage(
         context,
-        argument == NULL_PROOF_NULL
+        argument.evaluation_safe && argument.proof == NULL_PROOF_NULL
           ? type_null_admission(context->type_admissions,
                                 coerce->resulttype)
           : TYPE_NULL_UNKNOWN);
@@ -908,10 +1094,12 @@ parameter_usage_null_admission_walker(Node *node, void *walker_context)
     case T_FuncExpr:
     {
       const FuncExpr *function = (const FuncExpr *) node;
+      NullEvaluation evaluation = check_parameter_null_evaluation(
+        node, context->param_id, context->node_analysis);
 
       if (!func_strict(function->funcid) ||
-          check_parameter_null_proof(node, context->param_id,
-                                     context->node_analysis) != NULL_PROOF_NULL)
+          evaluation.proof != NULL_PROOF_NULL ||
+          !evaluation.evaluation_safe)
       {
         mark_parameter_usage(context, TYPE_NULL_UNKNOWN);
       }
@@ -920,10 +1108,12 @@ parameter_usage_null_admission_walker(Node *node, void *walker_context)
     case T_OpExpr:
     {
       const OpExpr *operation = (const OpExpr *) node;
+      NullEvaluation evaluation = check_parameter_null_evaluation(
+        node, context->param_id, context->node_analysis);
 
       if (!op_strict(operation->opno) ||
-          check_parameter_null_proof(node, context->param_id,
-                                     context->node_analysis) != NULL_PROOF_NULL)
+          evaluation.proof != NULL_PROOF_NULL ||
+          !evaluation.evaluation_safe)
       {
         mark_parameter_usage(context, TYPE_NULL_UNKNOWN);
       }
@@ -932,12 +1122,14 @@ parameter_usage_null_admission_walker(Node *node, void *walker_context)
     case T_ScalarArrayOpExpr:
     {
       const ScalarArrayOpExpr *operation = (const ScalarArrayOpExpr *) node;
-      NullProof proof = check_parameter_null_proof(node, context->param_id,
-                                                   context->node_analysis);
+      NullEvaluation evaluation = check_parameter_null_evaluation(
+        node, context->param_id, context->node_analysis);
 
       if (!op_strict(operation->opno) ||
-          (proof != NULL_PROOF_NULL && proof != NULL_PROOF_TRUE &&
-           proof != NULL_PROOF_FALSE))
+          !evaluation.evaluation_safe ||
+          (evaluation.proof != NULL_PROOF_NULL &&
+           evaluation.proof != NULL_PROOF_TRUE &&
+           evaluation.proof != NULL_PROOF_FALSE))
       {
         mark_parameter_usage(context, TYPE_NULL_UNKNOWN);
       }
@@ -946,10 +1138,12 @@ parameter_usage_null_admission_walker(Node *node, void *walker_context)
     case T_CoerceViaIO:
     {
       const CoerceViaIO *coerce = (const CoerceViaIO *) node;
+      NullEvaluation argument = check_parameter_null_evaluation(
+        (const Node *) coerce->arg, context->param_id,
+        context->node_analysis);
 
-      if (check_parameter_null_proof((const Node *) coerce->arg,
-                                     context->param_id,
-                                     context->node_analysis) != NULL_PROOF_NULL)
+      if (argument.proof != NULL_PROOF_NULL ||
+          !argument.evaluation_safe)
       {
         mark_parameter_usage(context, TYPE_NULL_UNKNOWN);
       }
@@ -958,10 +1152,12 @@ parameter_usage_null_admission_walker(Node *node, void *walker_context)
     case T_ArrayCoerceExpr:
     {
       const ArrayCoerceExpr *coerce = (const ArrayCoerceExpr *) node;
+      NullEvaluation argument = check_parameter_null_evaluation(
+        (const Node *) coerce->arg, context->param_id,
+        context->node_analysis);
 
-      if (check_parameter_null_proof((const Node *) coerce->arg,
-                                     context->param_id,
-                                     context->node_analysis) != NULL_PROOF_NULL)
+      if (argument.proof != NULL_PROOF_NULL ||
+          !argument.evaluation_safe)
       {
         mark_parameter_usage(context, TYPE_NULL_UNKNOWN);
       }
@@ -970,10 +1166,12 @@ parameter_usage_null_admission_walker(Node *node, void *walker_context)
     case T_ConvertRowtypeExpr:
     {
       const ConvertRowtypeExpr *coerce = (const ConvertRowtypeExpr *) node;
+      NullEvaluation argument = check_parameter_null_evaluation(
+        (const Node *) coerce->arg, context->param_id,
+        context->node_analysis);
 
-      if (check_parameter_null_proof((const Node *) coerce->arg,
-                                     context->param_id,
-                                     context->node_analysis) != NULL_PROOF_NULL)
+      if (argument.proof != NULL_PROOF_NULL ||
+          !argument.evaluation_safe)
       {
         mark_parameter_usage(context, TYPE_NULL_UNKNOWN);
       }
@@ -984,20 +1182,23 @@ parameter_usage_null_admission_walker(Node *node, void *walker_context)
       const DistinctExpr *distinct = (const DistinctExpr *) node;
       ListCell *cell;
       bool null_short_circuit = false;
+      bool arguments_safe = true;
 
       foreach(cell, distinct->args)
       {
         const Node *argument = (const Node *) lfirst(cell);
+        NullEvaluation evaluation = check_parameter_null_evaluation(
+          argument, context->param_id, context->node_analysis);
 
+        arguments_safe = arguments_safe && evaluation.evaluation_safe;
         if (node_mentions_external_parameter(argument, &mention_context) &&
-            check_parameter_null_proof(argument, context->param_id,
-                                       context->node_analysis) == NULL_PROOF_NULL)
+            evaluation.proof == NULL_PROOF_NULL &&
+            evaluation.evaluation_safe)
         {
           null_short_circuit = true;
-          break;
         }
       }
-      if (!null_short_circuit)
+      if (!null_short_circuit || !arguments_safe)
       {
         mark_parameter_usage(context, TYPE_NULL_UNKNOWN);
       }
@@ -1025,11 +1226,21 @@ parameter_usage_null_admission_walker(Node *node, void *walker_context)
         context, (const Node *) sample->repeatable);
       break;
     }
+    case T_BoolExpr:
+    {
+      NullEvaluation evaluation = check_parameter_null_evaluation(
+        node, context->param_id, context->node_analysis);
+
+      if (!evaluation.evaluation_safe)
+      {
+        mark_parameter_usage(context, TYPE_NULL_UNKNOWN);
+      }
+      break;
+    }
     case T_Query:
     case T_List:
     case T_TargetEntry:
     case T_NamedArgExpr:
-    case T_BoolExpr:
     case T_SubLink:
     case T_FieldSelect:
     case T_RelabelType:
@@ -1153,7 +1364,7 @@ populate_column_null_admissions(HTAB *cache, Oid relid)
         for (attnum = 1; attnum <= descriptor->natts; attnum++)
         {
           update_column_null_admission(cache, relid, attnum,
-                                       check_null_proof(check, attnum));
+                                       check_null_evaluation(check, attnum));
         }
       }
       else
@@ -1161,7 +1372,7 @@ populate_column_null_admissions(HTAB *cache, Oid relid)
         while ((attnum = bms_next_member(mentions.attnums, attnum)) >= 0)
         {
           update_column_null_admission(cache, relid, (AttrNumber) attnum,
-                                       check_null_proof(check, (AttrNumber) attnum));
+                                       check_null_evaluation(check, (AttrNumber) attnum));
         }
       }
       bms_free(mentions.attnums);
@@ -1256,18 +1467,23 @@ match_full_null_admission(const List *foreign_keys, const List *target_list,
     {
       AttrNumber key_attnum = foreign_key->conkey[key_index];
       const TargetEntry *target = target_entry_by_resno(target_list, key_attnum);
-      NullProof proof = key_attnum == target_attnum
-                          ? NULL_PROOF_NULL
-                          : target == NULL
-                              ? NULL_PROOF_UNKNOWN
-                              : check_parameter_null_proof((const Node *) target->expr,
-                                                           param_id, NULL);
+      NullEvaluation evaluation = key_attnum == target_attnum
+                                    ? make_null_evaluation(NULL_PROOF_NULL, true, true)
+                                    : target == NULL
+                                        ? make_null_evaluation(NULL_PROOF_UNKNOWN, false, true)
+                                        : check_parameter_null_evaluation(
+                                            (const Node *) target->expr,
+                                            param_id, NULL);
 
-      if (proof == NULL_PROOF_NULL)
+      if (!evaluation.evaluation_safe)
+      {
+        saw_unknown = true;
+      }
+      else if (evaluation.proof == NULL_PROOF_NULL)
       {
         saw_null = true;
       }
-      else if (proof == NULL_PROOF_UNKNOWN)
+      else if (evaluation.proof == NULL_PROOF_UNKNOWN)
       {
         saw_unknown = true;
       }

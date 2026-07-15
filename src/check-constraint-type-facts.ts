@@ -22,6 +22,7 @@ interface CheckConstraintCatalogRow {
   readonly collation_is_deterministic: boolean
   readonly constraint_name: string
   readonly expression: string
+  readonly operators_are_builtin: boolean
   readonly relid: number
   readonly relname: string
   readonly schema: string
@@ -312,7 +313,15 @@ export async function loadCheckConstraintLiteralUnionFacts(
         attribute.attname,
         (attribute.attcollation = 0 or collation_definition.collisdeterministic) as collation_is_deterministic,
         con.conname as constraint_name,
-        pg_get_expr(con.conbin, con.conrelid) as expression
+        pg_get_expr(con.conbin, con.conrelid) as expression,
+        not exists (
+          select 1
+          from pg_depend operator_dependency
+          where operator_dependency.classid = 'pg_constraint'::regclass
+            and operator_dependency.objid = con.oid
+            and operator_dependency.objsubid = 0
+            and operator_dependency.refclassid = 'pg_operator'::regclass
+        ) as operators_are_builtin
       from pg_constraint con
       join pg_class class
         on class.oid = con.conrelid
@@ -338,7 +347,7 @@ export async function loadCheckConstraintLiteralUnionFacts(
 
   const facts = new Map<string, MutableCheckConstraintLiteralUnionFact>()
   for (const row of result.rows) {
-    if (!row.collation_is_deterministic) {
+    if (!row.collation_is_deterministic || !row.operators_are_builtin) {
       continue
     }
     const labels = parseLiteralUnionConstraintExpression(row.expression, row.attname)

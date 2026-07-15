@@ -9,6 +9,7 @@ import {
   typedSqlRowCount,
   type TypedSqlQueryConfig,
   type TypedSqlRawRow,
+  type TypedSqlStatement,
 } from '../src/runtime.js'
 
 type QueryConfigRow<T> = T extends TypedSqlQueryConfig<infer Row> ? Row : never
@@ -135,6 +136,7 @@ test('runtime maps zero-column array rows to empty row objects', async () => {
   })
 
   assert.deepEqual(mapTypedSqlRow(statement, []), {})
+  assert.equal(statement.resultRowMode, 'array')
   const legacyObjectRow = { preserved: true }
   assert.equal(mapTypedSqlRow(statement, legacyObjectRow), legacyObjectRow)
   assert.deepEqual(
@@ -150,4 +152,44 @@ test('runtime maps zero-column array rows to empty row objects', async () => {
     ),
     [{}, {}]
   )
+})
+
+test('runtime preserves object rows when result-column metadata is omitted', async () => {
+  const statement = createTypedSqlStatement<Record<string, never>, { readonly value: number }>({
+    name: 'customObjectRows',
+    parameterNames: [],
+    text: 'select 1 as value',
+  })
+
+  assert.deepEqual(statement.columns, [])
+  assert.equal(statement.resultRowMode, undefined)
+  const rows = await executeTypedSql(
+    {
+      async query<Row>(config: TypedSqlQueryConfig<Row>) {
+        assert.equal(config.rowMode, undefined)
+        return { rows: [{ value: 1 }] as unknown as Row[] }
+      },
+    },
+    statement,
+    {}
+  )
+  assert.deepEqual(rows, [{ value: 1 }])
+})
+
+test('runtime public statement contract keeps result row mode optional for custom statements', () => {
+  const customStatement: TypedSqlStatement<Record<string, never>, { readonly value: number }> = {
+    access: 'read',
+    cardinality: 'many',
+    columns: [],
+    command: 'select',
+    name: 'structurallyCompatibleCustomStatement',
+    parameterNames: [],
+    parameters: [],
+    query: () => ({ text: 'select 1 as value', values: [] }),
+    rowBounds: { max: null, min: 0, proof: 'custom' },
+    text: 'select 1 as value',
+    values: () => [],
+  }
+
+  assert.equal(customStatement.resultRowMode, undefined)
 })

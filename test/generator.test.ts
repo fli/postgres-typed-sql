@@ -361,6 +361,21 @@ create table public.domain_inputs (
 create table public.outer_join_inputs (
   value text check (value in ('allowed'))
 );
+create function public.reject_null_arg(value integer)
+returns integer
+language plpgsql
+immutable
+as $$
+begin
+  if value is null then
+    raise exception 'reject_null_arg rejected null';
+  end if;
+  return value;
+end
+$$;
+create table public.unsafe_insert_select (
+  value integer check (value = public.reject_null_arg(value))
+);
 `
   )
   await writeFile(
@@ -418,6 +433,12 @@ from (values (1)) guaranteed(marker)
 left join (values (:value::text)) candidate(value) on false
 `
   )
+  await writeFile(
+    join(root, 'queries/unsafe-insert-select.typed.sql'),
+    `insert into public.unsafe_insert_select(value)
+select :value
+`
+  )
 
   const result = await generateTypedSql({
     include: ['queries'],
@@ -426,7 +447,7 @@ left join (values (:value::text)) candidate(value) on false
     schema: 'schema.sql',
   })
 
-  assert.equal(result.statementCount, 11)
+  assert.equal(result.statementCount, 12)
 
   const nativeFacts = await readFile(join(root, 'queries/native-dml-facts.typed-sql.ts'), 'utf8')
   assert.match(nativeFacts, /readonly email: string\n/u)
@@ -459,6 +480,10 @@ left join (values (:value::text)) candidate(value) on false
   const nullExtendedInput = await readFile(join(root, 'queries/null-extended-input.typed-sql.ts'), 'utf8')
   assert.match(nullExtendedInput, /readonly value: string \| null/u)
   assert.doesNotMatch(nullExtendedInput, /OuterJoinInputs__Value/u)
+
+  const unsafeInsertSelect = await readFile(join(root, 'queries/unsafe-insert-select.typed-sql.ts'), 'utf8')
+  assert.match(unsafeInsertSelect, /readonly value: bigint \| number \| string\n/u)
+  assert.doesNotMatch(unsafeInsertSelect, /readonly value: bigint \| number \| string \| null/u)
 })
 
 test('preserves exact parameter, result, JSON, relation, and schema-qualified type names', async () => {
