@@ -46,7 +46,8 @@
     "dist",
     "LICENSE",
     "NOTICE",
-    "README.md"
+    "README.md",
+    "SECURITY.md"
   ],
   "scripts": {
     "build": "pnpm run clean && tsc -p tsconfig.build.json && node scripts/stage-engine.mjs",

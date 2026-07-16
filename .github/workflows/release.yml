@@ -26,4 +26,4 @@ jobs:
       - run: pnpm install --frozen-lockfile --ignore-scripts
       - run: pnpm build:engine
       - run: pnpm test:all
-      - run: npm publish --access public --provenance
+      - run: npm publish --access public --provenance --tag beta

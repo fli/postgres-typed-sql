@@ -27,6 +27,11 @@ fi
 
 node -e "const p=require('./node_modules/postgres-typed-sql/package.json'); for (const key of ['preinstall','install','postinstall','prepare']) if (p.scripts?.[key]) throw new Error('lifecycle script: '+key)"
 
+if ! tar -tzf "$pack_dir/$tarball" | grep -Fx 'package/SECURITY.md' >/dev/null; then
+  echo 'The npm tarball does not contain SECURITY.md.' >&2
+  exit 1
+fi
+
 if tar -tzf "$pack_dir/$tarball" | grep -E '(^|/)source/|(^|/)test/|(^|/)engine/'; then
   echo 'The npm tarball contains publisher-only source.' >&2
   exit 1
