@@ -4925,6 +4925,244 @@ domain_constraints_invoke_volatile_function(Oid type_oid)
   return false;
 }
 
+typedef enum RuntimeTypeIoKind
+{
+  RUNTIME_TYPE_IO_TEXT_INPUT,
+  RUNTIME_TYPE_IO_BINARY_RECEIVE,
+  RUNTIME_TYPE_IO_TEXT_OUTPUT
+} RuntimeTypeIoKind;
+
+typedef struct RuntimeTypeIoKey
+{
+  Oid type_oid;
+  int32 typmod;
+  RuntimeTypeIoKind kind;
+} RuntimeTypeIoKey;
+
+typedef struct RuntimeTypeIoContext
+{
+  RuntimeTypeIoKey stack[MAX_RUNTIME_TYPE_SUPPORT_DEPTH];
+  int depth;
+} RuntimeTypeIoContext;
+
+typedef struct RuntimeTypeIoResult
+{
+  bool supported;
+  bool invokes_volatile;
+} RuntimeTypeIoResult;
+
+static RuntimeTypeIoResult
+runtime_type_io_result(bool supported, bool invokes_volatile)
+{
+  RuntimeTypeIoResult result = {supported, invokes_volatile};
+
+  return result;
+}
+
+/*
+ * Generic container I/O functions are declared immutable, but resolve their
+ * nested type's I/O procedure at runtime.  Domain input adds another hidden
+ * dependency by executing the domain constraints.  External parameters may
+ * arrive in either text or binary format, while CoerceViaIO specifically uses
+ * text output followed by text input.
+ */
+static RuntimeTypeIoResult
+type_io_invokes_volatile(Oid type_oid, int32 typmod,
+                         RuntimeTypeIoKind kind,
+                         RuntimeTypeIoContext *context)
+{
+  HeapTuple tuple;
+  Form_pg_type type;
+  Oid io_function;
+  Oid nested_type = InvalidOid;
+  int32 nested_typmod = -1;
+  char type_kind;
+  int stack_index;
+  RuntimeTypeIoResult nested_result;
+
+  if (!OidIsValid(type_oid) || context->depth >= MAX_RUNTIME_TYPE_SUPPORT_DEPTH)
+  {
+    return runtime_type_io_result(true, true);
+  }
+  for (stack_index = 0; stack_index < context->depth; stack_index++)
+  {
+    RuntimeTypeIoKey *key = &context->stack[stack_index];
+
+    if (key->type_oid == type_oid && key->typmod == typmod &&
+        key->kind == kind)
+    {
+      return runtime_type_io_result(true, true);
+    }
+  }
+  context->stack[context->depth].type_oid = type_oid;
+  context->stack[context->depth].typmod = typmod;
+  context->stack[context->depth].kind = kind;
+  context->depth++;
+
+  tuple = SearchSysCache1(TYPEOID, ObjectIdGetDatum(type_oid));
+  if (!HeapTupleIsValid(tuple))
+  {
+    context->depth--;
+    return runtime_type_io_result(true, true);
+  }
+  type = (Form_pg_type) GETSTRUCT(tuple);
+  type_kind = type->typtype;
+  io_function = kind == RUNTIME_TYPE_IO_TEXT_INPUT
+                  ? type->typinput
+                  : kind == RUNTIME_TYPE_IO_BINARY_RECEIVE
+                      ? type->typreceive
+                      : type->typoutput;
+  ReleaseSysCache(tuple);
+
+  if (!OidIsValid(io_function))
+  {
+    context->depth--;
+    return runtime_type_io_result(false, false);
+  }
+  if (function_is_volatile(io_function))
+  {
+    context->depth--;
+    return runtime_type_io_result(true, true);
+  }
+
+  if (type_kind == TYPTYPE_DOMAIN)
+  {
+    Oid base_type = getBaseTypeAndTypmod(type_oid, &typmod);
+
+    if ((kind == RUNTIME_TYPE_IO_TEXT_INPUT ||
+         kind == RUNTIME_TYPE_IO_BINARY_RECEIVE) &&
+        domain_constraints_invoke_volatile_function(type_oid))
+    {
+      context->depth--;
+      return runtime_type_io_result(true, true);
+    }
+    if (!OidIsValid(base_type) || base_type == type_oid)
+    {
+      context->depth--;
+      return runtime_type_io_result(true, true);
+    }
+    nested_type = base_type;
+    nested_typmod = typmod;
+  }
+  else
+  {
+    Oid element_type = get_element_type(type_oid);
+
+    if (OidIsValid(element_type))
+    {
+      nested_type = element_type;
+      nested_typmod = kind == RUNTIME_TYPE_IO_TEXT_OUTPUT ? -1 : typmod;
+    }
+    else if (type_kind == TYPTYPE_COMPOSITE || type_oid == RECORDOID)
+    {
+      TupleDesc descriptor = lookup_rowtype_tupdesc_domain(
+        type_oid, typmod, true);
+      int attribute_index;
+
+      if (descriptor == NULL)
+      {
+        context->depth--;
+        return runtime_type_io_result(true, true);
+      }
+      for (attribute_index = 0;
+           attribute_index < descriptor->natts;
+           attribute_index++)
+      {
+        Form_pg_attribute attribute = TupleDescAttr(descriptor,
+                                                    attribute_index);
+
+        if (attribute->attisdropped)
+        {
+          continue;
+        }
+        nested_result = type_io_invokes_volatile(
+          attribute->atttypid, attribute->atttypmod, kind, context);
+        if (nested_result.invokes_volatile)
+        {
+          ReleaseTupleDesc(descriptor);
+          context->depth--;
+          return nested_result;
+        }
+        if (!nested_result.supported)
+        {
+          ReleaseTupleDesc(descriptor);
+          context->depth--;
+          return nested_result;
+        }
+      }
+      ReleaseTupleDesc(descriptor);
+      context->depth--;
+      return runtime_type_io_result(true, false);
+    }
+    else if (type_kind == TYPTYPE_RANGE)
+    {
+      TypeCacheEntry *type_cache = lookup_type_cache(
+        type_oid, TYPECACHE_RANGE_INFO);
+
+      if (type_cache->rngelemtype == NULL)
+      {
+        context->depth--;
+        return runtime_type_io_result(true, true);
+      }
+      if ((kind == RUNTIME_TYPE_IO_TEXT_INPUT ||
+           kind == RUNTIME_TYPE_IO_BINARY_RECEIVE) &&
+          type_executor_support_invokes_volatile(
+            type_oid, typmod,
+            EXECUTOR_SUPPORT_COMPARE | EXECUTOR_SUPPORT_RANGE_CANONICAL))
+      {
+        context->depth--;
+        return runtime_type_io_result(true, true);
+      }
+      nested_type = type_cache->rngelemtype->type_id;
+    }
+    else if (type_kind == TYPTYPE_MULTIRANGE)
+    {
+      TypeCacheEntry *type_cache = lookup_type_cache(
+        type_oid, TYPECACHE_MULTIRANGE_INFO);
+
+      if (type_cache->rngtype == NULL)
+      {
+        context->depth--;
+        return runtime_type_io_result(true, true);
+      }
+      if ((kind == RUNTIME_TYPE_IO_TEXT_INPUT ||
+           kind == RUNTIME_TYPE_IO_BINARY_RECEIVE) &&
+          type_executor_support_invokes_volatile(
+            type_oid, typmod, EXECUTOR_SUPPORT_COMPARE))
+      {
+        context->depth--;
+        return runtime_type_io_result(true, true);
+      }
+      nested_type = type_cache->rngtype->type_id;
+    }
+  }
+
+  if (OidIsValid(nested_type))
+  {
+    nested_result = type_io_invokes_volatile(
+      nested_type, nested_typmod, kind, context);
+    context->depth--;
+    return nested_result;
+  }
+
+  context->depth--;
+  return runtime_type_io_result(true, false);
+}
+
+static bool
+external_parameter_io_invokes_volatile(Oid type_oid, int32 typmod)
+{
+  RuntimeTypeIoContext text_context = {0};
+  RuntimeTypeIoContext binary_context = {0};
+  RuntimeTypeIoResult text_result = type_io_invokes_volatile(
+    type_oid, typmod, RUNTIME_TYPE_IO_TEXT_INPUT, &text_context);
+  RuntimeTypeIoResult binary_result = type_io_invokes_volatile(
+    type_oid, typmod, RUNTIME_TYPE_IO_BINARY_RECEIVE, &binary_context);
+
+  return text_result.invokes_volatile ||
+         (binary_result.supported && binary_result.invokes_volatile);
+}
+
 static bool
 operator_operand_is_execution_relevant_walker(Node *node, void *context)
 {
@@ -5079,14 +5317,13 @@ node_invokes_volatile_function(Node *node, const QueryScope *scope)
       Param *param = (Param *) node;
 
       /*
-       * An explicitly domain-typed external parameter is represented as a
-       * Param of the domain type, without a surrounding CoerceToDomain node.
-       * PostgreSQL still applies the domain constraints while receiving the
-       * parameter value, so their volatility is part of executing the query.
+       * External parameters are represented without their text-input or
+       * binary-receive call in the expression tree.  Include those hidden I/O
+       * paths, including nested container I/O and domain constraints.
        */
       return param->paramkind == PARAM_EXTERN &&
-             get_typtype(param->paramtype) == TYPTYPE_DOMAIN &&
-             domain_constraints_invoke_volatile_function(param->paramtype);
+             external_parameter_io_invokes_volatile(
+               param->paramtype, exprTypmod(node));
     }
     case T_OpExpr:
     case T_DistinctExpr:
@@ -5123,20 +5360,18 @@ node_invokes_volatile_function(Node *node, const QueryScope *scope)
     case T_CoerceViaIO:
     {
       CoerceViaIO *expr = (CoerceViaIO *) node;
-      Oid function_oid;
-      Oid type_io_parameter;
-      bool type_is_varlena;
+      RuntimeTypeIoContext input_context = {0};
+      RuntimeTypeIoContext output_context = {0};
+      RuntimeTypeIoResult input_result = type_io_invokes_volatile(
+        expr->resulttype, exprTypmod(node), RUNTIME_TYPE_IO_TEXT_INPUT,
+        &input_context);
+      RuntimeTypeIoResult output_result = type_io_invokes_volatile(
+        exprType((Node *) expr->arg), exprTypmod((Node *) expr->arg),
+        RUNTIME_TYPE_IO_TEXT_OUTPUT, &output_context);
 
-      getTypeInputInfo(expr->resulttype, &function_oid, &type_io_parameter);
-      if (function_is_volatile(function_oid) ||
-          executor_support_dependency_invokes_volatile(
-            function_oid, NIL, false,
-            expr->resulttype, exprTypmod(node)))
-      {
-        return true;
-      }
-      getTypeOutputInfo(exprType((Node *) expr->arg), &function_oid, &type_is_varlena);
-      return function_is_volatile(function_oid);
+      return !input_result.supported || !output_result.supported ||
+             input_result.invokes_volatile ||
+             output_result.invokes_volatile;
     }
     case T_CoerceToDomain:
       return domain_constraints_invoke_volatile_function(

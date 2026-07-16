@@ -107,6 +107,7 @@ async function installSortKeyOperatorClass(
     | 'array_element_key'
     | 'executor_compare_key'
     | 'executor_equal_key'
+    | 'io_compare_key'
     | 'nested_compare_key'
     | 'precision_sort_key'
     | 'volatile_sort_key',
@@ -1060,6 +1061,7 @@ test('native analyzer closes generic executor support over concrete container ty
     await database.query('alter function pg_catalog.int4range_canonical(int4range) volatile')
 
     for (const [sql, params] of [
+      [`select $1::int4range as value`, ['[1,2]']],
       [`select int4range($1, $2, '[]') as value`, [1, 2]],
       [`select range_merge(value, value) as value from public.executor_int4_ranges`, []],
       [`select $1::text::int4range as value`, ['[1,2]']],
@@ -1077,6 +1079,82 @@ test('native analyzer closes generic executor support over concrete container ty
     await database.query('alter function pg_catalog.int4range_canonical(int4range) immutable')
     const immutableCanonical = await analyze(database, `select int4range($1, $2, '[]') as value`, [])
     assert.equal(immutableCanonical.statements[0]?.queries[0]?.hasVolatileFunctions, false)
+  })
+})
+
+test('native analyzer closes external parameter and CoerceViaIO container input dependencies', async () => {
+  await withDatabase(async (database) => {
+    await installSortKeyOperatorClass(database, 'io_compare_key', {
+      volatileComparator: true,
+      volatileEquality: false,
+    })
+    await database.query(`create type public.io_compare_range as range (
+      subtype = public.io_compare_key
+    )`)
+
+    const rangeSql = 'select $1::public.io_compare_range as value'
+    const rangeAnalysis = await analyze(database, rangeSql, [])
+    assert.equal(rangeAnalysis.statements[0]?.queries[0]?.hasVolatileFunctions, true)
+    await database.query('truncate public.io_compare_key_calls')
+    await database.query(rangeSql, ['["(1)","(3)"]'])
+    assert.deepEqual(
+      (
+        await database.query<{ called: boolean }>(`select exists(
+          select 1 from public.io_compare_key_calls
+        ) as called`)
+      ).rows,
+      [{ called: true }]
+    )
+
+    await database.query('create sequence public.io_domain_sequence')
+    await database.query(`create domain public.volatile_io_text as text
+      check (nextval('public.io_domain_sequence') > 0)`)
+    await database.query(`create type public.volatile_io_envelope as (
+      values public.volatile_io_text[]
+    )`)
+
+    const assertSequenceAdvanced = async (expected: string): Promise<void> => {
+      assert.deepEqual(
+        (
+          await database.query<{ lastValue: string }>(`select
+            last_value::text as "lastValue"
+          from public.io_domain_sequence`)
+        ).rows,
+        [{ lastValue: expected }]
+      )
+    }
+
+    const arrayParamSql = 'select $1::public.volatile_io_text[] as value'
+    const arrayParam = await analyze(database, arrayParamSql, [])
+    assert.equal(arrayParam.statements[0]?.queries[0]?.hasVolatileFunctions, true)
+    await database.query(arrayParamSql, ['{array}'])
+    await assertSequenceAdvanced('1')
+
+    const compositeParamSql = 'select $1::public.volatile_io_envelope as value'
+    const compositeParam = await analyze(database, compositeParamSql, [])
+    assert.equal(compositeParam.statements[0]?.queries[0]?.hasVolatileFunctions, true)
+    await database.query(compositeParamSql, ['("{composite}")'])
+    await assertSequenceAdvanced('2')
+
+    const coerceViaIoSql = 'select ($1::text)::public.volatile_io_text[] as value'
+    const coerceViaIo = await analyze(database, coerceViaIoSql, [])
+    assert.equal(coerceViaIo.statements[0]?.queries[0]?.hasVolatileFunctions, true)
+    await database.query(coerceViaIoSql, ['{coerced}'])
+    await assertSequenceAdvanced('3')
+
+    await database.query(`create type public.stable_io_envelope as (
+      values text[], span int4range
+    )`)
+    for (const sql of [
+      'select $1::text[]',
+      'select $1::int4range',
+      'select $1::public.stable_io_envelope',
+      'select ($1::text)::int4[]',
+      'select array[$1::text]::text',
+    ]) {
+      const analysis = await analyze(database, sql, [])
+      assert.equal(analysis.statements[0]?.queries[0]?.hasVolatileFunctions, false, sql)
+    }
   })
 })
 
