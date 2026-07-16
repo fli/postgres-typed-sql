@@ -133,6 +133,13 @@ test('normalizes PostgreSQL statement, nullability, DML, and cardinality facts c
       config('nullLimit', 'select 1 as value limit null'),
       config('allLimit', 'select 1 as value limit all'),
       config('zeroLimit', 'select 1 as value limit 0'),
+      config('noFromSelect', 'select 1 as value'),
+      config('noFromHaving', 'select 1 as value having false'),
+      config('noFromGroupingSets', 'select 1 as value group by grouping sets ((), ())'),
+      config('zeroColumnNoFromSelect', 'select'),
+      config('zeroColumnNoFromHaving', 'select having false'),
+      config('zeroColumnNoFromGroupingSets', 'select group by grouping sets ((), ())'),
+      config('nullableSelectParameter', 'select $1::text as value', ['value']),
       config('uniqueLookup', 'select account.id from public.accounts account where account.id = $1', ['id']),
       config(
         'multipliedUniqueLookup',
@@ -256,7 +263,8 @@ test('normalizes PostgreSQL statement, nullability, DML, and cardinality facts c
       proof: 'select_without_from+dynamic_limit_can_drop_rows',
     })
     assert.equal(query('dynamicLimit').rowCardinality, 'optional')
-    assert.equal(query('dynamicLimit').params[0]?.nullAdmission, 'unknown')
+    assert.equal(query('dynamicLimit').params[0]?.nullAdmission, 'accepts')
+    assert.equal(query('dynamicLimit').params[0]?.nullable, true)
     assert.equal(query('rejectingWindowFrame').params[0]?.nullAdmission, 'rejects')
     assert.equal(query('rejectingWindowFrame').params[0]?.nullable, false)
     assert.equal(query('acceptingWindowFrame').params[0]?.nullAdmission, 'unknown')
@@ -268,6 +276,22 @@ test('normalizes PostgreSQL statement, nullability, DML, and cardinality facts c
     assert.equal(query('nullLimit').rowCardinality, 'one')
     assert.equal(query('allLimit').rowCardinality, 'one')
     assert.equal(query('zeroLimit').rowCardinality, 'none')
+    assert.equal(query('noFromSelect').rowCardinality, 'one')
+    assert.equal(query('noFromHaving').rowCardinality, 'optional')
+    assert.deepEqual(query('noFromGroupingSets').rowBounds, {
+      max: null,
+      min: 0,
+      proof: 'select_without_from_with_grouping',
+    })
+    assert.equal(query('zeroColumnNoFromSelect').rowCardinality, 'one')
+    assert.equal(query('zeroColumnNoFromHaving').rowCardinality, 'optional')
+    assert.deepEqual(query('zeroColumnNoFromGroupingSets').rowBounds, {
+      max: null,
+      min: 0,
+      proof: 'select_without_from_with_grouping',
+    })
+    assert.equal(query('nullableSelectParameter').params[0]?.nullAdmission, 'accepts')
+    assert.equal(query('nullableSelectParameter').params[0]?.nullable, true)
 
     assert.equal(query('uniqueLookup').rowCardinality, 'optional')
     assert.deepEqual(query('multipliedUniqueLookup').rowBounds, {
@@ -362,6 +386,14 @@ test('normalizes PostgreSQL statement, nullability, DML, and cardinality facts c
     assert.equal(query('nullExtendedInsert').params[0]?.nullable, true)
     assert.equal(query('nullExtendedInsert').params[0]?.checkConstraintTypeName, undefined)
     assert.equal(query('nestedRowLock').isWrite, true)
+    assert.equal((await database.query('select 1 as value')).rows.length, 1)
+    assert.equal((await database.query('select 1 as value having false')).rows.length, 0)
+    assert.equal((await database.query('select 1 as value group by grouping sets ((), ())')).rows.length, 2)
+    assert.equal((await database.query('select')).rows.length, 1)
+    assert.equal((await database.query('select having false')).rows.length, 0)
+    assert.equal((await database.query('select group by grouping sets ((), ())')).rows.length, 2)
+    assert.deepEqual((await database.query('select $1::text as value', [null])).rows, [{ value: null }])
+    assert.deepEqual((await database.query('select 1 as value limit $1', [null])).rows, [{ value: 1 }])
     await assert.rejects(
       database.query('insert into public.source_domain_probe(value) values ($1::public.required_source_text)', [null]),
       /does not allow null/u

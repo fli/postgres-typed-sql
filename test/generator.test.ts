@@ -75,6 +75,19 @@ test('defaults to conservative unknown driver scalar values', async () => {
   assert.match(catalog, /readonly status: unknown/u)
 })
 
+test('generates nullable parameters when a direct SELECT use proves NULL is accepted', async () => {
+  const root = await createMinimalFixture('select 1;\n', 'select :value::text as value\n')
+  await generateTypedSql({
+    include: ['queries'],
+    rootDir: root,
+    scalarProfile: 'node-postgres',
+    schema: 'schema.sql',
+  })
+
+  const output = await readFile(join(root, 'queries/query.typed-sql.ts'), 'utf8')
+  assert.match(output, /export interface QueryParams \{[\s\S]*readonly value: string \| null/u)
+})
+
 test('requires serialized strings for PostgreSQL arrays whose element delimiter is not a comma', async () => {
   const root = await createMinimalFixture(
     'create domain public.int_list as integer[];\n',

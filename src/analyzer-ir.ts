@@ -805,7 +805,10 @@ function inferBaseRowBounds(
     }
 
     if ((query.rtable?.length ?? 0) === 0 && query.hasWindowFuncs !== true) {
-      return query.whereQual
+      if (hasGrouping) {
+        return { max: null, min: 0, proof: 'select_without_from_with_grouping' }
+      }
+      return query.whereQual || query.hasHavingQual === true
         ? { max: 1, min: 0, proof: 'select_without_from_with_qual' }
         : { max: 1, min: 1, proof: 'select_without_from' }
     }
@@ -896,14 +899,10 @@ function dmlParameterNullAdmissions(
 ): ReadonlyMap<number, TypedSqlPostgresIrParamNullAdmission> {
   const admissionByParamId = new Map<number, TypedSqlPostgresIrParamNullAdmission>()
   for (const [index, admission] of paramTypeNullAdmissions.entries()) {
-    if (admission !== 'accepts') {
-      admissionByParamId.set(index + 1, admission)
-    }
-  }
-  for (const [index, admission] of paramUsageNullAdmissions.entries()) {
-    if (admission !== 'accepts') {
-      admissionByParamId.set(index + 1, combineParameterNullAdmission(admissionByParamId.get(index + 1), admission))
-    }
+    admissionByParamId.set(
+      index + 1,
+      combineParameterNullAdmission(admission, paramUsageNullAdmissions[index] ?? 'unknown')
+    )
   }
   for (const query of queries) {
     walkQueryTree(query, (nested) => {

@@ -3,6 +3,8 @@
 #include "access/nbtree.h"
 #include "access/table.h"
 #include "catalog/pg_aggregate.h"
+#include "catalog/pg_amop.h"
+#include "catalog/pg_amproc.h"
 #include "catalog/pg_attribute.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_constraint.h"
@@ -22,9 +24,12 @@
 #include "tcop/tcopprot.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
+#include "utils/catcache.h"
+#include "utils/fmgroids.h"
 #include "utils/hsearch.h"
 #include "utils/jsonb.h"
 #include "utils/lsyscache.h"
+#include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/relcache.h"
 #include "utils/syscache.h"
@@ -85,6 +90,11 @@ struct QueryScope
   const struct QueryScope *parent;
 };
 
+typedef struct VolatileFunctionContext
+{
+  const QueryScope *scope;
+} VolatileFunctionContext;
+
 typedef enum NullProof
 {
   NULL_PROOF_NULL,
@@ -108,6 +118,23 @@ typedef enum TypeNullAdmission
   TYPE_NULL_UNKNOWN
 } TypeNullAdmission;
 
+typedef enum ArrayShapeProof
+{
+  ARRAY_SHAPE_VALID,
+  ARRAY_SHAPE_INVALID,
+  ARRAY_SHAPE_UNKNOWN
+} ArrayShapeProof;
+
+typedef struct ArrayShape
+{
+  ArrayShapeProof proof;
+  bool is_null;
+  int ndims;
+  int dims[MAXDIM];
+  int lbs[MAXDIM];
+  int nitems;
+} ArrayShape;
+
 typedef enum ArrayCardinalityProof
 {
   ARRAY_CARDINALITY_EMPTY,
@@ -115,58 +142,158 @@ typedef enum ArrayCardinalityProof
   ARRAY_CARDINALITY_UNKNOWN
 } ArrayCardinalityProof;
 
-static ArrayCardinalityProof
-array_cardinality_proof(const Node *node)
+static ArrayShape
+unknown_array_shape(void)
 {
+  ArrayShape shape = {0};
+
+  shape.proof = ARRAY_SHAPE_UNKNOWN;
+  return shape;
+}
+
+static ArrayShape
+invalid_array_shape(void)
+{
+  ArrayShape shape = {0};
+
+  shape.proof = ARRAY_SHAPE_INVALID;
+  return shape;
+}
+
+static ArrayShape
+array_shape_proof(const Node *node)
+{
+  ArrayShape shape = {0};
+
   if (node == NULL)
   {
-    return ARRAY_CARDINALITY_UNKNOWN;
+    return unknown_array_shape();
   }
   if (IsA(node, Const))
   {
     const Const *constant = (const Const *) node;
     ArrayType *value;
 
+    shape.proof = ARRAY_SHAPE_VALID;
     if (constant->constisnull)
     {
-      return ARRAY_CARDINALITY_UNKNOWN;
+      shape.is_null = true;
+      return shape;
     }
+
     value = DatumGetArrayTypeP(constant->constvalue);
-    return ArrayGetNItems(ARR_NDIM(value), ARR_DIMS(value)) == 0
-             ? ARRAY_CARDINALITY_EMPTY
-             : ARRAY_CARDINALITY_NONEMPTY;
+    shape.ndims = ARR_NDIM(value);
+    if (shape.ndims < 0 || shape.ndims > MAXDIM)
+    {
+      return invalid_array_shape();
+    }
+    if (shape.ndims > 0)
+    {
+      memcpy(shape.dims, ARR_DIMS(value), shape.ndims * sizeof(int));
+      memcpy(shape.lbs, ARR_LBOUND(value), shape.ndims * sizeof(int));
+    }
+    shape.nitems = ArrayGetNItems(shape.ndims, shape.dims);
+    return shape;
   }
   if (IsA(node, ArrayExpr))
   {
     const ArrayExpr *array = (const ArrayExpr *) node;
-    ListCell *cell;
-    bool saw_unknown = false;
+    int element_count = list_length(array->elements);
 
-    if (array->elements == NIL)
-    {
-      return ARRAY_CARDINALITY_EMPTY;
-    }
+    shape.proof = ARRAY_SHAPE_VALID;
     if (!array->multidims)
     {
-      return ARRAY_CARDINALITY_NONEMPTY;
+      shape.ndims = 1;
+      shape.dims[0] = element_count;
+      shape.lbs[0] = 1;
+      shape.nitems = element_count;
+      return shape;
     }
-    foreach(cell, array->elements)
-    {
-      ArrayCardinalityProof child =
-        array_cardinality_proof((const Node *) lfirst(cell));
 
-      if (child == ARRAY_CARDINALITY_NONEMPTY)
+    {
+      ArrayShape first_nonempty = {0};
+      ListCell *cell;
+      bool saw_empty = false;
+      bool saw_nonempty = false;
+      bool saw_unknown = false;
+
+      foreach(cell, array->elements)
       {
-        return ARRAY_CARDINALITY_NONEMPTY;
+        ArrayShape child = array_shape_proof((const Node *) lfirst(cell));
+
+        if (child.proof == ARRAY_SHAPE_INVALID)
+        {
+          return invalid_array_shape();
+        }
+        if (child.proof == ARRAY_SHAPE_UNKNOWN)
+        {
+          saw_unknown = true;
+          continue;
+        }
+        if (child.is_null || child.nitems == 0 || child.ndims <= 0)
+        {
+          saw_empty = true;
+          continue;
+        }
+        if (!saw_nonempty)
+        {
+          first_nonempty = child;
+          saw_nonempty = true;
+        }
+        else if (child.ndims != first_nonempty.ndims ||
+                 memcmp(child.dims, first_nonempty.dims,
+                        child.ndims * sizeof(int)) != 0 ||
+                 memcmp(child.lbs, first_nonempty.lbs,
+                        child.ndims * sizeof(int)) != 0)
+        {
+          return invalid_array_shape();
+        }
       }
-      if (child == ARRAY_CARDINALITY_UNKNOWN)
+
+      if (saw_unknown)
       {
-        saw_unknown = true;
+        return unknown_array_shape();
       }
+      if (!saw_nonempty)
+      {
+        return shape;
+      }
+      if (saw_empty || first_nonempty.ndims >= MAXDIM)
+      {
+        return invalid_array_shape();
+      }
+
+      shape.ndims = first_nonempty.ndims + 1;
+      shape.dims[0] = element_count;
+      shape.lbs[0] = 1;
+      memcpy(&shape.dims[1], first_nonempty.dims,
+             first_nonempty.ndims * sizeof(int));
+      memcpy(&shape.lbs[1], first_nonempty.lbs,
+             first_nonempty.ndims * sizeof(int));
+      if (first_nonempty.nitems > 0 &&
+          (Size) element_count > MaxArraySize / (Size) first_nonempty.nitems)
+      {
+        return unknown_array_shape();
+      }
+      shape.nitems = element_count * first_nonempty.nitems;
+      return shape;
     }
-    return saw_unknown ? ARRAY_CARDINALITY_UNKNOWN : ARRAY_CARDINALITY_EMPTY;
   }
-  return ARRAY_CARDINALITY_UNKNOWN;
+  return unknown_array_shape();
+}
+
+static ArrayCardinalityProof
+array_cardinality_proof(const Node *node)
+{
+  ArrayShape shape = array_shape_proof(node);
+
+  if (shape.proof != ARRAY_SHAPE_VALID || shape.is_null)
+  {
+    return ARRAY_CARDINALITY_UNKNOWN;
+  }
+  return shape.nitems == 0
+           ? ARRAY_CARDINALITY_EMPTY
+           : ARRAY_CARDINALITY_NONEMPTY;
 }
 
 typedef struct DmlParameterTargetKey
@@ -695,6 +822,13 @@ check_null_evaluation_for_subject_uncached(const Node *expr,
         evaluation_safe = evaluation_safe && element.evaluation_safe;
         depends_on_subject = depends_on_subject ||
                              element.depends_on_subject;
+      }
+      if (array->multidims)
+      {
+        ArrayShape shape = array_shape_proof(expr);
+
+        evaluation_safe = evaluation_safe &&
+                          shape.proof == ARRAY_SHAPE_VALID;
       }
       return make_null_evaluation(NULL_PROOF_NONNULL, evaluation_safe,
                                   depends_on_subject);
@@ -3543,6 +3677,36 @@ typedef enum SortGroupExecution
 } SortGroupExecution;
 
 static bool
+builtin_sortsupport_always_supplies_comparator(Oid function_oid)
+{
+  switch (function_oid)
+  {
+    case F_BTINT2SORTSUPPORT:
+    case F_BTINT4SORTSUPPORT:
+    case F_BTINT8SORTSUPPORT:
+    case F_BTFLOAT4SORTSUPPORT:
+    case F_BTFLOAT8SORTSUPPORT:
+    case F_BTOIDSORTSUPPORT:
+    case F_BTNAMESORTSUPPORT:
+    case F_DATE_SORTSUPPORT:
+    case F_TIMESTAMP_SORTSUPPORT:
+    case F_BTTEXTSORTSUPPORT:
+    case F_NUMERIC_SORTSUPPORT:
+    case F_UUID_SORTSUPPORT:
+    case F_BPCHAR_SORTSUPPORT:
+    case F_BYTEA_SORTSUPPORT:
+    case F_BTTEXT_PATTERN_SORTSUPPORT:
+    case F_BTBPCHAR_PATTERN_SORTSUPPORT:
+    case F_MACADDR_SORTSUPPORT:
+    case F_NETWORK_SORTSUPPORT:
+    case F_RANGE_SORTSUPPORT:
+      return true;
+    default:
+      return false;
+  }
+}
+
+static bool
 ordering_support_invokes_volatile_function(Oid ordering_operator)
 {
   Oid opfamily;
@@ -3568,6 +3732,11 @@ ordering_support_invokes_volatile_function(Oid ordering_operator)
       function_is_volatile(sort_support_function))
   {
     return true;
+  }
+  if (OidIsValid(sort_support_function) &&
+      builtin_sortsupport_always_supplies_comparator(sort_support_function))
+  {
+    return false;
   }
   if (!OidIsValid(order_function))
   {
@@ -3736,7 +3905,94 @@ domain_constraints_invoke_volatile_function(Oid type_oid)
 }
 
 static bool
-node_invokes_volatile_function(Node *node)
+operator_operand_is_execution_relevant_walker(Node *node, void *context)
+{
+  const QueryScope *scope = (const QueryScope *) context;
+
+  if (node == NULL)
+  {
+    return false;
+  }
+  if (IsA(node, Param))
+  {
+    return ((const Param *) node)->paramkind == PARAM_SUBLINK;
+  }
+  if (IsA(node, Var))
+  {
+    const Var *variable = (const Var *) node;
+    const QueryScope *owner_scope = query_scope_at_level(
+      scope, variable->varlevelsup);
+
+    if (owner_scope != NULL && variable->varno > 0 &&
+        variable->varno <= list_length(owner_scope->query->rtable))
+    {
+      const RangeTblEntry *rte = rt_fetch(
+        variable->varno, owner_scope->query->rtable);
+
+      return rte->rtekind == RTE_RELATION;
+    }
+    return false;
+  }
+  if (IsA(node, Query))
+  {
+    return false;
+  }
+  return expression_tree_walker(
+    node, operator_operand_is_execution_relevant_walker, context);
+}
+
+static bool
+operator_expr_has_execution_relevant_operand(Node *node,
+                                             const QueryScope *scope)
+{
+  return operator_operand_is_execution_relevant_walker(node, (void *) scope);
+}
+
+static bool
+operator_family_support_invokes_volatile_function(Oid operator_oid)
+{
+  CatCList *operator_memberships;
+  int operator_index;
+  bool invokes_volatile = false;
+
+  operator_memberships = SearchSysCacheList1(
+    AMOPOPID, ObjectIdGetDatum(operator_oid));
+  for (operator_index = 0;
+       operator_index < operator_memberships->n_members && !invokes_volatile;
+       operator_index++)
+  {
+    HeapTuple operator_tuple =
+      &operator_memberships->members[operator_index]->tuple;
+    Form_pg_amop operator_form =
+      (Form_pg_amop) GETSTRUCT(operator_tuple);
+    CatCList *support_functions = SearchSysCacheList1(
+      AMPROCNUM, ObjectIdGetDatum(operator_form->amopfamily));
+    int support_index;
+
+    for (support_index = 0;
+         support_index < support_functions->n_members;
+         support_index++)
+    {
+      HeapTuple support_tuple =
+        &support_functions->members[support_index]->tuple;
+      Form_pg_amproc support_form =
+        (Form_pg_amproc) GETSTRUCT(support_tuple);
+
+      if (OidIsValid(support_form->amproc) &&
+          function_is_volatile(support_form->amproc))
+      {
+        invokes_volatile = true;
+        break;
+      }
+    }
+    ReleaseSysCacheList(support_functions);
+  }
+  ReleaseSysCacheList(operator_memberships);
+  return invokes_volatile;
+}
+
+static bool
+node_invokes_volatile_function(Node *node, const QueryScope *scope)
 {
   switch (nodeTag(node))
   {
@@ -3781,14 +4037,18 @@ node_invokes_volatile_function(Node *node)
       OpExpr *expr = (OpExpr *) node;
       Oid function_oid = OidIsValid(expr->opfuncid) ? expr->opfuncid : get_opcode(expr->opno);
 
-      return function_is_volatile(function_oid);
+      return function_is_volatile(function_oid) ||
+             (operator_expr_has_execution_relevant_operand(node, scope) &&
+              operator_family_support_invokes_volatile_function(expr->opno));
     }
     case T_ScalarArrayOpExpr:
     {
       ScalarArrayOpExpr *expr = (ScalarArrayOpExpr *) node;
       Oid function_oid = OidIsValid(expr->opfuncid) ? expr->opfuncid : get_opcode(expr->opno);
 
-      return function_is_volatile(function_oid);
+      return function_is_volatile(function_oid) ||
+             (operator_expr_has_execution_relevant_operand(node, scope) &&
+              operator_family_support_invokes_volatile_function(expr->opno));
     }
     case T_CoerceViaIO:
     {
@@ -3811,10 +4071,16 @@ node_invokes_volatile_function(Node *node)
     case T_RowCompareExpr:
     {
       ListCell *operator_cell;
+      bool inspect_support = operator_expr_has_execution_relevant_operand(
+        node, scope);
 
       foreach(operator_cell, ((RowCompareExpr *) node)->opnos)
       {
-        if (function_is_volatile(get_opcode(lfirst_oid(operator_cell))))
+        Oid operator_oid = lfirst_oid(operator_cell);
+
+        if (function_is_volatile(get_opcode(operator_oid)) ||
+            (inspect_support &&
+             operator_family_support_invokes_volatile_function(operator_oid)))
         {
           return true;
         }
@@ -3831,20 +4097,30 @@ node_invokes_volatile_function(Node *node)
 static bool
 volatile_function_walker(Node *node, void *context)
 {
+  VolatileFunctionContext *volatile_context =
+    (VolatileFunctionContext *) context;
+
   if (node == NULL)
   {
     return false;
   }
-  if (node_invokes_volatile_function(node))
+  if (node_invokes_volatile_function(
+        node, volatile_context == NULL ? NULL : volatile_context->scope))
   {
     return true;
   }
   if (IsA(node, Query))
   {
     Query *query = (Query *) node;
+    QueryScope query_scope = {
+      query,
+      volatile_context == NULL ? NULL : volatile_context->scope
+    };
+    VolatileFunctionContext query_context = {&query_scope};
 
     return query_sort_group_support_invokes_volatile_function(query) ||
-           query_tree_walker(query, volatile_function_walker, context, 0);
+           query_tree_walker(query, volatile_function_walker,
+                             &query_context, 0);
   }
   return expression_tree_walker(node, volatile_function_walker, context);
 }

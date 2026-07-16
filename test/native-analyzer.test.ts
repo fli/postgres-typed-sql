@@ -589,6 +589,134 @@ test('native analyzer classifies only support functions reachable from sort exec
       ).rows,
       [{ called: false }]
     )
+
+    await database.query('create table public.builtin_sortsupport_calls (called boolean default true)')
+    for (const [suffix, operator] of [
+      ['lt', '<'],
+      ['le', '<='],
+      ['eq', '='],
+      ['ge', '>='],
+      ['gt', '>'],
+    ] as const) {
+      await database.query(`create function public.builtin_sortsupport_${suffix}(
+        left_value integer, right_value integer
+      ) returns boolean language sql immutable strict
+      as $$ select left_value ${operator} right_value $$`)
+    }
+    await database.query(`create function public.unreachable_volatile_int_compare(
+      left_value integer, right_value integer
+    ) returns integer language plpgsql volatile strict as $$
+    begin
+      insert into public.builtin_sortsupport_calls default values;
+      return case
+        when left_value < right_value then -1
+        when left_value > right_value then 1
+        else 0
+      end;
+    end
+    $$`)
+    for (const [name, suffix] of [
+      ['<~', 'lt'],
+      ['<=~', 'le'],
+      ['=~', 'eq'],
+      ['>=~', 'ge'],
+      ['>~', 'gt'],
+    ] as const) {
+      await database.query(`create operator public.${name} (
+        leftarg = integer,
+        rightarg = integer,
+        function = public.builtin_sortsupport_${suffix}
+      )`)
+    }
+    await database.query(`create operator class public.builtin_sortsupport_int_ops
+      for type integer using btree as
+        operator 1 public.<~,
+        operator 2 public.<=~,
+        operator 3 public.=~,
+        operator 4 public.>=~,
+        operator 5 public.>~,
+        function 1 public.unreachable_volatile_int_compare(integer, integer),
+        function 2 pg_catalog.btint4sortsupport(internal)`)
+
+    const builtinSortSupportSql = `select value
+      from (values (3), (1), (2)) input(value)
+      order by value using operator(public.<~)`
+    const builtinSortSupport = await analyze(database, builtinSortSupportSql, [])
+    assert.equal(builtinSortSupport.statements[0]?.queries[0]?.hasVolatileFunctions, false)
+    assert.deepEqual((await database.query<{ value: number }>(builtinSortSupportSql)).rows, [
+      { value: 1 },
+      { value: 2 },
+      { value: 3 },
+    ])
+    assert.deepEqual(
+      (
+        await database.query<{ called: boolean }>(`select exists(
+        select 1 from public.builtin_sortsupport_calls
+      ) as called`)
+      ).rows,
+      [{ called: false }]
+    )
+  })
+})
+
+test('native analyzer closes relation operators over volatile access-method support', async () => {
+  await withDatabase(async (database) => {
+    await database.query('create type public.hash_key as (value integer)')
+    await database.query('create table public.hash_key_calls (called boolean default true)')
+    await database.query(`create function public.hash_key_equal(
+      left_value public.hash_key, right_value public.hash_key
+    ) returns boolean language plpgsql immutable strict as $$
+    begin
+      return (left_value).value = (right_value).value;
+    end
+    $$`)
+    await database.query(`create function public.hash_key_hash(value public.hash_key)
+      returns integer language plpgsql volatile strict as $$
+    begin
+      insert into public.hash_key_calls default values;
+      return hashint4((value).value);
+    end
+    $$`)
+    await database.query(`create operator public.= (
+      leftarg = public.hash_key,
+      rightarg = public.hash_key,
+      function = public.hash_key_equal,
+      hashes
+    )`)
+    await database.query(`create operator class public.hash_key_ops
+      default for type public.hash_key using hash as
+        operator 1 public.=,
+        function 1 public.hash_key_hash(public.hash_key)`)
+    await database.query('create table public.hash_key_left (value public.hash_key)')
+    await database.query('create table public.hash_key_right (value public.hash_key)')
+    await database.query(`insert into public.hash_key_left(value)
+      values (row(1)::public.hash_key), (row(2)::public.hash_key)`)
+    await database.query(`insert into public.hash_key_right(value)
+      values (row(2)::public.hash_key), (row(3)::public.hash_key)`)
+
+    const constantSql = `select row(1)::public.hash_key
+      operator(public.=) row(1)::public.hash_key as equal`
+    const constant = await analyze(database, constantSql, [])
+    assert.equal(constant.statements[0]?.queries[0]?.hasVolatileFunctions, false)
+
+    const joinSql = `select left_value.value
+      from public.hash_key_left left_value
+      join public.hash_key_right right_value
+        on left_value.value operator(public.=) right_value.value`
+    const join = await analyze(database, joinSql, [])
+    assert.equal(join.statements[0]?.queries[0]?.hasVolatileFunctions, true)
+
+    await database.query('set enable_nestloop = off')
+    await database.query('set enable_mergejoin = off')
+    assert.equal((await database.query(joinSql)).rows.length, 1)
+    assert.deepEqual(
+      (
+        await database.query<{ called: boolean }>(`select exists(
+        select 1 from public.hash_key_calls
+      ) as called`)
+      ).rows,
+      [{ called: true }]
+    )
   })
 })
 
@@ -1220,6 +1348,49 @@ test('native analyzer maps direct DML parameters to PostgreSQL target columns', 
       emptyNestedArrayCheck.statements[0]?.queries[0]?.dmlParameterTargets[0]?.targetNullAdmission,
       'rejects'
     )
+    await assert.rejects(
+      database.query('insert into public.any_empty_probe(value) values ($1)', [null]),
+      /any_empty_probe_value_check/u
+    )
+
+    await database.query(`create table public.any_mismatched_array_probe (
+      value integer check (
+        value = any (array[array[]::integer[], array[value]])
+      )
+    )`)
+    const mismatchedNestedArrayCheck = await analyze(
+      database,
+      'insert into public.any_mismatched_array_probe(value) values ($1)',
+      []
+    )
+    assert.deepEqual(
+      mismatchedNestedArrayCheck.statements[0]?.queries[0]?.dmlParameterTargets.map(
+        ({ targetNullAdmission, targetNullable }) => ({ targetNullAdmission, targetNullable })
+      ),
+      [{ targetNullAdmission: 'unknown', targetNullable: false }]
+    )
+    await assert.rejects(
+      database.query('insert into public.any_mismatched_array_probe(value) values ($1)', [null]),
+      /multidimensional arrays must have array expressions with matching dimensions/u
+    )
+
+    await database.query(`create table public.any_compatible_array_probe (
+      value integer check (
+        value = any (array[array[value], array[value]])
+      )
+    )`)
+    const compatibleNestedArrayCheck = await analyze(
+      database,
+      'insert into public.any_compatible_array_probe(value) values ($1)',
+      []
+    )
+    assert.deepEqual(
+      compatibleNestedArrayCheck.statements[0]?.queries[0]?.dmlParameterTargets.map(
+        ({ targetNullAdmission, targetNullable }) => ({ targetNullAdmission, targetNullable })
+      ),
+      [{ targetNullAdmission: 'accepts', targetNullable: true }]
+    )
+    await database.query('insert into public.any_compatible_array_probe(value) values ($1)', [null])
 
     await database.query(`create table public.generated_probe (
       input text,
