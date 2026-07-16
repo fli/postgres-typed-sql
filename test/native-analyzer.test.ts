@@ -99,7 +99,7 @@ async function withDatabase(run: (database: AnalysisDatabase) => Promise<void>):
 
 async function installSortKeyOperatorClass(
   database: AnalysisDatabase,
-  name: 'precision_sort_key' | 'volatile_sort_key',
+  name: 'array_element_key' | 'precision_sort_key' | 'volatile_sort_key',
   options: { readonly volatileComparator: boolean; readonly volatileEquality: boolean }
 ): Promise<void> {
   await database.query(`create type public.${name} as (value integer)`)
@@ -659,6 +659,196 @@ test('native analyzer classifies only support functions reachable from sort exec
   })
 })
 
+test('native analyzer follows grouped and excluded DML lineage and keeps inherited enforcement opaque', async () => {
+  await withDatabase(async (database) => {
+    await database.query('create table public.inherited_target (value integer)')
+    await database.query('create table public.inherited_target_child () inherits (public.inherited_target)')
+    await database.query('alter table public.inherited_target_child alter column value set not null')
+    await database.query('insert into public.inherited_target_child(value) values (1)')
+    await database.query('insert into public.inherited_target(value) values (1)')
+
+    const inheritedSql = 'update public.inherited_target set value = $1'
+    const inherited = await analyze(database, inheritedSql, [23])
+    assert.deepEqual(
+      inherited.statements[0]?.queries[0]?.dmlParameterTargets.map(({ directAssignment, targetNullAdmission }) => ({
+        directAssignment,
+        targetNullAdmission,
+      })),
+      [{ directAssignment: false, targetNullAdmission: 'unknown' }]
+    )
+    await assert.rejects(database.query(inheritedSql, [null]), /not-null constraint/u)
+
+    const onlySql = 'update only public.inherited_target set value = $1'
+    const only = await analyze(database, onlySql, [23])
+    assert.deepEqual(
+      only.statements[0]?.queries[0]?.dmlParameterTargets.map(({ directAssignment, targetNullAdmission }) => ({
+        directAssignment,
+        targetNullAdmission,
+      })),
+      [{ directAssignment: false, targetNullAdmission: 'accepts' }]
+    )
+    await database.query(onlySql, [null])
+
+    await database.query('create table public.grouped_sink (value integer not null)')
+    const groupedSql = `insert into public.grouped_sink(value)
+      select $1::integer group by $1`
+    const grouped = await analyze(database, groupedSql, [23])
+    assert.deepEqual(
+      grouped.statements[0]?.queries[0]?.dmlParameterTargets.map(({ paramId, targetAttname, targetNullAdmission }) => ({
+        paramId,
+        targetAttname,
+        targetNullAdmission,
+      })),
+      [{ paramId: 1, targetAttname: 'value', targetNullAdmission: 'rejects' }]
+    )
+    await assert.rejects(database.query(groupedSql, [null]), /not-null constraint/u)
+
+    await database.query(`create table public.excluded_target (
+      key integer primary key,
+      source_value integer,
+      required_value integer not null
+    )`)
+    await database.query('insert into public.excluded_target(key, source_value, required_value) values (1, 1, 1)')
+    const excludedSql = `insert into public.excluded_target(key, source_value, required_value)
+      values (1, $1, 0)
+      on conflict (key) do update
+      set required_value = excluded.source_value`
+    const excluded = await analyze(database, excludedSql, [23])
+    assert.deepEqual(
+      excluded.statements[0]?.queries[0]?.dmlParameterTargets.map(
+        ({ paramId, source, targetAttname, targetNullAdmission }) => ({
+          paramId,
+          source,
+          targetAttname,
+          targetNullAdmission,
+        })
+      ),
+      [
+        {
+          paramId: 1,
+          source: 'INSERT',
+          targetAttname: 'source_value',
+          targetNullAdmission: 'accepts',
+        },
+        {
+          paramId: 1,
+          source: 'ON_CONFLICT_UPDATE',
+          targetAttname: 'required_value',
+          targetNullAdmission: 'unknown',
+        },
+      ]
+    )
+    await assert.rejects(database.query(excludedSql, [null]), /not-null constraint/u)
+
+    await database.query(`create function public.excluded_source_value(
+      value public.excluded_target
+    ) returns integer language sql immutable strict
+    as $$ select (value).source_value $$`)
+    const excludedWholeRowSql = `insert into public.excluded_target(key, source_value, required_value)
+      values (1, $1, 0)
+      on conflict (key) do update
+      set required_value = public.excluded_source_value(excluded)`
+    const excludedWholeRow = await analyze(database, excludedWholeRowSql, [23])
+    assert.ok(
+      excludedWholeRow.statements[0]?.queries[0]?.dmlParameterTargets.some(
+        ({ paramId, source, targetAttname, targetNullAdmission }) =>
+          paramId === 1 &&
+          source === 'ON_CONFLICT_UPDATE' &&
+          targetAttname === 'required_value' &&
+          targetNullAdmission === 'unknown'
+      )
+    )
+    await assert.rejects(database.query(excludedWholeRowSql, [null]), /not-null constraint/u)
+
+    await database.query('create table public.function_sink (value integer not null)')
+    const functionSql = `insert into public.function_sink(value)
+      select value from generate_series($1::integer, $1::integer) source(value)`
+    const functionLineage = await analyze(database, functionSql, [23])
+    assert.deepEqual(
+      functionLineage.statements[0]?.queries[0]?.dmlParameterTargets.map(
+        ({ paramId, targetAttname, targetNullAdmission }) => ({
+          paramId,
+          targetAttname,
+          targetNullAdmission,
+        })
+      ),
+      [{ paramId: 1, targetAttname: 'value', targetNullAdmission: 'unknown' }]
+    )
+    assert.deepEqual((await database.query(functionSql, [null])).rows, [])
+  })
+})
+
+test('native analyzer closes JSON conversion over casts, arrays, constructors, and aggregates', async () => {
+  await withDatabase(async (database) => {
+    await database.query("create type public.json_mood as enum ('calm', 'busy')")
+    await database.query('create table public.json_conversion_calls (value text)')
+    await database.query(`create function public.json_mood_to_json(value public.json_mood)
+      returns json language plpgsql volatile strict as $$
+      begin
+        insert into public.json_conversion_calls(value) values (value::text);
+        return pg_catalog.to_json(value::text);
+      end
+      $$`)
+    await database.query(`create cast (public.json_mood as json)
+      with function public.json_mood_to_json(public.json_mood) as assignment`)
+
+    for (const sql of [
+      "select to_json('calm'::public.json_mood)",
+      "select json_build_object('mood', 'calm'::public.json_mood)",
+      "select json_agg(value) from (values ('calm'::public.json_mood)) input(value)",
+      "select to_json(array['calm'::public.json_mood])",
+      "select json_scalar('calm'::public.json_mood)",
+    ]) {
+      const analysis = await analyze(database, sql, [])
+      assert.equal(analysis.statements[0]?.queries[0]?.hasVolatileFunctions, true, sql)
+      await database.query(sql)
+    }
+
+    assert.deepEqual(
+      (await database.query<{ count: string }>('select count(*)::text as count from public.json_conversion_calls'))
+        .rows,
+      [{ count: '5' }]
+    )
+
+    for (const sql of [
+      'select to_json(1)',
+      "select json_build_object('value', 1)",
+      'select json_agg(value) from (values (1)) input(value)',
+      'select json_scalar(1)',
+    ]) {
+      const analysis = await analyze(database, sql, [])
+      assert.equal(analysis.statements[0]?.queries[0]?.hasVolatileFunctions, false, sql)
+    }
+  })
+})
+
+test('native analyzer closes array comparison over concrete element support', async () => {
+  await withDatabase(async (database) => {
+    await installSortKeyOperatorClass(database, 'array_element_key', {
+      volatileComparator: false,
+      volatileEquality: true,
+    })
+
+    const arraySql = `select
+      array[row(1)::public.array_element_key] =
+      array[row(1)::public.array_element_key] as equal`
+    const arrayAnalysis = await analyze(database, arraySql, [])
+    assert.equal(arrayAnalysis.statements[0]?.queries[0]?.hasVolatileFunctions, true)
+    assert.deepEqual((await database.query<{ equal: boolean }>(arraySql)).rows, [{ equal: true }])
+    assert.deepEqual(
+      (
+        await database.query<{ called: boolean }>(`select exists(
+          select 1 from public.array_element_key_calls
+        ) as called`)
+      ).rows,
+      [{ called: true }]
+    )
+
+    const builtinArray = await analyze(database, 'select array[1] = array[1] as equal', [])
+    assert.equal(builtinArray.statements[0]?.queries[0]?.hasVolatileFunctions, false)
+  })
+})
+
 test('native analyzer closes relation operators over volatile access-method support', async () => {
   await withDatabase(async (database) => {
     await database.query('create type public.hash_key as (value integer)')
@@ -675,13 +865,23 @@ test('native analyzer closes relation operators over volatile access-method supp
     begin
       insert into public.hash_key_calls default values;
       return hashint4((value).value);
-    end
-    $$`)
+      end
+      $$`)
+    await database.query(`create function public.hash_key_not_equal(
+      left_value public.hash_key, right_value public.hash_key
+    ) returns boolean language sql immutable strict
+    as $$ select (left_value).value <> (right_value).value $$`)
     await database.query(`create operator public.= (
       leftarg = public.hash_key,
       rightarg = public.hash_key,
       function = public.hash_key_equal,
       hashes
+    )`)
+    await database.query(`create operator public.<> (
+      leftarg = public.hash_key,
+      rightarg = public.hash_key,
+      function = public.hash_key_not_equal,
+      negator = =
     )`)
     await database.query(`create operator class public.hash_key_ops
       default for type public.hash_key using hash as
@@ -706,9 +906,76 @@ test('native analyzer closes relation operators over volatile access-method supp
     const join = await analyze(database, joinSql, [])
     assert.equal(join.statements[0]?.queries[0]?.hasVolatileFunctions, true)
 
+    const derivedJoinSql = `with left_values as (
+        select value from public.hash_key_left
+      ), right_values as (
+        select value from public.hash_key_right
+      )
+      select left_value.value
+      from left_values left_value
+      join right_values right_value
+        on left_value.value operator(public.=) right_value.value`
+    const derivedJoin = await analyze(database, derivedJoinSql, [])
+    assert.equal(derivedJoin.statements[0]?.queries[0]?.hasVolatileFunctions, true)
+
+    await database.query(`create function public.stable_hash_key_identity(
+      value public.hash_key
+    ) returns public.hash_key language plpgsql stable strict as $$
+    begin
+      return value;
+    end
+    $$`)
+    const hashedScalarArraySql = `select public.stable_hash_key_identity(
+      $1::public.hash_key
+    ) operator(public.=) any(
+      array[
+        row(1)::public.hash_key, row(2)::public.hash_key,
+        row(3)::public.hash_key, row(4)::public.hash_key,
+        row(5)::public.hash_key, row(6)::public.hash_key,
+        row(7)::public.hash_key, row(8)::public.hash_key,
+        row(9)::public.hash_key
+      ]
+    ) as present`
+    const hashedScalarArray = await analyze(database, hashedScalarArraySql, [])
+    assert.equal(hashedScalarArray.statements[0]?.queries[0]?.hasVolatileFunctions, true)
+
+    const hashedScalarArrayAllSql = `select public.stable_hash_key_identity(
+      $1::public.hash_key
+    ) operator(public.<>) all(
+      array[
+        row(1)::public.hash_key, row(2)::public.hash_key,
+        row(3)::public.hash_key, row(4)::public.hash_key,
+        row(5)::public.hash_key, row(6)::public.hash_key,
+        row(7)::public.hash_key, row(8)::public.hash_key,
+        row(9)::public.hash_key
+      ]
+    ) as absent`
+    const hashedScalarArrayAll = await analyze(database, hashedScalarArrayAllSql, [])
+    assert.equal(hashedScalarArrayAll.statements[0]?.queries[0]?.hasVolatileFunctions, true)
+
+    const builtinScalarArray = await analyze(
+      database,
+      'select 1 = any(array[1, 2, 3, 4, 5, 6, 7, 8, 9]) as present',
+      []
+    )
+    assert.equal(builtinScalarArray.statements[0]?.queries[0]?.hasVolatileFunctions, false)
+
     await database.query('set enable_nestloop = off')
     await database.query('set enable_mergejoin = off')
     assert.equal((await database.query(joinSql)).rows.length, 1)
+    assert.equal((await database.query(derivedJoinSql)).rows.length, 1)
+    await database.query('truncate public.hash_key_calls')
+    assert.deepEqual((await database.query(hashedScalarArraySql, ['(1)'])).rows, [{ present: true }])
+    assert.deepEqual(
+      (
+        await database.query<{ called: boolean }>(`select exists(
+        select 1 from public.hash_key_calls
+      ) as called`)
+      ).rows,
+      [{ called: true }]
+    )
+    await database.query('truncate public.hash_key_calls')
+    assert.deepEqual((await database.query(hashedScalarArrayAllSql, ['(10)'])).rows, [{ absent: true }])
     assert.deepEqual(
       (
         await database.query<{ called: boolean }>(`select exists(

@@ -8,6 +8,7 @@
 #include "catalog/pg_attribute.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_constraint.h"
+#include "catalog/pg_inherits.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_trigger.h"
 #include "catalog/pg_type.h"
@@ -28,6 +29,7 @@
 #include "utils/fmgroids.h"
 #include "utils/hsearch.h"
 #include "utils/jsonb.h"
+#include "utils/jsonfuncs.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
@@ -2222,12 +2224,51 @@ append_direct_parameter_targets(DmlLineageContext *context, const QueryScope *sc
           value_preserving = false;
         }
 
-        if (variable_scope != NULL && var->varattno > 0 && var->varno > 0 &&
+        if (variable_scope != NULL && var->varno > 0 &&
             var->varno <= list_length(variable_scope->query->rtable))
         {
           const RangeTblEntry *rte = rt_fetch(var->varno, variable_scope->query->rtable);
 
-          if (rte->rtekind == RTE_VALUES)
+          if (variable_scope->query->onConflict != NULL &&
+              var->varno == variable_scope->query->onConflict->exclRelIndex)
+          {
+            if (var->varattno > 0)
+            {
+              const TargetEntry *insert_target = target_entry_by_resno(
+                variable_scope->query->targetList, var->varattno);
+
+              if (insert_target != NULL)
+              {
+                enqueue_lineage_work(context, &work, LINEAGE_WORK_EXPR,
+                                     variable_scope,
+                                     (const Node *) insert_target->expr,
+                                     0, item_admission, false,
+                                     item->null_propagating, false);
+              }
+            }
+            else if (var->varattno == InvalidAttrNumber)
+            {
+              ListCell *target_cell;
+
+              foreach(target_cell, variable_scope->query->targetList)
+              {
+                const TargetEntry *insert_target =
+                  lfirst_node(TargetEntry, target_cell);
+                UnknownLineageWalkerContext walker_context = {
+                  context,
+                  &work,
+                  variable_scope
+                };
+
+                if (!insert_target->resjunk)
+                {
+                  enqueue_unknown_lineage_walker(
+                    (Node *) insert_target->expr, &walker_context);
+                }
+              }
+            }
+          }
+          else if (var->varattno > 0 && rte->rtekind == RTE_VALUES)
           {
             ListCell *row_cell;
 
@@ -2245,7 +2286,8 @@ append_direct_parameter_targets(DmlLineageContext *context, const QueryScope *sc
               }
             }
           }
-          else if (rte->rtekind == RTE_SUBQUERY && rte->subquery != NULL)
+          else if (var->varattno > 0 && rte->rtekind == RTE_SUBQUERY &&
+                   rte->subquery != NULL)
           {
             QueryScope *child_scope = make_query_scope(rte->subquery, variable_scope);
 
@@ -2255,7 +2297,7 @@ append_direct_parameter_targets(DmlLineageContext *context, const QueryScope *sc
                                  value_preserving, item->null_propagating,
                                  item->unconditional);
           }
-          else if (rte->rtekind == RTE_CTE)
+          else if (var->varattno > 0 && rte->rtekind == RTE_CTE)
           {
             const QueryScope *owner_scope = query_scope_at_level(variable_scope,
                                                                  rte->ctelevelsup);
@@ -2275,7 +2317,7 @@ append_direct_parameter_targets(DmlLineageContext *context, const QueryScope *sc
                                    item->unconditional);
             }
           }
-          else if (rte->rtekind == RTE_JOIN &&
+          else if (var->varattno > 0 && rte->rtekind == RTE_JOIN &&
                    var->varattno <= list_length(rte->joinaliasvars))
           {
             enqueue_lineage_work(context, &work, LINEAGE_WORK_EXPR,
@@ -2284,6 +2326,99 @@ append_direct_parameter_targets(DmlLineageContext *context, const QueryScope *sc
                                                         var->varattno - 1),
                                  0, item_admission, value_preserving,
                                  item->null_propagating, item->unconditional);
+          }
+          else if (var->varattno > 0 && rte->rtekind == RTE_GROUP &&
+                   var->varattno <= list_length(rte->groupexprs))
+          {
+            enqueue_lineage_work(context, &work, LINEAGE_WORK_EXPR,
+                                 variable_scope,
+                                 (const Node *) list_nth(rte->groupexprs,
+                                                        var->varattno - 1),
+                                 0, item_admission, value_preserving,
+                                 item->null_propagating, item->unconditional);
+          }
+          else if (var->varattno == InvalidAttrNumber &&
+                   (rte->rtekind == RTE_VALUES ||
+                    rte->rtekind == RTE_JOIN ||
+                    rte->rtekind == RTE_GROUP))
+          {
+            const Node *payload = rte->rtekind == RTE_VALUES
+                                    ? (const Node *) rte->values_lists
+                                    : rte->rtekind == RTE_JOIN
+                                        ? (const Node *) rte->joinaliasvars
+                                        : (const Node *) rte->groupexprs;
+            UnknownLineageWalkerContext walker_context = {
+              context,
+              &work,
+              variable_scope
+            };
+
+            enqueue_unknown_lineage_walker((Node *) payload,
+                                            &walker_context);
+          }
+          else if (var->varattno == InvalidAttrNumber &&
+                   rte->rtekind == RTE_SUBQUERY && rte->subquery != NULL)
+          {
+            UnknownLineageWalkerContext walker_context = {
+              context,
+              &work,
+              variable_scope
+            };
+
+            enqueue_unknown_lineage_walker(
+              (Node *) rte->subquery, &walker_context);
+          }
+          else if (var->varattno == InvalidAttrNumber &&
+                   rte->rtekind == RTE_CTE)
+          {
+            const QueryScope *owner_scope = query_scope_at_level(
+              variable_scope, rte->ctelevelsup);
+            const CommonTableExpr *cte = owner_scope == NULL
+                                           ? NULL
+                                           : cte_by_name(owner_scope->query,
+                                                         rte->ctename);
+
+            if (cte != NULL && cte->ctequery != NULL &&
+                IsA(cte->ctequery, Query))
+            {
+              UnknownLineageWalkerContext walker_context = {
+                context,
+                &work,
+                owner_scope
+              };
+
+              enqueue_unknown_lineage_walker(cte->ctequery,
+                                              &walker_context);
+            }
+          }
+          else if (rte->rtekind == RTE_FUNCTION)
+          {
+            ListCell *function_cell;
+
+            foreach(function_cell, rte->functions)
+            {
+              const RangeTblFunction *function =
+                lfirst_node(RangeTblFunction, function_cell);
+              UnknownLineageWalkerContext walker_context = {
+                context,
+                &work,
+                variable_scope
+              };
+
+              enqueue_unknown_lineage_walker(function->funcexpr,
+                                              &walker_context);
+            }
+          }
+          else if (rte->rtekind == RTE_TABLEFUNC && rte->tablefunc != NULL)
+          {
+            UnknownLineageWalkerContext walker_context = {
+              context,
+              &work,
+              variable_scope
+            };
+
+            enqueue_unknown_lineage_walker((Node *) rte->tablefunc,
+                                            &walker_context);
           }
         }
       }
@@ -2303,7 +2438,8 @@ append_direct_parameter_targets(DmlLineageContext *context, const QueryScope *sc
 }
 
 static RelationWriteEnforcement
-relation_write_enforcement(Oid relid, CmdType command)
+relation_write_enforcement(Oid relid, const RangeTblEntry *target_rte,
+                           CmdType command)
 {
   Relation relation;
   Form_pg_class relation_form;
@@ -2322,7 +2458,10 @@ relation_write_enforcement(Oid relid, CmdType command)
 
   relation = table_open(relid, AccessShareLock);
   relation_form = RelationGetForm(relation);
-  result.opaque = relation_form->relkind == RELKIND_PARTITIONED_TABLE ||
+  /* Descendants can add stricter constraints and triggers than the parent. */
+  result.opaque = (target_rte != NULL && target_rte->inh &&
+                   has_subclass(relid)) ||
+                  relation_form->relkind == RELKIND_PARTITIONED_TABLE ||
                   relation_form->relkind == RELKIND_FOREIGN_TABLE ||
                   relation_form->relrowsecurity || relation_form->relforcerowsecurity;
   descriptor = RelationGetDescr(relation);
@@ -2465,7 +2604,8 @@ append_dml_parameter_targets(StringInfo out, const Query *query)
       (query->commandType == CMD_INSERT || query->commandType == CMD_UPDATE))
   {
     RelationWriteEnforcement enforcement =
-      relation_write_enforcement(target_relid, query->commandType);
+      relation_write_enforcement(target_relid, target_rte,
+                                 query->commandType);
 
     append_targets_from_list(out, &scope, query->targetList, target_relid,
                              command_type_name(query->commandType),
@@ -2483,7 +2623,7 @@ append_dml_parameter_targets(StringInfo out, const Query *query)
       query->onConflict->action == ONCONFLICT_UPDATE)
   {
     RelationWriteEnforcement enforcement =
-      relation_write_enforcement(target_relid, CMD_UPDATE);
+      relation_write_enforcement(target_relid, target_rte, CMD_UPDATE);
 
     append_targets_from_list(out, &scope, query->onConflict->onConflictSet,
                              target_relid, "ON_CONFLICT_UPDATE", false,
@@ -2498,9 +2638,9 @@ append_dml_parameter_targets(StringInfo out, const Query *query)
   {
     ListCell *cell;
     RelationWriteEnforcement insert_enforcement =
-      relation_write_enforcement(target_relid, CMD_INSERT);
+      relation_write_enforcement(target_relid, target_rte, CMD_INSERT);
     RelationWriteEnforcement update_enforcement =
-      relation_write_enforcement(target_relid, CMD_UPDATE);
+      relation_write_enforcement(target_relid, target_rte, CMD_UPDATE);
 
     foreach(cell, query->mergeActionList)
     {
@@ -3669,6 +3809,494 @@ aggregate_invokes_volatile_function(Oid aggregate_oid)
   return false;
 }
 
+/* Dynamic container support is recursive; unresolved cycles stay conservative. */
+#define MAX_RUNTIME_TYPE_SUPPORT_DEPTH 32
+
+typedef enum RuntimeTypeSupportKind
+{
+  RUNTIME_SUPPORT_EQUAL,
+  RUNTIME_SUPPORT_COMPARE,
+  RUNTIME_SUPPORT_HASH
+} RuntimeTypeSupportKind;
+
+typedef struct RuntimeTypeSupportKey
+{
+  Oid type_oid;
+  int32 typmod;
+  RuntimeTypeSupportKind kind;
+} RuntimeTypeSupportKey;
+
+typedef struct RuntimeTypeSupportContext
+{
+  RuntimeTypeSupportKey stack[MAX_RUNTIME_TYPE_SUPPORT_DEPTH];
+  int depth;
+} RuntimeTypeSupportContext;
+
+static bool
+type_runtime_support_invokes_volatile(Oid type_oid, int32 typmod,
+                                      RuntimeTypeSupportKind kind,
+                                      RuntimeTypeSupportContext *context)
+{
+  TypeCacheEntry *type_cache;
+  Oid base_type;
+  Oid element_type;
+  char type_kind;
+  FmgrInfo *support_function = NULL;
+  int stack_index;
+  bool result = false;
+
+  if (!OidIsValid(type_oid) || context->depth >= MAX_RUNTIME_TYPE_SUPPORT_DEPTH)
+  {
+    return true;
+  }
+
+  base_type = getBaseTypeAndTypmod(type_oid, &typmod);
+  for (stack_index = 0; stack_index < context->depth; stack_index++)
+  {
+    RuntimeTypeSupportKey *key = &context->stack[stack_index];
+
+    if (key->type_oid == base_type && key->typmod == typmod && key->kind == kind)
+    {
+      return true;
+    }
+  }
+  context->stack[context->depth].type_oid = base_type;
+  context->stack[context->depth].typmod = typmod;
+  context->stack[context->depth].kind = kind;
+  context->depth++;
+
+  switch (kind)
+  {
+    case RUNTIME_SUPPORT_EQUAL:
+      type_cache = lookup_type_cache(base_type, TYPECACHE_EQ_OPR_FINFO);
+      support_function = &type_cache->eq_opr_finfo;
+      break;
+    case RUNTIME_SUPPORT_COMPARE:
+      type_cache = lookup_type_cache(base_type, TYPECACHE_CMP_PROC_FINFO);
+      support_function = &type_cache->cmp_proc_finfo;
+      break;
+    case RUNTIME_SUPPORT_HASH:
+      type_cache = lookup_type_cache(base_type, TYPECACHE_HASH_PROC_FINFO);
+      support_function = &type_cache->hash_proc_finfo;
+      break;
+  }
+  if (support_function != NULL && OidIsValid(support_function->fn_oid) &&
+      function_is_volatile(support_function->fn_oid))
+  {
+    context->depth--;
+    return true;
+  }
+
+  element_type = get_element_type(base_type);
+  if (OidIsValid(element_type))
+  {
+    result = type_runtime_support_invokes_volatile(
+      element_type, -1, kind, context);
+    context->depth--;
+    return result;
+  }
+
+  type_kind = get_typtype(base_type);
+  if (type_kind == TYPTYPE_COMPOSITE || base_type == RECORDOID)
+  {
+    TupleDesc descriptor = lookup_rowtype_tupdesc_domain(base_type, typmod, true);
+    int attribute_index;
+
+    if (descriptor == NULL)
+    {
+      context->depth--;
+      return true;
+    }
+    for (attribute_index = 0; attribute_index < descriptor->natts; attribute_index++)
+    {
+      Form_pg_attribute attribute = TupleDescAttr(descriptor, attribute_index);
+
+      if (!attribute->attisdropped &&
+          type_runtime_support_invokes_volatile(
+            attribute->atttypid, attribute->atttypmod, kind, context))
+      {
+        result = true;
+        break;
+      }
+    }
+    ReleaseTupleDesc(descriptor);
+    context->depth--;
+    return result;
+  }
+
+  if (type_kind == TYPTYPE_RANGE)
+  {
+    type_cache = lookup_type_cache(base_type, TYPECACHE_RANGE_INFO);
+    if (type_cache->rngelemtype == NULL)
+    {
+      context->depth--;
+      return true;
+    }
+    if (kind == RUNTIME_SUPPORT_HASH)
+    {
+      result = type_runtime_support_invokes_volatile(
+        type_cache->rngelemtype->type_id, -1, RUNTIME_SUPPORT_HASH, context);
+    }
+    else
+    {
+      result = !OidIsValid(type_cache->rng_cmp_proc_finfo.fn_oid) ||
+               function_is_volatile(type_cache->rng_cmp_proc_finfo.fn_oid) ||
+               type_runtime_support_invokes_volatile(
+                 type_cache->rngelemtype->type_id, -1,
+                 RUNTIME_SUPPORT_COMPARE, context);
+    }
+    context->depth--;
+    return result;
+  }
+
+  if (type_kind == TYPTYPE_MULTIRANGE)
+  {
+    type_cache = lookup_type_cache(base_type, TYPECACHE_MULTIRANGE_INFO);
+    if (type_cache->rngtype == NULL)
+    {
+      context->depth--;
+      return true;
+    }
+    result = type_runtime_support_invokes_volatile(
+      type_cache->rngtype->type_id, -1, kind, context);
+    context->depth--;
+    return result;
+  }
+
+  context->depth--;
+  return false;
+}
+
+typedef struct JsonConversionKey
+{
+  Oid type_oid;
+  int32 typmod;
+  bool is_jsonb;
+} JsonConversionKey;
+
+typedef struct JsonConversionContext
+{
+  JsonConversionKey stack[MAX_RUNTIME_TYPE_SUPPORT_DEPTH];
+  int depth;
+} JsonConversionContext;
+
+static bool
+json_type_conversion_invokes_volatile(Oid type_oid, int32 typmod,
+                                      bool is_jsonb,
+                                      JsonConversionContext *context)
+{
+  JsonTypeCategory category;
+  Oid output_function;
+  Oid base_type;
+  int stack_index;
+  bool result = false;
+
+  if (!OidIsValid(type_oid) || context->depth >= MAX_RUNTIME_TYPE_SUPPORT_DEPTH)
+  {
+    return true;
+  }
+  base_type = getBaseTypeAndTypmod(type_oid, &typmod);
+  for (stack_index = 0; stack_index < context->depth; stack_index++)
+  {
+    JsonConversionKey *key = &context->stack[stack_index];
+
+    if (key->type_oid == base_type && key->typmod == typmod &&
+        key->is_jsonb == is_jsonb)
+    {
+      return true;
+    }
+  }
+  context->stack[context->depth].type_oid = base_type;
+  context->stack[context->depth].typmod = typmod;
+  context->stack[context->depth].is_jsonb = is_jsonb;
+  context->depth++;
+
+  json_categorize_type(base_type, is_jsonb, &category, &output_function);
+  if (category == JSONTYPE_ARRAY)
+  {
+    Oid element_type = get_element_type(base_type);
+
+    result = !OidIsValid(element_type) ||
+             json_type_conversion_invokes_volatile(
+               element_type, -1, is_jsonb, context);
+  }
+  else if (category == JSONTYPE_COMPOSITE)
+  {
+    TupleDesc descriptor = lookup_rowtype_tupdesc_domain(base_type, typmod, true);
+    int attribute_index;
+
+    if (descriptor == NULL)
+    {
+      result = true;
+    }
+    else
+    {
+      for (attribute_index = 0; attribute_index < descriptor->natts; attribute_index++)
+      {
+        Form_pg_attribute attribute = TupleDescAttr(descriptor, attribute_index);
+
+        if (!attribute->attisdropped &&
+            json_type_conversion_invokes_volatile(
+              attribute->atttypid, attribute->atttypmod, is_jsonb, context))
+        {
+          result = true;
+          break;
+        }
+      }
+      ReleaseTupleDesc(descriptor);
+    }
+  }
+  else if (OidIsValid(output_function))
+  {
+    result = function_is_volatile(output_function);
+  }
+
+  context->depth--;
+  return result;
+}
+
+static bool
+json_conversion_args_invoke_volatile(const List *args, bool is_jsonb,
+                                     bool target_entries)
+{
+  ListCell *cell;
+
+  foreach(cell, args)
+  {
+    const Node *argument = target_entries
+                             ? (const Node *) lfirst_node(TargetEntry, cell)->expr
+                             : (const Node *) lfirst(cell);
+    JsonConversionContext context = {0};
+
+    if (argument == NULL ||
+        json_type_conversion_invokes_volatile(
+          exprType(argument), exprTypmod(argument), is_jsonb, &context))
+    {
+      return true;
+    }
+  }
+  return false;
+}
+
+static bool
+json_function_args_invoke_volatile(Oid function_oid, const List *args)
+{
+  switch (function_oid)
+  {
+    case F_ARRAY_TO_JSON_ANYARRAY:
+    case F_ARRAY_TO_JSON_ANYARRAY_BOOL:
+    case F_ROW_TO_JSON_RECORD:
+    case F_ROW_TO_JSON_RECORD_BOOL:
+    case F_TO_JSON:
+    case F_JSON_BUILD_ARRAY_ANY:
+    case F_JSON_BUILD_OBJECT_ANY:
+      return json_conversion_args_invoke_volatile(args, false, false);
+    case F_TO_JSONB:
+    case F_JSONB_BUILD_ARRAY_ANY:
+    case F_JSONB_BUILD_OBJECT_ANY:
+      return json_conversion_args_invoke_volatile(args, true, false);
+    default:
+      return false;
+  }
+}
+
+static bool
+json_aggregate_args_invoke_volatile(Oid aggregate_oid, const List *args)
+{
+  bool is_jsonb;
+
+  switch (aggregate_oid)
+  {
+    case F_JSON_AGG:
+    case F_JSON_AGG_STRICT:
+    case F_JSON_OBJECT_AGG:
+    case F_JSON_OBJECT_AGG_STRICT:
+    case F_JSON_OBJECT_AGG_UNIQUE:
+    case F_JSON_OBJECT_AGG_UNIQUE_STRICT:
+      is_jsonb = false;
+      break;
+    case F_JSONB_AGG:
+    case F_JSONB_AGG_STRICT:
+    case F_JSONB_OBJECT_AGG:
+    case F_JSONB_OBJECT_AGG_STRICT:
+    case F_JSONB_OBJECT_AGG_UNIQUE:
+    case F_JSONB_OBJECT_AGG_UNIQUE_STRICT:
+      is_jsonb = true;
+      break;
+    default:
+      return false;
+  }
+  return json_conversion_args_invoke_volatile(args, is_jsonb, true);
+}
+
+static bool
+json_constructor_args_invoke_volatile(const JsonConstructorExpr *constructor)
+{
+  bool is_jsonb;
+
+  if (constructor->returning == NULL || constructor->returning->format == NULL)
+  {
+    return true;
+  }
+  switch (constructor->type)
+  {
+    case JSCTOR_JSON_OBJECT:
+    case JSCTOR_JSON_ARRAY:
+    case JSCTOR_JSON_OBJECTAGG:
+    case JSCTOR_JSON_ARRAYAGG:
+    case JSCTOR_JSON_SCALAR:
+      is_jsonb = constructor->returning->format->format_type == JS_FORMAT_JSONB;
+      return json_conversion_args_invoke_volatile(
+        constructor->args, is_jsonb, false);
+    case JSCTOR_JSON_PARSE:
+    case JSCTOR_JSON_SERIALIZE:
+      return false;
+  }
+  return true;
+}
+
+static bool
+container_function_support_kind(Oid function_oid,
+                                RuntimeTypeSupportKind *kind)
+{
+  switch (function_oid)
+  {
+    case F_ARRAY_EQ:
+    case F_ARRAY_NE:
+    case F_RECORD_EQ:
+    case F_RECORD_NE:
+    case F_RANGE_EQ:
+    case F_RANGE_NE:
+    case F_MULTIRANGE_EQ:
+    case F_MULTIRANGE_NE:
+      *kind = RUNTIME_SUPPORT_EQUAL;
+      return true;
+    case F_ARRAY_LT:
+    case F_ARRAY_GT:
+    case F_ARRAY_LE:
+    case F_ARRAY_GE:
+    case F_RECORD_LT:
+    case F_RECORD_GT:
+    case F_RECORD_LE:
+    case F_RECORD_GE:
+    case F_BTRECORDCMP:
+    case F_RANGE_CMP:
+    case F_RANGE_LT:
+    case F_RANGE_LE:
+    case F_RANGE_GE:
+    case F_RANGE_GT:
+    case F_MULTIRANGE_CMP:
+    case F_MULTIRANGE_LT:
+    case F_MULTIRANGE_LE:
+    case F_MULTIRANGE_GE:
+    case F_MULTIRANGE_GT:
+      *kind = RUNTIME_SUPPORT_COMPARE;
+      return true;
+    default:
+      return false;
+  }
+}
+
+static bool
+container_function_invokes_volatile(Oid function_oid, const List *args)
+{
+  RuntimeTypeSupportKind kind;
+  ListCell *cell;
+
+  if (!container_function_support_kind(function_oid, &kind))
+  {
+    return false;
+  }
+  foreach(cell, args)
+  {
+    const Node *argument = (const Node *) lfirst(cell);
+    RuntimeTypeSupportContext context = {0};
+
+    if (argument == NULL ||
+        type_runtime_support_invokes_volatile(
+          exprType(argument), exprTypmod(argument), kind, &context))
+    {
+      return true;
+    }
+  }
+  return false;
+}
+
+static bool
+operator_argument_support_invokes_volatile(const List *args)
+{
+  ListCell *cell;
+
+  foreach(cell, args)
+  {
+    const Node *argument = (const Node *) lfirst(cell);
+    RuntimeTypeSupportKind kind;
+
+    if (argument == NULL)
+    {
+      return true;
+    }
+    for (kind = RUNTIME_SUPPORT_EQUAL;
+         kind <= RUNTIME_SUPPORT_HASH;
+         kind++)
+    {
+      RuntimeTypeSupportContext context = {0};
+
+      if (type_runtime_support_invokes_volatile(
+            exprType(argument), exprTypmod(argument), kind, &context))
+      {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+static bool
+scalar_array_hash_support_invokes_volatile(const ScalarArrayOpExpr *expression)
+{
+  Oid equality_operator = expression->opno;
+  RegProcedure left_hash_function;
+  RegProcedure right_hash_function;
+  RuntimeTypeSupportContext context = {0};
+  const Node *left_argument;
+
+  /* A custom plan can fold an external RHS Param to a hashable Const. */
+  if (!expression->useOr)
+  {
+    equality_operator = get_negator(expression->opno);
+    if (!OidIsValid(equality_operator))
+    {
+      return false;
+    }
+    if (function_is_volatile(get_opcode(equality_operator)))
+    {
+      return true;
+    }
+  }
+  if (!get_op_hash_functions(equality_operator, &left_hash_function,
+                             &right_hash_function) ||
+      !OidIsValid(left_hash_function) || !OidIsValid(right_hash_function) ||
+      left_hash_function != right_hash_function)
+  {
+    return false;
+  }
+  if (function_is_volatile(left_hash_function) ||
+      function_is_volatile(right_hash_function))
+  {
+    return true;
+  }
+  if (expression->args == NIL)
+  {
+    return true;
+  }
+  left_argument = (const Node *) linitial(expression->args);
+  return left_argument == NULL ||
+         type_runtime_support_invokes_volatile(
+           exprType(left_argument), exprTypmod(left_argument),
+           RUNTIME_SUPPORT_HASH, &context);
+}
+
 typedef enum SortGroupExecution
 {
   SG_EXEC_SORT = 1 << 0,
@@ -3707,13 +4335,26 @@ builtin_sortsupport_always_supplies_comparator(Oid function_oid)
 }
 
 static bool
-ordering_support_invokes_volatile_function(Oid ordering_operator)
+ordering_support_invokes_volatile_function(Oid ordering_operator,
+                                           Oid concrete_type,
+                                           int32 concrete_typmod)
 {
   Oid opfamily;
   Oid opcintype;
   Oid order_function;
   Oid sort_support_function;
   CompareType compare_type;
+
+  if (OidIsValid(concrete_type))
+  {
+    RuntimeTypeSupportContext context = {0};
+
+    if (type_runtime_support_invokes_volatile(
+          concrete_type, concrete_typmod, RUNTIME_SUPPORT_COMPARE, &context))
+    {
+      return true;
+    }
+  }
 
   if (!get_ordering_op_properties(ordering_operator, &opfamily,
                                   &opcintype, &compare_type) ||
@@ -3746,9 +4387,22 @@ ordering_support_invokes_volatile_function(Oid ordering_operator)
 }
 
 static bool
-equality_support_invokes_volatile_function(Oid equality_operator)
+equality_support_invokes_volatile_function(Oid equality_operator,
+                                           Oid concrete_type,
+                                           int32 concrete_typmod)
 {
   Oid equality_function;
+
+  if (OidIsValid(concrete_type))
+  {
+    RuntimeTypeSupportContext context = {0};
+
+    if (type_runtime_support_invokes_volatile(
+          concrete_type, concrete_typmod, RUNTIME_SUPPORT_EQUAL, &context))
+    {
+      return true;
+    }
+  }
 
   if (!OidIsValid(equality_operator))
   {
@@ -3760,10 +4414,23 @@ equality_support_invokes_volatile_function(Oid equality_operator)
 }
 
 static bool
-hash_support_invokes_volatile_function(Oid equality_operator)
+hash_support_invokes_volatile_function(Oid equality_operator,
+                                       Oid concrete_type,
+                                       int32 concrete_typmod)
 {
   RegProcedure left_hash_function;
   RegProcedure right_hash_function;
+
+  if (OidIsValid(concrete_type))
+  {
+    RuntimeTypeSupportContext context = {0};
+
+    if (type_runtime_support_invokes_volatile(
+          concrete_type, concrete_typmod, RUNTIME_SUPPORT_HASH, &context))
+    {
+      return true;
+    }
+  }
 
   if (!OidIsValid(equality_operator) ||
       !get_op_hash_functions(equality_operator, &left_hash_function,
@@ -3778,29 +4445,52 @@ hash_support_invokes_volatile_function(Oid equality_operator)
 
 static bool
 sort_group_clause_invokes_volatile_function(const SortGroupClause *clause,
-                                            int execution)
+                                            int execution,
+                                            Oid concrete_type,
+                                            int32 concrete_typmod)
 {
   if ((execution & SG_EXEC_SORT) != 0 && OidIsValid(clause->sortop) &&
-      ordering_support_invokes_volatile_function(clause->sortop))
+      ordering_support_invokes_volatile_function(
+        clause->sortop, concrete_type, concrete_typmod))
   {
     return true;
   }
   if ((execution & SG_EXEC_EQUAL) != 0 &&
-      equality_support_invokes_volatile_function(clause->eqop))
+      equality_support_invokes_volatile_function(
+        clause->eqop, concrete_type, concrete_typmod))
   {
     return true;
   }
   if ((execution & SG_EXEC_HASH) != 0 && clause->hashable &&
-      hash_support_invokes_volatile_function(clause->eqop))
+      hash_support_invokes_volatile_function(
+        clause->eqop, concrete_type, concrete_typmod))
   {
     return true;
   }
   return false;
 }
 
+static const TargetEntry *
+target_entry_by_sortgroupref(const List *target_list, Index sortgroupref)
+{
+  ListCell *cell;
+
+  foreach(cell, target_list)
+  {
+    const TargetEntry *target = lfirst_node(TargetEntry, cell);
+
+    if (target->ressortgroupref == sortgroupref)
+    {
+      return target;
+    }
+  }
+  return NULL;
+}
+
 static bool
 sort_group_clause_list_invokes_volatile_function(const List *clauses,
-                                                 int execution)
+                                                 int execution,
+                                                 const List *target_list)
 {
   ListCell *cell;
 
@@ -3808,8 +4498,17 @@ sort_group_clause_list_invokes_volatile_function(const List *clauses,
   {
     const SortGroupClause *clause =
       lfirst_node(SortGroupClause, cell);
+    const TargetEntry *target = target_entry_by_sortgroupref(
+      target_list, clause->tleSortGroupRef);
+    Oid concrete_type = target == NULL
+                          ? InvalidOid
+                          : exprType((const Node *) target->expr);
+    int32 concrete_typmod = target == NULL
+                              ? -1
+                              : exprTypmod((const Node *) target->expr);
 
-    if (sort_group_clause_invokes_volatile_function(clause, execution))
+    if (sort_group_clause_invokes_volatile_function(
+          clause, execution, concrete_type, concrete_typmod))
     {
       return true;
     }
@@ -3831,11 +4530,24 @@ set_operation_support_invokes_volatile_function(const Node *node)
 
   {
     const SetOperationStmt *operation = (const SetOperationStmt *) node;
+    ListCell *clause_cell;
+    ListCell *type_cell;
 
-    return sort_group_clause_list_invokes_volatile_function(
-             operation->groupClauses,
-             SG_EXEC_SORT | SG_EXEC_EQUAL | SG_EXEC_HASH) ||
-           set_operation_support_invokes_volatile_function(operation->larg) ||
+    forboth(clause_cell, operation->groupClauses,
+            type_cell, operation->colTypes)
+    {
+      const SortGroupClause *clause =
+        lfirst_node(SortGroupClause, clause_cell);
+
+      if (sort_group_clause_invokes_volatile_function(
+            clause, SG_EXEC_SORT | SG_EXEC_EQUAL | SG_EXEC_HASH,
+            lfirst_oid(type_cell), -1))
+      {
+        return true;
+      }
+    }
+
+    return set_operation_support_invokes_volatile_function(operation->larg) ||
            set_operation_support_invokes_volatile_function(operation->rarg);
   }
 }
@@ -3852,11 +4564,12 @@ query_sort_group_support_invokes_volatile_function(const Query *query)
   }
 
   if (sort_group_clause_list_invokes_volatile_function(
-        query->sortClause, SG_EXEC_SORT) ||
+        query->sortClause, SG_EXEC_SORT, query->targetList) ||
       sort_group_clause_list_invokes_volatile_function(
-        query->groupClause, SG_EXEC_SORT | SG_EXEC_EQUAL | SG_EXEC_HASH) ||
+        query->groupClause, SG_EXEC_SORT | SG_EXEC_EQUAL | SG_EXEC_HASH,
+        query->targetList) ||
       sort_group_clause_list_invokes_volatile_function(
-        query->distinctClause, distinct_execution) ||
+        query->distinctClause, distinct_execution, query->targetList) ||
       set_operation_support_invokes_volatile_function(query->setOperations))
   {
     return true;
@@ -3867,9 +4580,11 @@ query_sort_group_support_invokes_volatile_function(const Query *query)
     const WindowClause *window = lfirst_node(WindowClause, cell);
 
     if (sort_group_clause_list_invokes_volatile_function(
-          window->partitionClause, SG_EXEC_SORT | SG_EXEC_EQUAL) ||
+          window->partitionClause, SG_EXEC_SORT | SG_EXEC_EQUAL,
+          query->targetList) ||
         sort_group_clause_list_invokes_volatile_function(
-          window->orderClause, SG_EXEC_SORT | SG_EXEC_EQUAL) ||
+          window->orderClause, SG_EXEC_SORT | SG_EXEC_EQUAL,
+          query->targetList) ||
         (OidIsValid(window->startInRangeFunc) &&
          function_is_volatile(window->startInRangeFunc)) ||
         (OidIsValid(window->endInRangeFunc) &&
@@ -3929,7 +4644,7 @@ operator_operand_is_execution_relevant_walker(Node *node, void *context)
       const RangeTblEntry *rte = rt_fetch(
         variable->varno, owner_scope->query->rtable);
 
-      return rte->rtekind == RTE_RELATION;
+      return rte->rtekind != RTE_RESULT;
     }
     return false;
   }
@@ -4001,10 +4716,13 @@ node_invokes_volatile_function(Node *node, const QueryScope *scope)
       Aggref *aggregate = (Aggref *) node;
 
       return aggregate_invokes_volatile_function(aggregate->aggfnoid) ||
+             json_aggregate_args_invoke_volatile(
+               aggregate->aggfnoid, aggregate->args) ||
              sort_group_clause_list_invokes_volatile_function(
-               aggregate->aggorder, SG_EXEC_SORT) ||
+               aggregate->aggorder, SG_EXEC_SORT, aggregate->args) ||
              sort_group_clause_list_invokes_volatile_function(
-               aggregate->aggdistinct, SG_EXEC_SORT | SG_EXEC_EQUAL);
+               aggregate->aggdistinct, SG_EXEC_SORT | SG_EXEC_EQUAL,
+               aggregate->args);
     }
     case T_WindowFunc:
     {
@@ -4015,7 +4733,18 @@ node_invokes_volatile_function(Node *node, const QueryScope *scope)
                : function_is_volatile(function->winfnoid);
     }
     case T_FuncExpr:
-      return function_is_volatile(((FuncExpr *) node)->funcid);
+    {
+      FuncExpr *function = (FuncExpr *) node;
+
+      return function_is_volatile(function->funcid) ||
+             json_function_args_invoke_volatile(
+               function->funcid, function->args) ||
+             container_function_invokes_volatile(
+               function->funcid, function->args);
+    }
+    case T_JsonConstructorExpr:
+      return json_constructor_args_invoke_volatile(
+        (const JsonConstructorExpr *) node);
     case T_Param:
     {
       Param *param = (Param *) node;
@@ -4037,9 +4766,14 @@ node_invokes_volatile_function(Node *node, const QueryScope *scope)
       OpExpr *expr = (OpExpr *) node;
       Oid function_oid = OidIsValid(expr->opfuncid) ? expr->opfuncid : get_opcode(expr->opno);
 
+      bool inspect_support = operator_expr_has_execution_relevant_operand(
+        node, scope);
+
       return function_is_volatile(function_oid) ||
-             (operator_expr_has_execution_relevant_operand(node, scope) &&
-              operator_family_support_invokes_volatile_function(expr->opno));
+             container_function_invokes_volatile(function_oid, expr->args) ||
+             (inspect_support &&
+              (operator_family_support_invokes_volatile_function(expr->opno) ||
+               operator_argument_support_invokes_volatile(expr->args)));
     }
     case T_ScalarArrayOpExpr:
     {
@@ -4047,8 +4781,11 @@ node_invokes_volatile_function(Node *node, const QueryScope *scope)
       Oid function_oid = OidIsValid(expr->opfuncid) ? expr->opfuncid : get_opcode(expr->opno);
 
       return function_is_volatile(function_oid) ||
+             container_function_invokes_volatile(function_oid, expr->args) ||
+             scalar_array_hash_support_invokes_volatile(expr) ||
              (operator_expr_has_execution_relevant_operand(node, scope) &&
-              operator_family_support_invokes_volatile_function(expr->opno));
+              (operator_family_support_invokes_volatile_function(expr->opno) ||
+               operator_argument_support_invokes_volatile(expr->args)));
     }
     case T_CoerceViaIO:
     {
