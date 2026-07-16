@@ -94,6 +94,11 @@ test('compiles named parameters only in PostgreSQL code contexts', () => {
       parameterNames: ['real'],
     },
     {
+      input: 'select payload -> :json_key, payload #>> :json_path, :fallback',
+      output: 'select payload -> $1, payload #>> $2, $3',
+      parameterNames: ['json_key', 'json_path', 'fallback'],
+    },
+    {
       input: 'select :real, :real, :second',
       output: 'select $1, $1, $2',
       parameterNames: ['real', 'second'],
@@ -106,6 +111,62 @@ test('compiles named parameters only in PostgreSQL code contexts', () => {
       sql: output,
     })
   }
+})
+
+test('preserves PostgreSQL array slice delimiters in expression subscripts', () => {
+  const cases: readonly string[] = [
+    'select values[1:upper_bound] from bounds',
+    'select values[1:array_length(values, 1)] from bounds',
+    'select values[:upper_bound] from bounds',
+    'select values[lower_bound:] from bounds',
+    'select values[:] from bounds',
+    'select values[1:first_upper][2:second_upper] from bounds',
+    'select values[indexes[1:nested_upper]:outer_upper] from bounds',
+    'select schema_name.array_column[1:upper_bound] from bounds',
+  ]
+
+  for (const sql of cases) {
+    assert.deepEqual(compileNamedParameters(sql), {
+      parameterNames: [],
+      sql,
+    })
+  }
+})
+
+test('compiles named parameters in ARRAY constructors and unambiguous subscript bounds', () => {
+  assert.deepEqual(
+    compileNamedParameters(
+      `select
+        ARRAY[:constructor_value],
+        ARRAY /* constructor comment */ [:commented_constructor_value],
+        values[(:index)],
+        values[(:lower):(:upper)],
+        values[1 : :explicit_upper],
+        values[1::integer + (:offset)],
+        nested[ARRAY[:nested_constructor_value][(:nested_index)]]`
+    ),
+    {
+      parameterNames: [
+        'constructor_value',
+        'commented_constructor_value',
+        'index',
+        'lower',
+        'upper',
+        'explicit_upper',
+        'offset',
+        'nested_constructor_value',
+        'nested_index',
+      ],
+      sql: `select
+        ARRAY[$1],
+        ARRAY /* constructor comment */ [$2],
+        values[($3)],
+        values[($4):($5)],
+        values[1 : $6],
+        values[1::integer + ($7)],
+        nested[ARRAY[$8][($9)]]`,
+    }
+  )
 })
 
 test('does not scan placeholders inside unterminated protected regions', () => {

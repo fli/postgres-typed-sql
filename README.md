@@ -58,6 +58,8 @@ from public.accounts
 where email = :email
 ```
 
+Inside PostgreSQL expression subscripts, an unparenthesized top-level colon remains the native array-slice delimiter. Use `items[(:index)]` for a named subscript, and use `items[1 : :upper]` or `items[1:(:upper)]` for a named slice bound. `ARRAY[:value]` continues to treat `:value` as a named parameter because `ARRAY[...]` is an array constructor rather than a subscript.
+
 Running `npm run generate:sql` creates `find-account-by-email.typed-sql.ts` containing:
 
 - parameter and result-row interfaces

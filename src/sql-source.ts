@@ -190,21 +190,61 @@ function blockCommentEnd(sql: string, start: number): number {
   return index
 }
 
+type SqlCodeToken = 'arrayKeyword' | 'dot' | 'other'
+
+function isDotCodeToken(token: SqlCodeToken | null): boolean {
+  return token === 'dot'
+}
+
+interface SqlBracketFrame {
+  readonly kind: 'arrayConstructor' | 'subscript'
+  parenthesisDepth: number
+  sliceDelimiterSeen: boolean
+}
+
+function unquotedIdentifierEnd(sql: string, start: number): number {
+  let end = start + 1
+  while (isPostgresIdentifierContinuation(sql[end])) {
+    end += 1
+  }
+  return end
+}
+
+function isSubscriptSliceDelimiter(
+  sql: string,
+  index: number,
+  frame: SqlBracketFrame | undefined
+): frame is SqlBracketFrame {
+  return (
+    frame?.kind === 'subscript' &&
+    frame.parenthesisDepth === 0 &&
+    !frame.sliceDelimiterSeen &&
+    sql[index - 1] !== ':' &&
+    sql[index + 1] !== ':' &&
+    sql[index + 1] !== '='
+  )
+}
+
 export function compileNamedParameters(sql: string, sourceFile = 'typed SQL'): CompiledNamedParameters {
   const chunks: string[] = []
   const parameterNames: string[] = []
   const placeholderByName = new Map<string, number>()
+  const bracketFrames: SqlBracketFrame[] = []
+  let lastCodeToken: SqlCodeToken | null = null
   let chunkStart = 0
   let index = 0
 
   while (index < sql.length) {
     const character = sql[index]
     let protectedEnd: number | null = null
+    let protectedToken = false
 
     if (character === "'") {
       protectedEnd = quotedEnd(sql, index, "'", isEscapeStringQuote(sql, index))
+      protectedToken = true
     } else if (character === '"') {
       protectedEnd = quotedEnd(sql, index, '"', false)
+      protectedToken = true
     } else if (character === '-' && sql[index + 1] === '-') {
       protectedEnd = lineCommentEnd(sql, index)
     } else if (character === '/' && sql[index + 1] === '*') {
@@ -214,11 +254,67 @@ export function compileNamedParameters(sql: string, sourceFile = 'typed SQL'): C
       if (delimiter) {
         const closingIndex = sql.indexOf(delimiter, index + delimiter.length)
         protectedEnd = closingIndex === -1 ? sql.length : closingIndex + delimiter.length
+        protectedToken = true
       }
     }
 
     if (protectedEnd !== null) {
+      if (protectedToken) {
+        lastCodeToken = 'other'
+      }
       index = protectedEnd
+      continue
+    }
+
+    if (character !== undefined && /\s/u.test(character)) {
+      index += 1
+      continue
+    }
+
+    if (isNamedParameterStart(character)) {
+      const identifierEnd = unquotedIdentifierEnd(sql, index)
+      lastCodeToken =
+        sql.slice(index, identifierEnd).toLowerCase() === 'array' && !isDotCodeToken(lastCodeToken)
+          ? 'arrayKeyword'
+          : 'other'
+      index = identifierEnd
+      continue
+    }
+
+    if (character === '[') {
+      bracketFrames.push({
+        kind: lastCodeToken === 'arrayKeyword' ? 'arrayConstructor' : 'subscript',
+        parenthesisDepth: 0,
+        sliceDelimiterSeen: false,
+      })
+      lastCodeToken = 'other'
+      index += 1
+      continue
+    }
+
+    if (character === ']') {
+      bracketFrames.pop()
+      lastCodeToken = 'other'
+      index += 1
+      continue
+    }
+
+    const bracketFrame = bracketFrames.at(-1)
+    if (character === '(') {
+      if (bracketFrame) {
+        bracketFrame.parenthesisDepth += 1
+      }
+      lastCodeToken = 'other'
+      index += 1
+      continue
+    }
+
+    if (character === ')') {
+      if (bracketFrame && bracketFrame.parenthesisDepth > 0) {
+        bracketFrame.parenthesisDepth -= 1
+      }
+      lastCodeToken = 'other'
+      index += 1
       continue
     }
 
@@ -232,7 +328,15 @@ export function compileNamedParameters(sql: string, sourceFile = 'typed SQL'): C
       )
     }
 
+    if (character === ':' && isSubscriptSliceDelimiter(sql, index, bracketFrame)) {
+      bracketFrame.sliceDelimiterSeen = true
+      lastCodeToken = 'other'
+      index += 1
+      continue
+    }
+
     if (character !== ':' || sql[index - 1] === ':' || !isNamedParameterStart(sql[index + 1])) {
+      lastCodeToken = character === '.' ? 'dot' : 'other'
       index += 1
       continue
     }
@@ -251,6 +355,7 @@ export function compileNamedParameters(sql: string, sourceFile = 'typed SQL'): C
 
     chunks.push(sql.slice(chunkStart, index), `$${placeholder}`)
     chunkStart = nameEnd
+    lastCodeToken = 'other'
     index = nameEnd
   }
 

@@ -88,6 +88,25 @@ test('generates nullable parameters when a direct SELECT use proves NULL is acce
   assert.match(output, /export interface QueryParams \{[\s\S]*readonly value: string \| null/u)
 })
 
+test('preserves PostgreSQL array slices through named-parameter compilation and analysis', async () => {
+  const root = await createMinimalFixture(
+    'select 1;\n',
+    `select numbers[1:upper_bound] as sliced
+from (values (array[10, 20, 30], 2)) as bounds(numbers, upper_bound)
+`
+  )
+  await generateTypedSql({
+    include: ['queries'],
+    rootDir: root,
+    scalarProfile: 'node-postgres',
+    schema: 'schema.sql',
+  })
+
+  const output = await readFile(join(root, 'queries/query.typed-sql.ts'), 'utf8')
+  assert.match(output, /parameterNames: \[\]/u)
+  assert.match(output, /numbers\[1:upper_bound\]/u)
+})
+
 test('requires serialized strings for PostgreSQL arrays whose element delimiter is not a comma', async () => {
   const root = await createMinimalFixture(
     'create domain public.int_list as integer[];\n',
