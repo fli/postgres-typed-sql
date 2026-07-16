@@ -45,6 +45,8 @@ PG_MODULE_MAGIC;
 PG_FUNCTION_INFO_V1(postgres_typed_sql_analyze);
 
 typedef struct QueryScope QueryScope;
+typedef bool (*ExecutionReachableQueryVisitor)(const QueryScope *scope,
+                                               void *context);
 
 static void append_expr_node(StringInfo out, const QueryScope *scope, const Node *expr, int depth);
 static void append_query_summary(StringInfo out, const Query *query,
@@ -59,10 +61,14 @@ static void append_json_string(StringInfo out, const char *value);
 static void append_bool_field(StringInfo out, const char *name, bool value);
 static void append_oid_field(StringInfo out, const char *name, Oid value);
 static void append_optional_name_field(StringInfo out, const char *name, const char *value);
+static const CommonTableExpr *cte_by_name(const Query *query, const char *name);
+static const QueryScope *query_scope_at_level(const QueryScope *scope,
+                                              Index levels_up);
+static bool execution_reachable_query_walker(
+  const Query *query, ExecutionReachableQueryVisitor visitor, void *context);
 static bool query_contains_volatile_functions(const Query *query);
 static bool volatile_function_walker(Node *node, void *context);
 static bool query_contains_row_marks(const Query *query);
-static bool row_marks_walker(Node *node, void *context);
 static bool executor_support_dependency_invokes_volatile(
   Oid function_oid, const List *args, bool target_entries,
   Oid result_type, int32 result_typmod);
@@ -1203,11 +1209,9 @@ parameter_usage_null_admission_walker(Node *node, void *walker_context)
   {
     return true;
   }
-
-  /* PostgreSQL's query_tree_walker deliberately does not visit utilityStmt. */
-  if (IsA(node, Query) && ((Query *) node)->utilityStmt != NULL)
+  if (IsA(node, Query))
   {
-    mark_parameter_usage(context, TYPE_NULL_UNKNOWN);
+    return false;
   }
 
   mentions_parameter = node_mentions_external_parameter(node,
@@ -1419,15 +1423,26 @@ parameter_usage_null_admission_walker(Node *node, void *walker_context)
   {
     return true;
   }
-  if (IsA(node, Query))
-  {
-    return query_tree_walker((Query *) node,
-                             parameter_usage_null_admission_walker,
-                             walker_context, QTW_EXAMINE_SORTGROUP);
-  }
   return expression_tree_walker(node,
                                 parameter_usage_null_admission_walker,
                                 walker_context);
+}
+
+static bool
+parameter_usage_null_admission_query(const QueryScope *scope,
+                                     void *walker_context)
+{
+  ParameterUsageContext *context =
+    (ParameterUsageContext *) walker_context;
+
+  /* PostgreSQL's query_tree_walker deliberately does not visit utilityStmt. */
+  if (scope->query->utilityStmt != NULL)
+  {
+    mark_parameter_usage(context, TYPE_NULL_UNKNOWN);
+  }
+  return query_tree_walker(
+    (Query *) scope->query, parameter_usage_null_admission_walker,
+    walker_context, QTW_EXAMINE_SORTGROUP | QTW_IGNORE_CTE_SUBQUERIES);
 }
 
 static void
@@ -1455,7 +1470,8 @@ update_parameter_usage_null_admissions(const Query *query,
       node_analysis
     };
 
-    parameter_usage_null_admission_walker((Node *) query, &context);
+    execution_reachable_query_walker(
+      query, parameter_usage_null_admission_query, &context);
     merge_parameter_usage_evidence(&evidence[index], &context.evidence);
   }
 
@@ -1860,6 +1876,153 @@ query_scope_at_level(const QueryScope *scope, Index levels_up)
   }
 
   return current;
+}
+
+typedef struct ExecutionReachableQueryKey
+{
+  const Query *query;
+} ExecutionReachableQueryKey;
+
+typedef struct ExecutionReachableQueryContext
+{
+  const QueryScope *scope;
+  ExecutionReachableQueryVisitor visitor;
+  void *visitor_context;
+  HTAB *visited;
+} ExecutionReachableQueryContext;
+
+static bool execution_reachable_query_walker_internal(
+  const Query *query, const QueryScope *parent_scope,
+  ExecutionReachableQueryVisitor visitor, void *visitor_context,
+  HTAB *visited);
+
+static bool
+query_is_data_modifying(const Query *query)
+{
+  return query->commandType == CMD_INSERT ||
+         query->commandType == CMD_UPDATE ||
+         query->commandType == CMD_DELETE ||
+         query->commandType == CMD_MERGE;
+}
+
+static bool
+execution_reachable_query_discovery_walker(Node *node,
+                                           void *walker_context)
+{
+  ExecutionReachableQueryContext *context =
+    (ExecutionReachableQueryContext *) walker_context;
+
+  if (node == NULL)
+  {
+    return false;
+  }
+  if (IsA(node, Query))
+  {
+    return execution_reachable_query_walker_internal(
+      (const Query *) node, context->scope, context->visitor,
+      context->visitor_context, context->visited);
+  }
+  if (IsA(node, RangeTblEntry))
+  {
+    const RangeTblEntry *rte = (const RangeTblEntry *) node;
+
+    if (rte->rtekind == RTE_CTE)
+    {
+      const QueryScope *owner_scope = query_scope_at_level(
+        context->scope, rte->ctelevelsup);
+      const CommonTableExpr *cte = owner_scope == NULL
+                                     ? NULL
+                                     : cte_by_name(owner_scope->query,
+                                                   rte->ctename);
+
+      if (cte != NULL && cte->ctequery != NULL &&
+          IsA(cte->ctequery, Query) &&
+          execution_reachable_query_walker_internal(
+            (const Query *) cte->ctequery, owner_scope, context->visitor,
+            context->visitor_context, context->visited))
+      {
+        return true;
+      }
+    }
+    return false;
+  }
+  return expression_tree_walker(
+    node, execution_reachable_query_discovery_walker, walker_context);
+}
+
+static bool
+execution_reachable_query_walker_internal(
+  const Query *query, const QueryScope *parent_scope,
+  ExecutionReachableQueryVisitor visitor, void *visitor_context,
+  HTAB *visited)
+{
+  ExecutionReachableQueryKey key;
+  QueryScope scope = {query, parent_scope};
+  ExecutionReachableQueryContext context = {
+    &scope,
+    visitor,
+    visitor_context,
+    visited
+  };
+  ListCell *cell;
+  bool found;
+
+  memset(&key, 0, sizeof(key));
+  key.query = query;
+  hash_search(visited, &key, HASH_ENTER, &found);
+  if (found)
+  {
+    return false;
+  }
+  if (visitor(&scope, visitor_context))
+  {
+    return true;
+  }
+
+  /*
+   * PostgreSQL executes data-modifying CTEs to completion when their owning
+   * query executes, even if no RTE_CTE references their result.
+   */
+  foreach(cell, query->cteList)
+  {
+    const CommonTableExpr *cte = lfirst_node(CommonTableExpr, cell);
+
+    if (cte->ctequery != NULL && IsA(cte->ctequery, Query) &&
+        query_is_data_modifying((const Query *) cte->ctequery) &&
+        execution_reachable_query_walker_internal(
+          (const Query *) cte->ctequery, &scope, visitor, visitor_context,
+          visited))
+    {
+      return true;
+    }
+  }
+
+  /*
+   * Ordinary CTE bodies are reached only through RTE_CTE references.  RTE
+   * subqueries and SubLinks remain ordinary reachable child queries.
+   */
+  return query_tree_walker(
+    (Query *) query, execution_reachable_query_discovery_walker, &context,
+    QTW_IGNORE_CTE_SUBQUERIES | QTW_EXAMINE_RTES_BEFORE);
+}
+
+static bool
+execution_reachable_query_walker(
+  const Query *query, ExecutionReachableQueryVisitor visitor, void *context)
+{
+  HASHCTL control;
+  HTAB *visited;
+  bool result;
+
+  memset(&control, 0, sizeof(control));
+  control.keysize = sizeof(ExecutionReachableQueryKey);
+  control.entrysize = sizeof(ExecutionReachableQueryKey);
+  visited = hash_create("typed SQL reachable query visits", 32,
+                        &control, HASH_ELEM | HASH_BLOBS);
+  result = execution_reachable_query_walker_internal(
+    query, NULL, visitor, context, visited);
+  hash_destroy(visited);
+  return result;
 }
 
 static void
@@ -5830,57 +5993,50 @@ volatile_function_walker(Node *node, void *context)
   {
     return false;
   }
+  if (IsA(node, Query))
+  {
+    return false;
+  }
   if (node_invokes_volatile_function(
         node, volatile_context == NULL ? NULL : volatile_context->scope))
   {
     return true;
   }
-  if (IsA(node, Query))
-  {
-    Query *query = (Query *) node;
-    QueryScope query_scope = {
-      query,
-      volatile_context == NULL ? NULL : volatile_context->scope
-    };
-    VolatileFunctionContext query_context = {&query_scope};
-
-    return query_sort_group_support_invokes_volatile_function(query) ||
-           query_tree_walker(query, volatile_function_walker,
-                             &query_context, 0);
-  }
   return expression_tree_walker(node, volatile_function_walker, context);
+}
+
+static bool
+query_contains_volatile_functions_visitor(const QueryScope *scope,
+                                          void *context)
+{
+  VolatileFunctionContext volatile_context = {scope};
+
+  (void) context;
+  return query_sort_group_support_invokes_volatile_function(scope->query) ||
+         query_tree_walker(
+           (Query *) scope->query, volatile_function_walker,
+           &volatile_context, QTW_IGNORE_CTE_SUBQUERIES);
 }
 
 static bool
 query_contains_volatile_functions(const Query *query)
 {
-  return volatile_function_walker((Node *) query, NULL);
+  return execution_reachable_query_walker(
+    query, query_contains_volatile_functions_visitor, NULL);
 }
 
 static bool
-row_marks_walker(Node *node, void *context)
+query_contains_row_marks_visitor(const QueryScope *scope, void *context)
 {
-  if (node == NULL)
-  {
-    return false;
-  }
-  if (IsA(node, Query))
-  {
-    Query *query = (Query *) node;
-
-    if (query->rowMarks != NIL)
-    {
-      return true;
-    }
-    return query_tree_walker(query, row_marks_walker, context, 0);
-  }
-  return expression_tree_walker(node, row_marks_walker, context);
+  (void) context;
+  return scope->query->rowMarks != NIL;
 }
 
 static bool
 query_contains_row_marks(const Query *query)
 {
-  return row_marks_walker((Node *) query, NULL);
+  return execution_reachable_query_walker(
+    query, query_contains_row_marks_visitor, NULL);
 }
 
 static void

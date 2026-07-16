@@ -26,6 +26,7 @@ interface NativeQuery {
   readonly commandType: string
   readonly cteList: readonly NativeCte[]
   readonly dmlParameterTargets: readonly NativeDmlParameterTarget[]
+  readonly hasModifyingCTE: boolean
   readonly hasLimitCount: boolean
   readonly hasRowMarks: boolean
   readonly limitWithTies: boolean
@@ -511,6 +512,112 @@ test('native analyzer reports row locks recursively through join predicates', as
     )
 
     assert.equal(analysis.statements[0]?.queries[0]?.hasRowMarks, true)
+  })
+})
+
+test('native analyzer follows only execution-reachable SELECT CTEs', async () => {
+  await withDatabase(async (database) => {
+    await database.query('create table public.cte_reachability_calls (value integer)')
+    await database.query('create table public.cte_reachability_dml (value integer)')
+    await database.query(`create function public.record_cte_reachability()
+      returns integer
+      language plpgsql
+      volatile
+      as $$
+      begin
+        insert into public.cte_reachability_calls(value) values (1);
+        return 1;
+      end
+      $$`)
+
+    const unusedVolatileSql = `with unused as (
+      select public.record_cte_reachability() as value
+    )
+    select 1 as value`
+    const unusedVolatile = await analyze(database, unusedVolatileSql, [])
+    assert.equal(unusedVolatile.statements[0]?.queries[0]?.hasVolatileFunctions, false)
+    await database.query(unusedVolatileSql)
+    assert.deepEqual((await database.query('select value from public.cte_reachability_calls')).rows, [])
+
+    const referencedVolatileSql = `with reached as (
+      select public.record_cte_reachability() as value
+    )
+    select value from reached`
+    const referencedVolatile = await analyze(database, referencedVolatileSql, [])
+    assert.equal(referencedVolatile.statements[0]?.queries[0]?.hasVolatileFunctions, true)
+    assert.deepEqual((await database.query(referencedVolatileSql)).rows, [{ value: 1 }])
+
+    const unusedLock = await analyze(
+      database,
+      `with unused as (
+         select account.id from public.accounts account for update
+       )
+       select 1`,
+      []
+    )
+    assert.equal(unusedLock.statements[0]?.queries[0]?.hasRowMarks, false)
+
+    const referencedLock = await analyze(
+      database,
+      `with reached as (
+         select account.id from public.accounts account for update
+       )
+       select id from reached`,
+      []
+    )
+    assert.equal(referencedLock.statements[0]?.queries[0]?.hasRowMarks, true)
+
+    const unusedFrameSql = `with unused as (
+      select sum(value) over (rows $1 preceding) as total
+      from (values (1), (2)) input(value)
+    )
+    select 1 as value`
+    const unusedFrame = await analyze(database, unusedFrameSql, [])
+    assert.deepEqual(unusedFrame.paramUsageNullAdmissions, ['unknown'])
+    assert.deepEqual((await database.query(unusedFrameSql, [null])).rows, [{ value: 1 }])
+
+    const referencedFrameSql = `with reached as (
+      select sum(value) over (rows $1 preceding) as total
+      from (values (1), (2)) input(value)
+    )
+    select total from reached`
+    const referencedFrame = await analyze(database, referencedFrameSql, [])
+    assert.deepEqual(referencedFrame.paramUsageNullAdmissions, ['rejects'])
+    await assert.rejects(database.query(referencedFrameSql, [null]), /frame starting offset must not be null/u)
+
+    const unusedDependencyChainSql = `with first_unused as (
+      select public.record_cte_reachability() as value
+    ), second_unused as (
+      select value from first_unused
+    )
+    select 1`
+    const unusedDependencyChain = await analyze(database, unusedDependencyChainSql, [])
+    assert.equal(unusedDependencyChain.statements[0]?.queries[0]?.hasVolatileFunctions, false)
+    await database.query(unusedDependencyChainSql)
+    assert.deepEqual((await database.query('select count(*)::int as count from public.cte_reachability_calls')).rows, [
+      { count: 1 },
+    ])
+
+    const modifyingCteSql = `with inserted as (
+      insert into public.cte_reachability_dml(value) values (1)
+      returning value
+    )
+    select 1`
+    const modifyingCte = await analyze(database, modifyingCteSql, [])
+    assert.equal(modifyingCte.statements[0]?.queries[0]?.hasModifyingCTE, true)
+    await database.query(modifyingCteSql)
+    assert.deepEqual((await database.query('select value from public.cte_reachability_dml')).rows, [{ value: 1 }])
+
+    const recursiveSql = `with recursive reached(value) as (
+      values (1)
+      union all
+      select value + 1 from reached where value < 2
+    )
+    select value from reached order by value`
+    const recursive = await analyze(database, recursiveSql, [])
+    assert.equal(recursive.statements[0]?.queries[0]?.hasVolatileFunctions, false)
+    assert.equal(recursive.statements[0]?.queries[0]?.hasRowMarks, false)
+    assert.deepEqual((await database.query(recursiveSql)).rows, [{ value: 1 }, { value: 2 }])
   })
 })
 
