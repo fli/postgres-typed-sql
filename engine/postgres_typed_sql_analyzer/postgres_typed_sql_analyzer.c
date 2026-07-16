@@ -4255,11 +4255,29 @@ operator_argument_support_invokes_volatile(const List *args)
 static bool
 scalar_array_hash_support_invokes_volatile(const ScalarArrayOpExpr *expression)
 {
+#define MIN_ARRAY_SIZE_FOR_HASHED_SAOP 9
   Oid equality_operator = expression->opno;
   RegProcedure left_hash_function;
   RegProcedure right_hash_function;
   RuntimeTypeSupportContext context = {0};
   const Node *left_argument;
+  const Node *array_argument;
+  ArrayShape array_shape;
+
+  if (list_length(expression->args) != 2)
+  {
+    return true;
+  }
+
+  array_argument = (const Node *) lsecond(expression->args);
+  array_shape = array_shape_proof(array_argument);
+  /* Keep this cutoff synchronized with convert_saop_to_hashed_saop(). */
+  if (array_shape.proof == ARRAY_SHAPE_VALID &&
+      (array_shape.is_null ||
+       array_shape.nitems < MIN_ARRAY_SIZE_FOR_HASHED_SAOP))
+  {
+    return false;
+  }
 
   /* A custom plan can fold an external RHS Param to a hashable Const. */
   if (!expression->useOr)
@@ -4283,10 +4301,6 @@ scalar_array_hash_support_invokes_volatile(const ScalarArrayOpExpr *expression)
   }
   if (function_is_volatile(left_hash_function) ||
       function_is_volatile(right_hash_function))
-  {
-    return true;
-  }
-  if (expression->args == NIL)
   {
     return true;
   }
@@ -4664,6 +4678,22 @@ operator_expr_has_execution_relevant_operand(Node *node,
 }
 
 static bool
+operator_family_support_type_pair_is_relevant(const Form_pg_amop operator_form,
+                                              const Form_pg_amproc support_form)
+{
+  if (operator_form->amopmethod != BTREE_AM_OID &&
+      operator_form->amopmethod != HASH_AM_OID)
+  {
+    return true;
+  }
+
+  return (support_form->amproclefttype == operator_form->amoplefttype ||
+          support_form->amproclefttype == operator_form->amoprighttype) &&
+         (support_form->amprocrighttype == operator_form->amoplefttype ||
+          support_form->amprocrighttype == operator_form->amoprighttype);
+}
+
+static bool
 operator_family_support_invokes_volatile_function(Oid operator_oid)
 {
   CatCList *operator_memberships;
@@ -4693,7 +4723,9 @@ operator_family_support_invokes_volatile_function(Oid operator_oid)
       Form_pg_amproc support_form =
         (Form_pg_amproc) GETSTRUCT(support_tuple);
 
-      if (OidIsValid(support_form->amproc) &&
+      if (operator_family_support_type_pair_is_relevant(operator_form,
+                                                        support_form) &&
+          OidIsValid(support_form->amproc) &&
           function_is_volatile(support_form->amproc))
       {
         invokes_volatile = true;
@@ -4807,15 +4839,27 @@ node_invokes_volatile_function(Node *node, const QueryScope *scope)
         ((CoerceToDomain *) node)->resulttype);
     case T_RowCompareExpr:
     {
+      RowCompareExpr *row_compare = (RowCompareExpr *) node;
       ListCell *operator_cell;
+      ListCell *left_cell;
+      ListCell *right_cell;
       bool inspect_support = operator_expr_has_execution_relevant_operand(
         node, scope);
 
-      foreach(operator_cell, ((RowCompareExpr *) node)->opnos)
+      forthree(operator_cell, row_compare->opnos,
+               left_cell, row_compare->largs,
+               right_cell, row_compare->rargs)
       {
         Oid operator_oid = lfirst_oid(operator_cell);
+        Oid function_oid = get_opcode(operator_oid);
+        List *arguments = list_make2(lfirst(left_cell), lfirst(right_cell));
+        bool container_invokes_volatile =
+          container_function_invokes_volatile(function_oid, arguments);
 
-        if (function_is_volatile(get_opcode(operator_oid)) ||
+        list_free(arguments);
+
+        if (function_is_volatile(function_oid) ||
+            container_invokes_volatile ||
             (inspect_support &&
              operator_family_support_invokes_volatile_function(operator_oid)))
         {
@@ -4823,6 +4867,15 @@ node_invokes_volatile_function(Node *node, const QueryScope *scope)
         }
       }
       return false;
+    }
+    case T_MinMaxExpr:
+    {
+      MinMaxExpr *minmax = (MinMaxExpr *) node;
+      RuntimeTypeSupportContext support_context = {0};
+
+      return type_runtime_support_invokes_volatile(
+        minmax->minmaxtype, exprTypmod(node), RUNTIME_SUPPORT_COMPARE,
+        &support_context);
     }
     case T_NextValueExpr:
       return true;

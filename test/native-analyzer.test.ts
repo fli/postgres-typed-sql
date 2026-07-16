@@ -99,7 +99,7 @@ async function withDatabase(run: (database: AnalysisDatabase) => Promise<void>):
 
 async function installSortKeyOperatorClass(
   database: AnalysisDatabase,
-  name: 'array_element_key' | 'precision_sort_key' | 'volatile_sort_key',
+  name: 'array_element_key' | 'nested_compare_key' | 'precision_sort_key' | 'volatile_sort_key',
   options: { readonly volatileComparator: boolean; readonly volatileEquality: boolean }
 ): Promise<void> {
   await database.query(`create type public.${name} as (value integer)`)
@@ -849,6 +849,40 @@ test('native analyzer closes array comparison over concrete element support', as
   })
 })
 
+test('native analyzer closes minmax and row comparison over concrete container support', async () => {
+  await withDatabase(async (database) => {
+    await installSortKeyOperatorClass(database, 'nested_compare_key', {
+      volatileComparator: true,
+      volatileEquality: false,
+    })
+
+    for (const sql of [
+      `select greatest(
+        row(1)::public.nested_compare_key,
+        row(2)::public.nested_compare_key
+      ) as greatest_value`,
+      `select
+        (array[row(1)::public.nested_compare_key], 0) <
+        (array[row(2)::public.nested_compare_key], 0) as ordered`,
+    ]) {
+      const analysis = await analyze(database, sql, [])
+      assert.equal(analysis.statements[0]?.queries[0]?.hasVolatileFunctions, true, sql)
+
+      await database.query(`truncate public.nested_compare_key_calls`)
+      await database.query(sql)
+      assert.deepEqual(
+        (
+          await database.query<{ called: boolean }>(`select exists(
+            select 1 from public.nested_compare_key_calls
+          ) as called`)
+        ).rows,
+        [{ called: true }],
+        sql
+      )
+    }
+  })
+})
+
 test('native analyzer closes relation operators over volatile access-method support', async () => {
   await withDatabase(async (database) => {
     await database.query('create type public.hash_key as (value integer)')
@@ -925,6 +959,12 @@ test('native analyzer closes relation operators over volatile access-method supp
       return value;
     end
     $$`)
+    const linearScalarArraySql = `select public.stable_hash_key_identity(
+      $1::public.hash_key
+    ) operator(public.=) any(array[row(1)::public.hash_key]) as present`
+    const linearScalarArray = await analyze(database, linearScalarArraySql, [])
+    assert.equal(linearScalarArray.statements[0]?.queries[0]?.hasVolatileFunctions, false)
+
     const hashedScalarArraySql = `select public.stable_hash_key_identity(
       $1::public.hash_key
     ) operator(public.=) any(
@@ -965,6 +1005,16 @@ test('native analyzer closes relation operators over volatile access-method supp
     assert.equal((await database.query(joinSql)).rows.length, 1)
     assert.equal((await database.query(derivedJoinSql)).rows.length, 1)
     await database.query('truncate public.hash_key_calls')
+    assert.deepEqual((await database.query(linearScalarArraySql, ['(1)'])).rows, [{ present: true }])
+    assert.deepEqual(
+      (
+        await database.query<{ called: boolean }>(`select exists(
+          select 1 from public.hash_key_calls
+        ) as called`)
+      ).rows,
+      [{ called: false }]
+    )
+    await database.query('truncate public.hash_key_calls')
     assert.deepEqual((await database.query(hashedScalarArraySql, ['(1)'])).rows, [{ present: true }])
     assert.deepEqual(
       (
@@ -983,6 +1033,81 @@ test('native analyzer closes relation operators over volatile access-method supp
       ) as called`)
       ).rows,
       [{ called: true }]
+    )
+  })
+})
+
+test('native analyzer ignores volatile support for unrelated types in a shared operator family', async () => {
+  await withDatabase(async (database) => {
+    await database.query('create type public.shared_family_left as (value integer)')
+    await database.query('create type public.shared_family_right as (value integer)')
+    await database.query('create table public.shared_family_right_calls (called boolean default true)')
+
+    for (const name of ['left', 'right'] as const) {
+      await database.query(`create function public.shared_family_${name}_equal(
+        left_value public.shared_family_${name}, right_value public.shared_family_${name}
+      ) returns boolean language sql immutable strict as $$
+        select (left_value).value = (right_value).value
+      $$`)
+      await database.query(`create operator public.= (
+        leftarg = public.shared_family_${name},
+        rightarg = public.shared_family_${name},
+        function = public.shared_family_${name}_equal
+      )`)
+    }
+
+    await database.query(`create function public.shared_family_left_compare(
+      left_value public.shared_family_left, right_value public.shared_family_left
+    ) returns integer language sql immutable strict as $$
+      select case
+        when (left_value).value < (right_value).value then -1
+        when (left_value).value > (right_value).value then 1
+        else 0
+      end
+    $$`)
+    await database.query(`create function public.shared_family_right_compare(
+      left_value public.shared_family_right, right_value public.shared_family_right
+    ) returns integer language plpgsql volatile strict as $$
+    begin
+      insert into public.shared_family_right_calls default values;
+      return case
+        when (left_value).value < (right_value).value then -1
+        when (left_value).value > (right_value).value then 1
+        else 0
+      end;
+    end
+    $$`)
+    await database.query('create operator family public.shared_key_ops using btree')
+    await database.query(`alter operator family public.shared_key_ops using btree add
+      operator 3 public.= (
+        public.shared_family_left, public.shared_family_left
+      ),
+      function 1 public.shared_family_left_compare(
+        public.shared_family_left, public.shared_family_left
+      ),
+      operator 3 public.= (
+        public.shared_family_right, public.shared_family_right
+      ),
+      function 1 public.shared_family_right_compare(
+        public.shared_family_right, public.shared_family_right
+      )`)
+    await database.query('create table public.shared_family_values (value public.shared_family_left)')
+    await database.query(`insert into public.shared_family_values(value)
+      values (row(1)::public.shared_family_left)`)
+
+    const sql = `select value
+      from public.shared_family_values
+      where value operator(public.=) row(1)::public.shared_family_left`
+    const analysis = await analyze(database, sql, [])
+    assert.equal(analysis.statements[0]?.queries[0]?.hasVolatileFunctions, false)
+    assert.equal((await database.query(sql)).rows.length, 1)
+    assert.deepEqual(
+      (
+        await database.query<{ called: boolean }>(`select exists(
+          select 1 from public.shared_family_right_calls
+        ) as called`)
+      ).rows,
+      [{ called: false }]
     )
   })
 })
