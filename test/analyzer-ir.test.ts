@@ -29,9 +29,29 @@ function config(
 test('infers build-object shapes only from proven complete argument lists', async () => {
   const database = await createAnalysisDatabase({ schemaFiles: [schemaFile] })
   try {
+    await database.query(`
+      create table public.json_variadic_inputs (
+        nullable_entries text[],
+        required_entries text[] not null
+      )
+    `)
+    await database.query(`
+      insert into public.json_variadic_inputs(nullable_entries, required_entries)
+      values (null, array['answer', '42'])
+    `)
     const result = await buildTypedSqlPostgresIrFromCompiledConfigs(database, [
       config('literalVariadicJson', "select json_build_object(variadic array['answer', '42']) as payload"),
       config('dynamicVariadicJson', 'select jsonb_build_object(variadic $1) as payload', ['entries'], ['text[]']),
+      config('nullVariadicJson', 'select jsonb_build_object(variadic null::text[]) as payload'),
+      config(
+        'nullableVarVariadicJson',
+        'select jsonb_build_object(variadic nullable_entries) as payload from public.json_variadic_inputs'
+      ),
+      config(
+        'requiredVarVariadicJson',
+        'select jsonb_build_object(variadic required_entries) as payload from public.json_variadic_inputs'
+      ),
+      config('flatNullableJson', "select jsonb_build_object('answer', null::text) as payload"),
       config('oddBuildObject', "select jsonb_build_object('unpaired') as payload"),
     ])
     const query = (name: string): TypedSqlPostgresIr => {
@@ -41,8 +61,10 @@ test('infers build-object shapes only from proven complete argument lists', asyn
     }
 
     const literalShape = query('literalVariadicJson').resultColumns[0]?.jsonShape
+    assert.equal(query('literalVariadicJson').resultColumns[0]?.nullable, false)
     assert.equal(literalShape?.kind, 'object')
     if (literalShape?.kind === 'object') {
+      assert.equal(literalShape.nullable, false)
       assert.equal(literalShape.fields.length, 1)
       assert.equal(literalShape.fields[0]?.name, 'answer')
       assert.equal(literalShape.fields[0]?.shape.kind, 'scalar')
@@ -50,12 +72,76 @@ test('infers build-object shapes only from proven complete argument lists', asyn
         assert.equal(literalShape.fields[0].shape.pgTypeName, 'text')
       }
     }
-    assert.equal(query('dynamicVariadicJson').resultColumns[0]?.jsonShape?.kind, 'opaque')
+    const dynamicColumn = query('dynamicVariadicJson').resultColumns[0]
+    assert.equal(dynamicColumn?.nullable, true)
+    assert.equal(dynamicColumn?.jsonShape?.kind, 'opaque')
+    assert.equal(dynamicColumn?.jsonShape?.nullable, true)
+    assert.equal(query('nullVariadicJson').resultColumns[0]?.nullable, true)
+    assert.equal(query('nullVariadicJson').resultColumns[0]?.jsonShape?.nullable, true)
+    assert.equal(query('nullableVarVariadicJson').resultColumns[0]?.nullable, true)
+    assert.equal(query('nullableVarVariadicJson').resultColumns[0]?.jsonShape?.nullable, true)
+    assert.equal(query('requiredVarVariadicJson').resultColumns[0]?.nullable, false)
+    assert.equal(query('requiredVarVariadicJson').resultColumns[0]?.jsonShape?.nullable, false)
+    assert.equal(query('flatNullableJson').resultColumns[0]?.nullable, false)
+    assert.equal(query('flatNullableJson').resultColumns[0]?.jsonShape?.nullable, false)
     assert.equal(query('oddBuildObject').resultColumns[0]?.jsonShape?.kind, 'opaque')
     assert.deepEqual(
       (await database.query("select json_build_object(variadic array['answer', '42']) as payload")).rows,
       [{ payload: { answer: '42' } }]
     )
+    assert.deepEqual((await database.query('select jsonb_build_object(variadic null::text[]) as payload')).rows, [
+      { payload: null },
+    ])
+    assert.deepEqual(
+      (
+        await database.query(
+          'select jsonb_build_object(variadic nullable_entries) as payload from public.json_variadic_inputs'
+        )
+      ).rows,
+      [{ payload: null }]
+    )
+    assert.deepEqual((await database.query("select jsonb_build_object('answer', null::text) as payload")).rows, [
+      { payload: { answer: null } },
+    ])
+  } finally {
+    await database.close()
+  }
+})
+
+test('rejects unmodeled PostgreSQL utilities while preserving no-result CALL as a write', async () => {
+  const database = await createAnalysisDatabase({ schemaFiles: [schemaFile] })
+  try {
+    await database.query(`create procedure public.ir_no_result(value integer)
+      language plpgsql
+      as $$ begin null; end $$`)
+    await database.query(`create procedure public.ir_out_result(
+      input_value integer,
+      out output_value integer
+    )
+      language plpgsql
+      as $$ begin output_value := input_value * 2; end $$`)
+
+    const result = await buildTypedSqlPostgresIrFromCompiledConfigs(database, [
+      config('noResultCall', 'call public.ir_no_result($1)', ['value'], ['integer']),
+    ])
+    const call = result.queries[0]
+    assert.equal(call?.command, 'UTILITY')
+    assert.equal(call?.isWrite, true)
+    assert.deepEqual(call?.resultColumns, [])
+    assert.deepEqual(call?.rowBounds, { max: 0, min: 0, proof: 'no_result_columns' })
+    assert.equal(call?.rowCardinality, 'none')
+    await database.query('call public.ir_no_result($1)', [1])
+
+    for (const [name, sql, error] of [
+      ['show', 'show timezone', /PostgreSQL SHOW utility statements are not supported/u],
+      ['explain', 'explain select 1', /PostgreSQL EXPLAIN utility statements are not supported/u],
+      ['ddl', 'create table public.unsupported_utility (id integer)', /PostgreSQL OTHER utility statements/u],
+      ['outCall', 'call public.ir_out_result(2, null)', /CALL statements with result rows are not supported/u],
+      ['fetch', 'fetch all from missing_cursor', /PostgreSQL FETCH utility statements are not supported/u],
+      ['execute', 'execute missing_statement', /PostgreSQL EXECUTE utility statements are not supported/u],
+    ] as const) {
+      await assert.rejects(buildTypedSqlPostgresIrFromCompiledConfigs(database, [config(name, sql)]), error)
+    }
   } finally {
     await database.close()
   }

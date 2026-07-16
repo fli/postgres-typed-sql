@@ -33,6 +33,8 @@ interface NativeQuery {
   readonly hasVolatileFunctions: boolean
   readonly rtable: readonly { readonly kind: string; readonly subquery?: NativeQuery }[]
   readonly targetList: readonly NativeTarget[]
+  readonly utilityKind: 'CALL' | 'EXECUTE' | 'EXPLAIN' | 'FETCH' | 'NONE' | 'OTHER' | 'SHOW'
+  readonly utilityReturnsTuples: boolean
 }
 
 interface NativeTarget {
@@ -1146,6 +1148,45 @@ test('native analyzer preserves explicit variadic function-call structure', asyn
       ?.queries[0]?.targetList[0]?.expr
     assert.equal(flatCall?.funcVariadic, false)
     assert.equal(flatCall?.args?.length, 2)
+  })
+})
+
+test('native analyzer marks stable and dynamic utility result surfaces', async () => {
+  await withDatabase(async (database) => {
+    await database.query(`create procedure public.native_no_result(value integer)
+      language plpgsql
+      as $$ begin null; end $$`)
+    await database.query(`create procedure public.native_out_result(
+      input_value integer,
+      out output_value integer
+    )
+      language plpgsql
+      as $$ begin output_value := input_value * 2; end $$`)
+
+    const noResultCall = (await analyze(database, 'call public.native_no_result(1)', [])).statements[0]?.queries[0]
+    assert.equal(noResultCall?.utilityKind, 'CALL')
+    assert.equal(noResultCall?.utilityReturnsTuples, false)
+
+    const outResultCall = (await analyze(database, 'call public.native_out_result(2, null)', [])).statements[0]
+      ?.queries[0]
+    assert.equal(outResultCall?.utilityKind, 'CALL')
+    assert.equal(outResultCall?.utilityReturnsTuples, true)
+
+    const show = (await analyze(database, 'show timezone', [])).statements[0]?.queries[0]
+    assert.equal(show?.utilityKind, 'SHOW')
+    assert.equal(show?.utilityReturnsTuples, true)
+
+    const explain = (await analyze(database, 'explain select 1', [])).statements[0]?.queries[0]
+    assert.equal(explain?.utilityKind, 'EXPLAIN')
+    assert.equal(explain?.utilityReturnsTuples, true)
+
+    const fetch = (await analyze(database, 'fetch all from missing_cursor', [])).statements[0]?.queries[0]
+    assert.equal(fetch?.utilityKind, 'FETCH')
+    assert.equal(fetch?.utilityReturnsTuples, true)
+
+    const execute = (await analyze(database, 'execute missing_statement', [])).statements[0]?.queries[0]
+    assert.equal(execute?.utilityKind, 'EXECUTE')
+    assert.equal(execute?.utilityReturnsTuples, true)
   })
 })
 

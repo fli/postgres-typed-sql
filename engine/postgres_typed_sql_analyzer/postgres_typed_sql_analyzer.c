@@ -28,6 +28,7 @@
 #include "optimizer/optimizer.h"
 #include "parser/parsetree.h"
 #include "tcop/tcopprot.h"
+#include "tcop/utility.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/catcache.h"
@@ -61,6 +62,8 @@ static void append_from_node(StringInfo out, const QueryScope *scope, const Node
 static void append_rtable(StringInfo out, const QueryScope *scope, int depth);
 static void append_set_operation(StringInfo out, const Node *node);
 static const char *command_type_name(CmdType command_type);
+static const char *utility_kind_name(const Node *utility_stmt);
+static bool utility_returns_tuples_stably(const Node *utility_stmt);
 static void append_json_string(StringInfo out, const char *value);
 static void append_bool_field(StringInfo out, const char *name, bool value);
 static void append_oid_field(StringInfo out, const char *name, Oid value);
@@ -2875,6 +2878,58 @@ command_type_name(CmdType command_type)
   }
 
   return "UNRECOGNIZED";
+}
+
+static const char *
+utility_kind_name(const Node *utility_stmt)
+{
+  if (utility_stmt == NULL)
+  {
+    return "NONE";
+  }
+
+  switch (nodeTag(utility_stmt))
+  {
+    case T_CallStmt:
+      return "CALL";
+    case T_ExplainStmt:
+      return "EXPLAIN";
+    case T_VariableShowStmt:
+      return "SHOW";
+    case T_FetchStmt:
+      return "FETCH";
+    case T_ExecuteStmt:
+      return "EXECUTE";
+    default:
+      return "OTHER";
+  }
+}
+
+static bool
+utility_returns_tuples_stably(const Node *utility_stmt)
+{
+  if (utility_stmt == NULL)
+  {
+    return false;
+  }
+
+  switch (nodeTag(utility_stmt))
+  {
+    case T_CallStmt:
+    case T_ExplainStmt:
+    case T_VariableShowStmt:
+      return UtilityReturnsTuples((Node *) utility_stmt);
+    case T_FetchStmt:
+    case T_ExecuteStmt:
+      /*
+       * Their descriptors depend on a live portal or prepared statement.
+       * Report a possible result so consumers cannot mistake them for
+       * stable no-result utilities.
+       */
+      return true;
+    default:
+      return false;
+  }
 }
 
 static const char *
@@ -6284,6 +6339,11 @@ append_query_summary(StringInfo out, const Query *query,
 
   appendStringInfoString(out, "{\"commandType\":");
   append_json_string(out, command_type_name(query->commandType));
+  appendStringInfoString(out, ",\"utilityKind\":");
+  append_json_string(out, utility_kind_name(query->utilityStmt));
+  append_bool_field(
+    out, "utilityReturnsTuples",
+    utility_returns_tuples_stably(query->utilityStmt));
   appendStringInfo(out, ",\"querySource\":%d,\"canSetTag\":%s",
                    query->querySource, query->canSetTag ? "true" : "false");
   appendStringInfo(out, ",\"resultRelation\":%d", query->resultRelation);

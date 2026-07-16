@@ -1534,6 +1534,7 @@ test('generates build-object contracts only from proven complete argument lists'
   let output = await readFile(outputFile, 'utf8')
   assert.match(output, /interface QueryJ7_payloadJson \{[\s\S]*readonly answer: string/u)
   assert.match(output, /readonly payload: QueryJ7_payloadJson/u)
+  assert.doesNotMatch(output, /readonly payload: QueryJ7_payloadJson \| null/u)
   assert.doesNotMatch(output, /readonly payload: DbJsonSelected/u)
 
   await writeFile(
@@ -1544,14 +1545,68 @@ select jsonb_build_object(variadic :entries) as payload
   )
   await generateTypedSql(config)
   output = await readFile(outputFile, 'utf8')
-  assert.match(output, /readonly payload: DbJsonSelected/u)
+  assert.match(output, /readonly payload: DbJsonSelected \| null/u)
   assert.doesNotMatch(output, /interface QueryJ7_payloadJson/u)
+
+  await writeFile(queryFile, 'select jsonb_build_object(variadic null::text[]) as payload\n')
+  await generateTypedSql(config)
+  output = await readFile(outputFile, 'utf8')
+  assert.match(output, /readonly payload: DbJsonSelected \| null/u)
+
+  await writeFile(queryFile, "select jsonb_build_object('answer', null::text) as payload\n")
+  await generateTypedSql(config)
+  output = await readFile(outputFile, 'utf8')
+  assert.match(output, /interface QueryJ7_payloadJson \{[\s\S]*readonly answer: string \| null/u)
+  assert.match(output, /readonly payload: QueryJ7_payloadJson\n/u)
+  assert.doesNotMatch(output, /readonly payload: QueryJ7_payloadJson \| null/u)
 
   await writeFile(queryFile, "select jsonb_build_object('unpaired') as payload\n")
   await generateTypedSql(config)
   output = await readFile(outputFile, 'utf8')
   assert.match(output, /readonly payload: DbJsonSelected/u)
   assert.doesNotMatch(output, /interface QueryJ7_payloadJson/u)
+})
+
+test('generates conservative no-result CALL metadata and rejects other utilities', async () => {
+  const root = await createMinimalFixture(
+    `create procedure public.generator_no_result(value integer)
+language plpgsql
+as $$ begin null; end $$;
+create procedure public.generator_out_result(input_value integer, out output_value integer)
+language plpgsql
+as $$ begin output_value := input_value * 2; end $$;
+`,
+    `-- @param value integer
+call public.generator_no_result(:value)
+`
+  )
+  const config = {
+    include: ['queries'],
+    rootDir: root,
+    scalarProfile: 'node-postgres' as const,
+    schema: 'schema.sql',
+  }
+  const queryFile = join(root, 'queries/query.typed.sql')
+  const outputFile = join(root, 'queries/query.typed-sql.ts')
+
+  await generateTypedSql(config)
+  const output = await readFile(outputFile, 'utf8')
+  assert.match(output, /export type QueryRow = Record<string, never>/u)
+  assert.match(output, /access: 'write'/u)
+  assert.match(output, /cardinality: 'none'/u)
+  assert.match(output, /rowBounds: \{ min: 0, max: 0, proof: 'no_result_columns' \}/u)
+
+  for (const [sql, error] of [
+    ['show timezone\n', /PostgreSQL SHOW utility statements are not supported/u],
+    ['explain select 1\n', /PostgreSQL EXPLAIN utility statements are not supported/u],
+    ['create table public.generator_unsupported (id integer)\n', /PostgreSQL OTHER utility statements/u],
+    ['call public.generator_out_result(2, null)\n', /CALL statements with result rows are not supported/u],
+    ['fetch all from missing_cursor\n', /PostgreSQL FETCH utility statements are not supported/u],
+    ['execute missing_statement\n', /PostgreSQL EXECUTE utility statements are not supported/u],
+  ] as const) {
+    await writeFile(queryFile, sql)
+    await assert.rejects(generateTypedSql(config), error)
+  }
 })
 
 test('terminates recursive CTE nullability inference from pass-through seed facts', async () => {

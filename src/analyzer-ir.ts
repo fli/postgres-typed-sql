@@ -164,6 +164,8 @@ interface PgAnalyzerQuery {
   readonly rtable?: readonly PgAnalyzerRte[]
   readonly setOperation?: PgAnalyzerSetOperation | null
   readonly targetList?: readonly PgAnalyzerTarget[]
+  readonly utilityKind?: 'CALL' | 'EXECUTE' | 'EXPLAIN' | 'FETCH' | 'NONE' | 'OTHER' | 'SHOW'
+  readonly utilityReturnsTuples?: boolean
   readonly whereQual?: PgAnalyzerExpr | null
 }
 
@@ -875,6 +877,7 @@ function queryHasDataModifyingCte(query: PgAnalyzerQuery): boolean {
 function queryTreeIsWrite(query: PgAnalyzerQuery): boolean {
   return (
     isDataModifyingCommand(query.commandType) ||
+    query.commandType === 'UTILITY' ||
     query.hasModifyingCTE === true ||
     query.hasRowMarks === true ||
     query.hasVolatileFunctions === true
@@ -1446,12 +1449,19 @@ function expressionNullable(
   if (expr.tag === 'BoolExpr') {
     return exprChildren(expr).some((child) => expressionNullable(catalog, scope, child, refinements, seen))
   }
+  if (expr.tag === 'ArrayExpr') {
+    return false
+  }
   if (expr.tag === 'FuncExpr') {
     if (
       isBuiltinPgProcNamed(catalog, expr.funcid, 'jsonb_build_object') ||
       isBuiltinPgProcNamed(catalog, expr.funcid, 'json_build_object')
     ) {
-      return false
+      if (expr.funcVariadic !== true) {
+        return false
+      }
+      const args = expr.args?.map(targetExprFromAggregateArg)
+      return args?.length === 1 ? expressionNullable(catalog, scope, args[0], refinements, seen) : true
     }
   }
   if (expr.tag === 'RelabelType' || expr.tag === 'CoerceViaIO') {
@@ -1843,11 +1853,30 @@ async function analyzeCompiledConfig(
   if (tagSettingQueries.length !== 1) {
     throw new Error(`expected exactly one tag-setting rewritten query; received ${tagSettingQueries.length}.`)
   }
+  const primaryQuery = tagSettingQueries[0] as PgAnalyzerQuery
+  if (primaryQuery.commandType === 'UTILITY') {
+    if (primaryQuery.utilityKind === 'CALL' && primaryQuery.utilityReturnsTuples === false) {
+      return {
+        analysis,
+        config,
+        primaryQuery,
+        rewrittenQueries: statement.queries,
+      }
+    }
+    if (primaryQuery.utilityKind === 'CALL' && primaryQuery.utilityReturnsTuples === true) {
+      throw new Error('PostgreSQL CALL statements with result rows are not supported by typed SQL.')
+    }
+
+    const utilityKind = primaryQuery.utilityKind ?? 'UNKNOWN'
+    throw new Error(
+      `PostgreSQL ${utilityKind} utility statements are not supported by typed SQL; only CALL statements without result rows are supported.`
+    )
+  }
 
   return {
     analysis,
     config,
-    primaryQuery: tagSettingQueries[0] as PgAnalyzerQuery,
+    primaryQuery,
     rewrittenQueries: statement.queries,
   }
 }
