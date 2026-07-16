@@ -3779,12 +3779,12 @@ function_is_volatile(Oid function_oid)
 
 static bool
 aggregate_invokes_volatile_function(Oid aggregate_oid, const List *args,
-                                    bool target_entries, Oid result_type,
-                                    int32 result_typmod)
+                                    bool target_entries, bool window_aggregate,
+                                    Oid result_type, int32 result_typmod)
 {
   HeapTuple tuple;
   Form_pg_aggregate aggregate;
-  Oid support_function_oids[8];
+  Oid support_function_oids[5];
   int index;
 
   tuple = SearchSysCache1(AGGFNOID, ObjectIdGetDatum(aggregate_oid));
@@ -3796,12 +3796,15 @@ aggregate_invokes_volatile_function(Oid aggregate_oid, const List *args,
   aggregate = (Form_pg_aggregate) GETSTRUCT(tuple);
   support_function_oids[0] = aggregate->aggtransfn;
   support_function_oids[1] = aggregate->aggfinalfn;
-  support_function_oids[2] = aggregate->aggcombinefn;
-  support_function_oids[3] = aggregate->aggserialfn;
-  support_function_oids[4] = aggregate->aggdeserialfn;
-  support_function_oids[5] = aggregate->aggmtransfn;
-  support_function_oids[6] = aggregate->aggminvtransfn;
-  support_function_oids[7] = aggregate->aggmfinalfn;
+  support_function_oids[2] = window_aggregate
+                                ? aggregate->aggmtransfn
+                                : aggregate->aggcombinefn;
+  support_function_oids[3] = window_aggregate
+                                ? aggregate->aggminvtransfn
+                                : aggregate->aggserialfn;
+  support_function_oids[4] = window_aggregate
+                                ? aggregate->aggmfinalfn
+                                : aggregate->aggdeserialfn;
   ReleaseSysCache(tuple);
 
   for (index = 0; index < lengthof(support_function_oids); index++)
@@ -5164,6 +5167,75 @@ external_parameter_io_invokes_volatile(Oid type_oid, int32 typmod)
 }
 
 static bool
+xml_type_conversion_invokes_volatile(Oid type_oid, int32 typmod)
+{
+  Oid element_type = get_base_element_type(type_oid);
+  Oid base_type;
+  RuntimeTypeIoContext context = {0};
+  RuntimeTypeIoResult output_result;
+
+  /* SQL/XML maps arrays element-by-element instead of invoking array_out. */
+  if (OidIsValid(element_type))
+  {
+    return xml_type_conversion_invokes_volatile(element_type, -1);
+  }
+
+  base_type = getBaseTypeAndTypmod(type_oid, &typmod);
+  switch (base_type)
+  {
+    /* map_sql_value_to_xml_value has native XSD encodings for these types. */
+    case BOOLOID:
+    case DATEOID:
+    case TIMESTAMPOID:
+    case TIMESTAMPTZOID:
+#ifdef USE_LIBXML
+    case BYTEAOID:
+#endif
+      return false;
+    default:
+      break;
+  }
+
+  output_result = type_io_invokes_volatile(
+    base_type, typmod, RUNTIME_TYPE_IO_TEXT_OUTPUT, &context);
+  return !output_result.supported || output_result.invokes_volatile;
+}
+
+static bool
+xml_conversion_args_invoke_volatile(const List *args)
+{
+  ListCell *cell;
+
+  foreach(cell, args)
+  {
+    const Node *argument = (const Node *) lfirst(cell);
+
+    if (argument == NULL ||
+        xml_type_conversion_invokes_volatile(
+          exprType(argument), exprTypmod(argument)))
+    {
+      return true;
+    }
+  }
+  return false;
+}
+
+static bool
+xml_expression_invokes_volatile(const XmlExpr *expression)
+{
+  switch (expression->op)
+  {
+    case IS_XMLELEMENT:
+      return xml_conversion_args_invoke_volatile(expression->named_args) ||
+             xml_conversion_args_invoke_volatile(expression->args);
+    case IS_XMLFOREST:
+      return xml_conversion_args_invoke_volatile(expression->named_args);
+    default:
+      return false;
+  }
+}
+
+static bool
 operator_operand_is_execution_relevant_walker(Node *node, void *context)
 {
   const QueryScope *scope = (const QueryScope *) context;
@@ -5278,7 +5350,7 @@ node_invokes_volatile_function(Node *node, const QueryScope *scope)
       Aggref *aggregate = (Aggref *) node;
 
       return aggregate_invokes_volatile_function(
-               aggregate->aggfnoid, aggregate->args, true,
+               aggregate->aggfnoid, aggregate->args, true, false,
                aggregate->aggtype, exprTypmod(node)) ||
              json_aggregate_args_invoke_volatile(
                aggregate->aggfnoid, aggregate->args) ||
@@ -5294,7 +5366,7 @@ node_invokes_volatile_function(Node *node, const QueryScope *scope)
 
       return function->winagg
                ? aggregate_invokes_volatile_function(
-                   function->winfnoid, function->args, false,
+                   function->winfnoid, function->args, false, true,
                    function->wintype, exprTypmod(node))
                : function_is_volatile(function->winfnoid);
     }
@@ -5312,6 +5384,8 @@ node_invokes_volatile_function(Node *node, const QueryScope *scope)
     case T_JsonConstructorExpr:
       return json_constructor_args_invoke_volatile(
         (const JsonConstructorExpr *) node);
+    case T_XmlExpr:
+      return xml_expression_invokes_volatile((const XmlExpr *) node);
     case T_Param:
     {
       Param *param = (Param *) node;
@@ -5347,6 +5421,16 @@ node_invokes_volatile_function(Node *node, const QueryScope *scope)
     {
       ScalarArrayOpExpr *expr = (ScalarArrayOpExpr *) node;
       Oid function_oid = OidIsValid(expr->opfuncid) ? expr->opfuncid : get_opcode(expr->opno);
+      const Node *array_argument = list_length(expr->args) == 2
+                                     ? (const Node *) lsecond(expr->args)
+                                     : NULL;
+      ArrayShape array_shape = array_shape_proof(array_argument);
+
+      if (array_shape.proof == ARRAY_SHAPE_VALID &&
+          (array_shape.is_null || array_shape.nitems == 0))
+      {
+        return false;
+      }
 
       return function_is_volatile(function_oid) ||
              executor_support_dependency_invokes_volatile(
@@ -5414,9 +5498,10 @@ node_invokes_volatile_function(Node *node, const QueryScope *scope)
       MinMaxExpr *minmax = (MinMaxExpr *) node;
       RuntimeTypeSupportContext support_context = {0};
 
-      return type_runtime_support_invokes_volatile(
-        minmax->minmaxtype, exprTypmod(node), RUNTIME_SUPPORT_COMPARE,
-        &support_context);
+      return list_length(minmax->args) >= 2 &&
+             type_runtime_support_invokes_volatile(
+               minmax->minmaxtype, exprTypmod(node), RUNTIME_SUPPORT_COMPARE,
+               &support_context);
     }
     case T_NextValueExpr:
       return true;

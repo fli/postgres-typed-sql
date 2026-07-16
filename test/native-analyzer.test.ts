@@ -550,6 +550,91 @@ test('native analyzer treats volatile aggregate support functions as writes', as
       'select value from public.aggregate_side_effects order by value'
     )
     assert.deepEqual(windowSideEffects.rows, [{ value: 1 }, { value: 2 }, { value: 3 }])
+
+    await database.query('create table public.aggregate_support_calls (kind text)')
+    await database.query(`create function public.immutable_sum_transition(state integer, value integer)
+      returns integer language sql immutable
+      as $$ select coalesce(state, 0) + coalesce(value, 0) $$`)
+    await database.query(`create function public.volatile_moving_sum_transition(
+      state integer, value integer
+    ) returns integer language plpgsql volatile as $$
+    begin
+      insert into public.aggregate_support_calls(kind) values ('moving-transition');
+      return coalesce(state, 0) + coalesce(value, 0);
+    end
+    $$`)
+    await database.query(`create function public.volatile_moving_sum_inverse(
+      state integer, value integer
+    ) returns integer language plpgsql volatile as $$
+    begin
+      insert into public.aggregate_support_calls(kind) values ('moving-inverse');
+      return coalesce(state, 0) - coalesce(value, 0);
+    end
+    $$`)
+    await database.query(`create function public.volatile_moving_sum_final(state integer)
+      returns integer language plpgsql volatile as $$
+    begin
+      insert into public.aggregate_support_calls(kind) values ('moving-final');
+      return state;
+    end
+    $$`)
+    await database.query(`create aggregate public.moving_capable_sum(integer) (
+      sfunc = public.immutable_sum_transition,
+      stype = integer,
+      initcond = '0',
+      msfunc = public.volatile_moving_sum_transition,
+      minvfunc = public.volatile_moving_sum_inverse,
+      mstype = integer,
+      minitcond = '0',
+      mfinalfunc = public.volatile_moving_sum_final
+    )`)
+
+    const ordinaryMovingSql = `select public.moving_capable_sum(value) as total
+      from (values (1), (2), (3)) input(value)`
+    const ordinaryMoving = await analyze(database, ordinaryMovingSql, [])
+    assert.equal(ordinaryMoving.statements[0]?.queries[0]?.hasVolatileFunctions, false)
+    assert.deepEqual((await database.query(ordinaryMovingSql)).rows, [{ total: 6 }])
+    assert.deepEqual((await database.query('select kind from public.aggregate_support_calls')).rows, [])
+
+    const windowMovingSql = `select public.moving_capable_sum(value) over (
+        order by value rows between 1 preceding and current row
+      ) as total
+      from (values (1), (2), (3)) input(value)`
+    const windowMoving = await analyze(database, windowMovingSql, [])
+    assert.equal(windowMoving.statements[0]?.queries[0]?.hasVolatileFunctions, true)
+    assert.deepEqual((await database.query(windowMovingSql)).rows, [{ total: 1 }, { total: 3 }, { total: 5 }])
+    assert.ok((await database.query('select kind from public.aggregate_support_calls')).rows.length > 0)
+
+    await database.query('truncate public.aggregate_support_calls')
+    await database.query(`create function public.volatile_sum_combine(
+      left_state integer, right_state integer
+    ) returns integer language plpgsql volatile parallel safe as $$
+    begin
+      insert into public.aggregate_support_calls(kind) values ('combine');
+      return coalesce(left_state, 0) + coalesce(right_state, 0);
+    end
+    $$`)
+    await database.query(`create aggregate public.combine_capable_sum(integer) (
+      sfunc = public.immutable_sum_transition,
+      stype = integer,
+      initcond = '0',
+      combinefunc = public.volatile_sum_combine,
+      parallel = safe
+    )`)
+
+    const ordinaryCombine = await analyze(
+      database,
+      'select public.combine_capable_sum(value) from (values (1), (2)) input(value)',
+      []
+    )
+    assert.equal(ordinaryCombine.statements[0]?.queries[0]?.hasVolatileFunctions, true)
+
+    const windowCombineSql = `select public.combine_capable_sum(value) over () as total
+      from (values (1), (2)) input(value)`
+    const windowCombine = await analyze(database, windowCombineSql, [])
+    assert.equal(windowCombine.statements[0]?.queries[0]?.hasVolatileFunctions, false)
+    assert.deepEqual((await database.query(windowCombineSql)).rows, [{ total: 3 }, { total: 3 }])
+    assert.deepEqual((await database.query('select kind from public.aggregate_support_calls')).rows, [])
   })
 })
 
@@ -833,6 +918,49 @@ test('native analyzer closes JSON conversion over casts, arrays, constructors, a
   })
 })
 
+test('native analyzer closes SQL/XML conversion over reachable type output functions', async () => {
+  await withDatabase(async (database) => {
+    await database.query("create type public.xml_mood as enum ('calm', 'busy')")
+    await database.query('create domain public.xml_mood_array as public.xml_mood[]')
+    await database.query('alter function pg_catalog.enum_out(anyenum) volatile')
+
+    for (const sql of [
+      "select xmlelement(name mood, 'calm'::public.xml_mood)",
+      "select xmlforest('calm'::public.xml_mood as mood)",
+      "select xmlelement(name moods, array['calm'::public.xml_mood])",
+      "select xmlelement(name moods, array['calm'::public.xml_mood]::public.xml_mood_array)",
+    ]) {
+      const analysis = await analyze(database, sql, [])
+      assert.equal(analysis.statements[0]?.queries[0]?.hasVolatileFunctions, true, sql)
+      assert.equal((await database.query(sql)).rows.length, 1)
+    }
+
+    for (const signature of [
+      'boolout(boolean)',
+      'date_out(date)',
+      'timestamp_out(timestamp without time zone)',
+      'timestamptz_out(timestamp with time zone)',
+      'byteaout(bytea)',
+      'array_out(anyarray)',
+    ]) {
+      await database.query(`alter function pg_catalog.${signature} volatile`)
+    }
+
+    const specialTypesSql = `select xmlelement(
+      name values,
+      true,
+      date '2026-07-16',
+      timestamp '2026-07-16 12:00:00',
+      timestamptz '2026-07-16 12:00:00+09:30',
+      decode('00ff', 'hex'),
+      array[true]
+    )`
+    const specialTypes = await analyze(database, specialTypesSql, [])
+    assert.equal(specialTypes.statements[0]?.queries[0]?.hasVolatileFunctions, false)
+    assert.equal((await database.query(specialTypesSql)).rows.length, 1)
+  })
+})
+
 test('native analyzer preserves explicit variadic function-call structure', async () => {
   await withDatabase(async (database) => {
     const literalSql = "select jsonb_build_object(variadic array['answer', '42']) as payload"
@@ -917,6 +1045,33 @@ test('native analyzer closes minmax and row comparison over concrete container s
         sql
       )
     }
+
+    await database.query('truncate public.nested_compare_key_calls')
+    const singleMinmaxSql = `select greatest(
+      row(1)::public.nested_compare_key
+    ) as greatest_value`
+    const singleMinmax = await analyze(database, singleMinmaxSql, [])
+    assert.equal(singleMinmax.statements[0]?.queries[0]?.hasVolatileFunctions, false)
+    await database.query(singleMinmaxSql)
+    assert.deepEqual((await database.query('select called from public.nested_compare_key_calls')).rows, [])
+
+    await database.query(`create function public.volatile_nested_compare_key(
+      value public.nested_compare_key
+    ) returns public.nested_compare_key language plpgsql volatile strict as $$
+    begin
+      insert into public.nested_compare_key_calls default values;
+      return value;
+    end
+    $$`)
+    const volatileChildSql = `select greatest(
+      public.volatile_nested_compare_key(row(1)::public.nested_compare_key)
+    ) as greatest_value`
+    const volatileChild = await analyze(database, volatileChildSql, [])
+    assert.equal(volatileChild.statements[0]?.queries[0]?.hasVolatileFunctions, true)
+    await database.query(volatileChildSql)
+    assert.deepEqual((await database.query('select called from public.nested_compare_key_calls')).rows, [
+      { called: true },
+    ])
   })
 })
 
@@ -1309,6 +1464,76 @@ test('native analyzer closes relation operators over volatile access-method supp
       ).rows,
       [{ called: true }]
     )
+  })
+})
+
+test('native analyzer skips unreachable scalar-array operator support for empty and null arrays', async () => {
+  await withDatabase(async (database) => {
+    await database.query('create type public.empty_saop_key as (value integer)')
+    await database.query('create table public.empty_saop_calls (kind text)')
+    await database.query(`create function public.empty_saop_equal(
+      left_value public.empty_saop_key, right_value public.empty_saop_key
+    ) returns boolean language plpgsql volatile strict as $$
+    begin
+      insert into public.empty_saop_calls(kind) values ('operator');
+      return (left_value).value = (right_value).value;
+    end
+    $$`)
+    await database.query(`create function public.empty_saop_not_equal(
+      left_value public.empty_saop_key, right_value public.empty_saop_key
+    ) returns boolean language plpgsql volatile strict as $$
+    begin
+      insert into public.empty_saop_calls(kind) values ('operator');
+      return (left_value).value <> (right_value).value;
+    end
+    $$`)
+    await database.query(`create operator public.= (
+      leftarg = public.empty_saop_key,
+      rightarg = public.empty_saop_key,
+      function = public.empty_saop_equal
+    )`)
+    await database.query(`create operator public.<> (
+      leftarg = public.empty_saop_key,
+      rightarg = public.empty_saop_key,
+      function = public.empty_saop_not_equal
+    )`)
+
+    for (const [sql, expected] of [
+      [
+        `select row(1)::public.empty_saop_key
+          operator(public.=) any('{}'::public.empty_saop_key[]) as result`,
+        false,
+      ],
+      [
+        `select row(1)::public.empty_saop_key
+          operator(public.<>) all('{}'::public.empty_saop_key[]) as result`,
+        true,
+      ],
+      [
+        `select row(1)::public.empty_saop_key
+          operator(public.=) any(null::public.empty_saop_key[]) as result`,
+        null,
+      ],
+    ] as const) {
+      const analysis = await analyze(database, sql, [])
+      assert.equal(analysis.statements[0]?.queries[0]?.hasVolatileFunctions, false, sql)
+      assert.deepEqual((await database.query(sql)).rows, [{ result: expected }], sql)
+      assert.deepEqual((await database.query('select kind from public.empty_saop_calls')).rows, [], sql)
+    }
+
+    await database.query(`create function public.volatile_empty_saop_key()
+      returns public.empty_saop_key language plpgsql volatile as $$
+    begin
+      insert into public.empty_saop_calls(kind) values ('child');
+      return row(1)::public.empty_saop_key;
+    end
+    $$`)
+    const volatileChildSql = `select public.volatile_empty_saop_key()
+      operator(public.=) any('{}'::public.empty_saop_key[]) as result`
+    const volatileChild = await analyze(database, volatileChildSql, [])
+    assert.equal(volatileChild.statements[0]?.queries[0]?.hasVolatileFunctions, true)
+    assert.deepEqual((await database.query(volatileChildSql)).rows, [{ result: false }])
+    assert.deepEqual((await database.query('select kind from public.empty_saop_calls')).rows, [{ kind: 'child' }])
   })
 })
 
