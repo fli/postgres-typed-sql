@@ -1313,6 +1313,88 @@ test('native analyzer closes external parameter and CoerceViaIO container input 
   })
 })
 
+test('native analyzer closes protocol result I/O over externally emitted container types only', async () => {
+  await withDatabase(async (database) => {
+    await database.query("create type public.result_io_mood as enum ('calm', 'busy')")
+    await database.query('create domain public.result_io_mood_domain as public.result_io_mood')
+    await database.query(`create type public.result_io_envelope as (
+      mood public.result_io_mood_domain,
+      moods public.result_io_mood[]
+    )`)
+    await database.query(`create type public.result_io_mood_range as range (
+      subtype = public.result_io_mood
+    )`)
+    await database.query('create table public.result_io_values (value public.result_io_mood)')
+
+    const resultSql = [
+      "select 'calm'::public.result_io_mood as value",
+      "select 'calm'::public.result_io_mood_domain as value",
+      "select array['calm'::public.result_io_mood] as value",
+      `select row(
+        'calm'::public.result_io_mood_domain,
+        array['busy'::public.result_io_mood]
+      )::public.result_io_envelope as value`,
+      "select public.result_io_mood_range('calm', 'busy', '[]') as value",
+      `select public.result_io_mood_multirange(
+        public.result_io_mood_range('calm', 'busy', '[]')
+      ) as value`,
+    ] as const
+
+    await database.query('alter function pg_catalog.enum_out(anyenum) volatile')
+    for (const sql of resultSql) {
+      const analysis = await analyze(database, sql, [])
+      assert.equal(analysis.statements[0]?.queries[0]?.hasVolatileFunctions, true, sql)
+      assert.equal((await database.query(sql)).rows.length, 1, sql)
+    }
+
+    for (const sql of [
+      'select null::public.result_io_mood as value',
+      'select array[null::public.result_io_mood] as value',
+      'select row(null::public.result_io_mood) as value',
+      "select row(1, 'stable') as value",
+      "select array[row(1, 'stable')] as value",
+      `select nested.visible
+       from (
+         select 1 as visible, 'calm'::public.result_io_mood as protocol_hidden
+       ) nested`,
+      `with nested as (
+         select 1 as visible, 'calm'::public.result_io_mood as protocol_hidden
+       )
+       select visible from nested`,
+      `select exists(
+         select 'calm'::public.result_io_mood as protocol_hidden
+       ) as visible`,
+    ]) {
+      const analysis = await analyze(database, sql, [])
+      assert.equal(analysis.statements[0]?.queries[0]?.hasVolatileFunctions, false, sql)
+      assert.equal((await database.query(sql)).rows.length, 1, sql)
+    }
+
+    for (const sql of [
+      `insert into public.result_io_values(value)
+       values ('calm') returning value`,
+      `update public.result_io_values
+       set value = 'busy' returning value`,
+      'delete from public.result_io_values returning value',
+    ]) {
+      const analysis = await analyze(database, sql, [])
+      const query = analysis.statements[0]?.queries[0]
+      assert.equal(query?.canSetTag, true, sql)
+      assert.equal(query?.hasVolatileFunctions, true, sql)
+      assert.equal((await database.query(sql)).rows.length, 1, sql)
+    }
+
+    /* PostgreSQL printtup selects typsend for a binary result format. */
+    await database.query('alter function pg_catalog.enum_out(anyenum) immutable')
+    await database.query('alter function pg_catalog.enum_send(anyenum) volatile')
+    for (const sql of resultSql) {
+      const analysis = await analyze(database, sql, [])
+      assert.equal(analysis.statements[0]?.queries[0]?.hasVolatileFunctions, true, sql)
+      assert.equal((await database.query(sql)).rows.length, 1, sql)
+    }
+  })
+})
+
 test('native analyzer closes relation operators over volatile access-method support', async () => {
   await withDatabase(async (database) => {
     await database.query('create type public.hash_key as (value integer)')

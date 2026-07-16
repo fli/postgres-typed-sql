@@ -45,7 +45,9 @@ PG_FUNCTION_INFO_V1(postgres_typed_sql_analyze);
 typedef struct QueryScope QueryScope;
 
 static void append_expr_node(StringInfo out, const QueryScope *scope, const Node *expr, int depth);
-static void append_query_summary(StringInfo out, const Query *query, const QueryScope *parent_scope, int depth);
+static void append_query_summary(StringInfo out, const Query *query,
+                                 const QueryScope *parent_scope, int depth,
+                                 bool protocol_output);
 static void append_from_node(StringInfo out, const QueryScope *scope, const Node *node, int depth);
 static void append_rtable(StringInfo out, const QueryScope *scope, int depth);
 static void append_set_operation(StringInfo out, const Node *node);
@@ -3447,7 +3449,8 @@ append_expr_node(StringInfo out, const QueryScope *scope, const Node *expr, int 
       if (sublink->subselect != NULL && IsA(sublink->subselect, Query))
       {
         appendStringInfoString(out, ",\"subquery\":");
-        append_query_summary(out, (const Query *) sublink->subselect, scope, depth - 1);
+        append_query_summary(out, (const Query *) sublink->subselect, scope,
+                             depth - 1, false);
       }
       else
       {
@@ -3492,7 +3495,7 @@ append_cte_list(StringInfo out, const QueryScope *scope, int depth)
       appendStringInfoString(out, ",\"commandType\":");
       append_json_string(out, command_type_name(cte_query->commandType));
       appendStringInfoString(out, ",\"query\":");
-      append_query_summary(out, cte_query, scope, depth - 1);
+      append_query_summary(out, cte_query, scope, depth - 1, false);
     }
     appendStringInfoChar(out, '}');
   }
@@ -3665,7 +3668,7 @@ append_rtable(StringInfo out, const QueryScope *scope, int depth)
     if (rte->rtekind == RTE_SUBQUERY && rte->subquery != NULL && depth > 0)
     {
       appendStringInfoString(out, ",\"subquery\":");
-      append_query_summary(out, rte->subquery, scope, depth - 1);
+      append_query_summary(out, rte->subquery, scope, depth - 1, false);
     }
     appendStringInfoChar(out, '}');
     index++;
@@ -4932,7 +4935,8 @@ typedef enum RuntimeTypeIoKind
 {
   RUNTIME_TYPE_IO_TEXT_INPUT,
   RUNTIME_TYPE_IO_BINARY_RECEIVE,
-  RUNTIME_TYPE_IO_TEXT_OUTPUT
+  RUNTIME_TYPE_IO_TEXT_OUTPUT,
+  RUNTIME_TYPE_IO_BINARY_SEND
 } RuntimeTypeIoKind;
 
 typedef struct RuntimeTypeIoKey
@@ -4962,6 +4966,20 @@ runtime_type_io_result(bool supported, bool invokes_volatile)
   return result;
 }
 
+static bool
+runtime_type_io_is_input(RuntimeTypeIoKind kind)
+{
+  return kind == RUNTIME_TYPE_IO_TEXT_INPUT ||
+         kind == RUNTIME_TYPE_IO_BINARY_RECEIVE;
+}
+
+static bool
+runtime_type_io_is_output(RuntimeTypeIoKind kind)
+{
+  return kind == RUNTIME_TYPE_IO_TEXT_OUTPUT ||
+         kind == RUNTIME_TYPE_IO_BINARY_SEND;
+}
+
 /*
  * Generic container I/O functions are declared immutable, but resolve their
  * nested type's I/O procedure at runtime.  Domain input adds another hidden
@@ -4976,7 +4994,7 @@ type_io_invokes_volatile(Oid type_oid, int32 typmod,
 {
   HeapTuple tuple;
   Form_pg_type type;
-  Oid io_function;
+  Oid io_function = InvalidOid;
   Oid nested_type = InvalidOid;
   int32 nested_typmod = -1;
   char type_kind;
@@ -5010,11 +5028,21 @@ type_io_invokes_volatile(Oid type_oid, int32 typmod,
   }
   type = (Form_pg_type) GETSTRUCT(tuple);
   type_kind = type->typtype;
-  io_function = kind == RUNTIME_TYPE_IO_TEXT_INPUT
-                  ? type->typinput
-                  : kind == RUNTIME_TYPE_IO_BINARY_RECEIVE
-                      ? type->typreceive
-                      : type->typoutput;
+  switch (kind)
+  {
+    case RUNTIME_TYPE_IO_TEXT_INPUT:
+      io_function = type->typinput;
+      break;
+    case RUNTIME_TYPE_IO_BINARY_RECEIVE:
+      io_function = type->typreceive;
+      break;
+    case RUNTIME_TYPE_IO_TEXT_OUTPUT:
+      io_function = type->typoutput;
+      break;
+    case RUNTIME_TYPE_IO_BINARY_SEND:
+      io_function = type->typsend;
+      break;
+  }
   ReleaseSysCache(tuple);
 
   if (!OidIsValid(io_function))
@@ -5032,8 +5060,7 @@ type_io_invokes_volatile(Oid type_oid, int32 typmod,
   {
     Oid base_type = getBaseTypeAndTypmod(type_oid, &typmod);
 
-    if ((kind == RUNTIME_TYPE_IO_TEXT_INPUT ||
-         kind == RUNTIME_TYPE_IO_BINARY_RECEIVE) &&
+    if (runtime_type_io_is_input(kind) &&
         domain_constraints_invoke_volatile_function(type_oid))
     {
       context->depth--;
@@ -5054,7 +5081,7 @@ type_io_invokes_volatile(Oid type_oid, int32 typmod,
     if (OidIsValid(element_type))
     {
       nested_type = element_type;
-      nested_typmod = kind == RUNTIME_TYPE_IO_TEXT_OUTPUT ? -1 : typmod;
+      nested_typmod = runtime_type_io_is_output(kind) ? -1 : typmod;
     }
     else if (type_kind == TYPTYPE_COMPOSITE || type_oid == RECORDOID)
     {
@@ -5107,8 +5134,7 @@ type_io_invokes_volatile(Oid type_oid, int32 typmod,
         context->depth--;
         return runtime_type_io_result(true, true);
       }
-      if ((kind == RUNTIME_TYPE_IO_TEXT_INPUT ||
-           kind == RUNTIME_TYPE_IO_BINARY_RECEIVE) &&
+      if (runtime_type_io_is_input(kind) &&
           type_executor_support_invokes_volatile(
             type_oid, typmod,
             EXECUTOR_SUPPORT_COMPARE | EXECUTOR_SUPPORT_RANGE_CANONICAL))
@@ -5128,8 +5154,7 @@ type_io_invokes_volatile(Oid type_oid, int32 typmod,
         context->depth--;
         return runtime_type_io_result(true, true);
       }
-      if ((kind == RUNTIME_TYPE_IO_TEXT_INPUT ||
-           kind == RUNTIME_TYPE_IO_BINARY_RECEIVE) &&
+      if (runtime_type_io_is_input(kind) &&
           type_executor_support_invokes_volatile(
             type_oid, typmod, EXECUTOR_SUPPORT_COMPARE))
       {
@@ -5150,6 +5175,174 @@ type_io_invokes_volatile(Oid type_oid, int32 typmod,
 
   context->depth--;
   return runtime_type_io_result(true, false);
+}
+
+/* Check one protocol I/O procedure without following container contents. */
+static RuntimeTypeIoResult
+direct_type_io_invokes_volatile(Oid type_oid, RuntimeTypeIoKind kind)
+{
+  HeapTuple tuple;
+  Form_pg_type type;
+  Oid io_function = InvalidOid;
+
+  if (!OidIsValid(type_oid))
+  {
+    return runtime_type_io_result(true, true);
+  }
+  tuple = SearchSysCache1(TYPEOID, ObjectIdGetDatum(type_oid));
+  if (!HeapTupleIsValid(tuple))
+  {
+    return runtime_type_io_result(true, true);
+  }
+  type = (Form_pg_type) GETSTRUCT(tuple);
+  switch (kind)
+  {
+    case RUNTIME_TYPE_IO_TEXT_INPUT:
+      io_function = type->typinput;
+      break;
+    case RUNTIME_TYPE_IO_BINARY_RECEIVE:
+      io_function = type->typreceive;
+      break;
+    case RUNTIME_TYPE_IO_TEXT_OUTPUT:
+      io_function = type->typoutput;
+      break;
+    case RUNTIME_TYPE_IO_BINARY_SEND:
+      io_function = type->typsend;
+      break;
+  }
+  ReleaseSysCache(tuple);
+
+  if (!OidIsValid(io_function))
+  {
+    return runtime_type_io_result(false, false);
+  }
+  return runtime_type_io_result(true, function_is_volatile(io_function));
+}
+
+static RuntimeTypeIoResult result_expression_io_invokes_volatile(
+  const Node *expression, RuntimeTypeIoKind kind);
+
+static RuntimeTypeIoResult
+array_expression_elements_io_invoke_volatile(const ArrayExpr *array,
+                                             RuntimeTypeIoKind kind)
+{
+  ListCell *cell;
+
+  foreach(cell, array->elements)
+  {
+    const Node *element = (const Node *) lfirst(cell);
+    RuntimeTypeIoResult element_result;
+
+    if (array->multidims)
+    {
+      if (element == NULL || !IsA(element, ArrayExpr))
+      {
+        return runtime_type_io_result(true, true);
+      }
+      element_result = array_expression_elements_io_invoke_volatile(
+        (const ArrayExpr *) element, kind);
+    }
+    else
+    {
+      element_result = result_expression_io_invokes_volatile(element, kind);
+    }
+    if (!element_result.supported || element_result.invokes_volatile)
+    {
+      return element_result;
+    }
+  }
+  return runtime_type_io_result(true, false);
+}
+
+/*
+ * Anonymous records carry a runtime typmod that is not present in the parsed
+ * expression.  RowExpr and ArrayExpr still expose their concrete contents,
+ * so follow those shapes instead of treating every anonymous row as opaque.
+ */
+static RuntimeTypeIoResult
+result_expression_io_invokes_volatile(const Node *expression,
+                                      RuntimeTypeIoKind kind)
+{
+  RuntimeTypeIoContext context = {0};
+
+  if (expression == NULL)
+  {
+    return runtime_type_io_result(true, true);
+  }
+  if (IsA(expression, Const) && ((const Const *) expression)->constisnull)
+  {
+    return runtime_type_io_result(true, false);
+  }
+  if (IsA(expression, ArrayExpr))
+  {
+    const ArrayExpr *array = (const ArrayExpr *) expression;
+    RuntimeTypeIoResult direct_result = direct_type_io_invokes_volatile(
+      array->array_typeid, kind);
+
+    if (!direct_result.supported || direct_result.invokes_volatile)
+    {
+      return direct_result;
+    }
+    return array_expression_elements_io_invoke_volatile(array, kind);
+  }
+  if (IsA(expression, RowExpr) && exprType(expression) == RECORDOID &&
+      exprTypmod(expression) < 0)
+  {
+    const RowExpr *row = (const RowExpr *) expression;
+    RuntimeTypeIoResult direct_result = direct_type_io_invokes_volatile(
+      RECORDOID, kind);
+    ListCell *cell;
+
+    if (!direct_result.supported || direct_result.invokes_volatile)
+    {
+      return direct_result;
+    }
+    foreach(cell, row->args)
+    {
+      RuntimeTypeIoResult field_result =
+        result_expression_io_invokes_volatile(
+          (const Node *) lfirst(cell), kind);
+
+      if (!field_result.supported || field_result.invokes_volatile)
+      {
+        return field_result;
+      }
+    }
+    return runtime_type_io_result(true, false);
+  }
+  return type_io_invokes_volatile(
+    exprType(expression), exprTypmod(expression), kind, &context);
+}
+
+static bool
+query_result_io_invokes_volatile(const Query *query)
+{
+  const List *targets = query->commandType == CMD_SELECT
+                          ? query->targetList
+                          : query->returningList;
+  ListCell *cell;
+
+  foreach(cell, targets)
+  {
+    const TargetEntry *target = lfirst_node(TargetEntry, cell);
+    RuntimeTypeIoResult text_result;
+    RuntimeTypeIoResult binary_result;
+
+    if (target->resjunk)
+    {
+      continue;
+    }
+    text_result = result_expression_io_invokes_volatile(
+      (const Node *) target->expr, RUNTIME_TYPE_IO_TEXT_OUTPUT);
+    binary_result = result_expression_io_invokes_volatile(
+      (const Node *) target->expr, RUNTIME_TYPE_IO_BINARY_SEND);
+    if (text_result.invokes_volatile ||
+        (binary_result.supported && binary_result.invokes_volatile))
+    {
+      return true;
+    }
+  }
+  return false;
 }
 
 static bool
@@ -5574,9 +5767,14 @@ query_contains_row_marks(const Query *query)
 }
 
 static void
-append_query_summary(StringInfo out, const Query *query, const QueryScope *parent_scope, int depth)
+append_query_summary(StringInfo out, const Query *query,
+                     const QueryScope *parent_scope, int depth,
+                     bool protocol_output)
 {
   QueryScope *scope = make_query_scope(query, parent_scope);
+  bool has_volatile_functions = query_contains_volatile_functions(query) ||
+                                (protocol_output &&
+                                 query_result_io_invokes_volatile(query));
 
   appendStringInfoString(out, "{\"commandType\":");
   append_json_string(out, command_type_name(query->commandType));
@@ -5590,7 +5788,7 @@ append_query_summary(StringInfo out, const Query *query, const QueryScope *paren
   append_bool_field(out, "hasModifyingCTE", query->hasModifyingCTE);
   append_bool_field(out, "hasRowSecurity", query->hasRowSecurity);
   append_bool_field(out, "hasRowMarks", query_contains_row_marks(query));
-  append_bool_field(out, "hasVolatileFunctions", query_contains_volatile_functions(query));
+  append_bool_field(out, "hasVolatileFunctions", has_volatile_functions);
   append_list_count_field(out, "groupClauseCount", query->groupClause);
   append_list_count_field(out, "groupingSetsCount", query->groupingSets);
   append_list_count_field(out, "distinctClauseCount", query->distinctClause);
@@ -5793,7 +5991,7 @@ postgres_typed_sql_analyze(PG_FUNCTION_ARGS)
       }
       first_query = false;
 
-      append_query_summary(&out, query, NULL, 10);
+      append_query_summary(&out, query, NULL, 10, true);
     }
 
     appendStringInfoString(&out, "]}");
