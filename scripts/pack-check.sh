@@ -17,6 +17,7 @@ npm install --ignore-scripts --no-audit --no-fund "$pack_dir/$tarball"
 
 before=$(find node_modules -type f -exec shasum -a 256 {} \; | sort | shasum -a 256 | awk '{print $1}')
 node smoke.mjs
+"$project_root/node_modules/.bin/tsc" --project tsconfig.json
 after=$(find node_modules -type f -exec shasum -a 256 {} \; | sort | shasum -a 256 | awk '{print $1}')
 
 if [ "$before" != "$after" ]; then
@@ -25,6 +26,11 @@ if [ "$before" != "$after" ]; then
 fi
 
 node -e "const p=require('./node_modules/postgres-typed-sql/package.json'); for (const key of ['preinstall','install','postinstall','prepare']) if (p.scripts?.[key]) throw new Error('lifecycle script: '+key)"
+
+if ! tar -tzf "$pack_dir/$tarball" | grep -Fx 'package/SECURITY.md' >/dev/null; then
+  echo 'The npm tarball does not contain SECURITY.md.' >&2
+  exit 1
+fi
 
 if tar -tzf "$pack_dir/$tarball" | grep -E '(^|/)source/|(^|/)test/|(^|/)engine/'; then
   echo 'The npm tarball contains publisher-only source.' >&2

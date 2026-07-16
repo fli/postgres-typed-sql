@@ -1,4 +1,5 @@
 import type { PostgresQueryable } from './database.js'
+import { postgresCheckConstraintTypeBinding } from './typescript-names.js'
 
 function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&')
@@ -18,8 +19,10 @@ export interface CheckConstraintLiteralUnionFact {
 interface CheckConstraintCatalogRow {
   readonly attname: string
   readonly attnum: number
+  readonly collation_is_deterministic: boolean
   readonly constraint_name: string
   readonly expression: string
+  readonly operators_are_builtin: boolean
   readonly relid: number
   readonly relname: string
   readonly schema: string
@@ -43,34 +46,12 @@ interface MutableCheckConstraintLiteralUnionFact {
 
 const defaultSchemas = ['public']
 
-function camelCaseIdentifier(identifier: string): string {
-  return identifier.replaceAll(/_([a-z0-9])/gu, (_match, letter: string) => letter.toUpperCase())
-}
-
-function pascalCaseIdentifier(identifier: string): string {
-  const camel = camelCaseIdentifier(identifier)
-  return `${camel.slice(0, 1).toUpperCase()}${camel.slice(1)}`
-}
-
-function relationTypeName(schema: string, relname: string): string {
-  const name = pascalCaseIdentifier(relname)
-  return schema === 'public' ? name : `${pascalCaseIdentifier(schema)}${name}`
-}
-
 export function checkConstraintLiteralUnionTypeName(row: {
   readonly attname: string
   readonly relname: string
   readonly schema: string
 }): string {
-  return `${relationTypeName(row.schema, row.relname)}${pascalCaseIdentifier(row.attname)}`
-}
-
-export function checkConstraintLiteralUnionCatalogKey(row: {
-  readonly attname: string
-  readonly relname: string
-  readonly schema: string
-}): string {
-  return `${row.schema}.${row.relname}.${row.attname}`
+  return postgresCheckConstraintTypeBinding(row.schema, row.relname, row.attname)
 }
 
 export function checkConstraintLiteralUnionColumnKey(row: { readonly attnum: number; readonly relid: number }): string {
@@ -293,7 +274,7 @@ function mergeFact(
   row: CheckConstraintCatalogRow,
   labels: readonly string[]
 ): void {
-  const key = checkConstraintLiteralUnionCatalogKey(row)
+  const key = checkConstraintLiteralUnionColumnKey(row)
   const existing = facts.get(key)
   if (!existing) {
     facts.set(key, {
@@ -330,8 +311,17 @@ export async function loadCheckConstraintLiteralUnionFacts(
         class.relname,
         attribute.attnum::int as attnum,
         attribute.attname,
+        (attribute.attcollation = 0 or collation_definition.collisdeterministic) as collation_is_deterministic,
         con.conname as constraint_name,
-        pg_get_expr(con.conbin, con.conrelid) as expression
+        pg_get_expr(con.conbin, con.conrelid) as expression,
+        not exists (
+          select 1
+          from pg_depend operator_dependency
+          where operator_dependency.classid = 'pg_constraint'::regclass
+            and operator_dependency.objid = con.oid
+            and operator_dependency.objsubid = 0
+            and operator_dependency.refclassid = 'pg_operator'::regclass
+        ) as operators_are_builtin
       from pg_constraint con
       join pg_class class
         on class.oid = con.conrelid
@@ -340,8 +330,12 @@ export async function loadCheckConstraintLiteralUnionFacts(
       join pg_attribute attribute
         on attribute.attrelid = con.conrelid
         and attribute.attnum = con.conkey[1]
+      left join pg_collation collation_definition
+        on collation_definition.oid = attribute.attcollation
       where ${relationFilter}
         and con.contype = 'c'
+        and con.conenforced
+        and not con.connoinherit
         and con.convalidated
         and array_length(con.conkey, 1) = 1
         and attribute.attnum > 0
@@ -353,6 +347,9 @@ export async function loadCheckConstraintLiteralUnionFacts(
 
   const facts = new Map<string, MutableCheckConstraintLiteralUnionFact>()
   for (const row of result.rows) {
+    if (!row.collation_is_deterministic || !row.operators_are_builtin) {
+      continue
+    }
     const labels = parseLiteralUnionConstraintExpression(row.expression, row.attname)
     if (!labels || labels.length === 0) {
       continue

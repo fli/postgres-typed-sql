@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.0-beta.2
+
+- Breaking beta.1 migration: regenerate every checked-in `*.typed-sql.ts` file. Generated catalog domain aliases were removed because PostgreSQL protocol results resolve domains through their base result types, and encoded or schema-qualified catalog type bindings were renamed; update any handwritten imports of those generated names. Scalar profiles now describe the driver contract explicitly, and runtime execution consumes PostgreSQL's positional result rows so otherwise non-object-safe unique names such as `__proto__` remain exact. The public runtime contract also removed the phantom `type` property and the row generic from `TypedSqlQueryConfig`; handwritten consumers must remove `type`, pass an explicit result-row generic to direct driver `query()` calls, and provide explicit `Params` and `Row` type arguments to `createTypedSqlStatement` where they previously relied on `type`-based inference. `TypedSqlQueryConfig.values` is now mutable for driver compatibility; copy a handwritten readonly array with `values: [...values]` or otherwise supply a mutable array. Duplicate result-column names are rejected during generation and require aliases because a generated object row cannot represent both values under one property name. Beta.1 treated `values[:index]` as a named subscript, but beta.2 parses it as native PostgreSQL slice syntax; rewrite named indexes as `values[(:index)]` and use the explicit named slice-bound forms documented in the README.
+- Expanded PostgreSQL analysis for nested query scopes, rewrites and DML lineage, set operations, row bounds, parameter NULL admission, JSON shapes, CHECK constraints, row locks, volatile functions, and execution support hidden behind aggregates, sorting, grouping, operators, domains, triggers, and rules.
+- PostgreSQL/JSON property spelling is preserved exactly as PostgreSQL reports it; this is intentional rather than a generated TypeScript naming normalization.
+- Improved the typed-SQL scanner and generated-name validation with source-oriented diagnostics for malformed directives, unresolved parameters, duplicate names, reserved bindings, and TypeScript identifier collisions.
+- Generated outputs are staged before replacement, and rollback is attempted when a commit error is caught. Publication is not crash-atomic, so interrupted generation must be rerun. Added a packed-consumer verification path covering script-free installation, typechecking, and runtime package exports.
+
 ## 0.1.0-beta.1
 
 - Initial public beta.

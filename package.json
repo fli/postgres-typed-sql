@@ -1,6 +1,6 @@
 {
   "name": "postgres-typed-sql",
-  "version": "0.1.0-beta.1",
+  "version": "0.1.0-beta.2",
   "description": "PostgreSQL-native typed SQL generation for TypeScript",
   "type": "module",
   "license": "MIT",
@@ -46,7 +46,8 @@
     "dist",
     "LICENSE",
     "NOTICE",
-    "README.md"
+    "README.md",
+    "SECURITY.md"
   ],
   "scripts": {
     "build": "pnpm run clean && tsc -p tsconfig.build.json && node scripts/stage-engine.mjs",
@@ -66,6 +67,7 @@
     "@eslint/js": "9.31.0",
     "@types/node": "24.0.14",
     "eslint": "9.31.0",
+    "pg-types": "2.2.0",
     "prettier": "3.6.2",
     "typescript": "5.8.3",
     "typescript-eslint": "8.37.0"

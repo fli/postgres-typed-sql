@@ -1,25 +1,22 @@
 /* oxlint-disable eslint/no-use-before-define -- The analyzer IR traversal uses small mutually recursive local helpers. */
 
-import { readFileSync } from 'node:fs'
-import { readdir } from 'node:fs/promises'
-import { basename, join } from 'node:path'
-
 import {
   checkConstraintLiteralUnionColumnKey,
   loadCheckConstraintLiteralUnionFacts,
   type CheckConstraintLiteralUnionFact,
 } from './check-constraint-type-facts.js'
 import type { PostgresQueryable } from './database.js'
+import { loadPostgresTypeFacts } from './postgres-type-facts.js'
+import type { PostgresTypeFact } from './postgres-types.js'
 
-const ANALYZER_SCHEMA_VERSION = 2
+const ANALYZER_SCHEMA_VERSION = 6
 const ANALYZER_SQL_FUNCTION = 'pg_temp.postgres_typed_sql_analyze'
-const TYPED_SQL_SOURCE_SUFFIX = '.typed.sql'
 
 export interface TypedSqlPostgresIr {
   readonly analyzerSchemaVersion: number
   readonly command: string
-  readonly diagnostics: readonly string[]
   readonly hasDataModifyingCte: boolean
+  readonly isWrite: boolean
   readonly name: string
   readonly params: readonly TypedSqlPostgresIrParam[]
   readonly postgresVersionNum: number
@@ -27,7 +24,6 @@ export interface TypedSqlPostgresIr {
   readonly rowBounds: TypedSqlPostgresIrRowBounds
   readonly rowCardinality: TypedSqlPostgresIrRowCardinality
   readonly sourceFile: string
-  readonly typePreview: string
 }
 
 export type TypedSqlPostgresIrRowCardinality = 'many' | 'none' | 'one' | 'optional'
@@ -38,26 +34,33 @@ export interface TypedSqlPostgresIrRowBounds {
   readonly proof: string
 }
 
-export interface TypedSqlPostgresIrParam {
+export interface TypedSqlPostgresIrParam extends PostgresTypeFact {
+  readonly checkConstraintTypeName?: string
   readonly name: string
-  readonly pgType: string
-  readonly pgTypeName: string
-  readonly pgTypeSchema: string
+  readonly nullAdmission: TypedSqlPostgresIrParamNullAdmission
+  readonly nullable: boolean
   readonly propertyName: string
-  readonly tsType: string
-  readonly tsTypeSource?: 'checkConstraint'
 }
 
-export interface TypedSqlPostgresIrColumn {
+export type TypedSqlPostgresIrParamNullAdmission = 'accepts' | 'rejects' | 'unknown'
+
+export interface TypedSqlPostgresIrColumn extends PostgresTypeFact {
+  readonly checkConstraintType?: TypedSqlPostgresIrCheckConstraintTypeExpression
   readonly jsonShape?: TypedSqlPostgresIrJsonShape
   readonly name: string | null
   readonly nullable: boolean
-  readonly pgType: string
-  readonly pgTypeName: string
-  readonly pgTypeSchema: string
   readonly source: TypedSqlPostgresIrColumnSource
-  readonly tsType: string
 }
+
+export type TypedSqlPostgresIrCheckConstraintTypeExpression =
+  | {
+      readonly kind: 'named'
+      readonly name: string
+    }
+  | {
+      readonly kind: 'intersection' | 'union'
+      readonly members: readonly TypedSqlPostgresIrCheckConstraintTypeExpression[]
+    }
 
 export type TypedSqlPostgresIrJsonShape =
   | {
@@ -75,13 +78,15 @@ export type TypedSqlPostgresIrJsonShape =
       readonly nullable: boolean
     }
   | {
+      readonly alternatives: readonly TypedSqlPostgresIrJsonShape[]
+      readonly kind: 'union'
+      readonly nullable: boolean
+    }
+  | (PostgresTypeFact & {
+      readonly checkConstraintTypeName?: string
       readonly kind: 'scalar'
       readonly nullable: boolean
-      readonly pgType: string
-      readonly pgTypeName: string
-      readonly pgTypeSchema: string
-      readonly tsType?: string
-    }
+    })
 
 export interface TypedSqlPostgresIrJsonField {
   readonly name: string
@@ -103,17 +108,6 @@ export type TypedSqlPostgresIrColumnSource =
       readonly tag: string
     }
 
-interface SqlConfig {
-  readonly name: string
-  readonly params: ReadonlyMap<string, string>
-  readonly sourceFile: string
-  readonly sql: string
-}
-
-interface CompiledSqlConfig extends SqlConfig {
-  readonly parameterNames: readonly string[]
-}
-
 export interface TypedSqlPostgresIrCompiledConfig {
   readonly name: string
   readonly parameterNames: readonly string[]
@@ -124,7 +118,10 @@ export interface TypedSqlPostgresIrCompiledConfig {
 
 interface PgAnalyzerResult {
   readonly paramTypeOids: readonly number[]
+  readonly paramTypeNullAdmissions: readonly TypedSqlPostgresIrParamNullAdmission[]
+  readonly paramUsageNullAdmissions: readonly TypedSqlPostgresIrParamNullAdmission[]
   readonly postgresVersionNum: number
+  readonly rawStatementCount: number
   readonly schemaVersion: number
   readonly statements: readonly PgAnalyzerStatement[]
 }
@@ -139,26 +136,63 @@ export async function bindTypedSqlPostgresAnalyzer(client: PostgresQueryable): P
 
 interface PgAnalyzerStatement {
   readonly queries: readonly PgAnalyzerQuery[]
+  readonly rewrittenQueryCount: number
 }
 
 interface PgAnalyzerQuery {
+  readonly canSetTag: boolean
   readonly commandType: string
   readonly cteList?: readonly PgAnalyzerCte[]
+  readonly dmlParameterTargets: readonly PgAnalyzerDmlParameterTarget[]
   readonly distinctClauseCount?: number
   readonly groupClauseCount?: number
   readonly groupingSetsCount?: number
   readonly hasAggs?: boolean
   readonly hasHavingQual?: boolean
   readonly hasLimitOffset?: boolean
+  readonly hasLimitCount?: boolean
+  readonly hasModifyingCTE?: boolean
+  readonly hasRowMarks?: boolean
   readonly hasSetOperations?: boolean
   readonly hasTargetSRFs?: boolean
+  readonly hasVolatileFunctions?: boolean
   readonly hasWindowFuncs?: boolean
   readonly limitCount?: PgAnalyzerExpr | null
+  readonly limitWithTies?: boolean
   readonly returningList?: readonly PgAnalyzerTarget[]
   readonly resultRelation?: number
   readonly rtable?: readonly PgAnalyzerRte[]
+  readonly setOperation?: PgAnalyzerSetOperation | null
   readonly targetList?: readonly PgAnalyzerTarget[]
+  readonly utilityKind?: 'CALL' | 'EXECUTE' | 'EXPLAIN' | 'FETCH' | 'NONE' | 'OTHER' | 'SHOW'
+  readonly utilityReturnsTuples?: boolean
   readonly whereQual?: PgAnalyzerExpr | null
+}
+
+type PgAnalyzerSetOperation =
+  | {
+      readonly kind: 'leaf'
+      readonly rtindex: number
+    }
+  | {
+      readonly all: boolean
+      readonly kind: 'operation'
+      readonly left: PgAnalyzerSetOperation
+      readonly operation: 'EXCEPT' | 'INTERSECT' | 'UNION'
+      readonly right: PgAnalyzerSetOperation
+    }
+
+interface PgAnalyzerDmlParameterTarget {
+  readonly directAssignment: boolean
+  readonly paramId: number
+  readonly source: 'INSERT' | 'MERGE_INSERT' | 'MERGE_UPDATE' | 'ON_CONFLICT_UPDATE' | 'UPDATE'
+  readonly targetAttname: string
+  readonly targetAttnum: number
+  readonly targetNullAdmission: TypedSqlPostgresIrParamNullAdmission
+  readonly targetNullable: boolean
+  readonly targetRelid: number
+  readonly targetTypeName: string | null
+  readonly targetTypeOid: number
 }
 
 interface PgAnalyzerTarget {
@@ -177,33 +211,47 @@ interface PgAnalyzerCte {
 
 interface PgAnalyzerRte {
   readonly cteName?: string
+  readonly cteLevelSup?: number
+  readonly inh?: boolean
   readonly kind: string
   readonly relid?: number | null
   readonly subquery?: PgAnalyzerQuery
 }
 
 interface PgAnalyzerExpr {
+  readonly aggfnoid?: number
   readonly aggname?: string
   readonly arg?: PgAnalyzerExpr | null
   readonly args?: readonly (PgAnalyzerExpr | { readonly expr?: PgAnalyzerExpr | null })[]
   readonly attname?: string
   readonly boolOp?: string
   readonly constInteger?: string
+  readonly constEmptyJsonArray?: boolean
   readonly constIsNull?: boolean
   readonly constString?: string
+  readonly condition?: PgAnalyzerExpr | null
   readonly defresult?: PgAnalyzerExpr | null
+  readonly elements?: readonly PgAnalyzerExpr[]
   readonly expr?: PgAnalyzerExpr | null
   readonly funcid?: number
   readonly funcname?: string
+  readonly funcVariadic?: boolean
+  readonly inputCollationOid?: number
+  readonly multidims?: boolean
   readonly nullTestType?: string
   readonly opfuncid?: number
+  readonly opno?: number
   readonly opname?: string
   readonly paramTypeOid?: number
   readonly paramId?: number
   readonly relid?: number
   readonly relname?: string | null
   readonly result?: PgAnalyzerExpr | null
+  readonly subLinkType?: string
+  readonly subquery?: PgAnalyzerQuery | null
   readonly tag: string
+  readonly testExpr?: PgAnalyzerExpr | null
+  readonly truncated?: boolean
   readonly typeName?: string
   readonly typeOid?: number
   readonly varattno?: number
@@ -213,16 +261,17 @@ interface PgAnalyzerExpr {
   readonly whenClauses?: readonly PgAnalyzerExpr[]
 }
 
-interface TypeCatalogRow {
-  readonly formatted_type: string
-  readonly oid: number
-  readonly type_schema: string
-  readonly typname: string
+interface AnalyzedCompiledConfig {
+  readonly analysis: PgAnalyzerResult
+  readonly config: TypedSqlPostgresIrCompiledConfig
+  readonly primaryQuery: PgAnalyzerQuery
+  readonly rewrittenQueries: readonly PgAnalyzerQuery[]
 }
 
 interface ProcCatalogRow {
+  readonly is_builtin: boolean
   readonly oid: number
-  readonly proisstrict: boolean
+  readonly proname: string
 }
 
 interface ColumnCatalogRow {
@@ -235,17 +284,27 @@ interface ColumnCatalogRow {
 
 interface UniqueIndexCatalogRow {
   readonly attnums: readonly number[]
+  readonly collation_oids: readonly number[]
+  readonly has_inheritors: boolean
   readonly index_name: string
   readonly indexrelid: number
   readonly indisprimary: boolean
+  readonly opfamily_oids: readonly number[]
+  readonly relkind: string
   readonly relid: number
+}
+
+interface UniqueEqualityOperatorCatalogRow {
+  readonly amopfamily: number
+  readonly amopopr: number
 }
 
 interface CatalogFacts {
   readonly checkConstraintTypesByColumn: ReadonlyMap<string, CheckConstraintLiteralUnionFact>
   readonly columns: ReadonlyMap<string, ColumnCatalogRow>
   readonly procs: ReadonlyMap<number, ProcCatalogRow>
-  readonly types: ReadonlyMap<number, TypeCatalogRow>
+  readonly types: ReadonlyMap<number, PostgresTypeFact>
+  readonly uniqueEqualityOperators: ReadonlySet<string>
   readonly uniqueIndexesByRelid: ReadonlyMap<number, readonly UniqueIndexCatalogRow[]>
 }
 
@@ -258,261 +317,6 @@ export interface TypedSqlPostgresIrBuildResult {
     readonly uniqueIndexes: number
   }
   readonly queries: readonly TypedSqlPostgresIr[]
-}
-
-const pgTypeToTsType = new Map<string, string>([
-  ['bigint', 'PgInt8String'],
-  ['bit', 'string'],
-  ['bit varying', 'string'],
-  ['boolean', 'boolean'],
-  ['box', 'string'],
-  ['bytea', 'PgByteaHexString'],
-  ['char', 'string'],
-  ['cidr', 'string'],
-  ['circle', 'string'],
-  ['date', 'PgDateString'],
-  ['double precision', 'PgFloat8String'],
-  ['inet', 'string'],
-  ['integer', 'PgInt4String'],
-  ['interval', 'PgIntervalString'],
-  ['json', 'DbJsonSelected'],
-  ['jsonb', 'DbJsonSelected'],
-  ['line', 'string'],
-  ['lseg', 'string'],
-  ['macaddr', 'string'],
-  ['macaddr8', 'string'],
-  ['money', 'string'],
-  ['name', 'string'],
-  ['numeric', 'PgNumericString'],
-  ['oid', 'PgOidString'],
-  ['path', 'string'],
-  ['pg_lsn', 'string'],
-  ['point', 'string'],
-  ['polygon', 'string'],
-  ['real', 'PgFloat4String'],
-  ['smallint', 'PgInt2String'],
-  ['text', 'string'],
-  ['time without time zone', 'PgTimeString'],
-  ['time with time zone', 'PgTimetzString'],
-  ['timestamp without time zone', 'PgTimestampString'],
-  ['timestamp with time zone', 'PgTimestamptzString'],
-  ['timestamptz', 'PgTimestamptzString'],
-  ['tsquery', 'string'],
-  ['tsvector', 'string'],
-  ['unknown', 'unknown'],
-  ['uuid', 'PgUuidString'],
-  ['void', 'unknown'],
-  ['xml', 'string'],
-  ['uuid[]', 'readonly PgUuidString[]'],
-])
-
-for (const rangeType of ['daterange', 'int4range', 'int8range', 'numrange', 'tsrange', 'tstzrange']) {
-  pgTypeToTsType.set(rangeType, 'string')
-}
-
-function camelCaseIdentifier(identifier: string): string {
-  return identifier.replaceAll(/_([a-z0-9])/gu, (_match, letter: string) => letter.toUpperCase())
-}
-
-function normalizePgTypeName(pgType: string): string {
-  if (pgType.startsWith('character varying') || pgType.startsWith('character(') || pgType === 'varchar') {
-    return 'text'
-  }
-  if (pgType.startsWith('numeric(')) {
-    return 'numeric'
-  }
-  if (pgType.startsWith('timestamp(') && pgType.endsWith(' without time zone')) {
-    return 'timestamp without time zone'
-  }
-  if (pgType.startsWith('timestamp(') && pgType.endsWith(' with time zone')) {
-    return 'timestamp with time zone'
-  }
-  if (pgType.startsWith('time(') && pgType.endsWith(' without time zone')) {
-    return 'time without time zone'
-  }
-  if (pgType.startsWith('time(') && pgType.endsWith(' with time zone')) {
-    return 'time with time zone'
-  }
-  return pgType
-}
-
-function postgresArrayElementType(pgType: string, typeName: string): string | null {
-  const normalizedPgType = normalizePgTypeName(pgType)
-  if (normalizedPgType.endsWith('[]')) {
-    return normalizedPgType.slice(0, -2)
-  }
-
-  const normalizedTypeName = normalizePgTypeName(typeName)
-  if (normalizedTypeName.startsWith('_') && normalizedTypeName.length > 1) {
-    return normalizedTypeName.slice(1)
-  }
-
-  return null
-}
-
-function splitSchemaQualifiedPgType(pgType: string): { readonly schema: string; readonly typeName: string } | null {
-  const match = /^([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)(\[\])?$/u.exec(pgType)
-  if (!match?.[1] || !match[2]) {
-    return null
-  }
-
-  return { schema: match[1], typeName: `${match[2]}${match[3] ?? ''}` }
-}
-
-function lowerCamelCaseFromPathBase(base: string): string {
-  const parts = base.split(/[^A-Za-z0-9]+/u)
-  const head = parts.find((part) => part.length > 0)
-  if (!head) {
-    throw new Error(`${base}: typed SQL filename must contain at least one identifier segment.`)
-  }
-  const tail = parts.slice(parts.indexOf(head) + 1).filter((part) => part.length > 0)
-  const identifier = [
-    head.toLowerCase(),
-    ...tail.map((part) => `${part.slice(0, 1).toUpperCase()}${part.slice(1).toLowerCase()}`),
-  ].join('')
-  if (!/^[a-z][A-Za-z0-9]*$/u.test(identifier)) {
-    throw new Error(`${base}: typed SQL filename must produce a lower camel-case identifier.`)
-  }
-  return identifier
-}
-
-function pascalCaseIdentifier(identifier: string): string {
-  const camel = camelCaseIdentifier(identifier)
-  return `${camel.slice(0, 1).toUpperCase()}${camel.slice(1)}`
-}
-
-function quotePropertyName(propertyName: string): string {
-  return /^[A-Za-z_$][\w$]*$/u.test(propertyName) ? propertyName : JSON.stringify(propertyName)
-}
-
-function tsTypeForPgType(typeFact: Pick<TypedSqlPostgresIrColumn, 'pgType' | 'pgTypeName' | 'pgTypeSchema'>): string {
-  const schemaQualifiedType =
-    typeFact.pgTypeSchema === 'pg_catalog' && !typeFact.pgTypeName ? splitSchemaQualifiedPgType(typeFact.pgType) : null
-  if (schemaQualifiedType) {
-    return tsTypeForPgType({
-      pgType: schemaQualifiedType.typeName,
-      pgTypeName: schemaQualifiedType.typeName,
-      pgTypeSchema: schemaQualifiedType.schema,
-    })
-  }
-
-  const arrayElementType = postgresArrayElementType(typeFact.pgType, typeFact.pgTypeName)
-  if (arrayElementType) {
-    const elementType =
-      typeFact.pgTypeSchema === 'pg_catalog'
-        ? tsTypeForPgType({
-            pgType: arrayElementType,
-            pgTypeName: arrayElementType,
-            pgTypeSchema: 'pg_catalog',
-          })
-        : pascalCaseIdentifier(arrayElementType)
-    return `readonly ${elementType}[]`
-  }
-
-  if (typeFact.pgTypeSchema !== 'pg_catalog') {
-    return pascalCaseIdentifier(typeFact.pgTypeName || typeFact.pgType)
-  }
-
-  const tsType = pgTypeToTsType.get(normalizePgTypeName(typeFact.pgType))
-  if (!tsType) {
-    throw new Error(`No TypeScript mapping configured for PostgreSQL type ${typeFact.pgType}.`)
-  }
-
-  return tsType
-}
-
-function parseDirectiveLine(line: string): readonly string[] | null {
-  const match = /^--\s*@(\w+)\s+(.+)$/u.exec(line)
-  if (!match) {
-    return null
-  }
-
-  const kind = match[1]
-  const body = match[2]
-  return kind && body ? [kind, ...body.trim().split(/\s+/u)] : null
-}
-
-function stripNullablePgTypeSuffix(pgType: string): string {
-  return pgType.endsWith('?') ? pgType.slice(0, -1) : pgType
-}
-
-async function readConfigs(sqlDir: string): Promise<readonly SqlConfig[]> {
-  const sourceFiles = (await readdir(sqlDir)).filter((file) => file.endsWith(TYPED_SQL_SOURCE_SUFFIX)).toSorted()
-  return sourceFiles.map((sourceFile) => {
-    const params = new Map<string, string>()
-    const sqlLines: string[] = []
-    let name = lowerCamelCaseFromPathBase(basename(sourceFile, TYPED_SQL_SOURCE_SUFFIX))
-
-    for (const line of readFileSync(join(sqlDir, sourceFile), 'utf8').split(/\r?\n/u)) {
-      const directive = parseDirectiveLine(line)
-      if (!directive) {
-        sqlLines.push(line)
-        continue
-      }
-
-      const [kind, identifier, pgType] = directive
-      if (kind === 'name') {
-        if (identifier) {
-          name = identifier
-        }
-      } else if (kind === 'param' && identifier && pgType) {
-        params.set(identifier, stripNullablePgTypeSuffix(pgType))
-      }
-    }
-
-    return {
-      name,
-      params,
-      sourceFile,
-      sql: sqlLines.join('\n').trim(),
-    } satisfies SqlConfig
-  })
-}
-
-function compileNamedParams(config: SqlConfig): CompiledSqlConfig {
-  const parameterNames: string[] = []
-  const placeholdersByName = new Map<string, number>()
-  const sql = config.sql.replaceAll(/(?<!:):([A-Za-z_][A-Za-z0-9_]*)/gu, (_match, name: string) => {
-    const existing = placeholdersByName.get(name)
-    if (existing !== undefined) {
-      return `$${existing}`
-    }
-
-    const index = parameterNames.length + 1
-    placeholdersByName.set(name, index)
-    parameterNames.push(name)
-    return `$${index}`
-  })
-
-  return {
-    ...config,
-    parameterNames,
-    sql,
-  }
-}
-
-async function explicitParamTypeOids(client: PostgresQueryable, config: CompiledSqlConfig): Promise<readonly number[]> {
-  if (config.parameterNames.length === 0 || !config.parameterNames.every((name) => config.params.has(name))) {
-    return []
-  }
-
-  const typeOids: number[] = []
-  for (const name of config.parameterNames) {
-    const pgType = config.params.get(name)
-    if (!pgType) {
-      throw new Error(`${config.sourceFile}: missing parameter type for ${name}.`)
-    }
-
-    const result = await client.query<{ readonly oid: number | null }>('select to_regtype($1)::oid::int as oid', [
-      pgType,
-    ])
-    const oid = result.rows[0]?.oid
-    if (!oid) {
-      throw new Error(`${config.sourceFile}: unknown explicit parameter type ${pgType}.`)
-    }
-    typeOids.push(oid)
-  }
-  return typeOids
 }
 
 async function explicitCompiledParamTypeOids(
@@ -549,12 +353,13 @@ async function explicitCompiledParamTypeOids(
 
 function exprChildren(expr: PgAnalyzerExpr): readonly PgAnalyzerExpr[] {
   const children: PgAnalyzerExpr[] = []
-  for (const key of ['arg', 'defresult', 'expr'] as const) {
+  for (const key of ['arg', 'condition', 'defresult', 'expr', 'result', 'testExpr'] as const) {
     const child = expr[key]
     if (child) {
       children.push(child)
     }
   }
+  children.push(...(expr.elements ?? []))
   for (const whenClause of expr.whenClauses ?? []) {
     children.push(whenClause)
   }
@@ -587,6 +392,82 @@ function resultTargets(query: PgAnalyzerQuery): readonly PgAnalyzerTarget[] {
   return targets.filter((target) => target.resjunk !== true)
 }
 
+interface QueryScope {
+  readonly parent: QueryScope | null
+  readonly query: PgAnalyzerQuery
+}
+
+function queryScope(query: PgAnalyzerQuery, parent: QueryScope | null = null): QueryScope {
+  return { parent, query }
+}
+
+function queryScopeAtLevel(scope: QueryScope, levelsUp: number): QueryScope | null {
+  let owner: QueryScope | null = scope
+  for (let level = 0; owner && level < levelsUp; level += 1) {
+    owner = owner.parent
+  }
+  return owner
+}
+
+function queryScopeForRteOutput(ownerScope: QueryScope, rte: PgAnalyzerRte): QueryScope | null {
+  if (rte.kind === 'SUBQUERY' && rte.subquery) {
+    return queryScope(rte.subquery, ownerScope)
+  }
+  if (rte.kind !== 'CTE') {
+    return null
+  }
+
+  const cteOwnerScope = queryScopeAtLevel(ownerScope, rte.cteLevelSup ?? 0)
+  const cteQuery = cteOwnerScope ? cteByName(cteOwnerScope.query, rte.cteName)?.query : undefined
+  return cteQuery && cteOwnerScope ? queryScope(cteQuery, cteOwnerScope) : null
+}
+
+function varOwnerRte(scope: QueryScope, expr: PgAnalyzerExpr): readonly [QueryScope, PgAnalyzerRte] | null {
+  if (expr.tag !== 'Var' || !expr.varno) {
+    return null
+  }
+
+  const ownerScope = queryScopeAtLevel(scope, expr.varlevelsup ?? 0)
+  const rte = ownerScope?.query.rtable?.[expr.varno - 1]
+  return ownerScope && rte ? [ownerScope, rte] : null
+}
+
+interface QueryOutputSemantics<T> {
+  readonly except: (left: T, right: T) => T
+  readonly intersect: (left: T, right: T) => T
+  readonly target: (scope: QueryScope, target: PgAnalyzerTarget) => T
+  readonly union: (left: T, right: T) => T
+  readonly unknown: () => T
+}
+
+function foldQueryOutput<T>(scope: QueryScope, outputIndex: number, semantics: QueryOutputSemantics<T>): T {
+  const { query } = scope
+  const foldSetOperation = (operation: PgAnalyzerSetOperation): T => {
+    if (operation.kind === 'leaf') {
+      const leafQuery = query.rtable?.[operation.rtindex - 1]?.subquery
+      return leafQuery ? foldQueryOutput(queryScope(leafQuery, scope), outputIndex, semantics) : semantics.unknown()
+    }
+
+    const left = foldSetOperation(operation.left)
+    const right = foldSetOperation(operation.right)
+    switch (operation.operation) {
+      case 'UNION':
+        return semantics.union(left, right)
+      case 'INTERSECT':
+        return semantics.intersect(left, right)
+      case 'EXCEPT':
+        return semantics.except(left, right)
+    }
+  }
+
+  if (query.setOperation) {
+    return foldSetOperation(query.setOperation)
+  }
+
+  const target = resultTargets(query)[outputIndex]
+  return target ? semantics.target(scope, target) : semantics.unknown()
+}
+
 function rowCardinalityFromBounds(bounds: TypedSqlPostgresIrRowBounds): TypedSqlPostgresIrRowCardinality {
   if (bounds.min === 0 && bounds.max === 0) {
     return 'none'
@@ -600,10 +481,14 @@ function rowCardinalityFromBounds(bounds: TypedSqlPostgresIrRowBounds): TypedSql
   return 'many'
 }
 
-function constNonNegativeSafeInteger(expr: PgAnalyzerExpr | null | undefined): number | null {
+function constNonNegativeSafeInteger(catalog: CatalogFacts, expr: PgAnalyzerExpr | null | undefined): number | null {
   const unwrapped = unwrapTransparentExpr(expr)
-  if (unwrapped?.tag === 'FuncExpr' && unwrapped.funcname === 'int8' && unwrapped.args?.length === 1) {
-    return constNonNegativeSafeInteger(targetExprFromAggregateArg(unwrapped.args[0]))
+  if (
+    unwrapped?.tag === 'FuncExpr' &&
+    isBuiltinPgProcNamed(catalog, unwrapped.funcid, 'int8') &&
+    unwrapped.args?.length === 1
+  ) {
+    return constNonNegativeSafeInteger(catalog, targetExprFromAggregateArg(unwrapped.args[0]))
   }
 
   if (!unwrapped || unwrapped.tag !== 'Const' || unwrapped.constIsNull === true || !unwrapped.constInteger) {
@@ -614,71 +499,178 @@ function constNonNegativeSafeInteger(expr: PgAnalyzerExpr | null | undefined): n
   return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : null
 }
 
-function applyLimitBounds(query: PgAnalyzerQuery, base: TypedSqlPostgresIrRowBounds): TypedSqlPostgresIrRowBounds {
-  const limit = constNonNegativeSafeInteger(query.limitCount)
-  const maxAfterLimit = limit === null ? base.max : base.max === null ? limit : Math.min(base.max, limit)
-  const minAfterLimit = limit === 0 || query.hasLimitOffset === true ? 0 : base.min
+type LimitFact =
+  | { readonly kind: 'absent' | 'unbounded' }
+  | { readonly kind: 'constant'; readonly value: number }
+  | { readonly kind: 'dynamic' }
 
-  if (limit === null && query.hasLimitOffset !== true) {
+function limitFact(catalog: CatalogFacts, query: PgAnalyzerQuery): LimitFact {
+  if (query.hasLimitCount !== true) {
+    return { kind: 'absent' }
+  }
+
+  const unwrapped = unwrapTransparentExpr(query.limitCount)
+  if (unwrapped?.tag === 'Const' && unwrapped.constIsNull === true) {
+    return { kind: 'unbounded' }
+  }
+
+  const value = constNonNegativeSafeInteger(catalog, query.limitCount)
+  return value === null ? { kind: 'dynamic' } : { kind: 'constant', value }
+}
+
+function applyLimitBounds(
+  catalog: CatalogFacts,
+  query: PgAnalyzerQuery,
+  base: TypedSqlPostgresIrRowBounds
+): TypedSqlPostgresIrRowBounds {
+  const limit = limitFact(catalog, query)
+  const hasOffset = query.hasLimitOffset === true
+  if ((limit.kind === 'absent' || limit.kind === 'unbounded') && !hasOffset) {
     return base
   }
+
+  const maxAfterLimit =
+    limit.kind === 'constant' && (query.limitWithTies !== true || limit.value === 0)
+      ? base.max === null
+        ? limit.value
+        : Math.min(base.max, limit.value)
+      : base.max
+  const minAfterLimit =
+    hasOffset || limit.kind === 'dynamic' || (limit.kind === 'constant' && limit.value === 0) ? 0 : base.min
 
   return {
     max: maxAfterLimit,
     min: maxAfterLimit === 0 ? 0 : Math.min(minAfterLimit, maxAfterLimit ?? minAfterLimit),
     proof: [
       base.proof,
-      limit === null ? null : `constant_limit_${limit}`,
-      query.hasLimitOffset === true ? 'offset_can_drop_rows' : null,
+      limit.kind === 'constant'
+        ? query.limitWithTies === true
+          ? `constant_fetch_with_ties_${limit.value}`
+          : `constant_limit_${limit.value}`
+        : null,
+      limit.kind === 'dynamic' ? 'dynamic_limit_can_drop_rows' : null,
+      hasOffset ? 'offset_can_drop_rows' : null,
     ]
       .filter((part): part is string => part !== null)
       .join('+'),
   }
 }
 
-function simpleRelationRelid(query: PgAnalyzerQuery): number | null {
-  const relationRtes = (query.rtable ?? []).filter(
-    (rte): rte is PgAnalyzerRte & { readonly relid: number } => rte.kind === 'RELATION' && typeof rte.relid === 'number'
-  )
-  return relationRtes.length === 1 ? (relationRtes[0]?.relid ?? null) : null
+interface UniqueProofRelation {
+  readonly inh: boolean
+  readonly relid: number
+  readonly varno: number
+}
+
+function uniqueProofRelation(query: PgAnalyzerQuery): UniqueProofRelation | null {
+  const rtable = query.rtable ?? []
+  if (query.commandType === 'SELECT') {
+    const rowSources = rtable.map((rte, index) => ({ rte, varno: index + 1 })).filter(({ rte }) => rte.kind !== 'JOIN')
+    const source = rowSources.length === 1 ? rowSources[0] : undefined
+    return source?.rte.kind === 'RELATION' && typeof source.rte.relid === 'number'
+      ? { inh: source.rte.inh === true, relid: source.rte.relid, varno: source.varno }
+      : null
+  }
+
+  if (query.commandType !== 'UPDATE' && query.commandType !== 'DELETE') {
+    return null
+  }
+
+  const varno = query.resultRelation
+  if (!varno) {
+    return null
+  }
+  const target = rtable[varno - 1]
+  return target?.kind === 'RELATION' && typeof target.relid === 'number'
+    ? { inh: target.inh === true, relid: target.relid, varno }
+    : null
 }
 
 function isParamOrConstValue(expr: PgAnalyzerExpr | null | undefined): boolean {
-  const unwrapped = unwrapTransparentExpr(expr)
+  const unwrapped = unwrapValuePreservingExpr(expr)
   return unwrapped?.tag === 'Param' || unwrapped?.tag === 'Const'
 }
 
-function constrainedAttnumsFromQual(
+interface EqualityConstraint {
+  readonly attnum: number
+  readonly inputCollationOid: number
+  readonly opno: number
+}
+
+function equalityConstraintsFromQual(
   expr: PgAnalyzerExpr | null | undefined,
-  relid: number,
-  output = new Set<number>()
-): ReadonlySet<number> {
+  relation: UniqueProofRelation,
+  output: EqualityConstraint[] = []
+): readonly EqualityConstraint[] {
   if (!expr) {
     return output
   }
 
   if (expr.tag === 'BoolExpr' && expr.boolOp === 'AND') {
     for (const child of exprChildren(expr)) {
-      constrainedAttnumsFromQual(child, relid, output)
+      equalityConstraintsFromQual(child, relation, output)
     }
     return output
   }
 
-  if (expr.tag !== 'OpExpr' || expr.opname !== '=' || expr.args?.length !== 2) {
+  if (expr.tag !== 'OpExpr' || !expr.opno || expr.args?.length !== 2) {
     return output
   }
 
   const left = targetExprFromAggregateArg(expr.args[0])
   const right = targetExprFromAggregateArg(expr.args[1])
-  const leftVar = unwrapTransparentExpr(left)
-  const rightVar = unwrapTransparentExpr(right)
-  if (leftVar?.tag === 'Var' && leftVar.relid === relid && leftVar.varattno && isParamOrConstValue(right)) {
-    output.add(leftVar.varattno)
-  } else if (rightVar?.tag === 'Var' && rightVar.relid === relid && rightVar.varattno && isParamOrConstValue(left)) {
-    output.add(rightVar.varattno)
+  const leftVar = unwrapValuePreservingExpr(left)
+  const rightVar = unwrapValuePreservingExpr(right)
+  let attnum: number | undefined
+  if (
+    leftVar?.tag === 'Var' &&
+    leftVar.relid === relation.relid &&
+    leftVar.varno === relation.varno &&
+    (leftVar.varlevelsup ?? 0) === 0 &&
+    leftVar.varattno &&
+    isParamOrConstValue(right)
+  ) {
+    attnum = leftVar.varattno
+  } else if (
+    rightVar?.tag === 'Var' &&
+    rightVar.relid === relation.relid &&
+    rightVar.varno === relation.varno &&
+    (rightVar.varlevelsup ?? 0) === 0 &&
+    rightVar.varattno &&
+    isParamOrConstValue(left)
+  ) {
+    attnum = rightVar.varattno
+  }
+  if (attnum) {
+    output.push({
+      attnum,
+      inputCollationOid: expr.inputCollationOid ?? 0,
+      opno: expr.opno,
+    })
   }
 
   return output
+}
+
+function uniqueEqualityOperatorKey(opfamilyOid: number, operatorOid: number): string {
+  return `${opfamilyOid}:${operatorOid}`
+}
+
+function uniqueIndexIsConstrained(
+  catalog: CatalogFacts,
+  index: UniqueIndexCatalogRow,
+  constraints: readonly EqualityConstraint[]
+): boolean {
+  return index.attnums.every((attnum, keyIndex) =>
+    constraints.some(
+      (constraint) =>
+        constraint.attnum === attnum &&
+        constraint.inputCollationOid === index.collation_oids[keyIndex] &&
+        catalog.uniqueEqualityOperators.has(
+          uniqueEqualityOperatorKey(index.opfamily_oids[keyIndex] ?? 0, constraint.opno)
+        )
+    )
+  )
 }
 
 function compareUniqueIndexCatalogRows(left: UniqueIndexCatalogRow, right: UniqueIndexCatalogRow): number {
@@ -714,15 +706,19 @@ function uniqueIndexRowBounds(catalog: CatalogFacts, query: PgAnalyzerQuery): Ty
     return null
   }
 
-  const relid = simpleRelationRelid(query)
-  if (relid === null || !query.whereQual) {
+  const relation = uniqueProofRelation(query)
+  if (!relation || !query.whereQual) {
     return null
   }
 
-  const constrainedAttnums = constrainedAttnumsFromQual(query.whereQual, relid)
+  const constraints = equalityConstraintsFromQual(query.whereQual, relation)
   const uniqueIndex = catalog.uniqueIndexesByRelid
-    .get(relid)
-    ?.find((index) => index.attnums.every((attnum) => constrainedAttnums.has(attnum)))
+    .get(relation.relid)
+    ?.find(
+      (index) =>
+        !(relation.inh && index.has_inheritors && index.relkind !== 'p') &&
+        uniqueIndexIsConstrained(catalog, index, constraints)
+    )
   if (!uniqueIndex) {
     return null
   }
@@ -783,7 +779,7 @@ function inferBaseRowBounds(
   query: PgAnalyzerQuery,
   resultColumnCount: number
 ): TypedSqlPostgresIrRowBounds {
-  if (resultColumnCount === 0) {
+  if (resultColumnCount === 0 && query.commandType !== 'SELECT') {
     return { max: 0, min: 0, proof: 'no_result_columns' }
   }
 
@@ -813,7 +809,10 @@ function inferBaseRowBounds(
     }
 
     if ((query.rtable?.length ?? 0) === 0 && query.hasWindowFuncs !== true) {
-      return query.whereQual
+      if (hasGrouping) {
+        return { max: null, min: 0, proof: 'select_without_from_with_grouping' }
+      }
+      return query.whereQual || query.hasHavingQual === true
         ? { max: 1, min: 0, proof: 'select_without_from_with_qual' }
         : { max: 1, min: 1, proof: 'select_without_from' }
     }
@@ -827,45 +826,106 @@ function inferRowBounds(
   query: PgAnalyzerQuery,
   resultColumnCount: number
 ): TypedSqlPostgresIrRowBounds {
-  return applyLimitBounds(query, inferBaseRowBounds(catalog, query, resultColumnCount))
+  return applyLimitBounds(catalog, query, inferBaseRowBounds(catalog, query, resultColumnCount))
 }
 
 function isDataModifyingCommand(commandType: string | undefined): boolean {
   return commandType === 'UPDATE' || commandType === 'INSERT' || commandType === 'DELETE' || commandType === 'MERGE'
 }
 
-function queryHasDataModifyingCte(query: PgAnalyzerQuery): boolean {
-  for (const cte of query.cteList ?? []) {
-    if (isDataModifyingCommand(cte.commandType) || (cte.query && isDataModifyingCommand(cte.query.commandType))) {
-      return true
-    }
-    if (cte.query && queryHasDataModifyingCte(cte.query)) {
-      return true
-    }
-  }
-  for (const rte of query.rtable ?? []) {
-    if (rte.subquery && queryHasDataModifyingCte(rte.subquery)) {
-      return true
-    }
-  }
-  return false
-}
-
-function walkQuery(query: PgAnalyzerQuery, visitExpr: (expr: PgAnalyzerExpr) => void): void {
+function walkDirectQueryExpressions(query: PgAnalyzerQuery, visitExpr: (expr: PgAnalyzerExpr) => void): void {
   for (const target of [...(query.targetList ?? []), ...(query.returningList ?? [])]) {
     walkExpr(target.expr, visitExpr)
   }
   walkExpr(query.whereQual, visitExpr)
-  for (const cte of query.cteList ?? []) {
-    if (cte.query) {
-      walkQuery(cte.query, visitExpr)
-    }
-  }
+  walkExpr(query.limitCount, visitExpr)
+}
+
+function walkQueryTree(query: PgAnalyzerQuery, visitQuery: (query: PgAnalyzerQuery) => void): void {
+  visitQuery(query)
   for (const rte of query.rtable ?? []) {
     if (rte.subquery) {
-      walkQuery(rte.subquery, visitExpr)
+      walkQueryTree(rte.subquery, visitQuery)
     }
   }
+  for (const cte of query.cteList ?? []) {
+    if (cte.query) {
+      walkQueryTree(cte.query, visitQuery)
+    }
+  }
+  walkDirectQueryExpressions(query, (expr) => {
+    if (expr.subquery) {
+      walkQueryTree(expr.subquery, visitQuery)
+    }
+  })
+}
+
+function queryHasDataModifyingCte(query: PgAnalyzerQuery): boolean {
+  if (query.hasModifyingCTE === true) {
+    return true
+  }
+
+  let hasDataModifyingCte = false
+  walkQueryTree(query, (nested) => {
+    if (nested !== query && isDataModifyingCommand(nested.commandType)) {
+      hasDataModifyingCte = true
+    }
+  })
+  return hasDataModifyingCte
+}
+
+function queryTreeIsWrite(query: PgAnalyzerQuery): boolean {
+  return (
+    isDataModifyingCommand(query.commandType) ||
+    query.commandType === 'UTILITY' ||
+    query.hasModifyingCTE === true ||
+    query.hasRowMarks === true ||
+    query.hasVolatileFunctions === true
+  )
+}
+
+function combineParameterNullAdmission(
+  current: TypedSqlPostgresIrParamNullAdmission | undefined,
+  next: TypedSqlPostgresIrParamNullAdmission
+): TypedSqlPostgresIrParamNullAdmission {
+  if (current === 'rejects' || next === 'rejects') {
+    return 'rejects'
+  }
+  if (current === 'unknown' || next === 'unknown') {
+    return 'unknown'
+  }
+  return 'accepts'
+}
+
+function dmlParameterNullAdmissions(
+  queries: readonly PgAnalyzerQuery[],
+  paramTypeNullAdmissions: readonly TypedSqlPostgresIrParamNullAdmission[],
+  paramUsageNullAdmissions: readonly TypedSqlPostgresIrParamNullAdmission[]
+): ReadonlyMap<number, TypedSqlPostgresIrParamNullAdmission> {
+  const admissionByParamId = new Map<number, TypedSqlPostgresIrParamNullAdmission>()
+  for (const [index, admission] of paramTypeNullAdmissions.entries()) {
+    admissionByParamId.set(
+      index + 1,
+      combineParameterNullAdmission(admission, paramUsageNullAdmissions[index] ?? 'unknown')
+    )
+  }
+  for (const query of queries) {
+    walkQueryTree(query, (nested) => {
+      for (const target of nested.dmlParameterTargets) {
+        admissionByParamId.set(
+          target.paramId,
+          combineParameterNullAdmission(admissionByParamId.get(target.paramId), target.targetNullAdmission)
+        )
+      }
+    })
+  }
+  return admissionByParamId
+}
+
+function walkQuery(query: PgAnalyzerQuery, visitExpr: (expr: PgAnalyzerExpr) => void): void {
+  walkQueryTree(query, (nested) => {
+    walkDirectQueryExpressions(nested, visitExpr)
+  })
 }
 
 function collectOids(analysis: PgAnalyzerResult): {
@@ -894,7 +954,7 @@ function collectOids(analysis: PgAnalyzerResult): {
         if (expr.paramTypeOid) {
           typeOids.add(expr.paramTypeOid)
         }
-        for (const oid of [expr.funcid, expr.opfuncid]) {
+        for (const oid of [expr.aggfnoid, expr.funcid, expr.opfuncid]) {
           if (oid) {
             procOids.add(oid)
           }
@@ -918,19 +978,13 @@ function collectOids(analysis: PgAnalyzerResult): {
 }
 
 function walkQueryRelations(query: PgAnalyzerQuery, visitRelid: (relid: number) => void): void {
-  for (const rte of query.rtable ?? []) {
-    if (rte.kind === 'RELATION' && typeof rte.relid === 'number') {
-      visitRelid(rte.relid)
+  walkQueryTree(query, (nested) => {
+    for (const rte of nested.rtable ?? []) {
+      if (rte.kind === 'RELATION' && typeof rte.relid === 'number') {
+        visitRelid(rte.relid)
+      }
     }
-    if (rte.subquery) {
-      walkQueryRelations(rte.subquery, visitRelid)
-    }
-  }
-  for (const cte of query.cteList ?? []) {
-    if (cte.query) {
-      walkQueryRelations(cte.query, visitRelid)
-    }
-  }
+  })
 }
 
 async function loadCatalog(client: PostgresQueryable, analyses: readonly PgAnalyzerResult[]): Promise<CatalogFacts> {
@@ -954,35 +1008,19 @@ async function loadCatalog(client: PostgresQueryable, analyses: readonly PgAnaly
     }
   }
 
-  const types = new Map<number, TypeCatalogRow>()
-  if (typeOids.size > 0) {
-    const result = await client.query<TypeCatalogRow>(
-      `
-        select
-          t.oid::int as oid,
-          format_type(t.oid, null) as formatted_type,
-          n.nspname as type_schema,
-          t.typname
-        from pg_type t
-        inner join pg_namespace n
-          on n.oid = t.typnamespace
-        where t.oid = any($1::oid[])
-      `,
-      [[...typeOids]]
-    )
-    for (const row of result.rows) {
-      types.set(row.oid, row)
-    }
-  }
+  const types = await loadPostgresTypeFacts(client, [...typeOids])
 
   const procs = new Map<number, ProcCatalogRow>()
   if (procOids.size > 0) {
     const result = await client.query<ProcCatalogRow>(
       `
         select
+          p.oid < 16384 and namespace.nspname = 'pg_catalog' as is_builtin,
           p.oid::int as oid,
-          p.proisstrict
+          p.proname
         from pg_proc p
+        join pg_namespace namespace
+          on namespace.oid = p.pronamespace
         where p.oid = any($1::oid[])
       `,
       [[...procOids]]
@@ -1017,6 +1055,7 @@ async function loadCatalog(client: PostgresQueryable, analyses: readonly PgAnaly
   }
 
   const uniqueIndexesByRelid = new Map<number, UniqueIndexCatalogRow[]>()
+  const uniqueEqualityOperators = new Set<string>()
   if (relationRelids.size > 0) {
     const result = await client.query<UniqueIndexCatalogRow>(
       `
@@ -1025,18 +1064,44 @@ async function loadCatalog(client: PostgresQueryable, analyses: readonly PgAnaly
           i.indexrelid::int as indexrelid,
           index_class.relname as index_name,
           i.indisprimary,
-          array_agg(key.attnum::int order by key.ordinality) as attnums
+          relation_class.relkind,
+          exists (
+            select 1
+            from pg_inherits inheritance
+            where inheritance.inhparent = i.indrelid
+          ) as has_inheritors,
+          array_agg(key.attnum::int order by key.ordinality) as attnums,
+          array_agg(key.collation_oid::int order by key.ordinality) as collation_oids,
+          array_agg(opclass.opcfamily::int order by key.ordinality) as opfamily_oids
         from pg_index i
         join pg_class index_class
           on index_class.oid = i.indexrelid
-        cross join lateral unnest(string_to_array(i.indkey::text, ' ')::int[]) with ordinality as key(attnum, ordinality)
+        join pg_class relation_class
+          on relation_class.oid = i.indrelid
+        cross join lateral unnest(
+          i.indkey::smallint[],
+          i.indclass::oid[],
+          i.indcollation::oid[]
+        ) with ordinality as key(attnum, opclass_oid, collation_oid, ordinality)
+        join pg_opclass opclass
+          on opclass.oid = key.opclass_oid
+        join pg_am access_method
+          on access_method.oid = opclass.opcmethod
+         and access_method.amname = 'btree'
         where i.indrelid = any($1::oid[])
           and i.indisunique
           and i.indisvalid
+          and i.indimmediate
           and i.indpred is null
           and i.indexprs is null
+          and key.ordinality <= i.indnkeyatts
           and key.attnum > 0
-        group by i.indrelid, i.indexrelid, index_class.relname, i.indisprimary
+        group by
+          i.indrelid,
+          i.indexrelid,
+          index_class.relname,
+          i.indisprimary,
+          relation_class.relkind
       `,
       [[...relationRelids]]
     )
@@ -1047,6 +1112,33 @@ async function loadCatalog(client: PostgresQueryable, analyses: readonly PgAnaly
     }
     for (const entries of uniqueIndexesByRelid.values()) {
       entries.sort(compareUniqueIndexCatalogRows)
+    }
+
+    const opfamilyOids = [...new Set(result.rows.flatMap((row) => row.opfamily_oids))]
+    if (opfamilyOids.length > 0) {
+      const equalityResult = await client.query<UniqueEqualityOperatorCatalogRow>(
+        `
+          select
+            operator.amopfamily::int as amopfamily,
+            operator.amopopr::int as amopopr
+          from pg_amop operator
+          join pg_operator definition
+            on definition.oid = operator.amopopr
+          join pg_proc implementation
+            on implementation.oid = definition.oprcode
+          join pg_am access_method
+            on access_method.oid = operator.amopmethod
+          where operator.amopfamily = any($1::oid[])
+            and operator.amopstrategy = 3
+            and operator.amoppurpose = 's'
+            and access_method.amname = 'btree'
+            and implementation.proisstrict
+        `,
+        [opfamilyOids]
+      )
+      for (const row of equalityResult.rows) {
+        uniqueEqualityOperators.add(uniqueEqualityOperatorKey(row.amopfamily, row.amopopr))
+      }
     }
   }
 
@@ -1064,6 +1156,7 @@ async function loadCatalog(client: PostgresQueryable, analyses: readonly PgAnaly
     columns,
     procs,
     types,
+    uniqueEqualityOperators,
     uniqueIndexesByRelid,
   }
 }
@@ -1072,26 +1165,26 @@ function typeFactForOid(
   catalog: CatalogFacts,
   oid: number | undefined,
   fallback: string | undefined
-): Pick<TypedSqlPostgresIrColumn, 'pgType' | 'pgTypeName' | 'pgTypeSchema'> {
+): PostgresTypeFact {
   if (oid) {
     const type = catalog.types.get(oid)
     if (type) {
-      return {
-        pgType: type.formatted_type,
-        pgTypeName: type.typname,
-        pgTypeSchema: type.type_schema,
-      }
+      return type
     }
     return {
       pgType: fallback ?? `oid:${oid}`,
+      pgTypeKind: 'unknown',
       pgTypeName: `oid_${oid}`,
+      pgTypeOid: oid,
       pgTypeSchema: 'unknown',
     }
   }
 
   return {
     pgType: fallback ?? 'unknown',
+    pgTypeKind: 'unknown',
     pgTypeName: fallback ?? 'unknown',
+    pgTypeOid: 0,
     pgTypeSchema: 'unknown',
   }
 }
@@ -1103,47 +1196,99 @@ function exprKey(expr: PgAnalyzerExpr | null | undefined): string | null {
   return `${expr.varno}:${expr.varattno}:${expr.varlevelsup ?? 0}`
 }
 
-function collectNonNullVarKeys(
-  expr: PgAnalyzerExpr | null | undefined,
-  output = new Set<string>()
-): ReadonlySet<string> {
-  if (!expr) {
-    return output
+interface VisitedVar {
+  readonly key: string
+  readonly query: PgAnalyzerQuery
+}
+
+function visitVar(seen: readonly VisitedVar[], scope: QueryScope, expr: PgAnalyzerExpr): readonly VisitedVar[] | null {
+  const key = exprKey(expr)
+  if (!key || seen.some((visited) => visited.query === scope.query && visited.key === key)) {
+    return null
+  }
+  return [...seen, { key, query: scope.query }]
+}
+
+function collectNonNullVarKeys(expr: PgAnalyzerExpr | null | undefined): ReadonlySet<string> {
+  if (expr?.tag === 'NullTest' && expr.nullTestType === 'IS_NOT_NULL') {
+    const key = exprKey(expr.arg)
+    return key ? new Set([key]) : new Set()
   }
 
-  if (expr.tag === 'NullTest' && expr.nullTestType === 'IS_NOT_NULL') {
-    const key = exprKey(expr.arg)
-    if (key) {
-      output.add(key)
-    }
+  if (expr?.tag !== 'BoolExpr' || expr.boolOp === 'NOT') {
+    return new Set()
   }
-  for (const child of exprChildren(expr)) {
-    collectNonNullVarKeys(child, output)
+
+  const branches = exprChildren(expr).map(collectNonNullVarKeys)
+  if (expr.boolOp === 'AND') {
+    return new Set(branches.flatMap((branch) => [...branch]))
   }
-  return output
+
+  if (expr.boolOp === 'OR' && branches.length > 0) {
+    const [first, ...rest] = branches
+    return new Set([...(first ?? [])].filter((key) => rest.every((branch) => branch.has(key))))
+  }
+
+  return new Set()
 }
 
 function cteByName(query: PgAnalyzerQuery, name: string | undefined): PgAnalyzerCte | undefined {
   return name ? (query.cteList ?? []).find((cte) => cte.name === name) : undefined
 }
 
+function checkConstraintTypeForQueryOutput(
+  catalog: CatalogFacts,
+  scope: QueryScope,
+  outputIndex: number,
+  seen: readonly VisitedVar[]
+): TypedSqlPostgresIrCheckConstraintTypeExpression | null {
+  return foldQueryOutput<TypedSqlPostgresIrCheckConstraintTypeExpression | null>(scope, outputIndex, {
+    except: (left) => left,
+    intersect: (left, right) =>
+      left && right ? combineCheckConstraintTypes('intersection', left, right) : (left ?? right),
+    target: (targetScope, target) => checkConstraintTypeForExpr(catalog, targetScope, target.expr, seen),
+    union: (left, right) => (left && right ? combineCheckConstraintTypes('union', left, right) : null),
+    unknown: () => null,
+  })
+}
+
+function checkConstraintTypeKey(type: TypedSqlPostgresIrCheckConstraintTypeExpression): string {
+  return type.kind === 'named'
+    ? `named:${type.name}`
+    : `${type.kind}(${type.members.map(checkConstraintTypeKey).join(',')})`
+}
+
+function combineCheckConstraintTypes(
+  kind: 'intersection' | 'union',
+  left: TypedSqlPostgresIrCheckConstraintTypeExpression,
+  right: TypedSqlPostgresIrCheckConstraintTypeExpression
+): TypedSqlPostgresIrCheckConstraintTypeExpression {
+  if (checkConstraintTypeKey(left) === checkConstraintTypeKey(right)) {
+    return left
+  }
+
+  const candidates = [left, right].flatMap((type) => (type.kind === kind ? type.members : [type]))
+  const members = candidates.filter(
+    (type, index) =>
+      candidates.findIndex((candidate) => checkConstraintTypeKey(candidate) === checkConstraintTypeKey(type)) === index
+  )
+  return members.length === 1 ? (members[0] as TypedSqlPostgresIrCheckConstraintTypeExpression) : { kind, members }
+}
+
 function checkConstraintTypeForExpr(
   catalog: CatalogFacts,
-  query: PgAnalyzerQuery,
+  scope: QueryScope,
   expr: PgAnalyzerExpr | null | undefined,
-  seen = new Set<string>()
-): string | null {
-  const unwrapped = unwrapTransparentExpr(expr)
+  seen: readonly VisitedVar[]
+): TypedSqlPostgresIrCheckConstraintTypeExpression | null {
+  const unwrapped = unwrapValuePreservingExpr(expr)
   if (!unwrapped || unwrapped.tag !== 'Var') {
     return null
   }
 
-  const key = exprKey(unwrapped)
-  if (key && seen.has(key)) {
+  const nestedSeen = visitVar(seen, scope, unwrapped)
+  if (!nestedSeen) {
     return null
-  }
-  if (key) {
-    seen.add(key)
   }
 
   if (unwrapped.relid && unwrapped.varattno) {
@@ -1154,96 +1299,59 @@ function checkConstraintTypeForExpr(
       })
     )
     if (fact) {
-      return fact.typeName
+      return { kind: 'named', name: fact.typeName }
     }
   }
 
-  const rte = unwrapped.varno ? query.rtable?.[unwrapped.varno - 1] : undefined
-  if (rte?.kind === 'CTE') {
-    const cte = cteByName(query, rte.cteName)
-    const cteQuery = cte?.query
-    const source = cteQuery ? resultTargets(cteQuery)[(unwrapped.varattno ?? 1) - 1] : undefined
-    return source && cteQuery ? checkConstraintTypeForExpr(catalog, cteQuery, source.expr, seen) : null
-  }
-  if (rte?.kind === 'SUBQUERY' && rte.subquery) {
-    const source = resultTargets(rte.subquery)[(unwrapped.varattno ?? 1) - 1]
-    return source ? checkConstraintTypeForExpr(catalog, rte.subquery, source.expr, seen) : null
-  }
-
-  return null
+  const ownerRte = varOwnerRte(scope, unwrapped)
+  const outputScope = ownerRte ? queryScopeForRteOutput(...ownerRte) : null
+  return outputScope
+    ? checkConstraintTypeForQueryOutput(catalog, outputScope, (unwrapped.varattno ?? 1) - 1, nestedSeen)
+    : null
 }
 
-function tsTypeForExpr(
+function namedCheckConstraintTypeForExpr(
   catalog: CatalogFacts,
-  query: PgAnalyzerQuery,
-  expr: PgAnalyzerExpr | null | undefined,
-  typeFact: Pick<TypedSqlPostgresIrColumn, 'pgType' | 'pgTypeName' | 'pgTypeSchema'>
-): string {
-  return checkConstraintTypeForExpr(catalog, query, expr) ?? tsTypeForPgType(typeFact)
+  scope: QueryScope,
+  expr: PgAnalyzerExpr | null | undefined
+): string | null {
+  const type = checkConstraintTypeForExpr(catalog, scope, expr, [])
+  return type?.kind === 'named' ? type.name : null
 }
 
-function resultRelationRelid(query: PgAnalyzerQuery): number | null {
-  const resultRelationIndex = query.resultRelation
-  if (!resultRelationIndex) {
-    return null
-  }
-
-  const rte = query.rtable?.[resultRelationIndex - 1]
-  return rte?.kind === 'RELATION' && typeof rte.relid === 'number' ? rte.relid : null
-}
-
-function directParamId(expr: PgAnalyzerExpr | null | undefined): number | null {
-  const unwrapped = unwrapTransparentExpr(expr)
-  return unwrapped?.tag === 'Param' && Number.isInteger(unwrapped.paramId) ? (unwrapped.paramId ?? null) : null
-}
-
-function collectDirectCheckedColumnParamTypes(
+function checkedColumnParamTypes(
   catalog: CatalogFacts,
-  query: PgAnalyzerQuery,
-  output = new Map<number, Set<string>>()
-): Map<number, Set<string>> {
-  if (query.commandType === 'INSERT' || query.commandType === 'UPDATE') {
-    const relid = resultRelationRelid(query)
-    if (relid) {
-      for (const target of query.targetList ?? []) {
-        if (target.resjunk === true) {
+  queries: readonly PgAnalyzerQuery[],
+  paramTypeOids: readonly number[]
+): ReadonlyMap<number, string> {
+  const candidates = new Map<number, Set<string>>()
+  for (const query of queries) {
+    walkQueryTree(query, (nested) => {
+      for (const target of nested.dmlParameterTargets) {
+        if (!target.directAssignment) {
+          continue
+        }
+        if (paramTypeOids[target.paramId - 1] !== target.targetTypeOid) {
           continue
         }
 
-        const attnum = target.resno
-        const paramId = directParamId(target.expr)
-        if (!attnum || !paramId) {
-          continue
-        }
-
-        const fact = catalog.checkConstraintTypesByColumn.get(checkConstraintLiteralUnionColumnKey({ attnum, relid }))
+        const fact = catalog.checkConstraintTypesByColumn.get(
+          checkConstraintLiteralUnionColumnKey({
+            attnum: target.targetAttnum,
+            relid: target.targetRelid,
+          })
+        )
         if (!fact) {
           continue
         }
 
-        const types = output.get(paramId) ?? new Set<string>()
+        const types = candidates.get(target.paramId) ?? new Set<string>()
         types.add(fact.typeName)
-        output.set(paramId, types)
+        candidates.set(target.paramId, types)
       }
-    }
+    })
   }
 
-  for (const cte of query.cteList ?? []) {
-    if (cte.query) {
-      collectDirectCheckedColumnParamTypes(catalog, cte.query, output)
-    }
-  }
-  for (const rte of query.rtable ?? []) {
-    if (rte.subquery) {
-      collectDirectCheckedColumnParamTypes(catalog, rte.subquery, output)
-    }
-  }
-
-  return output
-}
-
-function checkedColumnParamTypes(catalog: CatalogFacts, query: PgAnalyzerQuery): ReadonlyMap<number, string> {
-  const candidates = collectDirectCheckedColumnParamTypes(catalog, query)
   const resolved = new Map<number, string>()
   for (const [paramId, types] of candidates) {
     if (types.size === 1) {
@@ -1256,13 +1364,29 @@ function checkedColumnParamTypes(catalog: CatalogFacts, query: PgAnalyzerQuery):
   return resolved
 }
 
+function queryOutputNullable(
+  catalog: CatalogFacts,
+  scope: QueryScope,
+  outputIndex: number,
+  seen: readonly VisitedVar[] = []
+): boolean {
+  return foldQueryOutput<boolean>(scope, outputIndex, {
+    except: (left) => left,
+    intersect: (left, right) => left && right,
+    target: (targetScope, target) => expressionNullable(catalog, targetScope, target.expr, undefined, seen),
+    union: (left, right) => left || right,
+    unknown: () => true,
+  })
+}
+
 function expressionNullable(
   catalog: CatalogFacts,
-  query: PgAnalyzerQuery,
+  scope: QueryScope,
   expr: PgAnalyzerExpr | null | undefined,
-  refinements = collectNonNullVarKeys(query.whereQual)
+  refinements = collectNonNullVarKeys(scope.query.whereQual),
+  seen: readonly VisitedVar[] = []
 ): boolean {
-  if (!expr) {
+  if (!expr || expr.truncated === true) {
     return true
   }
 
@@ -1280,18 +1404,20 @@ function expressionNullable(
       }
     }
 
-    const rte = expr.varno ? query.rtable?.[expr.varno - 1] : undefined
-    if (rte?.kind === 'CTE') {
-      const cte = cteByName(query, rte.cteName)
-      const cteQuery = cte?.query
-      const source = cteQuery ? resultTargets(cteQuery)[(expr.varattno ?? 1) - 1] : undefined
-      return source && cteQuery ? expressionNullable(catalog, cteQuery, source.expr) : true
+    if (!exprKey(expr)) {
+      return true
     }
-    if (rte?.kind === 'SUBQUERY' && rte.subquery) {
-      const source = resultTargets(rte.subquery)[(expr.varattno ?? 1) - 1]
-      return source ? expressionNullable(catalog, rte.subquery, source.expr) : true
+    const nestedSeen = visitVar(seen, scope, expr)
+    if (!nestedSeen) {
+      // Recursive CTE evaluation starts from the nonrecursive term. A repeated
+      // exact Var is the bottom of this monotone nullability recurrence; the
+      // seed or another set-operation arm still contributes its nullable fact.
+      return false
     }
-    return true
+
+    const ownerRte = varOwnerRte(scope, expr)
+    const outputScope = ownerRte ? queryScopeForRteOutput(...ownerRte) : null
+    return outputScope ? queryOutputNullable(catalog, outputScope, (expr.varattno ?? 1) - 1, nestedSeen) : true
   }
 
   if (expr.tag === 'Const') {
@@ -1300,38 +1426,46 @@ function expressionNullable(
   if (expr.tag === 'Param') {
     return true
   }
-  if (expr.tag === 'NullTest' || expr.tag === 'BooleanTest' || expr.tag === 'SubLink') {
+  if (expr.tag === 'NullTest' || expr.tag === 'BooleanTest') {
     return false
   }
+  if (expr.tag === 'SubLink') {
+    return expr.subLinkType !== 'EXISTS' && expr.subLinkType !== 'ARRAY'
+  }
   if (expr.tag === 'Aggref') {
-    return expr.aggname !== 'count'
+    return !isBuiltinPgProcNamed(catalog, expr.aggfnoid, 'count')
   }
   if (expr.tag === 'CoalesceExpr') {
-    return !exprChildren(expr).some((child) => !expressionNullable(catalog, query, child, refinements))
+    return !exprChildren(expr).some((child) => !expressionNullable(catalog, scope, child, refinements, seen))
   }
   if (expr.tag === 'CaseExpr') {
     const results = [...(expr.whenClauses ?? []).map((whenClause) => whenClause.result), expr.defresult].filter(
       (child): child is PgAnalyzerExpr => Boolean(child)
     )
-    return results.length === 0 || results.some((result) => expressionNullable(catalog, query, result, refinements))
+    return (
+      results.length === 0 || results.some((result) => expressionNullable(catalog, scope, result, refinements, seen))
+    )
   }
   if (expr.tag === 'BoolExpr') {
-    return exprChildren(expr).some((child) => expressionNullable(catalog, query, child, refinements))
+    return exprChildren(expr).some((child) => expressionNullable(catalog, scope, child, refinements, seen))
   }
-  if (expr.tag === 'OpExpr' || expr.tag === 'FuncExpr' || expr.tag === 'ScalarArrayOpExpr') {
-    const proc = catalog.procs.get(expr.opfuncid ?? expr.funcid ?? 0)
+  if (expr.tag === 'ArrayExpr') {
+    return false
+  }
+  if (expr.tag === 'FuncExpr') {
     if (
-      proc?.proisstrict === true &&
-      exprChildren(expr).every((child) => !expressionNullable(catalog, query, child, refinements))
+      isBuiltinPgProcNamed(catalog, expr.funcid, 'jsonb_build_object') ||
+      isBuiltinPgProcNamed(catalog, expr.funcid, 'json_build_object')
     ) {
-      return false
-    }
-    if (expr.funcname === 'jsonb_build_object' || expr.funcname === 'json_build_object') {
-      return false
+      if (expr.funcVariadic !== true) {
+        return false
+      }
+      const args = expr.args?.map(targetExprFromAggregateArg)
+      return args?.length === 1 ? expressionNullable(catalog, scope, args[0], refinements, seen) : true
     }
   }
   if (expr.tag === 'RelabelType' || expr.tag === 'CoerceViaIO') {
-    return expressionNullable(catalog, query, expr.arg, refinements)
+    return expressionNullable(catalog, scope, expr.arg, refinements, seen)
   }
 
   return true
@@ -1356,6 +1490,19 @@ function isJsonType(typeName: string | undefined): boolean {
   return typeName === 'json' || typeName === 'jsonb'
 }
 
+function isBuiltinPgProcNamed(catalog: CatalogFacts, oid: number | undefined, name: string): boolean {
+  const proc = oid ? catalog.procs.get(oid) : undefined
+  return proc?.is_builtin === true && proc.proname === name
+}
+
+function unwrapValuePreservingExpr(expr: PgAnalyzerExpr | null | undefined): PgAnalyzerExpr | null | undefined {
+  let current = expr
+  while (current?.tag === 'RelabelType' || current?.tag === 'CoerceToDomain') {
+    current = current.arg
+  }
+  return current
+}
+
 function unwrapTransparentExpr(expr: PgAnalyzerExpr | null | undefined): PgAnalyzerExpr | null | undefined {
   let current = expr
   while (current?.tag === 'RelabelType' || current?.tag === 'CoerceViaIO' || current?.tag === 'CoerceToDomain') {
@@ -1373,7 +1520,29 @@ function constStringValue(expr: PgAnalyzerExpr | null | undefined): string | nul
 }
 
 function isEmptyJsonArrayConst(expr: PgAnalyzerExpr | null | undefined): boolean {
-  return constStringValue(expr) === '[]'
+  const unwrapped = unwrapTransparentExpr(expr)
+  return unwrapped?.constEmptyJsonArray === true || constStringValue(unwrapped) === '[]'
+}
+
+function jsonBuildObjectArguments(expr: PgAnalyzerExpr): readonly PgAnalyzerExpr[] | null {
+  const args = expr.args?.map(targetExprFromAggregateArg)
+  if (!args || args.some((arg) => !arg)) {
+    return null
+  }
+
+  let objectArgs = args as readonly PgAnalyzerExpr[]
+  if (expr.funcVariadic === true) {
+    if (objectArgs.length !== 1) {
+      return null
+    }
+    const array = unwrapTransparentExpr(objectArgs[0])
+    if (!array || array.tag !== 'ArrayExpr' || array.multidims === true || !array.elements) {
+      return null
+    }
+    objectArgs = array.elements
+  }
+
+  return objectArgs.length % 2 === 0 ? objectArgs : null
 }
 
 function targetExprFromAggregateArg(
@@ -1393,14 +1562,47 @@ function jsonShapeWithNullability(shape: TypedSqlPostgresIrJsonShape, nullable: 
       return { ...shape, nullable }
     case 'opaque':
       return { ...shape, nullable }
+    case 'union':
+      return { ...shape, nullable }
     case 'scalar':
       return { ...shape, nullable }
   }
 }
 
+function flattenJsonShapeAlternatives(shape: TypedSqlPostgresIrJsonShape): readonly TypedSqlPostgresIrJsonShape[] {
+  return shape.kind === 'union' ? shape.alternatives.flatMap(flattenJsonShapeAlternatives) : [shape]
+}
+
+function combineJsonShapes(
+  left: TypedSqlPostgresIrJsonShape,
+  right: TypedSqlPostgresIrJsonShape,
+  nullable: boolean,
+  operation: 'INTERSECT' | 'UNION'
+): TypedSqlPostgresIrJsonShape {
+  if (operation === 'UNION' && (left.kind === 'opaque' || right.kind === 'opaque')) {
+    return { kind: 'opaque', nullable }
+  }
+  if (operation === 'INTERSECT') {
+    if (left.kind === 'opaque') {
+      return jsonShapeWithNullability(right, nullable)
+    }
+    if (right.kind === 'opaque') {
+      return jsonShapeWithNullability(left, nullable)
+    }
+  }
+
+  const alternatives = [...flattenJsonShapeAlternatives(left), ...flattenJsonShapeAlternatives(right)].filter(
+    (shape, index, shapes) =>
+      shapes.findIndex((candidate) => JSON.stringify(candidate) === JSON.stringify(shape)) === index
+  )
+  return alternatives.length === 1
+    ? jsonShapeWithNullability(alternatives[0] as TypedSqlPostgresIrJsonShape, nullable)
+    : { alternatives, kind: 'union', nullable }
+}
+
 function scalarJsonShapeForExpr(
   catalog: CatalogFacts,
-  query: PgAnalyzerQuery,
+  scope: QueryScope,
   expr: PgAnalyzerExpr,
   refinements: ReadonlySet<string>
 ): TypedSqlPostgresIrJsonShape {
@@ -1408,80 +1610,112 @@ function scalarJsonShapeForExpr(
   if (isJsonType(typeFact.pgTypeName)) {
     return {
       kind: 'opaque',
-      nullable: expressionNullable(catalog, query, expr, refinements),
+      nullable: expressionNullable(catalog, scope, expr, refinements),
     }
   }
 
-  const checkConstraintType = checkConstraintTypeForExpr(catalog, query, expr)
+  const checkConstraintType = namedCheckConstraintTypeForExpr(catalog, scope, expr)
   return {
     kind: 'scalar',
-    nullable: expressionNullable(catalog, query, expr, refinements),
+    nullable: expressionNullable(catalog, scope, expr, refinements),
     ...typeFact,
-    ...(checkConstraintType ? { tsType: checkConstraintType } : {}),
+    ...(checkConstraintType ? { checkConstraintTypeName: checkConstraintType } : {}),
   }
+}
+
+function inferQueryOutputJsonShape(
+  catalog: CatalogFacts,
+  scope: QueryScope,
+  outputIndex: number,
+  seen: readonly VisitedVar[]
+): TypedSqlPostgresIrJsonShape {
+  return foldQueryOutput<TypedSqlPostgresIrJsonShape>(scope, outputIndex, {
+    except: (left) => left,
+    intersect: (left, right) => combineJsonShapes(left, right, left.nullable && right.nullable, 'INTERSECT'),
+    target: (targetScope, target) =>
+      inferJsonShape(catalog, targetScope, target.expr, undefined, seen) ?? {
+        kind: 'opaque',
+        nullable: expressionNullable(catalog, targetScope, target.expr),
+      },
+    union: (left, right) => combineJsonShapes(left, right, left.nullable || right.nullable, 'UNION'),
+    unknown: () => ({ kind: 'opaque', nullable: true }),
+  })
 }
 
 function inferJsonShape(
   catalog: CatalogFacts,
-  query: PgAnalyzerQuery,
+  scope: QueryScope,
   expr: PgAnalyzerExpr | null | undefined,
-  refinements = collectNonNullVarKeys(query.whereQual),
-  seen = new Set<string>(),
-  queryScope = 'root'
+  refinements = collectNonNullVarKeys(scope.query.whereQual),
+  seen: readonly VisitedVar[] = []
 ): TypedSqlPostgresIrJsonShape | null {
   const unwrapped = unwrapTransparentExpr(expr)
-  if (!unwrapped) {
+  if (!unwrapped || unwrapped.truncated === true) {
     return null
   }
 
   if (unwrapped.tag === 'CoalesceExpr') {
     const children = exprChildren(unwrapped)
-    const firstShape = inferJsonShape(catalog, query, children[0], refinements, seen, queryScope)
+    const firstShape = inferJsonShape(catalog, scope, children[0], refinements, seen)
     if (!firstShape) {
       return null
     }
 
-    if (firstShape.kind === 'array' && children.slice(1).some(isEmptyJsonArrayConst)) {
+    if (firstShape.kind === 'array' && children.length > 1 && children.slice(1).every(isEmptyJsonArrayConst)) {
       return jsonShapeWithNullability(firstShape, false)
     }
 
-    return jsonShapeWithNullability(firstShape, expressionNullable(catalog, query, unwrapped, refinements))
+    return {
+      kind: 'opaque',
+      nullable: expressionNullable(catalog, scope, unwrapped, refinements),
+    }
   }
 
   if (
     unwrapped.tag === 'FuncExpr' &&
-    (unwrapped.funcname === 'jsonb_build_object' || unwrapped.funcname === 'json_build_object')
+    (isBuiltinPgProcNamed(catalog, unwrapped.funcid, 'jsonb_build_object') ||
+      isBuiltinPgProcNamed(catalog, unwrapped.funcid, 'json_build_object'))
   ) {
-    const args = unwrapped.args ?? []
-    const fields: TypedSqlPostgresIrJsonField[] = []
+    const args = jsonBuildObjectArguments(unwrapped)
+    if (!args) {
+      return {
+        kind: 'opaque',
+        nullable: expressionNullable(catalog, scope, unwrapped, refinements),
+      }
+    }
+    const fields = new Map<string, TypedSqlPostgresIrJsonField>()
     for (let index = 0; index + 1 < args.length; index += 2) {
       const keyExpr = args[index]
       const valueExpr = args[index + 1]
       const key = constStringValue(targetExprFromAggregateArg(keyExpr))
       const value = targetExprFromAggregateArg(valueExpr)
-      if (!key || !value) {
+      if (key === null || !value) {
         return {
           kind: 'opaque',
-          nullable: expressionNullable(catalog, query, unwrapped, refinements),
+          nullable: expressionNullable(catalog, scope, unwrapped, refinements),
         }
       }
 
-      fields.push({
+      fields.set(key, {
         name: key,
         shape:
-          inferJsonShape(catalog, query, value, refinements, seen, queryScope) ??
-          scalarJsonShapeForExpr(catalog, query, value, refinements),
+          inferJsonShape(catalog, scope, value, refinements, seen) ??
+          scalarJsonShapeForExpr(catalog, scope, value, refinements),
       })
     }
 
     return {
-      fields,
+      fields: [...fields.values()],
       kind: 'object',
-      nullable: expressionNullable(catalog, query, unwrapped, refinements),
+      nullable: expressionNullable(catalog, scope, unwrapped, refinements),
     }
   }
 
-  if (unwrapped.tag === 'Aggref' && (unwrapped.aggname === 'jsonb_agg' || unwrapped.aggname === 'json_agg')) {
+  if (
+    unwrapped.tag === 'Aggref' &&
+    (isBuiltinPgProcNamed(catalog, unwrapped.aggfnoid, 'jsonb_agg') ||
+      isBuiltinPgProcNamed(catalog, unwrapped.aggfnoid, 'json_agg'))
+  ) {
     const valueExpr = targetExprFromAggregateArg(unwrapped.args?.[0])
     if (!valueExpr) {
       return null
@@ -1489,206 +1723,84 @@ function inferJsonShape(
 
     return {
       element:
-        inferJsonShape(catalog, query, valueExpr, refinements, seen, queryScope) ??
-        scalarJsonShapeForExpr(catalog, query, valueExpr, refinements),
+        inferJsonShape(catalog, scope, valueExpr, refinements, seen) ??
+        scalarJsonShapeForExpr(catalog, scope, valueExpr, refinements),
       kind: 'array',
-      nullable: expressionNullable(catalog, query, unwrapped, refinements),
+      nullable: expressionNullable(catalog, scope, unwrapped, refinements),
     }
   }
 
   if (unwrapped.tag === 'Var') {
-    const key = exprKey(unwrapped)
-    const scopedKey = key ? `${queryScope}:${key}` : null
-    if (scopedKey && seen.has(scopedKey)) {
+    const nestedSeen = visitVar(seen, scope, unwrapped)
+    if (!nestedSeen) {
       return null
     }
-    const nestedSeen = scopedKey ? new Set(seen) : seen
-    if (scopedKey) {
-      nestedSeen.add(scopedKey)
-    }
 
-    const rte = unwrapped.varno ? query.rtable?.[unwrapped.varno - 1] : undefined
-    if (rte?.kind === 'CTE') {
-      const cte = cteByName(query, rte.cteName)
-      const cteQuery = cte?.query
-      const source = cteQuery ? resultTargets(cteQuery)[(unwrapped.varattno ?? 1) - 1] : undefined
-      const shape =
-        source && cteQuery
-          ? inferJsonShape(catalog, cteQuery, source.expr, undefined, nestedSeen, `${queryScope}/cte:${rte.cteName}`)
-          : null
-      return shape ? jsonShapeWithNullability(shape, expressionNullable(catalog, query, unwrapped, refinements)) : null
-    }
-
-    if (rte?.kind === 'SUBQUERY' && rte.subquery) {
-      const source = resultTargets(rte.subquery)[(unwrapped.varattno ?? 1) - 1]
-      const shape = source
-        ? inferJsonShape(
-            catalog,
-            rte.subquery,
-            source.expr,
-            undefined,
-            nestedSeen,
-            `${queryScope}/subquery:${key ?? 'var'}`
-          )
-        : null
-      return shape ? jsonShapeWithNullability(shape, expressionNullable(catalog, query, unwrapped, refinements)) : null
-    }
+    const ownerRte = varOwnerRte(scope, unwrapped)
+    const outputScope = ownerRte ? queryScopeForRteOutput(...ownerRte) : null
+    const shape = outputScope
+      ? inferQueryOutputJsonShape(catalog, outputScope, (unwrapped.varattno ?? 1) - 1, nestedSeen)
+      : null
+    return shape ? jsonShapeWithNullability(shape, expressionNullable(catalog, scope, unwrapped, refinements)) : null
   }
 
   if (isJsonType(unwrapped.typeName)) {
     return {
       kind: 'opaque',
-      nullable: expressionNullable(catalog, query, unwrapped, refinements),
+      nullable: expressionNullable(catalog, scope, unwrapped, refinements),
     }
   }
 
   return null
 }
 
-function renderInterface(
-  name: string,
-  fields: readonly {
-    readonly nullable: boolean
-    readonly propertyName: string
-    readonly tsType: string
-  }[]
-): string {
-  if (fields.length === 0) {
-    return `export type ${name} = Record<string, never>`
-  }
+function normalizeCompiledIr(catalog: CatalogFacts, analyzed: AnalyzedCompiledConfig): TypedSqlPostgresIr {
+  const { analysis, config, primaryQuery: query, rewrittenQueries } = analyzed
+  const rootScope = queryScope(query)
 
-  return [
-    `export interface ${name} {`,
-    ...fields.map(
-      (field) =>
-        `  readonly ${quotePropertyName(field.propertyName)}: ${field.tsType}${field.nullable ? ' | null' : ''}`
-    ),
-    '}',
-  ].join('\n')
-}
-
-function renderTypePreview(ir: Omit<TypedSqlPostgresIr, 'typePreview'>): string {
-  const baseName = pascalCaseIdentifier(ir.name)
-  return [
-    renderInterface(
-      `${baseName}Params`,
-      ir.params.map((param) => ({
-        nullable: false,
-        propertyName: param.propertyName,
-        tsType: param.tsType,
-      }))
-    ),
-    '',
-    renderInterface(
-      `${baseName}Row`,
-      ir.resultColumns.map((entry, index) => ({
-        nullable: entry.nullable,
-        propertyName: camelCaseIdentifier(entry.name ?? `column_${index + 1}`),
-        tsType: entry.tsType,
-      }))
-    ),
-  ].join('\n')
-}
-
-function normalizeIr(catalog: CatalogFacts, config: CompiledSqlConfig, analysis: PgAnalyzerResult): TypedSqlPostgresIr {
-  const query = analysis.statements[0]?.queries[0]
-  if (!query) {
-    throw new Error(`${config.sourceFile}: analyzer returned no query.`)
-  }
-
-  const resultColumns = resultTargets(query).map((target): TypedSqlPostgresIrColumn => {
+  const resultColumns = resultTargets(query).map((target, outputIndex): TypedSqlPostgresIrColumn => {
     const expr = target.expr
     const typeFact = typeFactForOid(catalog, expr?.typeOid, expr?.typeName)
-    const tsType = tsTypeForExpr(catalog, query, expr, typeFact)
+    const checkConstraintType = checkConstraintTypeForQueryOutput(catalog, rootScope, outputIndex, [])
     return {
-      jsonShape: isJsonType(typeFact.pgTypeName) ? (inferJsonShape(catalog, query, expr) ?? undefined) : undefined,
+      jsonShape: isJsonType(typeFact.pgTypeName)
+        ? inferQueryOutputJsonShape(catalog, rootScope, outputIndex, [])
+        : undefined,
       name: target.resname ?? null,
-      nullable: expressionNullable(catalog, query, expr),
+      nullable: queryOutputNullable(catalog, rootScope, outputIndex),
       ...typeFact,
       source: sourceForExpr(expr),
-      tsType,
+      ...(checkConstraintType ? { checkConstraintType } : {}),
     }
   })
 
-  const checkConstraintParamTypes = checkedColumnParamTypes(catalog, query)
-  const params = config.parameterNames.map((name, index): TypedSqlPostgresIrParam => {
-    const oid = analysis.paramTypeOids[index]
-    const typeFact = typeFactForOid(catalog, oid, config.params.get(name))
-    const checkConstraintTsType = checkConstraintParamTypes.get(index + 1)
-    return {
-      name,
-      ...typeFact,
-      propertyName: camelCaseIdentifier(name),
-      tsType: checkConstraintTsType ?? tsTypeForPgType(typeFact),
-      ...(checkConstraintTsType ? { tsTypeSource: 'checkConstraint' as const } : {}),
-    }
-  })
-  const rowBounds = inferRowBounds(catalog, query, resultColumns.length)
-
-  const partial = {
-    analyzerSchemaVersion: analysis.schemaVersion,
-    command: query.commandType,
-    diagnostics: [],
-    hasDataModifyingCte: queryHasDataModifyingCte(query),
-    name: config.name,
-    params,
-    postgresVersionNum: analysis.postgresVersionNum,
-    resultColumns,
-    rowBounds,
-    rowCardinality: rowCardinalityFromBounds(rowBounds),
-    sourceFile: config.sourceFile,
-  } satisfies Omit<TypedSqlPostgresIr, 'typePreview'>
-
-  return {
-    ...partial,
-    typePreview: renderTypePreview(partial),
-  }
-}
-
-function normalizeCompiledIr(
-  catalog: CatalogFacts,
-  config: TypedSqlPostgresIrCompiledConfig,
-  analysis: PgAnalyzerResult
-): TypedSqlPostgresIr {
-  const query = analysis.statements[0]?.queries[0]
-  if (!query) {
-    throw new Error(`${config.sourceFile}: analyzer returned no query.`)
-  }
-
-  const resultColumns = resultTargets(query).map((target): TypedSqlPostgresIrColumn => {
-    const expr = target.expr
-    const typeFact = typeFactForOid(catalog, expr?.typeOid, expr?.typeName)
-    const tsType = tsTypeForExpr(catalog, query, expr, typeFact)
-    return {
-      jsonShape: isJsonType(typeFact.pgTypeName) ? (inferJsonShape(catalog, query, expr) ?? undefined) : undefined,
-      name: target.resname ?? null,
-      nullable: expressionNullable(catalog, query, expr),
-      ...typeFact,
-      source: sourceForExpr(expr),
-      tsType,
-    }
-  })
-
-  const checkConstraintParamTypes = checkedColumnParamTypes(catalog, query)
+  const checkConstraintParamTypes = checkedColumnParamTypes(catalog, rewrittenQueries, analysis.paramTypeOids)
+  const nullAdmissionByParamId = dmlParameterNullAdmissions(
+    rewrittenQueries,
+    analysis.paramTypeNullAdmissions,
+    analysis.paramUsageNullAdmissions
+  )
   const params = config.parameterNames.map((name, index): TypedSqlPostgresIrParam => {
     const oid = analysis.paramTypeOids[index]
     const typeFact = typeFactForOid(catalog, oid, config.parameterTypes?.[index])
-    const checkConstraintTsType = checkConstraintParamTypes.get(index + 1)
+    const checkConstraintTypeName = checkConstraintParamTypes.get(index + 1)
+    const nullAdmission = nullAdmissionByParamId.get(index + 1) ?? 'unknown'
     return {
       name,
+      nullAdmission,
+      nullable: nullAdmission === 'accepts',
       ...typeFact,
       propertyName: name,
-      tsType: checkConstraintTsType ?? tsTypeForPgType(typeFact),
-      ...(checkConstraintTsType ? { tsTypeSource: 'checkConstraint' as const } : {}),
+      ...(checkConstraintTypeName ? { checkConstraintTypeName } : {}),
     }
   })
   const rowBounds = inferRowBounds(catalog, query, resultColumns.length)
 
-  const partial = {
+  return {
     analyzerSchemaVersion: analysis.schemaVersion,
     command: query.commandType,
-    diagnostics: [],
-    hasDataModifyingCte: queryHasDataModifyingCte(query),
+    hasDataModifyingCte: rewrittenQueries.some(queryHasDataModifyingCte),
+    isWrite: rewrittenQueries.some(queryTreeIsWrite),
     name: config.name,
     params,
     postgresVersionNum: analysis.postgresVersionNum,
@@ -1696,67 +1808,76 @@ function normalizeCompiledIr(
     rowBounds,
     rowCardinality: rowCardinalityFromBounds(rowBounds),
     sourceFile: config.sourceFile,
-  } satisfies Omit<TypedSqlPostgresIr, 'typePreview'>
-
-  return {
-    ...partial,
-    typePreview: renderTypePreview(partial),
   }
-}
-
-async function analyzeConfig(client: PostgresQueryable, config: CompiledSqlConfig): Promise<PgAnalyzerResult> {
-  const result = await client.query<{ readonly analysis: PgAnalyzerResult }>(
-    `select ${ANALYZER_SQL_FUNCTION}($1, $2::oid[])::jsonb as analysis`,
-    [config.sql, await explicitParamTypeOids(client, config)]
-  )
-  const analysis = result.rows[0]?.analysis
-  if (!analysis || analysis.schemaVersion !== ANALYZER_SCHEMA_VERSION) {
-    throw new Error(`${config.sourceFile}: analyzer returned unsupported schema.`)
-  }
-  return analysis
 }
 
 async function analyzeCompiledConfig(
   client: PostgresQueryable,
   config: TypedSqlPostgresIrCompiledConfig
-): Promise<PgAnalyzerResult> {
+): Promise<AnalyzedCompiledConfig> {
   const result = await client.query<{ readonly analysis: PgAnalyzerResult }>(
     `select ${ANALYZER_SQL_FUNCTION}($1, $2::oid[])::jsonb as analysis`,
     [config.sql, await explicitCompiledParamTypeOids(client, config)]
   )
   const analysis = result.rows[0]?.analysis
   if (!analysis || analysis.schemaVersion !== ANALYZER_SCHEMA_VERSION) {
-    throw new Error(`${config.sourceFile}: analyzer returned unsupported schema.`)
+    throw new Error('analyzer returned unsupported schema.')
   }
-  return analysis
-}
-
-export async function buildTypedSqlPostgresIr(
-  client: PostgresQueryable,
-  sqlDir: string
-): Promise<TypedSqlPostgresIrBuildResult> {
-  const configs = (await readConfigs(sqlDir)).map(compileNamedParams)
-  const analyses: {
-    readonly analysis: PgAnalyzerResult
-    readonly config: CompiledSqlConfig
-  }[] = []
-  for (const config of configs) {
-    analyses.push({ analysis: await analyzeConfig(client, config), config })
+  if (analysis.rawStatementCount !== 1) {
+    throw new Error(`typed SQL must contain exactly one PostgreSQL statement; received ${analysis.rawStatementCount}.`)
+  }
+  if (analysis.statements.length !== 1) {
+    throw new Error(`analyzer returned ${analysis.statements.length} statement envelopes for one raw statement.`)
+  }
+  if (analysis.paramTypeOids.length !== config.parameterNames.length) {
+    throw new Error(
+      `analyzer returned ${analysis.paramTypeOids.length} parameter types for ${config.parameterNames.length} compiled parameters.`
+    )
+  }
+  if (analysis.paramTypeNullAdmissions.length !== config.parameterNames.length) {
+    throw new Error(
+      `analyzer returned ${analysis.paramTypeNullAdmissions.length} parameter type NULL admissions for ${config.parameterNames.length} compiled parameters.`
+    )
+  }
+  if (analysis.paramUsageNullAdmissions.length !== config.parameterNames.length) {
+    throw new Error(
+      `analyzer returned ${analysis.paramUsageNullAdmissions.length} parameter usage NULL admissions for ${config.parameterNames.length} compiled parameters.`
+    )
   }
 
-  const catalog = await loadCatalog(
-    client,
-    analyses.map((entry) => entry.analysis)
-  )
+  const statement = analysis.statements[0]
+  if (!statement || statement.rewrittenQueryCount !== statement.queries.length) {
+    throw new Error('analyzer returned an inconsistent rewritten-query envelope.')
+  }
+  const tagSettingQueries = statement.queries.filter((query) => query.canSetTag)
+  if (tagSettingQueries.length !== 1) {
+    throw new Error(`expected exactly one tag-setting rewritten query; received ${tagSettingQueries.length}.`)
+  }
+  const primaryQuery = tagSettingQueries[0] as PgAnalyzerQuery
+  if (primaryQuery.commandType === 'UTILITY') {
+    if (primaryQuery.utilityKind === 'CALL' && primaryQuery.utilityReturnsTuples === false) {
+      return {
+        analysis,
+        config,
+        primaryQuery,
+        rewrittenQueries: statement.queries,
+      }
+    }
+    if (primaryQuery.utilityKind === 'CALL' && primaryQuery.utilityReturnsTuples === true) {
+      throw new Error('PostgreSQL CALL statements with result rows are not supported by typed SQL.')
+    }
+
+    const utilityKind = primaryQuery.utilityKind ?? 'UNKNOWN'
+    throw new Error(
+      `PostgreSQL ${utilityKind} utility statements are not supported by typed SQL; only CALL statements without result rows are supported.`
+    )
+  }
+
   return {
-    catalogFacts: {
-      checkConstraintLiteralUnions: catalog.checkConstraintTypesByColumn.size,
-      columns: catalog.columns.size,
-      procs: catalog.procs.size,
-      types: catalog.types.size,
-      uniqueIndexes: [...catalog.uniqueIndexesByRelid.values()].reduce((count, entries) => count + entries.length, 0),
-    },
-    queries: analyses.map(({ analysis, config }) => normalizeIr(catalog, config, analysis)),
+    analysis,
+    config,
+    primaryQuery,
+    rewrittenQueries: statement.queries,
   }
 }
 
@@ -1764,16 +1885,10 @@ export async function buildTypedSqlPostgresIrFromCompiledConfigs(
   client: PostgresQueryable,
   configs: readonly TypedSqlPostgresIrCompiledConfig[]
 ): Promise<TypedSqlPostgresIrBuildResult> {
-  const analyses: {
-    readonly analysis: PgAnalyzerResult
-    readonly config: TypedSqlPostgresIrCompiledConfig
-  }[] = []
+  const analyses: AnalyzedCompiledConfig[] = []
   for (const config of configs) {
     try {
-      analyses.push({
-        analysis: await analyzeCompiledConfig(client, config),
-        config,
-      })
+      analyses.push(await analyzeCompiledConfig(client, config))
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
       throw new Error(`${config.sourceFile}: failed to analyze typed SQL ${config.name}: ${message}`, {
@@ -1794,6 +1909,6 @@ export async function buildTypedSqlPostgresIrFromCompiledConfigs(
       types: catalog.types.size,
       uniqueIndexes: [...catalog.uniqueIndexesByRelid.values()].reduce((count, entries) => count + entries.length, 0),
     },
-    queries: analyses.map(({ analysis, config }) => normalizeCompiledIr(catalog, config, analysis)),
+    queries: analyses.map((analyzed) => normalizeCompiledIr(catalog, analyzed)),
   }
 }
