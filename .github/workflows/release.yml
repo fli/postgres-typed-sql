@@ -22,7 +22,7 @@ jobs:
           node-version: 24
           cache: pnpm
           registry-url: https://registry.npmjs.org
-      - run: npm install --global npm@latest
+      - run: npm install --global npm@11.16.0
       - run: pnpm install --frozen-lockfile --ignore-scripts
       - run: pnpm build:engine
       - run: pnpm test:all
