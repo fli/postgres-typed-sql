@@ -3,8 +3,11 @@ export type PgScalarString<PgType extends string> = string & {
   readonly __postgresTypedSqlScalar: PgType
 }
 
-/** PostgreSQL arrays may be multidimensional and may contain SQL NULL elements. */
+/** A decoded PostgreSQL array result, including nested dimensions and SQL NULL elements. */
 export type PgArray<Element> = readonly (Element | null | PgArray<Element>)[]
+
+/** A one-dimensional PostgreSQL array parameter; use a serialized array-literal string for multiple dimensions. */
+export type PgArrayParameter<Element> = readonly (Element | null)[]
 
 /** Object returned by pg-types 2.2.0 for PostgreSQL point values. */
 export interface PgPoint {

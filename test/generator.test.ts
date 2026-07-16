@@ -106,8 +106,8 @@ test('requires serialized strings for PostgreSQL arrays whose element delimiter 
   const output = await readFile(join(root, 'queries/query.typed-sql.ts'), 'utf8')
   assert.match(output, /readonly boxes: string/u)
   assert.doesNotMatch(output, /readonly boxes: PgArray/u)
-  assert.match(output, /readonly lists: PgArray<string>/u)
-  assert.doesNotMatch(output, /readonly lists: PgArray<PgArray/u)
+  assert.match(output, /readonly lists: PgArrayParameter<string> \| string/u)
+  assert.doesNotMatch(output, /readonly lists: PgArrayParameter<PgArray/u)
 })
 
 test('imports every scalar dependency used by bytea array parameters', async () => {
@@ -124,8 +124,15 @@ test('imports every scalar dependency used by bytea array parameters', async () 
   })
 
   const output = await readFile(join(root, 'queries/query.typed-sql.ts'), 'utf8')
-  assert.match(output, /import type \{ PgArray, PgByteaHexString \} from 'postgres-typed-sql\/scalars'/u)
-  assert.match(output, /readonly payloads: PgArray<PgByteaHexString>/u)
+  assert.match(
+    output,
+    /import type \{ PgArray, PgArrayParameter, PgByteaHexString \} from 'postgres-typed-sql\/scalars'/u
+  )
+  assert.match(
+    output,
+    /export interface QueryParams \{[\s\S]*readonly payloads: PgArrayParameter<PgByteaHexString> \| string/u
+  )
+  assert.match(output, /export interface QueryRow \{[\s\S]*readonly payloads: PgArray<Uint8Array> \| null/u)
 })
 
 test('surfaces native PostgreSQL diagnostics for invalid SQL', async () => {
@@ -683,12 +690,12 @@ where event_id = :event_id
   assert.match(exact, /readonly big: number/u)
   assert.match(exact, /readonly ratio: number/u)
   assert.match(exact, /readonly numbers: DbJsonSelected/u)
-  assert.match(exact, /readonly json_numbers: PgArray<bigint \| number \| string>/u)
-  assert.match(exact, /readonly json_values: PgArray<DbJsonParameter>/u)
+  assert.match(exact, /readonly json_numbers: PgArrayParameter<bigint \| number \| string> \| string/u)
+  assert.match(exact, /readonly json_values: PgArrayParameter<DbJsonParameter> \| string/u)
   assert.match(exact, /readonly json_values: PgArray<DbJsonSelected> \| null/u)
   assert.match(exact, /readonly __proto__: string/u)
   assert.match(exact, /name: '__proto__',[\s\S]*?propertyName: '__proto__'/u)
-  assert.match(exact, /import type \{ DbJsonParameter, DbJsonSelected, PgArray \}/u)
+  assert.match(exact, /import type \{ DbJsonParameter, DbJsonSelected, PgArray, PgArrayParameter \}/u)
   assert.doesNotMatch(exact, /import type \{ URL \}/u)
 
   const audit = await readFile(join(root, 'queries/audit-event.typed-sql.ts'), 'utf8')
@@ -898,6 +905,13 @@ create type public.uint8_array as enum ('ambient_bytes');
       schema: `create type public.pg_int8_string as enum ('scalar');
 `,
       sql: 'select :kind::public.pg_int8_string as kind, 1::bigint as count\n',
+    },
+    {
+      error:
+        /generated TypeScript binding PgArrayParameter for postgres-typed-sql scalar type import collides with catalog type import/u,
+      schema: `create type public.pg_array_parameter as enum ('scalar');
+`,
+      sql: 'select :kind::public.pg_array_parameter as kind, cardinality(:values::integer[]) as count\n',
     },
     {
       error:

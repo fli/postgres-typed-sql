@@ -209,7 +209,7 @@ test('parameter resolution is independent of result decoding and recursively use
         pgArrayElementType: pgCatalog('jsonb', 'jsonb', 3802),
       })
     ),
-    'PgArray<DbJsonParameter>'
+    'PgArrayParameter<DbJsonParameter> | string'
   )
   assert.equal(
     parameterType(
@@ -219,13 +219,13 @@ test('parameter resolution is independent of result decoding and recursively use
         pgArrayElementType: pgCatalog('bigint', 'int8', 20),
       })
     ),
-    'PgArray<bigint | number | string>'
+    'PgArrayParameter<bigint | number | string> | string'
   )
   assert.deepEqual(resolveTypeScriptParameterTypeForPostgresType(enumArray), {
     ambientBindings: [],
     catalogImports: ['Audit_AccountStatus'],
-    scalarImports: ['PgArray'],
-    type: 'PgArray<Audit_AccountStatus>',
+    scalarImports: ['PgArrayParameter'],
+    type: 'PgArrayParameter<Audit_AccountStatus> | string',
   })
   assert.equal(
     parameterType({
@@ -248,7 +248,7 @@ test('parameter resolution is independent of result decoding and recursively use
         }),
       },
     }),
-    'PgArray<string>'
+    'PgArrayParameter<string> | string'
   )
   assert.equal(
     parameterType({
@@ -282,7 +282,7 @@ test('parameter resolution is independent of result decoding and recursively use
         pgArrayElementType: pgCatalog('oid', 'oid', 26),
       })
     ),
-    'PgArray<bigint | number | string>'
+    'PgArrayParameter<bigint | number | string> | string'
   )
   assert.equal(parameterType(pgCatalog('bytea', 'bytea', 17)), 'PgByteaHexString | Uint8Array')
   assert.deepEqual(
@@ -296,8 +296,8 @@ test('parameter resolution is independent of result decoding and recursively use
     {
       ambientBindings: [],
       catalogImports: [],
-      scalarImports: ['PgArray', 'PgByteaHexString'],
-      type: 'PgArray<PgByteaHexString>',
+      scalarImports: ['PgArrayParameter', 'PgByteaHexString'],
+      type: 'PgArrayParameter<PgByteaHexString> | string',
     }
   )
   assert.equal(parameterType(pgCatalog('interval', 'interval', 1186)), 'PgInterval | string')
@@ -309,7 +309,7 @@ test('parameter resolution is independent of result decoding and recursively use
         pgArrayElementType: pgCatalog('interval', 'interval', 1186),
       })
     ),
-    'PgArray<PgInterval | string>'
+    'PgArrayParameter<PgInterval | string> | string'
   )
   assert.equal(
     parameterType(
@@ -319,7 +319,7 @@ test('parameter resolution is independent of result decoding and recursively use
         pgArrayElementType: pgCatalog('date', 'date', 1082),
       })
     ),
-    'PgArray<Date | number | string>'
+    'PgArrayParameter<Date | number | string> | string'
   )
   assert.equal(
     parameterType(

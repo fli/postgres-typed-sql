@@ -11,16 +11,17 @@ export interface TypedSqlRowBounds {
   readonly proof: string
 }
 
-export interface TypedSqlQueryConfig<Row = unknown> {
+export interface TypedSqlQueryConfig {
   readonly name?: string
   readonly rowMode?: 'array'
   readonly text: string
-  readonly type?: Row
-  readonly values: readonly unknown[]
+  readonly values: unknown[]
 }
 
 export type TypedSqlRawRow = Readonly<Record<string, unknown>>
 export type TypedSqlArrayRow = readonly unknown[]
+
+declare const typedSqlStatementRow: unique symbol
 
 function isTypedSqlArrayRow(row: TypedSqlArrayRow | TypedSqlRawRow): row is TypedSqlArrayRow {
   return Array.isArray(row)
@@ -86,13 +87,15 @@ export interface TypedSqlStatement<
   readonly resultRowMode?: 'array'
   readonly rowBounds: TypedSqlRowBounds
   readonly text: string
-  readonly type?: Row
-  query(params: Params): TypedSqlQueryConfig<Row>
+  readonly [typedSqlStatementRow]?: Row
+  query(params: Params): TypedSqlQueryConfig
   values(params: Params): readonly unknown[]
 }
 
 export interface TypedSqlClient {
-  query<Row>(config: TypedSqlQueryConfig<Row>): Promise<{ readonly rowCount?: number | null; readonly rows: Row[] }>
+  query<Row = TypedSqlRawRow>(
+    config: TypedSqlQueryConfig
+  ): Promise<{ readonly rowCount?: number | null; readonly rows: Row[] }>
 }
 
 export interface TypedSqlDefinition<
@@ -110,7 +113,7 @@ export interface TypedSqlDefinition<
   readonly parameters?: readonly TypedSqlParameterMetadata[]
   readonly rowBounds?: TypedSqlRowBounds
   readonly text: string
-  readonly type?: Row
+  readonly [typedSqlStatementRow]?: Row
 }
 
 export function typedSqlAccessForCommand(command: TypedSqlCommandKind): TypedSqlAccessKind {
@@ -152,13 +155,11 @@ export function createTypedSqlStatement<
       proof: 'unspecified',
     },
     text: definition.text,
-    type: definition.type,
     query(params) {
       return {
         name: definition.name,
         text: definition.text,
-        type: definition.type,
-        values: this.values(params),
+        values: [...this.values(params)],
       }
     },
     values(params) {
@@ -277,7 +278,7 @@ export async function executeTypedSql<Params extends TypedSqlParams, Row>(
       name: statement.name,
       rowMode: 'array',
       text: statement.text,
-      values: statement.values(params),
+      values: [...statement.values(params)],
     })
     return mapTypedSqlRows(statement, result.rows)
   }
@@ -285,7 +286,7 @@ export async function executeTypedSql<Params extends TypedSqlParams, Row>(
   const result = await client.query<TypedSqlRawRow>({
     name: statement.name,
     text: statement.text,
-    values: statement.values(params),
+    values: [...statement.values(params)],
   })
   return mapTypedSqlRows(statement, result.rows)
 }
@@ -319,6 +320,6 @@ export async function executeTypedSqlCommand<Params extends TypedSqlParams, Row>
   statement: TypedSqlStatement<Params, Row>,
   params: Params
 ): Promise<number> {
-  const result = await client.query<Row>(statement.query(params))
+  const result = await client.query(statement.query(params))
   return typedSqlRowCount(result.rowCount)
 }

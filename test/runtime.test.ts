@@ -7,16 +7,16 @@ import {
   executeTypedSqlOptional,
   mapTypedSqlRow,
   typedSqlRowCount,
+  type TypedSqlClient,
   type TypedSqlQueryConfig,
+  type TypedSqlRawRow,
   type TypedSqlStatement,
 } from '../src/runtime.js'
 
-type QueryConfigRow<T> = T extends TypedSqlQueryConfig<infer Row> ? Row : never
 type IsExactly<Left, Right> =
   (<Value>() => Value extends Left ? 1 : 2) extends <Value>() => Value extends Right ? 1 : 2 ? true : false
 
 test('runtime binds named parameters in generated order', async () => {
-  const statementType = { email: 'type-only@example.test' }
   const statement = createTypedSqlStatement<{ readonly email: string }, { readonly email: string }>({
     cardinality: 'optional',
     columns: [
@@ -33,18 +33,35 @@ test('runtime binds named parameters in generated order', async () => {
     name: 'findAccount',
     parameterNames: ['email'],
     text: 'select email from accounts where email = $1',
-    type: statementType,
   })
 
   assert.deepEqual(statement.values({ email: 'reader@example.test' }), ['reader@example.test'])
   const rawQuery = statement.query({ email: 'reader@example.test' })
-  const queryUsesDeclaredRows: IsExactly<QueryConfigRow<typeof rawQuery>, { readonly email: string }> = true
-  assert.equal(queryUsesDeclaredRows, true)
-  assert.equal(rawQuery.type, statementType)
+  const secondRawQuery = statement.query({ email: 'reader@example.test' })
+  assert.notEqual(rawQuery.values, secondRawQuery.values)
+  assert.equal(Object.hasOwn(statement, 'type'), false)
+  assert.equal(Object.hasOwn(rawQuery, 'type'), false)
   assert.deepEqual(rawQuery.values, ['reader@example.test'])
+  rawQuery.values.push('mutable-driver-value')
+  assert.deepEqual(rawQuery.values, ['reader@example.test', 'mutable-driver-value'])
+
+  // @ts-expect-error A direct query config cannot claim the generated result row type.
+  void rawQuery.type
+
+  const directClient: TypedSqlClient = {
+    async query() {
+      return { rows: [] }
+    },
+  }
+  const directResult = directClient.query(rawQuery)
+  type DirectRow = Awaited<typeof directResult>['rows'][number]
+  void directResult
+  const directUsesUnknownValuedRows: IsExactly<DirectRow, TypedSqlRawRow> = true
+  assert.equal(directUsesUnknownValuedRows, true)
+
   const row = await executeTypedSqlOptional(
     {
-      async query<Row>(config: TypedSqlQueryConfig<Row>) {
+      async query<Row>(config: TypedSqlQueryConfig) {
         assert.deepEqual(config.values, ['reader@example.test'])
         assert.equal(config.rowMode, 'array')
         return {
@@ -56,6 +73,8 @@ test('runtime binds named parameters in generated order', async () => {
     statement,
     { email: 'reader@example.test' }
   )
+  const helperUsesDeclaredRow: IsExactly<typeof row, { readonly email: string } | null> = true
+  assert.equal(helperUsesDeclaredRow, true)
   assert.deepEqual(row, { email: 'reader@example.test' })
 })
 
@@ -114,7 +133,7 @@ test('runtime preserves an exact __proto__ output property from array rows witho
 
   const executed = await executeTypedSqlOptional(
     {
-      async query<Row>(config: TypedSqlQueryConfig<Row>) {
+      async query<Row>(config: TypedSqlQueryConfig) {
         assert.equal(config.rowMode, 'array')
         return { rows: [['executed']] as unknown as Row[] }
       },
@@ -144,7 +163,7 @@ test('runtime maps zero-column array rows to empty row objects', async () => {
   assert.deepEqual(
     await executeTypedSql(
       {
-        async query<Row>(config: TypedSqlQueryConfig<Row>) {
+        async query<Row>(config: TypedSqlQueryConfig) {
           assert.equal(config.rowMode, 'array')
           return { rows: [[], []] as unknown as Row[] }
         },
@@ -167,7 +186,7 @@ test('runtime preserves object rows when result-column metadata is omitted', asy
   assert.equal(statement.resultRowMode, undefined)
   const rows = await executeTypedSql(
     {
-      async query<Row>(config: TypedSqlQueryConfig<Row>) {
+      async query<Row>(config: TypedSqlQueryConfig) {
         assert.equal(config.rowMode, undefined)
         return { rows: [{ value: 1 }] as unknown as Row[] }
       },
@@ -200,7 +219,7 @@ test('runtime public statement contract preserves legacy custom object-row mappi
     name: 'structurallyCompatibleCustomStatement',
     parameterNames: [],
     parameters: [],
-    query: (): TypedSqlQueryConfig<CustomRow> => ({ text: 'select 1 as camel_value', values: [] }),
+    query: (): TypedSqlQueryConfig => ({ text: 'select 1 as camel_value', values: [] }),
     rowBounds: { max: null, min: 0, proof: 'custom' },
     text: 'select 1 as camel_value',
     values: () => [],
@@ -210,7 +229,7 @@ test('runtime public statement contract preserves legacy custom object-row mappi
   assert.deepEqual(
     await executeTypedSql(
       {
-        async query<Row>(config: TypedSqlQueryConfig<Row>) {
+        async query<Row>(config: TypedSqlQueryConfig) {
           assert.equal(config.rowMode, undefined)
           return { rows: [{ camel_value: 1 }] as unknown as Row[] }
         },

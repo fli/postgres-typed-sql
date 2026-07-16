@@ -23,8 +23,9 @@ assert.match(output, /readonly count: number/u)
 assert.doesNotMatch(output, /import type \{ URL \}/u)
 
 const echoBytes = await readFile('echo-bytes.typed-sql.ts', 'utf8')
-assert.match(echoBytes, /import type \{ PgArray, PgByteaHexString \}/u)
-assert.match(echoBytes, /readonly payloads: PgArray<PgByteaHexString>/u)
+assert.match(echoBytes, /import type \{ PgArray, PgArrayParameter, PgByteaHexString \}/u)
+assert.match(echoBytes, /readonly payloads: PgArrayParameter<PgByteaHexString> \| string/u)
+assert.match(echoBytes, /readonly payloads: PgArray<Uint8Array> \| null/u)
 
 const conservativeResult = await generateTypedSql({
   include: ['.'],

@@ -48,6 +48,7 @@ export const defaultPostgresScalarProfile: PostgresScalarProfile = 'conservative
 const scalarImportNames = new Set([
   'DbJsonParameter',
   'DbJsonSelected',
+  'PgArrayParameter',
   'PgByteaHexString',
   'PgCircle',
   'PgInt8String',
@@ -87,11 +88,19 @@ function uniqueImports(imports: readonly string[]): readonly string[] {
   return [...new Set(imports)]
 }
 
-function pgArrayResolution(element: PostgresTypeScriptResolution): PostgresTypeScriptResolution {
+function pgResultArrayResolution(element: PostgresTypeScriptResolution): PostgresTypeScriptResolution {
   return resolution(`PgArray<${element.type}>`, {
     ambientBindings: element.ambientBindings,
     catalogImports: element.catalogImports,
     scalarImports: uniqueImports(['PgArray', ...element.scalarImports]),
+  })
+}
+
+function pgParameterArrayResolution(element: PostgresTypeScriptResolution): PostgresTypeScriptResolution {
+  return resolution(`PgArrayParameter<${element.type}> | string`, {
+    ambientBindings: element.ambientBindings,
+    catalogImports: element.catalogImports,
+    scalarImports: uniqueImports(['PgArrayParameter', ...element.scalarImports]),
   })
 }
 
@@ -145,47 +154,47 @@ const nodePostgresTextResolutionByOid = new Map<number, PostgresTypeScriptResolu
   [23, resolution('number')], // int4
   [26, resolution('number')], // oid
   [114, resolution('DbJsonSelected')], // json
-  [199, pgArrayResolution(resolution('DbJsonSelected'))], // json[]
+  [199, pgResultArrayResolution(resolution('DbJsonSelected'))], // json[]
   [600, resolution('PgPoint')], // point
-  [651, pgArrayResolution(stringResolution)], // cidr[]
+  [651, pgResultArrayResolution(stringResolution)], // cidr[]
   [700, resolution('number')], // float4
   [701, resolution('number')], // float8
   [718, resolution('PgCircle')], // circle
-  [791, pgArrayResolution(stringResolution)], // money[]
-  [1000, pgArrayResolution(resolution('boolean'))], // bool[]
-  [1001, pgArrayResolution(byteaResolution)], // bytea[]
-  [1005, pgArrayResolution(resolution('number'))], // int2[]
-  [1007, pgArrayResolution(resolution('number'))], // int4[]
-  [1008, pgArrayResolution(stringResolution)], // regproc[]
-  [1009, pgArrayResolution(stringResolution)], // text[]
-  [1014, pgArrayResolution(stringResolution)], // bpchar[]
-  [1015, pgArrayResolution(stringResolution)], // varchar[]
-  [1016, pgArrayResolution(resolution('PgInt8String'))], // int8[]
-  [1017, pgArrayResolution(resolution('PgPoint'))], // point[]
-  [1021, pgArrayResolution(resolution('number'))], // float4[]
-  [1022, pgArrayResolution(resolution('number'))], // float8[]
-  [1028, pgArrayResolution(resolution('number'))], // oid[]
-  [1040, pgArrayResolution(stringResolution)], // macaddr[]
-  [1041, pgArrayResolution(stringResolution)], // inet[]
+  [791, pgResultArrayResolution(stringResolution)], // money[]
+  [1000, pgResultArrayResolution(resolution('boolean'))], // bool[]
+  [1001, pgResultArrayResolution(byteaResolution)], // bytea[]
+  [1005, pgResultArrayResolution(resolution('number'))], // int2[]
+  [1007, pgResultArrayResolution(resolution('number'))], // int4[]
+  [1008, pgResultArrayResolution(stringResolution)], // regproc[]
+  [1009, pgResultArrayResolution(stringResolution)], // text[]
+  [1014, pgResultArrayResolution(stringResolution)], // bpchar[]
+  [1015, pgResultArrayResolution(stringResolution)], // varchar[]
+  [1016, pgResultArrayResolution(resolution('PgInt8String'))], // int8[]
+  [1017, pgResultArrayResolution(resolution('PgPoint'))], // point[]
+  [1021, pgResultArrayResolution(resolution('number'))], // float4[]
+  [1022, pgResultArrayResolution(resolution('number'))], // float8[]
+  [1028, pgResultArrayResolution(resolution('number'))], // oid[]
+  [1040, pgResultArrayResolution(stringResolution)], // macaddr[]
+  [1041, pgResultArrayResolution(stringResolution)], // inet[]
   [1082, dateResultResolution], // date (number is +/-infinity)
   [1083, resolution('PgTimeString')], // time (identity text parser)
   [1114, dateResultResolution], // timestamp (number is +/-infinity)
-  [1115, pgArrayResolution(dateResultResolution)], // timestamp[]
-  [1182, pgArrayResolution(dateResultResolution)], // date[]
-  [1183, pgArrayResolution(resolution('PgTimeString'))], // time[]
+  [1115, pgResultArrayResolution(dateResultResolution)], // timestamp[]
+  [1182, pgResultArrayResolution(dateResultResolution)], // date[]
+  [1183, pgResultArrayResolution(resolution('PgTimeString'))], // time[]
   [1184, dateResultResolution], // timestamptz (number is +/-infinity)
-  [1185, pgArrayResolution(dateResultResolution)], // timestamptz[]
+  [1185, pgResultArrayResolution(dateResultResolution)], // timestamptz[]
   [1186, resolution('PgInterval')], // interval
-  [1187, pgArrayResolution(resolution('PgInterval'))], // interval[]
-  [1231, pgArrayResolution(resolution('number'))], // numeric[]
+  [1187, pgResultArrayResolution(resolution('PgInterval'))], // interval[]
+  [1231, pgResultArrayResolution(resolution('number'))], // numeric[]
   [1266, resolution('PgTimetzString')], // timetz (identity text parser)
-  [1270, pgArrayResolution(resolution('PgTimetzString'))], // timetz[]
+  [1270, pgResultArrayResolution(resolution('PgTimetzString'))], // timetz[]
   [1700, resolution('PgNumericString')], // numeric (identity text parser)
   [2950, resolution('PgUuidString')], // uuid (identity text parser)
-  [2951, pgArrayResolution(resolution('PgUuidString'))], // uuid[]
+  [2951, pgResultArrayResolution(resolution('PgUuidString'))], // uuid[]
   [3802, resolution('DbJsonSelected')], // jsonb
-  [3807, pgArrayResolution(resolution('DbJsonSelected'))], // jsonb[]
-  [3907, pgArrayResolution(stringResolution)], // numrange[]
+  [3807, pgResultArrayResolution(resolution('DbJsonSelected'))], // jsonb[]
+  [3907, pgResultArrayResolution(stringResolution)], // numrange[]
 ])
 
 const pgCatalogTypeAliases = new Map([
@@ -280,7 +289,7 @@ export function resolveTypeScriptParameterTypeForPostgresType(
       return stringResolution
     }
     return typeFact.pgArrayElementType
-      ? pgArrayResolution(resolveArrayElementParameterType(typeFact.pgArrayElementType, scalarProfile))
+      ? pgParameterArrayResolution(resolveArrayElementParameterType(typeFact.pgArrayElementType, scalarProfile))
       : unknownParameterResolution
   }
 
