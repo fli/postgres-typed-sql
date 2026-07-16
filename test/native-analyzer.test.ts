@@ -1535,6 +1535,53 @@ test('native analyzer closes protocol result I/O over externally emitted contain
     )`)
     await database.query('create table public.result_io_values (value public.result_io_mood)')
 
+    await database.query('alter function pg_catalog.enum_out(anyenum) volatile')
+    await database.query('alter function pg_catalog.enum_send(anyenum) volatile')
+    for (const [sql, expectedVolatile] of [
+      ["select '{}'::public.result_io_mood[] as value", false],
+      ["select '{NULL}'::public.result_io_mood[] as value", false],
+      ["select '{calm}'::public.result_io_mood[] as value", true],
+      ["select '(,{})'::public.result_io_envelope as value", false],
+      ["select '(,{NULL})'::public.result_io_envelope as value", false],
+      ["select '(calm,{NULL})'::public.result_io_envelope as value", true],
+      ["select 'empty'::public.result_io_mood_range as value", false],
+      ["select '(,)'::public.result_io_mood_range as value", false],
+      ["select '[calm,)'::public.result_io_mood_range as value", true],
+      ["select '{}'::public.result_io_mood_multirange as value", false],
+      ["select '{(,)}'::public.result_io_mood_multirange as value", false],
+      ["select '{[calm,)}'::public.result_io_mood_multirange as value", true],
+    ] as const) {
+      const analysis = await analyze(database, sql, [])
+      const query = analysis.statements[0]?.queries[0]
+
+      assert.equal(query?.targetList[0]?.expr.tag, 'Const', sql)
+      assert.equal(query?.hasVolatileFunctions, expectedVolatile, sql)
+      assert.equal((await database.query(sql)).rows.length, 1, sql)
+    }
+    await database.query('alter function pg_catalog.enum_send(anyenum) immutable')
+
+    await database.query('alter function pg_catalog.array_out(anyarray) volatile')
+    await database.query('alter function pg_catalog.array_send(anyarray) volatile')
+    for (const sql of [
+      "select '{}'::public.result_io_mood[] as value",
+      "select '{NULL}'::public.result_io_mood[] as value",
+    ]) {
+      const analysis = await analyze(database, sql, [])
+      assert.equal(analysis.statements[0]?.queries[0]?.hasVolatileFunctions, true, sql)
+    }
+    await database.query('alter function pg_catalog.array_out(anyarray) immutable')
+    await database.query('alter function pg_catalog.array_send(anyarray) immutable')
+
+    await database.query('alter function pg_catalog.int2out(smallint) volatile')
+    const vectorTextOutput = await analyze(database, "select '1 2'::int2vector as value", [])
+    assert.equal(vectorTextOutput.statements[0]?.queries[0]?.hasVolatileFunctions, false)
+    await database.query('alter function pg_catalog.int2out(smallint) immutable')
+
+    await database.query('alter function pg_catalog.int2send(smallint) volatile')
+    const vectorBinarySend = await analyze(database, "select '1 2'::int2vector as value", [])
+    assert.equal(vectorBinarySend.statements[0]?.queries[0]?.hasVolatileFunctions, true)
+    await database.query('alter function pg_catalog.int2send(smallint) immutable')
+
     const resultSql = [
       "select 'calm'::public.result_io_mood as value",
       "select 'calm'::public.result_io_mood_domain as value",
@@ -1549,7 +1596,6 @@ test('native analyzer closes protocol result I/O over externally emitted contain
       ) as value`,
     ] as const
 
-    await database.query('alter function pg_catalog.enum_out(anyenum) volatile')
     for (const sql of resultSql) {
       const analysis = await analyze(database, sql, [])
       assert.equal(analysis.statements[0]?.queries[0]?.hasVolatileFunctions, true, sql)
@@ -1825,6 +1871,198 @@ test('native analyzer skips unreachable scalar-array operator support for empty 
     assert.equal(volatileChild.statements[0]?.queries[0]?.hasVolatileFunctions, true)
     assert.deepEqual((await database.query(volatileChildSql)).rows, [{ result: false }])
     assert.deepEqual((await database.query('select kind from public.empty_saop_calls')).rows, [{ kind: 'child' }])
+  })
+})
+
+test('native analyzer selects only execution-reachable access-method support roles', async () => {
+  await withDatabase(async (database) => {
+    await installSortKeyOperatorClass(database, 'precision_sort_key', {
+      volatileComparator: false,
+      volatileEquality: false,
+    })
+    await database.query(`create function public.precision_sort_key_in_range(
+      value public.precision_sort_key,
+      base public.precision_sort_key,
+      offset_value public.precision_sort_key,
+      subtract boolean,
+      less boolean
+    ) returns boolean language plpgsql volatile strict as $$
+    begin
+      insert into public.precision_sort_key_calls default values;
+      return true;
+    end
+    $$`)
+    await database.query(`alter operator family public.precision_sort_key_ops
+      using btree add function 3 public.precision_sort_key_in_range(
+        public.precision_sort_key,
+        public.precision_sort_key,
+        public.precision_sort_key,
+        boolean,
+        boolean
+      )`)
+    await database.query('create table public.precision_sort_key_values (value public.precision_sort_key)')
+    await database.query(`insert into public.precision_sort_key_values(value)
+      values (row(1)::public.precision_sort_key), (row(2)::public.precision_sort_key)`)
+
+    const btreeSql = `select value
+      from public.precision_sort_key_values
+      where value operator(public.=) row(1)::public.precision_sort_key`
+    const unreachableInRange = await analyze(database, btreeSql, [])
+    assert.equal(unreachableInRange.statements[0]?.queries[0]?.hasVolatileFunctions, false)
+    assert.equal((await database.query(btreeSql)).rows.length, 1)
+    assert.deepEqual((await database.query('select called from public.precision_sort_key_calls')).rows, [])
+
+    await database.query(`create or replace function public.precision_sort_key_compare(
+      left_value public.precision_sort_key, right_value public.precision_sort_key
+    ) returns integer language plpgsql volatile strict as $$
+    begin
+      insert into public.precision_sort_key_calls default values;
+      return case
+        when (left_value).value < (right_value).value then -1
+        when (left_value).value > (right_value).value then 1
+        else 0
+      end;
+    end
+    $$`)
+    const reachableComparator = await analyze(database, btreeSql, [])
+    assert.equal(reachableComparator.statements[0]?.queries[0]?.hasVolatileFunctions, true)
+    await database.query('truncate public.precision_sort_key_calls')
+    assert.equal((await database.query(btreeSql)).rows.length, 1)
+    await database.query(`select value
+      from public.precision_sort_key_values
+      order by value`)
+    assert.deepEqual(
+      (
+        await database.query<{ called: boolean }>(`select exists(
+          select 1 from public.precision_sort_key_calls
+        ) as called`)
+      ).rows,
+      [{ called: true }]
+    )
+
+    await database.query('create table public.ssort_left (value integer)')
+    await database.query('create table public.ssort_right (value integer)')
+    await database.query('insert into public.ssort_left values (1), (2)')
+    await database.query('insert into public.ssort_right values (2), (3)')
+    await database.query('alter function pg_catalog.btint4sortsupport(internal) volatile')
+    const sortSupportSql = `select left_value.value
+      from public.ssort_left left_value
+      join public.ssort_right right_value on left_value.value = right_value.value`
+    const reachableSortSupport = await analyze(database, sortSupportSql, [])
+    assert.equal(reachableSortSupport.statements[0]?.queries[0]?.hasVolatileFunctions, true)
+    await database.query('set enable_hashjoin = off')
+    await database.query('set enable_nestloop = off')
+    assert.deepEqual((await database.query(sortSupportSql)).rows, [{ value: 2 }])
+    await database.query('alter function pg_catalog.btint4sortsupport(internal) immutable')
+    await database.query('set enable_hashjoin = on')
+    await database.query('set enable_nestloop = on')
+
+    await database.query('create type public.direction_left as (value integer)')
+    await database.query('create type public.direction_right as (value integer)')
+    await database.query('create table public.direction_calls (called boolean default true)')
+    await database.query(`create function public.direction_equal(
+      left_value public.direction_left, right_value public.direction_right
+    ) returns boolean language sql immutable strict as $$
+      select (left_value).value = (right_value).value
+    $$`)
+    await database.query(`create function public.direction_compare(
+      left_value public.direction_left, right_value public.direction_right
+    ) returns integer language sql immutable strict as $$
+      select case
+        when (left_value).value < (right_value).value then -1
+        when (left_value).value > (right_value).value then 1
+        else 0
+      end
+    $$`)
+    await database.query(`create function public.direction_reverse_compare(
+      left_value public.direction_right, right_value public.direction_left
+    ) returns integer language plpgsql volatile strict as $$
+    begin
+      insert into public.direction_calls default values;
+      return case
+        when (left_value).value < (right_value).value then -1
+        when (left_value).value > (right_value).value then 1
+        else 0
+      end;
+    end
+    $$`)
+    await database.query(`create operator public.=~ (
+      leftarg = public.direction_left,
+      rightarg = public.direction_right,
+      function = public.direction_equal
+    )`)
+    await database.query('create operator family public.direction_ops using btree')
+    await database.query(`alter operator family public.direction_ops using btree add
+      operator 3 public.=~ (public.direction_left, public.direction_right),
+      function 1 public.direction_compare(public.direction_left, public.direction_right),
+      function 1 public.direction_reverse_compare(public.direction_right, public.direction_left)`)
+    await database.query('create table public.direction_values (value public.direction_left)')
+    await database.query('insert into public.direction_values values (row(1)::public.direction_left)')
+    const directionalSql = `select value
+      from public.direction_values
+      where value operator(public.=~) row(1)::public.direction_right`
+    const directional = await analyze(database, directionalSql, [])
+    assert.equal(directional.statements[0]?.queries[0]?.hasVolatileFunctions, false)
+    assert.equal((await database.query(directionalSql)).rows.length, 1)
+    assert.deepEqual((await database.query('select called from public.direction_calls')).rows, [])
+
+    await database.query('create type public.extended_hash_key as (value integer)')
+    await database.query('create table public.extended_hash_key_calls (called boolean default true)')
+    await database.query(`create function public.extended_hash_key_equal(
+      left_value public.extended_hash_key, right_value public.extended_hash_key
+    ) returns boolean language sql immutable strict as $$
+      select (left_value).value = (right_value).value
+    $$`)
+    await database.query(`create function public.extended_hash_key_hash(value public.extended_hash_key)
+      returns integer language sql immutable strict as $$
+        select pg_catalog.hashint4((value).value)
+      $$`)
+    await database.query(`create function public.extended_hash_key_hash_extended(
+      value public.extended_hash_key, seed bigint
+    ) returns bigint language plpgsql volatile strict as $$
+    begin
+      insert into public.extended_hash_key_calls default values;
+      return pg_catalog.hashint4extended((value).value, seed);
+    end
+    $$`)
+    await database.query(`create operator public.= (
+      leftarg = public.extended_hash_key,
+      rightarg = public.extended_hash_key,
+      function = public.extended_hash_key_equal,
+      hashes
+    )`)
+    await database.query(`create operator class public.extended_hash_key_ops
+      default for type public.extended_hash_key using hash as
+        operator 1 public.=,
+        function 1 public.extended_hash_key_hash(public.extended_hash_key),
+        function 2 public.extended_hash_key_hash_extended(public.extended_hash_key, bigint)`)
+    await database.query(`create table public.extended_hash_values (
+      value public.extended_hash_key
+    ) partition by hash(value)`)
+    await database.query(`create table public.extended_hash_values_zero
+      partition of public.extended_hash_values for values with (modulus 2, remainder 0)`)
+    await database.query(`create table public.extended_hash_values_one
+      partition of public.extended_hash_values for values with (modulus 2, remainder 1)`)
+    await database.query(`insert into public.extended_hash_values
+      values (row(1)::public.extended_hash_key), (row(2)::public.extended_hash_key)`)
+    await database.query('truncate public.extended_hash_key_calls')
+
+    const extendedHashSql = `select value
+      from public.extended_hash_values
+      where value operator(public.=) row(1)::public.extended_hash_key`
+    const reachableExtendedHash = await analyze(database, extendedHashSql, [])
+    assert.equal(reachableExtendedHash.statements[0]?.queries[0]?.hasVolatileFunctions, true)
+    assert.equal((await database.query(extendedHashSql)).rows.length, 1)
+    await database.query(`insert into public.extended_hash_values
+      values (row(3)::public.extended_hash_key)`)
+    assert.deepEqual(
+      (
+        await database.query<{ called: boolean }>(`select exists(
+          select 1 from public.extended_hash_key_calls
+        ) as called`)
+      ).rows,
+      [{ called: true }]
+    )
   })
 })
 

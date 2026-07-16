@@ -1,5 +1,7 @@
 #include "postgres.h"
 
+#include "access/hash.h"
+#include "access/htup_details.h"
 #include "access/nbtree.h"
 #include "access/table.h"
 #include "catalog/pg_aggregate.h"
@@ -35,6 +37,8 @@
 #include "utils/jsonfuncs.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
+#include "utils/multirangetypes.h"
+#include "utils/rangetypes.h"
 #include "utils/rel.h"
 #include "utils/relcache.h"
 #include "utils/syscache.h"
@@ -5498,6 +5502,220 @@ direct_type_io_invokes_volatile(Oid type_oid, RuntimeTypeIoKind kind)
 static RuntimeTypeIoResult result_expression_io_invokes_volatile(
   const Node *expression, RuntimeTypeIoKind kind);
 
+typedef struct RuntimeTypeIoValueContext
+{
+  int depth;
+} RuntimeTypeIoValueContext;
+
+static bool
+array_value_io_invokes_element_io(Oid array_type, RuntimeTypeIoKind kind)
+{
+  /*
+   * int2vectorout and oidvectorout format their values directly, while their
+   * send functions delegate to array_send.
+   */
+  return kind == RUNTIME_TYPE_IO_BINARY_SEND ||
+         (array_type != INT2VECTOROID && array_type != OIDVECTOROID);
+}
+
+static RuntimeTypeIoResult
+datum_io_invokes_volatile(Datum value, bool is_null, Oid type_oid,
+                          int32 typmod, RuntimeTypeIoKind kind,
+                          RuntimeTypeIoValueContext *context)
+{
+  RuntimeTypeIoResult direct_result;
+  Oid base_type;
+  Oid element_type;
+  char type_kind;
+
+  if (is_null)
+  {
+    return runtime_type_io_result(true, false);
+  }
+  if (!OidIsValid(type_oid) || context->depth >= MAX_RUNTIME_TYPE_SUPPORT_DEPTH)
+  {
+    return runtime_type_io_result(true, true);
+  }
+
+  direct_result = direct_type_io_invokes_volatile(type_oid, kind);
+  if (!direct_result.supported || direct_result.invokes_volatile)
+  {
+    return direct_result;
+  }
+  if (!runtime_type_io_is_output(kind))
+  {
+    return runtime_type_io_result(true, true);
+  }
+
+  base_type = getBaseTypeAndTypmod(type_oid, &typmod);
+  if (!OidIsValid(base_type))
+  {
+    return runtime_type_io_result(true, true);
+  }
+  element_type = get_element_type(base_type);
+  type_kind = get_typtype(base_type);
+  context->depth++;
+
+  if (OidIsValid(element_type) &&
+      array_value_io_invokes_element_io(base_type, kind))
+  {
+    ArrayType *array = DatumGetArrayTypeP(value);
+    Datum *element_values;
+    bool *element_nulls;
+    int element_count;
+    int16 element_length;
+    bool element_by_value;
+    char element_alignment;
+    int index;
+
+    if (ARR_ELEMTYPE(array) != element_type)
+    {
+      context->depth--;
+      return runtime_type_io_result(true, true);
+    }
+    get_typlenbyvalalign(element_type, &element_length, &element_by_value,
+                        &element_alignment);
+    deconstruct_array(array, element_type, element_length, element_by_value,
+                      element_alignment, &element_values, &element_nulls,
+                      &element_count);
+    for (index = 0; index < element_count; index++)
+    {
+      RuntimeTypeIoResult element_result = datum_io_invokes_volatile(
+        element_values[index], element_nulls[index], element_type, -1, kind,
+        context);
+
+      if (!element_result.supported || element_result.invokes_volatile)
+      {
+        pfree(element_values);
+        pfree(element_nulls);
+        context->depth--;
+        return element_result;
+      }
+    }
+    pfree(element_values);
+    pfree(element_nulls);
+  }
+  else if (type_kind == TYPTYPE_COMPOSITE || base_type == RECORDOID)
+  {
+    HeapTupleHeader record = DatumGetHeapTupleHeader(value);
+    Oid record_type = HeapTupleHeaderGetTypeId(record);
+    int32 record_typmod = HeapTupleHeaderGetTypMod(record);
+    TupleDesc descriptor = lookup_rowtype_tupdesc(record_type, record_typmod);
+    HeapTupleData tuple;
+    Datum *field_values;
+    bool *field_nulls;
+    int index;
+
+    tuple.t_len = HeapTupleHeaderGetDatumLength(record);
+    ItemPointerSetInvalid(&tuple.t_self);
+    tuple.t_tableOid = InvalidOid;
+    tuple.t_data = record;
+    field_values = palloc(sizeof(Datum) * descriptor->natts);
+    field_nulls = palloc(sizeof(bool) * descriptor->natts);
+    heap_deform_tuple(&tuple, descriptor, field_values, field_nulls);
+
+    for (index = 0; index < descriptor->natts; index++)
+    {
+      Form_pg_attribute attribute = TupleDescAttr(descriptor, index);
+      RuntimeTypeIoResult field_result;
+
+      if (attribute->attisdropped || field_nulls[index])
+      {
+        continue;
+      }
+      field_result = datum_io_invokes_volatile(
+        field_values[index], false, attribute->atttypid, attribute->atttypmod,
+        kind, context);
+      if (!field_result.supported || field_result.invokes_volatile)
+      {
+        pfree(field_values);
+        pfree(field_nulls);
+        ReleaseTupleDesc(descriptor);
+        context->depth--;
+        return field_result;
+      }
+    }
+    pfree(field_values);
+    pfree(field_nulls);
+    ReleaseTupleDesc(descriptor);
+  }
+  else if (type_kind == TYPTYPE_RANGE)
+  {
+    RangeType *range = DatumGetRangeTypeP(value);
+    TypeCacheEntry *type_cache = lookup_type_cache(
+      RangeTypeGetOid(range), TYPECACHE_RANGE_INFO);
+    RangeBound lower;
+    RangeBound upper;
+    bool empty;
+
+    if (type_cache->rngelemtype == NULL)
+    {
+      context->depth--;
+      return runtime_type_io_result(true, true);
+    }
+    range_deserialize(type_cache, range, &lower, &upper, &empty);
+    if (!empty && !lower.infinite)
+    {
+      RuntimeTypeIoResult lower_result = datum_io_invokes_volatile(
+        lower.val, false, type_cache->rngelemtype->type_id, -1, kind, context);
+
+      if (!lower_result.supported || lower_result.invokes_volatile)
+      {
+        context->depth--;
+        return lower_result;
+      }
+    }
+    if (!empty && !upper.infinite)
+    {
+      RuntimeTypeIoResult upper_result = datum_io_invokes_volatile(
+        upper.val, false, type_cache->rngelemtype->type_id, -1, kind, context);
+
+      if (!upper_result.supported || upper_result.invokes_volatile)
+      {
+        context->depth--;
+        return upper_result;
+      }
+    }
+  }
+  else if (type_kind == TYPTYPE_MULTIRANGE)
+  {
+    MultirangeType *multirange = DatumGetMultirangeTypeP(value);
+    TypeCacheEntry *type_cache = lookup_type_cache(
+      MultirangeTypeGetOid(multirange), TYPECACHE_MULTIRANGE_INFO);
+    RangeType **ranges;
+    int32 range_count;
+    int32 index;
+
+    if (type_cache->rngtype == NULL)
+    {
+      context->depth--;
+      return runtime_type_io_result(true, true);
+    }
+    multirange_deserialize(type_cache->rngtype, multirange, &range_count,
+                           &ranges);
+    for (index = 0; index < range_count; index++)
+    {
+      RuntimeTypeIoResult range_result = datum_io_invokes_volatile(
+        RangeTypePGetDatum(ranges[index]), false,
+        type_cache->rngtype->type_id, -1, kind, context);
+
+      if (!range_result.supported || range_result.invokes_volatile)
+      {
+        pfree(ranges);
+        context->depth--;
+        return range_result;
+      }
+    }
+    if (ranges != NULL)
+    {
+      pfree(ranges);
+    }
+  }
+
+  context->depth--;
+  return runtime_type_io_result(true, false);
+}
+
 static RuntimeTypeIoResult
 array_expression_elements_io_invoke_volatile(const ArrayExpr *array,
                                              RuntimeTypeIoKind kind)
@@ -5540,14 +5758,19 @@ result_expression_io_invokes_volatile(const Node *expression,
                                       RuntimeTypeIoKind kind)
 {
   RuntimeTypeIoContext context = {0};
+  RuntimeTypeIoValueContext value_context = {0};
 
   if (expression == NULL)
   {
     return runtime_type_io_result(true, true);
   }
-  if (IsA(expression, Const) && ((const Const *) expression)->constisnull)
+  if (IsA(expression, Const))
   {
-    return runtime_type_io_result(true, false);
+    const Const *constant = (const Const *) expression;
+
+    return datum_io_invokes_volatile(
+      constant->constvalue, constant->constisnull, constant->consttype,
+      constant->consttypmod, kind, &value_context);
   }
   if (IsA(expression, ArrayExpr))
   {
@@ -5767,16 +5990,24 @@ static bool
 operator_family_support_type_pair_is_relevant(const Form_pg_amop operator_form,
                                               const Form_pg_amproc support_form)
 {
-  if (operator_form->amopmethod != BTREE_AM_OID &&
-      operator_form->amopmethod != HASH_AM_OID)
+  if (operator_form->amopmethod == BTREE_AM_OID)
   {
-    return true;
+    return (support_form->amprocnum == BTORDER_PROC ||
+            support_form->amprocnum == BTSORTSUPPORT_PROC) &&
+           support_form->amproclefttype == operator_form->amoplefttype &&
+           support_form->amprocrighttype == operator_form->amoprighttype;
+  }
+  if (operator_form->amopmethod == HASH_AM_OID)
+  {
+    return (support_form->amprocnum == HASHSTANDARD_PROC ||
+            support_form->amprocnum == HASHEXTENDED_PROC) &&
+           support_form->amproclefttype == support_form->amprocrighttype &&
+           (support_form->amproclefttype == operator_form->amoplefttype ||
+            support_form->amproclefttype == operator_form->amoprighttype);
   }
 
-  return (support_form->amproclefttype == operator_form->amoplefttype ||
-          support_form->amproclefttype == operator_form->amoprighttype) &&
-         (support_form->amprocrighttype == operator_form->amoplefttype ||
-          support_form->amprocrighttype == operator_form->amoprighttype);
+  /* Unknown access methods keep their existing conservative closure. */
+  return true;
 }
 
 static bool
