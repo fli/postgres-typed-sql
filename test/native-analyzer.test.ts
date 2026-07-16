@@ -63,7 +63,11 @@ interface NativeDmlParameterTarget {
 }
 
 interface NativeExpr {
+  readonly args?: readonly NativeExpr[]
   readonly attname?: string | null
+  readonly elements?: readonly NativeExpr[]
+  readonly funcVariadic?: boolean
+  readonly multidims?: boolean
   readonly relname?: string | null
   readonly rteKind?: string
   readonly subLinkType?: string
@@ -825,6 +829,32 @@ test('native analyzer closes JSON conversion over casts, arrays, constructors, a
       const analysis = await analyze(database, sql, [])
       assert.equal(analysis.statements[0]?.queries[0]?.hasVolatileFunctions, false, sql)
     }
+  })
+})
+
+test('native analyzer preserves explicit variadic function-call structure', async () => {
+  await withDatabase(async (database) => {
+    const literalSql = "select jsonb_build_object(variadic array['answer', '42']) as payload"
+    const literalAnalysis = await analyze(database, literalSql, [])
+    const literalCall = literalAnalysis.statements[0]?.queries[0]?.targetList[0]?.expr
+    assert.equal(literalCall?.tag, 'FuncExpr')
+    assert.equal(literalCall?.funcVariadic, true)
+    assert.equal(literalCall?.args?.length, 1)
+    assert.equal(literalCall?.args?.[0]?.tag, 'ArrayExpr')
+    assert.equal(literalCall?.args?.[0]?.multidims, false)
+    assert.equal(literalCall?.args?.[0]?.elements?.length, 2)
+    assert.deepEqual((await database.query(literalSql)).rows, [{ payload: { answer: '42' } }])
+
+    const dynamicAnalysis = await analyze(database, 'select jsonb_build_object(variadic $1)', [1009])
+    const dynamicCall = dynamicAnalysis.statements[0]?.queries[0]?.targetList[0]?.expr
+    assert.equal(dynamicCall?.funcVariadic, true)
+    assert.equal(dynamicCall?.args?.length, 1)
+    assert.equal(dynamicCall?.args?.[0]?.tag, 'Param')
+
+    const flatCall = (await analyze(database, "select jsonb_build_object('answer', '42')", [])).statements[0]
+      ?.queries[0]?.targetList[0]?.expr
+    assert.equal(flatCall?.funcVariadic, false)
+    assert.equal(flatCall?.args?.length, 2)
   })
 })
 

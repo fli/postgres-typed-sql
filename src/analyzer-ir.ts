@@ -233,7 +233,9 @@ interface PgAnalyzerExpr {
   readonly expr?: PgAnalyzerExpr | null
   readonly funcid?: number
   readonly funcname?: string
+  readonly funcVariadic?: boolean
   readonly inputCollationOid?: number
+  readonly multidims?: boolean
   readonly nullTestType?: string
   readonly opfuncid?: number
   readonly opno?: number
@@ -1512,6 +1514,27 @@ function isEmptyJsonArrayConst(expr: PgAnalyzerExpr | null | undefined): boolean
   return unwrapped?.constEmptyJsonArray === true || constStringValue(unwrapped) === '[]'
 }
 
+function jsonBuildObjectArguments(expr: PgAnalyzerExpr): readonly PgAnalyzerExpr[] | null {
+  const args = expr.args?.map(targetExprFromAggregateArg)
+  if (!args || args.some((arg) => !arg)) {
+    return null
+  }
+
+  let objectArgs = args as readonly PgAnalyzerExpr[]
+  if (expr.funcVariadic === true) {
+    if (objectArgs.length !== 1) {
+      return null
+    }
+    const array = unwrapTransparentExpr(objectArgs[0])
+    if (!array || array.tag !== 'ArrayExpr' || array.multidims === true || !array.elements) {
+      return null
+    }
+    objectArgs = array.elements
+  }
+
+  return objectArgs.length % 2 === 0 ? objectArgs : null
+}
+
 function targetExprFromAggregateArg(
   arg: PgAnalyzerExpr | { readonly expr?: PgAnalyzerExpr | null } | undefined
 ): PgAnalyzerExpr | null | undefined {
@@ -1643,7 +1666,13 @@ function inferJsonShape(
     (isBuiltinPgProcNamed(catalog, unwrapped.funcid, 'jsonb_build_object') ||
       isBuiltinPgProcNamed(catalog, unwrapped.funcid, 'json_build_object'))
   ) {
-    const args = unwrapped.args ?? []
+    const args = jsonBuildObjectArguments(unwrapped)
+    if (!args) {
+      return {
+        kind: 'opaque',
+        nullable: expressionNullable(catalog, scope, unwrapped, refinements),
+      }
+    }
     const fields = new Map<string, TypedSqlPostgresIrJsonField>()
     for (let index = 0; index + 1 < args.length; index += 2) {
       const keyExpr = args[index]

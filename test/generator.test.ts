@@ -1467,6 +1467,45 @@ from (
   assert.doesNotMatch(output, /readonly payload: DbJsonSelected/u)
 })
 
+test('generates build-object contracts only from proven complete argument lists', async () => {
+  const root = await createMinimalFixture(
+    'select 1;\n',
+    `select jsonb_build_object(variadic array['answer', '42']) as payload
+`
+  )
+  const config = {
+    include: ['queries'],
+    rootDir: root,
+    scalarProfile: 'node-postgres' as const,
+    schema: 'schema.sql',
+  }
+  const queryFile = join(root, 'queries/query.typed.sql')
+  const outputFile = join(root, 'queries/query.typed-sql.ts')
+
+  await generateTypedSql(config)
+  let output = await readFile(outputFile, 'utf8')
+  assert.match(output, /interface QueryJ7_payloadJson \{[\s\S]*readonly answer: string/u)
+  assert.match(output, /readonly payload: QueryJ7_payloadJson/u)
+  assert.doesNotMatch(output, /readonly payload: DbJsonSelected/u)
+
+  await writeFile(
+    queryFile,
+    `-- @param entries text[]
+select jsonb_build_object(variadic :entries) as payload
+`
+  )
+  await generateTypedSql(config)
+  output = await readFile(outputFile, 'utf8')
+  assert.match(output, /readonly payload: DbJsonSelected/u)
+  assert.doesNotMatch(output, /interface QueryJ7_payloadJson/u)
+
+  await writeFile(queryFile, "select jsonb_build_object('unpaired') as payload\n")
+  await generateTypedSql(config)
+  output = await readFile(outputFile, 'utf8')
+  assert.match(output, /readonly payload: DbJsonSelected/u)
+  assert.doesNotMatch(output, /interface QueryJ7_payloadJson/u)
+})
+
 test('terminates recursive CTE nullability inference from pass-through seed facts', async () => {
   const root = await createMinimalFixture(
     'select 1;\n',

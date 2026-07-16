@@ -3261,6 +3261,7 @@ append_expr_specific_fields(StringInfo out, const QueryScope *scope, const Node 
       const FuncExpr *func = (const FuncExpr *) expr;
       append_oid_field(out, "funcid", func->funcid);
       append_optional_name_field(out, "funcname", OidIsValid(func->funcid) ? get_func_name(func->funcid) : NULL);
+      append_bool_field(out, "funcVariadic", func->funcvariadic);
       append_bool_field(out, "returnsSet", func->funcretset);
       break;
     }

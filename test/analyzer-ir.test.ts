@@ -26,6 +26,41 @@ function config(
   }
 }
 
+test('infers build-object shapes only from proven complete argument lists', async () => {
+  const database = await createAnalysisDatabase({ schemaFiles: [schemaFile] })
+  try {
+    const result = await buildTypedSqlPostgresIrFromCompiledConfigs(database, [
+      config('literalVariadicJson', "select json_build_object(variadic array['answer', '42']) as payload"),
+      config('dynamicVariadicJson', 'select jsonb_build_object(variadic $1) as payload', ['entries'], ['text[]']),
+      config('oddBuildObject', "select jsonb_build_object('unpaired') as payload"),
+    ])
+    const query = (name: string): TypedSqlPostgresIr => {
+      const resolved = result.queries.find((candidate) => candidate.name === name)
+      assert.ok(resolved, `expected ${name}`)
+      return resolved
+    }
+
+    const literalShape = query('literalVariadicJson').resultColumns[0]?.jsonShape
+    assert.equal(literalShape?.kind, 'object')
+    if (literalShape?.kind === 'object') {
+      assert.equal(literalShape.fields.length, 1)
+      assert.equal(literalShape.fields[0]?.name, 'answer')
+      assert.equal(literalShape.fields[0]?.shape.kind, 'scalar')
+      if (literalShape.fields[0]?.shape.kind === 'scalar') {
+        assert.equal(literalShape.fields[0].shape.pgTypeName, 'text')
+      }
+    }
+    assert.equal(query('dynamicVariadicJson').resultColumns[0]?.jsonShape?.kind, 'opaque')
+    assert.equal(query('oddBuildObject').resultColumns[0]?.jsonShape?.kind, 'opaque')
+    assert.deepEqual(
+      (await database.query("select json_build_object(variadic array['answer', '42']) as payload")).rows,
+      [{ payload: { answer: '42' } }]
+    )
+  } finally {
+    await database.close()
+  }
+})
+
 test('normalizes PostgreSQL statement, nullability, DML, and cardinality facts conservatively', async () => {
   const database = await createAnalysisDatabase({ schemaFiles: [schemaFile] })
   try {
