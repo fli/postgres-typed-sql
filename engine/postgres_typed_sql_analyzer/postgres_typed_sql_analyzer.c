@@ -22,6 +22,8 @@
 #include "nodes/parsenodes.h"
 #include "nodes/primnodes.h"
 #include "nodes/value.h"
+#include "optimizer/clauses.h"
+#include "optimizer/optimizer.h"
 #include "parser/parsetree.h"
 #include "tcop/tcopprot.h"
 #include "utils/array.h"
@@ -47,7 +49,8 @@ typedef struct QueryScope QueryScope;
 static void append_expr_node(StringInfo out, const QueryScope *scope, const Node *expr, int depth);
 static void append_query_summary(StringInfo out, const Query *query,
                                  const QueryScope *parent_scope, int depth,
-                                 bool protocol_output);
+                                 bool protocol_output,
+                                 bool bind_io_invokes_volatile);
 static void append_from_node(StringInfo out, const QueryScope *scope, const Node *node, int depth);
 static void append_rtable(StringInfo out, const QueryScope *scope, int depth);
 static void append_set_operation(StringInfo out, const Node *node);
@@ -3450,7 +3453,7 @@ append_expr_node(StringInfo out, const QueryScope *scope, const Node *expr, int 
       {
         appendStringInfoString(out, ",\"subquery\":");
         append_query_summary(out, (const Query *) sublink->subselect, scope,
-                             depth - 1, false);
+                             depth - 1, false, false);
       }
       else
       {
@@ -3495,7 +3498,7 @@ append_cte_list(StringInfo out, const QueryScope *scope, int depth)
       appendStringInfoString(out, ",\"commandType\":");
       append_json_string(out, command_type_name(cte_query->commandType));
       appendStringInfoString(out, ",\"query\":");
-      append_query_summary(out, cte_query, scope, depth - 1, false);
+      append_query_summary(out, cte_query, scope, depth - 1, false, false);
     }
     appendStringInfoChar(out, '}');
   }
@@ -3668,7 +3671,7 @@ append_rtable(StringInfo out, const QueryScope *scope, int depth)
     if (rte->rtekind == RTE_SUBQUERY && rte->subquery != NULL && depth > 0)
     {
       appendStringInfoString(out, ",\"subquery\":");
-      append_query_summary(out, rte->subquery, scope, depth - 1, false);
+      append_query_summary(out, rte->subquery, scope, depth - 1, false, false);
     }
     appendStringInfoChar(out, '}');
     index++;
@@ -3780,14 +3783,24 @@ function_is_volatile(Oid function_oid)
   return result;
 }
 
+typedef enum AggregateExecutionProfile
+{
+  AGG_EXECUTION_NONWINDOW,
+  AGG_EXECUTION_WINDOW_ORDINARY,
+  AGG_EXECUTION_WINDOW_MOVING,
+  AGG_EXECUTION_WINDOW_UNRESOLVED
+} AggregateExecutionProfile;
+
 static bool
 aggregate_invokes_volatile_function(Oid aggregate_oid, const List *args,
-                                    bool target_entries, bool window_aggregate,
+                                    bool target_entries,
+                                    AggregateExecutionProfile execution,
                                     Oid result_type, int32 result_typmod)
 {
   HeapTuple tuple;
   Form_pg_aggregate aggregate;
   Oid support_function_oids[5];
+  int support_function_count = 0;
   int index;
 
   tuple = SearchSysCache1(AGGFNOID, ObjectIdGetDatum(aggregate_oid));
@@ -3797,20 +3810,29 @@ aggregate_invokes_volatile_function(Oid aggregate_oid, const List *args,
   }
 
   aggregate = (Form_pg_aggregate) GETSTRUCT(tuple);
-  support_function_oids[0] = aggregate->aggtransfn;
-  support_function_oids[1] = aggregate->aggfinalfn;
-  support_function_oids[2] = window_aggregate
-                                ? aggregate->aggmtransfn
-                                : aggregate->aggcombinefn;
-  support_function_oids[3] = window_aggregate
-                                ? aggregate->aggminvtransfn
-                                : aggregate->aggserialfn;
-  support_function_oids[4] = window_aggregate
-                                ? aggregate->aggmfinalfn
-                                : aggregate->aggdeserialfn;
+  if (execution == AGG_EXECUTION_NONWINDOW ||
+      execution == AGG_EXECUTION_WINDOW_ORDINARY ||
+      execution == AGG_EXECUTION_WINDOW_UNRESOLVED)
+  {
+    support_function_oids[support_function_count++] = aggregate->aggtransfn;
+    support_function_oids[support_function_count++] = aggregate->aggfinalfn;
+  }
+  if (execution == AGG_EXECUTION_NONWINDOW)
+  {
+    support_function_oids[support_function_count++] = aggregate->aggcombinefn;
+    support_function_oids[support_function_count++] = aggregate->aggserialfn;
+    support_function_oids[support_function_count++] = aggregate->aggdeserialfn;
+  }
+  else if (execution == AGG_EXECUTION_WINDOW_MOVING ||
+           execution == AGG_EXECUTION_WINDOW_UNRESOLVED)
+  {
+    support_function_oids[support_function_count++] = aggregate->aggmtransfn;
+    support_function_oids[support_function_count++] = aggregate->aggminvtransfn;
+    support_function_oids[support_function_count++] = aggregate->aggmfinalfn;
+  }
   ReleaseSysCache(tuple);
 
-  for (index = 0; index < lengthof(support_function_oids); index++)
+  for (index = 0; index < support_function_count; index++)
   {
     Oid function_oid = support_function_oids[index];
 
@@ -3823,6 +3845,97 @@ aggregate_invokes_volatile_function(Oid aggregate_oid, const List *args,
     }
   }
   return false;
+}
+
+static const WindowClause *
+window_clause_for_function(const WindowFunc *function,
+                           const QueryScope *scope)
+{
+  ListCell *cell;
+
+  if (scope == NULL || scope->query == NULL)
+  {
+    return NULL;
+  }
+  foreach(cell, scope->query->windowClause)
+  {
+    const WindowClause *window = lfirst_node(WindowClause, cell);
+
+    if (window->winref == function->winref)
+    {
+      return window;
+    }
+  }
+  return NULL;
+}
+
+static bool
+window_function_arguments_contain_volatile(const WindowFunc *function)
+{
+  return function_is_volatile(function->winfnoid) ||
+         contain_volatile_functions((Node *) function->args) ||
+         contain_volatile_functions((Node *) function->aggfilter);
+}
+
+static bool
+window_function_arguments_contain_subplans(const WindowFunc *function)
+{
+  return contain_subplans((Node *) function->args) ||
+         contain_subplans((Node *) function->aggfilter);
+}
+
+static AggregateExecutionProfile
+window_aggregate_execution_profile(const WindowFunc *function,
+                                   const QueryScope *scope)
+{
+  HeapTuple tuple;
+  Form_pg_aggregate aggregate;
+  const WindowClause *window;
+  AggregateExecutionProfile execution;
+
+  tuple = SearchSysCache1(AGGFNOID, ObjectIdGetDatum(function->winfnoid));
+  if (!HeapTupleIsValid(tuple))
+  {
+    elog(ERROR, "cache lookup failed for aggregate %u", function->winfnoid);
+  }
+  aggregate = (Form_pg_aggregate) GETSTRUCT(tuple);
+
+  /*
+   * Keep this ordering synchronized with initialize_peragg() in
+   * nodeWindowAgg.c.  Moving-final safety can force moving mode before the
+   * frame and argument checks are considered.
+   */
+  if (!OidIsValid(aggregate->aggminvtransfn))
+  {
+    execution = AGG_EXECUTION_WINDOW_ORDINARY;
+  }
+  else if (aggregate->aggmfinalmodify == AGGMODIFY_READ_ONLY &&
+           aggregate->aggfinalmodify != AGGMODIFY_READ_ONLY)
+  {
+    execution = AGG_EXECUTION_WINDOW_MOVING;
+  }
+  else
+  {
+    window = window_clause_for_function(function, scope);
+    if (window == NULL)
+    {
+      execution = AGG_EXECUTION_WINDOW_UNRESOLVED;
+    }
+    else if ((window->frameOptions &
+              FRAMEOPTION_START_UNBOUNDED_PRECEDING) != 0 ||
+             window_function_arguments_contain_volatile(function) ||
+             window_function_arguments_contain_subplans(function))
+    {
+      execution = AGG_EXECUTION_WINDOW_ORDINARY;
+    }
+    else
+    {
+      execution = AGG_EXECUTION_WINDOW_MOVING;
+    }
+  }
+
+  ReleaseSysCache(tuple);
+  return execution;
 }
 
 /* Dynamic container support is recursive; unresolved cycles stay conservative. */
@@ -5360,6 +5473,21 @@ external_parameter_io_invokes_volatile(Oid type_oid, int32 typmod)
 }
 
 static bool
+parameter_bind_io_invokes_volatile(const Oid *param_types, int param_count)
+{
+  int index;
+
+  for (index = 0; index < param_count; index++)
+  {
+    if (external_parameter_io_invokes_volatile(param_types[index], -1))
+    {
+      return true;
+    }
+  }
+  return false;
+}
+
+static bool
 xml_type_conversion_invokes_volatile(Oid type_oid, int32 typmod)
 {
   Oid element_type = get_base_element_type(type_oid);
@@ -5543,7 +5671,8 @@ node_invokes_volatile_function(Node *node, const QueryScope *scope)
       Aggref *aggregate = (Aggref *) node;
 
       return aggregate_invokes_volatile_function(
-               aggregate->aggfnoid, aggregate->args, true, false,
+               aggregate->aggfnoid, aggregate->args, true,
+               AGG_EXECUTION_NONWINDOW,
                aggregate->aggtype, exprTypmod(node)) ||
              json_aggregate_args_invoke_volatile(
                aggregate->aggfnoid, aggregate->args) ||
@@ -5559,7 +5688,8 @@ node_invokes_volatile_function(Node *node, const QueryScope *scope)
 
       return function->winagg
                ? aggregate_invokes_volatile_function(
-                   function->winfnoid, function->args, false, true,
+                   function->winfnoid, function->args, false,
+                   window_aggregate_execution_profile(function, scope),
                    function->wintype, exprTypmod(node))
                : function_is_volatile(function->winfnoid);
     }
@@ -5579,19 +5709,6 @@ node_invokes_volatile_function(Node *node, const QueryScope *scope)
         (const JsonConstructorExpr *) node);
     case T_XmlExpr:
       return xml_expression_invokes_volatile((const XmlExpr *) node);
-    case T_Param:
-    {
-      Param *param = (Param *) node;
-
-      /*
-       * External parameters are represented without their text-input or
-       * binary-receive call in the expression tree.  Include those hidden I/O
-       * paths, including nested container I/O and domain constraints.
-       */
-      return param->paramkind == PARAM_EXTERN &&
-             external_parameter_io_invokes_volatile(
-               param->paramtype, exprTypmod(node));
-    }
     case T_OpExpr:
     case T_DistinctExpr:
     case T_NullIfExpr:
@@ -5769,10 +5886,12 @@ query_contains_row_marks(const Query *query)
 static void
 append_query_summary(StringInfo out, const Query *query,
                      const QueryScope *parent_scope, int depth,
-                     bool protocol_output)
+                     bool protocol_output,
+                     bool bind_io_invokes_volatile)
 {
   QueryScope *scope = make_query_scope(query, parent_scope);
-  bool has_volatile_functions = query_contains_volatile_functions(query) ||
+  bool has_volatile_functions = bind_io_invokes_volatile ||
+                                query_contains_volatile_functions(query) ||
                                 (protocol_output &&
                                  query_result_io_invokes_volatile(query));
 
@@ -5948,6 +6067,8 @@ postgres_typed_sql_analyze(PG_FUNCTION_ARGS)
     List *rewritten_queries = param_count == 0 || param_types_need_inference(param_types, param_count)
                                 ? pg_analyze_and_rewrite_varparams(raw_stmt, sql, &param_types, &param_count, NULL)
                                 : pg_analyze_and_rewrite_fixedparams(raw_stmt, sql, param_types, param_count, NULL);
+    bool bind_io_invokes_volatile =
+      parameter_bind_io_invokes_volatile(param_types, param_count);
     ListCell *query_cell;
     bool first_query = true;
 
@@ -5991,7 +6112,8 @@ postgres_typed_sql_analyze(PG_FUNCTION_ARGS)
       }
       first_query = false;
 
-      append_query_summary(&out, query, NULL, 10, true);
+      append_query_summary(&out, query, NULL, 10, true,
+                           bind_io_invokes_volatile);
     }
 
     appendStringInfoString(&out, "]}");

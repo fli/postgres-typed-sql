@@ -596,6 +596,13 @@ test('native analyzer treats volatile aggregate support functions as writes', as
     assert.deepEqual((await database.query(ordinaryMovingSql)).rows, [{ total: 6 }])
     assert.deepEqual((await database.query('select kind from public.aggregate_support_calls')).rows, [])
 
+    const unboundedWindowSql = `select public.moving_capable_sum(value) over () as total
+      from (values (1), (2), (3)) input(value)`
+    const unboundedWindow = await analyze(database, unboundedWindowSql, [])
+    assert.equal(unboundedWindow.statements[0]?.queries[0]?.hasVolatileFunctions, false)
+    assert.deepEqual((await database.query(unboundedWindowSql)).rows, [{ total: 6 }, { total: 6 }, { total: 6 }])
+    assert.deepEqual((await database.query('select kind from public.aggregate_support_calls')).rows, [])
+
     const windowMovingSql = `select public.moving_capable_sum(value) over (
         order by value rows between 1 preceding and current row
       ) as total
@@ -635,6 +642,54 @@ test('native analyzer treats volatile aggregate support functions as writes', as
     assert.equal(windowCombine.statements[0]?.queries[0]?.hasVolatileFunctions, false)
     assert.deepEqual((await database.query(windowCombineSql)).rows, [{ total: 3 }, { total: 3 }])
     assert.deepEqual((await database.query('select kind from public.aggregate_support_calls')).rows, [])
+
+    await database.query(`create function public.volatile_ordinary_sum_transition(
+      state integer, value integer
+    ) returns integer language plpgsql volatile as $$
+    begin
+      insert into public.aggregate_support_calls(kind) values ('ordinary-transition');
+      return coalesce(state, 0) + coalesce(value, 0);
+    end
+    $$`)
+    await database.query(`create function public.immutable_moving_sum_transition(
+      state integer, value integer
+    ) returns integer language sql immutable as $$
+      select coalesce(state, 0) + coalesce(value, 0)
+    $$`)
+    await database.query(`create function public.immutable_moving_sum_inverse(
+      state integer, value integer
+    ) returns integer language sql immutable as $$
+      select coalesce(state, 0) - coalesce(value, 0)
+    $$`)
+    await database.query(`create aggregate public.subplan_fallback_sum(integer) (
+      sfunc = public.volatile_ordinary_sum_transition,
+      stype = integer,
+      initcond = '0',
+      msfunc = public.immutable_moving_sum_transition,
+      minvfunc = public.immutable_moving_sum_inverse,
+      mstype = integer,
+      minitcond = '0'
+    )`)
+
+    const directMovingSql = `select public.subplan_fallback_sum(value) over (
+        order by value rows between 1 preceding and current row
+      ) as total
+      from (values (1), (2), (3)) input(value)`
+    const directMoving = await analyze(database, directMovingSql, [])
+    assert.equal(directMoving.statements[0]?.queries[0]?.hasVolatileFunctions, false)
+    assert.deepEqual((await database.query(directMovingSql)).rows, [{ total: 1 }, { total: 3 }, { total: 5 }])
+    assert.deepEqual((await database.query('select kind from public.aggregate_support_calls')).rows, [])
+
+    const subplanFallbackSql = `select public.subplan_fallback_sum((
+        select input.value
+      )) over (
+        order by value rows between 1 preceding and current row
+      ) as total
+      from (values (1), (2), (3)) input(value)`
+    const subplanFallback = await analyze(database, subplanFallbackSql, [])
+    assert.equal(subplanFallback.statements[0]?.queries[0]?.hasVolatileFunctions, true)
+    assert.deepEqual((await database.query(subplanFallbackSql)).rows, [{ total: 1 }, { total: 3 }, { total: 5 }])
+    assert.ok((await database.query('select kind from public.aggregate_support_calls')).rows.length > 0)
   })
 })
 
@@ -1310,6 +1365,53 @@ test('native analyzer closes external parameter and CoerceViaIO container input 
       const analysis = await analyze(database, sql, [])
       assert.equal(analysis.statements[0]?.queries[0]?.hasVolatileFunctions, false, sql)
     }
+  })
+})
+
+test('native analyzer retains Bind input dependencies after rewrite removes parameters', async () => {
+  await withDatabase(async (database) => {
+    await database.query('create sequence public.rewritten_bind_sequence')
+    await database.query(`create domain public.rewritten_bind_domain as text
+      check (nextval('public.rewritten_bind_sequence') > 0)`)
+    await database.query('create table public.rewritten_bind_source (value public.rewritten_bind_domain)')
+    await database.query('create table public.rewritten_bind_target (value text)')
+    await database.query(`create rule rewritten_bind_replace as
+      on insert to public.rewritten_bind_source
+      do instead insert into public.rewritten_bind_target(value) values ('fixed')`)
+
+    const domainOid = Number(
+      (await database.query<{ oid: number }>(`select 'public.rewritten_bind_domain'::regtype::oid as oid`)).rows[0]?.oid
+    )
+    const sql = 'insert into public.rewritten_bind_source(value) values ($1)'
+    const analysis = await analyze(database, sql, [domainOid])
+    const query = analysis.statements[0]?.queries[0]
+
+    assert.equal(analysis.statements[0]?.rewrittenQueryCount, 1)
+    assert.equal(query?.hasVolatileFunctions, true)
+    assert.equal(query?.targetList[0]?.expr.tag, 'Const')
+    assert.equal(JSON.stringify(query).includes('"tag":"Param"'), false)
+
+    const stableBind = await analyze(database, sql, [25])
+    assert.equal(stableBind.statements[0]?.queries[0]?.hasVolatileFunctions, false)
+
+    await database.query(`prepare rewritten_bind_statement(public.rewritten_bind_domain) as ${sql}`)
+    await database.query(`execute rewritten_bind_statement('nonnull')`)
+    assert.deepEqual(
+      (await database.query<{ value: string }>('select last_value::text as value from public.rewritten_bind_sequence'))
+        .rows,
+      [{ value: '1' }]
+    )
+
+    await database.query('execute rewritten_bind_statement(null)')
+    assert.deepEqual(
+      (await database.query<{ value: string }>('select last_value::text as value from public.rewritten_bind_sequence'))
+        .rows,
+      [{ value: '2' }]
+    )
+    assert.deepEqual((await database.query('select value from public.rewritten_bind_target order by value')).rows, [
+      { value: 'fixed' },
+      { value: 'fixed' },
+    ])
   })
 })
 
