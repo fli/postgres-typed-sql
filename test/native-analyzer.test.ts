@@ -97,6 +97,91 @@ async function withDatabase(run: (database: AnalysisDatabase) => Promise<void>):
   }
 }
 
+async function installSortKeyOperatorClass(
+  database: AnalysisDatabase,
+  name: 'precision_sort_key' | 'volatile_sort_key',
+  options: { readonly volatileComparator: boolean; readonly volatileEquality: boolean }
+): Promise<void> {
+  await database.query(`create type public.${name} as (value integer)`)
+  await database.query(`create table public.${name}_calls (called boolean default true)`)
+
+  for (const [suffix, operator] of [
+    ['lt', '<'],
+    ['le', '<='],
+    ['ge', '>='],
+    ['gt', '>'],
+  ] as const) {
+    await database.query(`create function public.${name}_${suffix}(
+      left_value public.${name}, right_value public.${name}
+    ) returns boolean language sql immutable strict
+    as $$ select (left_value).value ${operator} (right_value).value $$`)
+  }
+
+  await database.query(
+    options.volatileEquality
+      ? `create function public.${name}_eq(
+          left_value public.${name}, right_value public.${name}
+        ) returns boolean language plpgsql volatile strict as $$
+        begin
+          insert into public.${name}_calls default values;
+          return (left_value).value = (right_value).value;
+        end
+        $$`
+      : `create function public.${name}_eq(
+          left_value public.${name}, right_value public.${name}
+        ) returns boolean language sql immutable strict
+        as $$ select (left_value).value = (right_value).value $$`
+  )
+
+  await database.query(
+    options.volatileComparator
+      ? `create function public.${name}_compare(
+          left_value public.${name}, right_value public.${name}
+        ) returns integer language plpgsql volatile strict as $$
+        begin
+          insert into public.${name}_calls default values;
+          return case
+            when (left_value).value < (right_value).value then -1
+            when (left_value).value > (right_value).value then 1
+            else 0
+          end;
+        end
+        $$`
+      : `create function public.${name}_compare(
+          left_value public.${name}, right_value public.${name}
+        ) returns integer language sql immutable strict as $$
+        select case
+          when (left_value).value < (right_value).value then -1
+          when (left_value).value > (right_value).value then 1
+          else 0
+        end
+        $$`
+  )
+
+  for (const [suffix, operator] of [
+    ['lt', '<'],
+    ['le', '<='],
+    ['eq', '='],
+    ['ge', '>='],
+    ['gt', '>'],
+  ] as const) {
+    await database.query(`create operator public.${operator} (
+      leftarg = public.${name},
+      rightarg = public.${name},
+      function = public.${name}_${suffix}
+    )`)
+  }
+
+  await database.query(`create operator class public.${name}_ops
+    default for type public.${name} using btree as
+      operator 1 public.<,
+      operator 2 public.<=,
+      operator 3 public.=,
+      operator 4 public.>=,
+      operator 5 public.>,
+      function 1 public.${name}_compare(public.${name}, public.${name})`)
+}
+
 test('native analyzer exposes the versioned PostgreSQL query envelope', async () => {
   await withDatabase(async (database) => {
     const analysis = await analyze(
@@ -457,6 +542,56 @@ test('native analyzer treats volatile aggregate support functions as writes', as
   })
 })
 
+test('native analyzer classifies only support functions reachable from sort execution', async () => {
+  await withDatabase(async (database) => {
+    await installSortKeyOperatorClass(database, 'volatile_sort_key', {
+      volatileComparator: true,
+      volatileEquality: false,
+    })
+    const volatileSortSql = `select value
+      from (values
+        (row(3)::public.volatile_sort_key),
+        (row(1)::public.volatile_sort_key),
+        (row(2)::public.volatile_sort_key)
+      ) input(value)
+      order by value`
+    const volatileSort = await analyze(database, volatileSortSql, [])
+    assert.equal(volatileSort.statements[0]?.queries[0]?.hasVolatileFunctions, true)
+    await database.query(volatileSortSql)
+    assert.deepEqual(
+      (
+        await database.query<{ called: boolean }>(`select exists(
+        select 1 from public.volatile_sort_key_calls
+      ) as called`)
+      ).rows,
+      [{ called: true }]
+    )
+
+    await installSortKeyOperatorClass(database, 'precision_sort_key', {
+      volatileComparator: false,
+      volatileEquality: true,
+    })
+    const precisionSortSql = `select value
+      from (values
+        (row(3)::public.precision_sort_key),
+        (row(1)::public.precision_sort_key),
+        (row(2)::public.precision_sort_key)
+      ) input(value)
+      order by value`
+    const precisionSort = await analyze(database, precisionSortSql, [])
+    assert.equal(precisionSort.statements[0]?.queries[0]?.hasVolatileFunctions, false)
+    await database.query(precisionSortSql)
+    assert.deepEqual(
+      (
+        await database.query<{ called: boolean }>(`select exists(
+        select 1 from public.precision_sort_key_calls
+      ) as called`)
+      ).rows,
+      [{ called: false }]
+    )
+  })
+})
+
 test('native analyzer maps direct DML parameters to PostgreSQL target columns', async () => {
   await withDatabase(async (database) => {
     const insert = await analyze(
@@ -698,6 +833,24 @@ test('native analyzer maps direct DML parameters to PostgreSQL target columns', 
       ),
       [{ directAssignment: false, paramId: 1, targetNullAdmission: 'unknown' }]
     )
+
+    const intersectRightLineageSql = `insert into public.accounts(email, display_name)
+      select null::text, $1::text
+      intersect
+      select $1::text, $1::text`
+    const intersectRightLineage = await analyze(database, intersectRightLineageSql, [])
+    assert.deepEqual(
+      intersectRightLineage.statements[0]?.queries[0]?.dmlParameterTargets
+        .filter(({ targetAttname }) => targetAttname === 'email')
+        .map(({ directAssignment, paramId, targetNullAdmission }) => ({
+          directAssignment,
+          paramId,
+          targetNullAdmission,
+        })),
+      [{ directAssignment: false, paramId: 1, targetNullAdmission: 'unknown' }]
+    )
+    await assert.rejects(database.query(intersectRightLineageSql, [null]), /null value in column "email"/u)
+    await database.query(intersectRightLineageSql, ['different@example.test'])
 
     const filteredProjection = await analyze(
       database,
@@ -1145,6 +1298,35 @@ test('native analyzer maps direct DML parameters to PostgreSQL target columns', 
       for each row execute function public.reject_null_trigger()`)
     const triggerTarget = await analyze(database, 'insert into public.trigger_probe(value) values ($1)', [])
     assert.equal(triggerTarget.statements[0]?.queries[0]?.dmlParameterTargets[0]?.targetNullAdmission, 'unknown')
+
+    await database.query(`create table public.trigger_checked_probe (
+      value text check (value in ('allowed'))
+    )`)
+    await database.query(`create function public.force_allowed_trigger() returns trigger
+      language plpgsql as $$
+      begin
+        new.value := 'allowed';
+        return new;
+      end
+      $$`)
+    await database.query(`create trigger force_allowed before insert on public.trigger_checked_probe
+      for each row execute function public.force_allowed_trigger()`)
+    const rewrittenTriggerSql = 'insert into public.trigger_checked_probe(value) values ($1)'
+    const rewrittenTriggerTarget = await analyze(database, rewrittenTriggerSql, [])
+    assert.deepEqual(
+      rewrittenTriggerTarget.statements[0]?.queries[0]?.dmlParameterTargets.map(
+        ({ directAssignment, paramId, targetNullAdmission }) => ({
+          directAssignment,
+          paramId,
+          targetNullAdmission,
+        })
+      ),
+      [{ directAssignment: false, paramId: 1, targetNullAdmission: 'unknown' }]
+    )
+    await database.query(rewrittenTriggerSql, ['outside'])
+    assert.deepEqual((await database.query<{ value: string }>('select value from public.trigger_checked_probe')).rows, [
+      { value: 'allowed' },
+    ])
 
     await database.query('create table public.rls_probe (value text)')
     await database.query('alter table public.rls_probe enable row level security')

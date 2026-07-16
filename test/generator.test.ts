@@ -245,6 +245,100 @@ join public.lock_values right_value on exists (
   await assert.rejects(generateTypedSql(config), /@access read conflicts with PostgreSQL's write classification/u)
 })
 
+test('rejects read access for volatile btree comparator execution hidden behind ORDER BY', async () => {
+  const root = await createMinimalFixture(
+    `create type public.volatile_sort_key as (value integer);
+create table public.volatile_sort_key_calls (called boolean default true);
+create function public.volatile_sort_key_lt(
+  left_value public.volatile_sort_key, right_value public.volatile_sort_key
+) returns boolean language sql immutable strict
+as $$ select (left_value).value < (right_value).value $$;
+create function public.volatile_sort_key_le(
+  left_value public.volatile_sort_key, right_value public.volatile_sort_key
+) returns boolean language sql immutable strict
+as $$ select (left_value).value <= (right_value).value $$;
+create function public.volatile_sort_key_eq(
+  left_value public.volatile_sort_key, right_value public.volatile_sort_key
+) returns boolean language sql immutable strict
+as $$ select (left_value).value = (right_value).value $$;
+create function public.volatile_sort_key_ge(
+  left_value public.volatile_sort_key, right_value public.volatile_sort_key
+) returns boolean language sql immutable strict
+as $$ select (left_value).value >= (right_value).value $$;
+create function public.volatile_sort_key_gt(
+  left_value public.volatile_sort_key, right_value public.volatile_sort_key
+) returns boolean language sql immutable strict
+as $$ select (left_value).value > (right_value).value $$;
+create function public.volatile_sort_key_compare(
+  left_value public.volatile_sort_key, right_value public.volatile_sort_key
+) returns integer language plpgsql volatile strict as $$
+begin
+  insert into public.volatile_sort_key_calls default values;
+  return case
+    when (left_value).value < (right_value).value then -1
+    when (left_value).value > (right_value).value then 1
+    else 0
+  end;
+end
+$$;
+create operator public.< (
+  leftarg = public.volatile_sort_key,
+  rightarg = public.volatile_sort_key,
+  function = public.volatile_sort_key_lt
+);
+create operator public.<= (
+  leftarg = public.volatile_sort_key,
+  rightarg = public.volatile_sort_key,
+  function = public.volatile_sort_key_le
+);
+create operator public.= (
+  leftarg = public.volatile_sort_key,
+  rightarg = public.volatile_sort_key,
+  function = public.volatile_sort_key_eq
+);
+create operator public.>= (
+  leftarg = public.volatile_sort_key,
+  rightarg = public.volatile_sort_key,
+  function = public.volatile_sort_key_ge
+);
+create operator public.> (
+  leftarg = public.volatile_sort_key,
+  rightarg = public.volatile_sort_key,
+  function = public.volatile_sort_key_gt
+);
+create operator class public.volatile_sort_key_ops
+default for type public.volatile_sort_key using btree as
+  operator 1 public.<,
+  operator 2 public.<=,
+  operator 3 public.=,
+  operator 4 public.>=,
+  operator 5 public.>,
+  function 1 public.volatile_sort_key_compare(
+    public.volatile_sort_key, public.volatile_sort_key
+  );
+`,
+    `-- @access read
+select value
+from (values
+  (row(3)::public.volatile_sort_key),
+  (row(1)::public.volatile_sort_key),
+  (row(2)::public.volatile_sort_key)
+) input(value)
+order by value
+`
+  )
+
+  await assert.rejects(
+    generateTypedSql({
+      include: ['queries'],
+      rootDir: root,
+      scalarProfile: 'node-postgres',
+      schema: 'schema.sql',
+    }),
+    /@access read conflicts with PostgreSQL's write classification/u
+  )
+})
+
 test('preserves non-code parameter text and limits directives to the header', async () => {
   const root = await copyFixture()
   await writeFile(
@@ -1049,6 +1143,55 @@ insert into public.checked_values(value) values (coalesce(:value, 'A'))
   output = await readFile(join(root, 'queries/query.typed-sql.ts'), 'utf8')
   assert.match(output, /readonly value: string \| null/u)
   assert.doesNotMatch(output, /readonly value: CheckedValues__Value/u)
+})
+
+test('does not narrow CHECK parameters across rewriting triggers or miss INTERSECT right-side lineage', async () => {
+  const root = await createMinimalFixture(
+    `create table public.trigger_checked_values (
+  value text check (value in ('allowed'))
+);
+create function public.force_allowed_trigger() returns trigger
+language plpgsql as $$
+begin
+  new.value := 'allowed';
+  return new;
+end
+$$;
+create trigger force_allowed before insert on public.trigger_checked_values
+for each row execute function public.force_allowed_trigger();
+create table public.intersect_accounts (
+  email text not null,
+  display_name text
+);
+`,
+    `insert into public.trigger_checked_values(value) values (:value)
+`
+  )
+  const config = {
+    include: ['queries'],
+    rootDir: root,
+    scalarProfile: 'node-postgres' as const,
+    schema: 'schema.sql',
+  }
+
+  await generateTypedSql(config)
+  const outputFile = join(root, 'queries/query.typed-sql.ts')
+  let output = await readFile(outputFile, 'utf8')
+  assert.match(output, /readonly value: string/u)
+  assert.doesNotMatch(output, /readonly value: TriggerCheckedValues__Value/u)
+
+  await writeFile(
+    join(root, 'queries/query.typed.sql'),
+    `insert into public.intersect_accounts(email, display_name)
+select null::text, :value::text
+intersect
+select :value::text, :value::text
+`
+  )
+  await generateTypedSql(config)
+  output = await readFile(outputFile, 'utf8')
+  assert.match(output, /readonly value: string/u)
+  assert.doesNotMatch(output, /readonly value: string \| null/u)
 })
 
 test('does not apply textual CHECK aliases to transformed driver or JSON representations', async () => {

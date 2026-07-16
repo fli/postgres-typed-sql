@@ -1,5 +1,6 @@
 #include "postgres.h"
 
+#include "access/nbtree.h"
 #include "access/table.h"
 #include "catalog/pg_aggregate.h"
 #include "catalog/pg_attribute.h"
@@ -1658,7 +1659,8 @@ append_dml_parameter_target(DmlLineageContext *context, int param_id,
   {
     target_admission = TYPE_NULL_UNKNOWN;
   }
-  direct_assignment = value_preserving && unconditional;
+  direct_assignment = value_preserving && unconditional &&
+                      !context->has_opaque_enforcement;
 
   memset(&lookup_key, 0, sizeof(lookup_key));
   lookup_key.param_id = param_id;
@@ -1990,23 +1992,44 @@ append_direct_parameter_targets(DmlLineageContext *context, const QueryScope *sc
       {
         const SetOperationStmt *set = (const SetOperationStmt *) item->node;
 
-        if (set->op == SETOP_UNION)
+        switch (set->op)
         {
-          enqueue_lineage_work(context, &work, LINEAGE_WORK_SET_OPERATION,
-                               item->scope, set->larg, item->output_attnum,
-                               item->null_admission, item->value_preserving,
-                               item->null_propagating, item->unconditional);
-          enqueue_lineage_work(context, &work, LINEAGE_WORK_SET_OPERATION,
-                               item->scope, set->rarg, item->output_attnum,
-                               item->null_admission, item->value_preserving,
-                               item->null_propagating, item->unconditional);
-        }
-        else
-        {
-          enqueue_lineage_work(context, &work, LINEAGE_WORK_SET_OPERATION,
-                               item->scope, set->larg, item->output_attnum,
-                               item->null_admission, item->value_preserving,
-                               item->null_propagating, false);
+          case SETOP_UNION:
+            enqueue_lineage_work(context, &work, LINEAGE_WORK_SET_OPERATION,
+                                 item->scope, set->larg, item->output_attnum,
+                                 item->null_admission, item->value_preserving,
+                                 item->null_propagating, item->unconditional);
+            enqueue_lineage_work(context, &work, LINEAGE_WORK_SET_OPERATION,
+                                 item->scope, set->rarg, item->output_attnum,
+                                 item->null_admission, item->value_preserving,
+                                 item->null_propagating, item->unconditional);
+            break;
+          case SETOP_INTERSECT:
+            enqueue_lineage_work(context, &work, LINEAGE_WORK_SET_OPERATION,
+                                 item->scope, set->larg, item->output_attnum,
+                                 item->null_admission, item->value_preserving,
+                                 item->null_propagating, false);
+            enqueue_lineage_work(context, &work, LINEAGE_WORK_SET_OPERATION,
+                                 item->scope, set->rarg, item->output_attnum,
+                                 item->null_admission, item->value_preserving,
+                                 item->null_propagating, false);
+            break;
+          case SETOP_EXCEPT:
+            enqueue_lineage_work(context, &work, LINEAGE_WORK_SET_OPERATION,
+                                 item->scope, set->larg, item->output_attnum,
+                                 item->null_admission, item->value_preserving,
+                                 item->null_propagating, false);
+            break;
+          case SETOP_NONE:
+            enqueue_lineage_work(context, &work, LINEAGE_WORK_SET_OPERATION,
+                                 item->scope, set->larg, item->output_attnum,
+                                 item->null_admission, item->value_preserving,
+                                 item->null_propagating, false);
+            enqueue_lineage_work(context, &work, LINEAGE_WORK_SET_OPERATION,
+                                 item->scope, set->rarg, item->output_attnum,
+                                 item->null_admission, item->value_preserving,
+                                 item->null_propagating, false);
+            break;
         }
       }
       else if (IsA(item->node, RangeTblRef))
@@ -3512,6 +3535,183 @@ aggregate_invokes_volatile_function(Oid aggregate_oid)
   return false;
 }
 
+typedef enum SortGroupExecution
+{
+  SG_EXEC_SORT = 1 << 0,
+  SG_EXEC_EQUAL = 1 << 1,
+  SG_EXEC_HASH = 1 << 2
+} SortGroupExecution;
+
+static bool
+ordering_support_invokes_volatile_function(Oid ordering_operator)
+{
+  Oid opfamily;
+  Oid opcintype;
+  Oid order_function;
+  Oid sort_support_function;
+  CompareType compare_type;
+
+  if (!get_ordering_op_properties(ordering_operator, &opfamily,
+                                  &opcintype, &compare_type) ||
+      !OidIsValid(opfamily) || !OidIsValid(opcintype) ||
+      (compare_type != COMPARE_LT && compare_type != COMPARE_GT))
+  {
+    return true;
+  }
+
+  sort_support_function = get_opfamily_proc(
+    opfamily, opcintype, opcintype, BTSORTSUPPORT_PROC);
+  order_function = get_opfamily_proc(
+    opfamily, opcintype, opcintype, BTORDER_PROC);
+
+  if (OidIsValid(sort_support_function) &&
+      function_is_volatile(sort_support_function))
+  {
+    return true;
+  }
+  if (!OidIsValid(order_function))
+  {
+    return true;
+  }
+  return function_is_volatile(order_function);
+}
+
+static bool
+equality_support_invokes_volatile_function(Oid equality_operator)
+{
+  Oid equality_function;
+
+  if (!OidIsValid(equality_operator))
+  {
+    return true;
+  }
+  equality_function = get_opcode(equality_operator);
+  return !OidIsValid(equality_function) ||
+         function_is_volatile(equality_function);
+}
+
+static bool
+hash_support_invokes_volatile_function(Oid equality_operator)
+{
+  RegProcedure left_hash_function;
+  RegProcedure right_hash_function;
+
+  if (!OidIsValid(equality_operator) ||
+      !get_op_hash_functions(equality_operator, &left_hash_function,
+                             &right_hash_function) ||
+      !OidIsValid(left_hash_function) || !OidIsValid(right_hash_function))
+  {
+    return true;
+  }
+  return function_is_volatile(left_hash_function) ||
+         function_is_volatile(right_hash_function);
+}
+
+static bool
+sort_group_clause_invokes_volatile_function(const SortGroupClause *clause,
+                                            int execution)
+{
+  if ((execution & SG_EXEC_SORT) != 0 && OidIsValid(clause->sortop) &&
+      ordering_support_invokes_volatile_function(clause->sortop))
+  {
+    return true;
+  }
+  if ((execution & SG_EXEC_EQUAL) != 0 &&
+      equality_support_invokes_volatile_function(clause->eqop))
+  {
+    return true;
+  }
+  if ((execution & SG_EXEC_HASH) != 0 && clause->hashable &&
+      hash_support_invokes_volatile_function(clause->eqop))
+  {
+    return true;
+  }
+  return false;
+}
+
+static bool
+sort_group_clause_list_invokes_volatile_function(const List *clauses,
+                                                 int execution)
+{
+  ListCell *cell;
+
+  foreach(cell, clauses)
+  {
+    const SortGroupClause *clause =
+      lfirst_node(SortGroupClause, cell);
+
+    if (sort_group_clause_invokes_volatile_function(clause, execution))
+    {
+      return true;
+    }
+  }
+  return false;
+}
+
+static bool
+set_operation_support_invokes_volatile_function(const Node *node)
+{
+  if (node == NULL || IsA(node, RangeTblRef))
+  {
+    return false;
+  }
+  if (!IsA(node, SetOperationStmt))
+  {
+    return true;
+  }
+
+  {
+    const SetOperationStmt *operation = (const SetOperationStmt *) node;
+
+    return sort_group_clause_list_invokes_volatile_function(
+             operation->groupClauses,
+             SG_EXEC_SORT | SG_EXEC_EQUAL | SG_EXEC_HASH) ||
+           set_operation_support_invokes_volatile_function(operation->larg) ||
+           set_operation_support_invokes_volatile_function(operation->rarg);
+  }
+}
+
+static bool
+query_sort_group_support_invokes_volatile_function(const Query *query)
+{
+  ListCell *cell;
+  int distinct_execution = SG_EXEC_SORT | SG_EXEC_EQUAL;
+
+  if (!query->hasDistinctOn)
+  {
+    distinct_execution |= SG_EXEC_HASH;
+  }
+
+  if (sort_group_clause_list_invokes_volatile_function(
+        query->sortClause, SG_EXEC_SORT) ||
+      sort_group_clause_list_invokes_volatile_function(
+        query->groupClause, SG_EXEC_SORT | SG_EXEC_EQUAL | SG_EXEC_HASH) ||
+      sort_group_clause_list_invokes_volatile_function(
+        query->distinctClause, distinct_execution) ||
+      set_operation_support_invokes_volatile_function(query->setOperations))
+  {
+    return true;
+  }
+
+  foreach(cell, query->windowClause)
+  {
+    const WindowClause *window = lfirst_node(WindowClause, cell);
+
+    if (sort_group_clause_list_invokes_volatile_function(
+          window->partitionClause, SG_EXEC_SORT | SG_EXEC_EQUAL) ||
+        sort_group_clause_list_invokes_volatile_function(
+          window->orderClause, SG_EXEC_SORT | SG_EXEC_EQUAL) ||
+        (OidIsValid(window->startInRangeFunc) &&
+         function_is_volatile(window->startInRangeFunc)) ||
+        (OidIsValid(window->endInRangeFunc) &&
+         function_is_volatile(window->endInRangeFunc)))
+    {
+      return true;
+    }
+  }
+  return false;
+}
+
 static bool
 domain_constraints_invoke_volatile_function(Oid type_oid)
 {
@@ -3541,7 +3741,15 @@ node_invokes_volatile_function(Node *node)
   switch (nodeTag(node))
   {
     case T_Aggref:
-      return aggregate_invokes_volatile_function(((Aggref *) node)->aggfnoid);
+    {
+      Aggref *aggregate = (Aggref *) node;
+
+      return aggregate_invokes_volatile_function(aggregate->aggfnoid) ||
+             sort_group_clause_list_invokes_volatile_function(
+               aggregate->aggorder, SG_EXEC_SORT) ||
+             sort_group_clause_list_invokes_volatile_function(
+               aggregate->aggdistinct, SG_EXEC_SORT | SG_EXEC_EQUAL);
+    }
     case T_WindowFunc:
     {
       WindowFunc *function = (WindowFunc *) node;
@@ -3633,7 +3841,10 @@ volatile_function_walker(Node *node, void *context)
   }
   if (IsA(node, Query))
   {
-    return query_tree_walker((Query *) node, volatile_function_walker, context, 0);
+    Query *query = (Query *) node;
+
+    return query_sort_group_support_invokes_volatile_function(query) ||
+           query_tree_walker(query, volatile_function_walker, context, 0);
   }
   return expression_tree_walker(node, volatile_function_walker, context);
 }

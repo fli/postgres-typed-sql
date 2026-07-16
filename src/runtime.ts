@@ -87,7 +87,7 @@ export interface TypedSqlStatement<
   readonly rowBounds: TypedSqlRowBounds
   readonly text: string
   readonly type?: Row
-  query(params: Params): TypedSqlQueryConfig<TypedSqlRawRow>
+  query(params: Params): TypedSqlQueryConfig<Row>
   values(params: Params): readonly unknown[]
 }
 
@@ -157,6 +157,7 @@ export function createTypedSqlStatement<
       return {
         name: definition.name,
         text: definition.text,
+        type: definition.type,
         values: this.values(params),
       }
     },
@@ -286,8 +287,7 @@ export async function executeTypedSql<Params extends TypedSqlParams, Row>(
     text: statement.text,
     values: statement.values(params),
   })
-  // oxlint-disable-next-line typescript/no-unsafe-type-assertion -- A custom statement without result-column metadata retains the driver's object-row shape as its declared Row type.
-  return result.rows as Row[]
+  return mapTypedSqlRows(statement, result.rows)
 }
 
 export async function executeTypedSqlOptional<Params extends TypedSqlParams, Row>(
@@ -319,6 +319,6 @@ export async function executeTypedSqlCommand<Params extends TypedSqlParams, Row>
   statement: TypedSqlStatement<Params, Row>,
   params: Params
 ): Promise<number> {
-  const result = await client.query<TypedSqlRawRow>(statement.query(params))
+  const result = await client.query<Row>(statement.query(params))
   return typedSqlRowCount(result.rowCount)
 }
