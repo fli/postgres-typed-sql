@@ -1359,11 +1359,16 @@ function checkedColumnParamTypes(
   return resolved
 }
 
-function queryOutputNullable(catalog: CatalogFacts, scope: QueryScope, outputIndex: number): boolean {
+function queryOutputNullable(
+  catalog: CatalogFacts,
+  scope: QueryScope,
+  outputIndex: number,
+  seen: readonly VisitedVar[] = []
+): boolean {
   return foldQueryOutput<boolean>(scope, outputIndex, {
     except: (left) => left,
     intersect: (left, right) => left && right,
-    target: (targetScope, target) => expressionNullable(catalog, targetScope, target.expr),
+    target: (targetScope, target) => expressionNullable(catalog, targetScope, target.expr, undefined, seen),
     union: (left, right) => left || right,
     unknown: () => true,
   })
@@ -1373,7 +1378,8 @@ function expressionNullable(
   catalog: CatalogFacts,
   scope: QueryScope,
   expr: PgAnalyzerExpr | null | undefined,
-  refinements = collectNonNullVarKeys(scope.query.whereQual)
+  refinements = collectNonNullVarKeys(scope.query.whereQual),
+  seen: readonly VisitedVar[] = []
 ): boolean {
   if (!expr || expr.truncated === true) {
     return true
@@ -1393,9 +1399,20 @@ function expressionNullable(
       }
     }
 
+    if (!exprKey(expr)) {
+      return true
+    }
+    const nestedSeen = visitVar(seen, scope, expr)
+    if (!nestedSeen) {
+      // Recursive CTE evaluation starts from the nonrecursive term. A repeated
+      // exact Var is the bottom of this monotone nullability recurrence; the
+      // seed or another set-operation arm still contributes its nullable fact.
+      return false
+    }
+
     const ownerRte = varOwnerRte(scope, expr)
     const outputScope = ownerRte ? queryScopeForRteOutput(...ownerRte) : null
-    return outputScope ? queryOutputNullable(catalog, outputScope, (expr.varattno ?? 1) - 1) : true
+    return outputScope ? queryOutputNullable(catalog, outputScope, (expr.varattno ?? 1) - 1, nestedSeen) : true
   }
 
   if (expr.tag === 'Const') {
@@ -1414,16 +1431,18 @@ function expressionNullable(
     return !isBuiltinPgProcNamed(catalog, expr.aggfnoid, 'count')
   }
   if (expr.tag === 'CoalesceExpr') {
-    return !exprChildren(expr).some((child) => !expressionNullable(catalog, scope, child, refinements))
+    return !exprChildren(expr).some((child) => !expressionNullable(catalog, scope, child, refinements, seen))
   }
   if (expr.tag === 'CaseExpr') {
     const results = [...(expr.whenClauses ?? []).map((whenClause) => whenClause.result), expr.defresult].filter(
       (child): child is PgAnalyzerExpr => Boolean(child)
     )
-    return results.length === 0 || results.some((result) => expressionNullable(catalog, scope, result, refinements))
+    return (
+      results.length === 0 || results.some((result) => expressionNullable(catalog, scope, result, refinements, seen))
+    )
   }
   if (expr.tag === 'BoolExpr') {
-    return exprChildren(expr).some((child) => expressionNullable(catalog, scope, child, refinements))
+    return exprChildren(expr).some((child) => expressionNullable(catalog, scope, child, refinements, seen))
   }
   if (expr.tag === 'FuncExpr') {
     if (
@@ -1434,7 +1453,7 @@ function expressionNullable(
     }
   }
   if (expr.tag === 'RelabelType' || expr.tag === 'CoerceViaIO') {
-    return expressionNullable(catalog, scope, expr.arg, refinements)
+    return expressionNullable(catalog, scope, expr.arg, refinements, seen)
   }
 
   return true

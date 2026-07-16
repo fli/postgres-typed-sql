@@ -1467,6 +1467,50 @@ from (
   assert.doesNotMatch(output, /readonly payload: DbJsonSelected/u)
 })
 
+test('terminates recursive CTE nullability inference from pass-through seed facts', async () => {
+  const root = await createMinimalFixture(
+    'select 1;\n',
+    `with recursive walk(value, depth) as (
+  select 1, 1
+  union all
+  select value, depth + 1
+  from walk
+  where depth < 3
+)
+select value from walk
+`
+  )
+  const config = {
+    include: ['queries'],
+    rootDir: root,
+    scalarProfile: 'node-postgres' as const,
+    schema: 'schema.sql',
+  }
+  const queryFile = join(root, 'queries/query.typed.sql')
+  const outputFile = join(root, 'queries/query.typed-sql.ts')
+
+  await generateTypedSql(config)
+  let output = await readFile(outputFile, 'utf8')
+  assert.match(output, /readonly value: number\n/u)
+  assert.doesNotMatch(output, /readonly value: number \| null/u)
+
+  await writeFile(
+    queryFile,
+    `with recursive walk(value, depth) as (
+  select null::integer, 1
+  union all
+  select value, depth + 1
+  from walk
+  where depth < 3
+)
+select value from walk
+`
+  )
+  await generateTypedSql(config)
+  output = await readFile(outputFile, 'utf8')
+  assert.match(output, /readonly value: number \| null/u)
+})
+
 test('encodes arbitrary JSON result and field names only in generated type bindings', async () => {
   const root = await createMinimalFixture(
     'select 1;\n',
