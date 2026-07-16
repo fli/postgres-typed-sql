@@ -99,7 +99,13 @@ async function withDatabase(run: (database: AnalysisDatabase) => Promise<void>):
 
 async function installSortKeyOperatorClass(
   database: AnalysisDatabase,
-  name: 'array_element_key' | 'nested_compare_key' | 'precision_sort_key' | 'volatile_sort_key',
+  name:
+    | 'array_element_key'
+    | 'executor_compare_key'
+    | 'executor_equal_key'
+    | 'nested_compare_key'
+    | 'precision_sort_key'
+    | 'volatile_sort_key',
   options: { readonly volatileComparator: boolean; readonly volatileEquality: boolean }
 ): Promise<void> {
   await database.query(`create type public.${name} as (value integer)`)
@@ -880,6 +886,167 @@ test('native analyzer closes minmax and row comparison over concrete container s
         sql
       )
     }
+  })
+})
+
+test('native analyzer closes generic executor support over concrete container types', async () => {
+  await withDatabase(async (database) => {
+    await installSortKeyOperatorClass(database, 'executor_equal_key', {
+      volatileComparator: false,
+      volatileEquality: true,
+    })
+    await installSortKeyOperatorClass(database, 'executor_compare_key', {
+      volatileComparator: true,
+      volatileEquality: false,
+    })
+
+    const assertVolatileExecution = async (
+      sql: string,
+      params: readonly unknown[],
+      callsTable: 'executor_compare_key_calls' | 'executor_equal_key_calls'
+    ): Promise<void> => {
+      const analysis = await analyze(database, sql, [])
+      assert.equal(analysis.statements[0]?.queries[0]?.hasVolatileFunctions, true, sql)
+
+      await database.query(`truncate public.${callsTable}`)
+      await database.query(sql, params)
+      assert.deepEqual(
+        (
+          await database.query<{ called: boolean }>(`select exists(
+            select 1 from public.${callsTable}
+          ) as called`)
+        ).rows,
+        [{ called: true }],
+        sql
+      )
+    }
+
+    for (const sql of [
+      `select array[row($1)::public.executor_equal_key]
+        @> array[row($2)::public.executor_equal_key] as present`,
+      `select array_position(
+        array[row($1)::public.executor_equal_key],
+        row($2)::public.executor_equal_key
+      ) as position`,
+      `select array_remove(
+        array[row($1)::public.executor_equal_key],
+        row($2)::public.executor_equal_key
+      ) as remaining`,
+    ]) {
+      await assertVolatileExecution(sql, [1, 1], 'executor_equal_key_calls')
+    }
+
+    const arrayLengthSql = `select array_length(
+      array[row($1)::public.executor_equal_key], 1
+    ) as length`
+    const arrayLength = await analyze(database, arrayLengthSql, [])
+    assert.equal(arrayLength.statements[0]?.queries[0]?.hasVolatileFunctions, false)
+    await database.query('truncate public.executor_equal_key_calls')
+    assert.deepEqual((await database.query(arrayLengthSql, [1])).rows, [{ length: 1 }])
+    assert.deepEqual(
+      (
+        await database.query<{ called: boolean }>(`select exists(
+          select 1 from public.executor_equal_key_calls
+        ) as called`)
+      ).rows,
+      [{ called: false }]
+    )
+
+    await database.query(`create function public.executor_equal_key_hash(
+      value public.executor_equal_key
+    ) returns integer language plpgsql volatile strict as $$
+    begin
+      insert into public.executor_equal_key_calls default values;
+      return hashint4((value).value);
+    end
+    $$`)
+    await database.query(`create operator class public.executor_equal_key_hash_ops
+      default for type public.executor_equal_key using hash as
+        operator 1 public.=,
+        function 1 public.executor_equal_key_hash(public.executor_equal_key)`)
+    await assertVolatileExecution(
+      'select pg_catalog.hash_array(array[row($1)::public.executor_equal_key]) as hash',
+      [1],
+      'executor_equal_key_calls'
+    )
+
+    for (const [sql, params] of [
+      [
+        `select array_sort(array[
+          row($1)::public.executor_compare_key,
+          row($2)::public.executor_compare_key
+        ]) as sorted`,
+        [2, 1],
+      ],
+      [
+        `select width_bucket(
+          row($1)::public.executor_compare_key,
+          array[
+            row($2)::public.executor_compare_key,
+            row($3)::public.executor_compare_key
+          ]
+        ) as bucket`,
+        [2, 1, 3],
+      ],
+    ] as const) {
+      await assertVolatileExecution(sql, params, 'executor_compare_key_calls')
+    }
+
+    await database.query(`create type public.executor_compare_range as range (
+      subtype = public.executor_compare_key
+    )`)
+    const rangeSql = `select public.executor_compare_range(
+      row($1)::public.executor_compare_key,
+      row($2)::public.executor_compare_key,
+      '[]'
+    ) @> row($3)::public.executor_compare_key as present`
+    await assertVolatileExecution(rangeSql, [1, 3, 2], 'executor_compare_key_calls')
+
+    await database.query(`create table public.executor_compare_ranges (
+      value public.executor_compare_range
+    )`)
+    await database.query(`insert into public.executor_compare_ranges(value) values
+      (public.executor_compare_range(
+        row(1)::public.executor_compare_key,
+        row(2)::public.executor_compare_key,
+        '[]'
+      )),
+      (public.executor_compare_range(
+        row(3)::public.executor_compare_key,
+        row(4)::public.executor_compare_key,
+        '[]'
+      ))`)
+    await assertVolatileExecution(
+      'select range_agg(value) from public.executor_compare_ranges',
+      [],
+      'executor_compare_key_calls'
+    )
+
+    await database.query(`create table public.executor_int4_ranges (
+      value int4range not null
+    )`)
+    await database.query(`insert into public.executor_int4_ranges(value)
+      values (int4range(1, 2, '[]'))`)
+    await database.query('alter function pg_catalog.int4range_canonical(int4range) volatile')
+
+    for (const [sql, params] of [
+      [`select int4range($1, $2, '[]') as value`, [1, 2]],
+      [`select range_merge(value, value) as value from public.executor_int4_ranges`, []],
+      [`select $1::text::int4range as value`, ['[1,2]']],
+    ] as const) {
+      const analysis = await analyze(database, sql, [])
+      assert.equal(analysis.statements[0]?.queries[0]?.hasVolatileFunctions, true, sql)
+      assert.deepEqual((await database.query(sql, params)).rows, [{ value: '[1,3)' }], sql)
+    }
+
+    const rangeLowerSql = 'select lower(value) from public.executor_int4_ranges'
+    const rangeLower = await analyze(database, rangeLowerSql, [])
+    assert.equal(rangeLower.statements[0]?.queries[0]?.hasVolatileFunctions, false)
+    assert.deepEqual((await database.query(rangeLowerSql)).rows, [{ lower: 1 }])
+
+    await database.query('alter function pg_catalog.int4range_canonical(int4range) immutable')
+    const immutableCanonical = await analyze(database, `select int4range($1, $2, '[]') as value`, [])
+    assert.equal(immutableCanonical.statements[0]?.queries[0]?.hasVolatileFunctions, false)
   })
 })
 

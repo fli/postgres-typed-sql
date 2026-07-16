@@ -9,6 +9,7 @@
 #include "catalog/pg_class.h"
 #include "catalog/pg_constraint.h"
 #include "catalog/pg_inherits.h"
+#include "catalog/pg_language_d.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_trigger.h"
 #include "catalog/pg_type.h"
@@ -57,6 +58,9 @@ static bool query_contains_volatile_functions(const Query *query);
 static bool volatile_function_walker(Node *node, void *context);
 static bool query_contains_row_marks(const Query *query);
 static bool row_marks_walker(Node *node, void *context);
+static bool executor_support_dependency_invokes_volatile(
+  Oid function_oid, const List *args, bool target_entries,
+  Oid result_type, int32 result_typmod);
 
 static bool
 json_text_is_empty_array(const char *value)
@@ -3773,7 +3777,9 @@ function_is_volatile(Oid function_oid)
 }
 
 static bool
-aggregate_invokes_volatile_function(Oid aggregate_oid)
+aggregate_invokes_volatile_function(Oid aggregate_oid, const List *args,
+                                    bool target_entries, Oid result_type,
+                                    int32 result_typmod)
 {
   HeapTuple tuple;
   Form_pg_aggregate aggregate;
@@ -3801,7 +3807,10 @@ aggregate_invokes_volatile_function(Oid aggregate_oid)
   {
     Oid function_oid = support_function_oids[index];
 
-    if (OidIsValid(function_oid) && function_is_volatile(function_oid))
+    if (OidIsValid(function_oid) &&
+        (function_is_volatile(function_oid) ||
+         executor_support_dependency_invokes_volatile(
+           function_oid, args, target_entries, result_type, result_typmod)))
     {
       return true;
     }
@@ -4155,9 +4164,135 @@ json_constructor_args_invoke_volatile(const JsonConstructorExpr *constructor)
   return true;
 }
 
-static bool
-container_function_support_kind(Oid function_oid,
-                                RuntimeTypeSupportKind *kind)
+typedef enum ExecutorSupportDependency
+{
+  EXECUTOR_SUPPORT_NONE = 0,
+  EXECUTOR_SUPPORT_EQUAL = 1 << 0,
+  EXECUTOR_SUPPORT_COMPARE = 1 << 1,
+  EXECUTOR_SUPPORT_HASH = 1 << 2,
+  EXECUTOR_SUPPORT_RANGE_CANONICAL = 1 << 3
+} ExecutorSupportDependency;
+
+typedef struct ExecutorSupportProfile
+{
+  int dependencies;
+  bool inspect_arguments;
+  bool inspect_result;
+} ExecutorSupportProfile;
+
+static ExecutorSupportProfile
+executor_support_profile(int dependencies, bool inspect_arguments,
+                         bool inspect_result)
+{
+  ExecutorSupportProfile profile = {
+    dependencies,
+    inspect_arguments,
+    inspect_result
+  };
+
+  return profile;
+}
+
+/*
+ * CREATE TYPE AS RANGE manufactures constructor OIDs, so unlike the fixed
+ * pg_catalog functions below they must be recognized by their trusted
+ * INTERNAL implementation and exact generated signature.
+ */
+static ExecutorSupportProfile
+dynamic_container_executor_support_profile(Oid function_oid)
+{
+  HeapTuple tuple;
+  Form_pg_proc procedure;
+  Datum source_datum;
+  char *source;
+  bool is_null;
+  ExecutorSupportProfile profile = executor_support_profile(
+    EXECUTOR_SUPPORT_NONE, false, false);
+
+  if (!OidIsValid(function_oid))
+  {
+    return profile;
+  }
+  tuple = SearchSysCache1(PROCOID, ObjectIdGetDatum(function_oid));
+  if (!HeapTupleIsValid(tuple))
+  {
+    elog(ERROR, "cache lookup failed for function %u", function_oid);
+  }
+  procedure = (Form_pg_proc) GETSTRUCT(tuple);
+  if (procedure->prolang != INTERNALlanguageId ||
+      procedure->prokind != PROKIND_FUNCTION)
+  {
+    ReleaseSysCache(tuple);
+    return profile;
+  }
+
+  source_datum = SysCacheGetAttr(
+    PROCOID, tuple, Anum_pg_proc_prosrc, &is_null);
+  if (is_null)
+  {
+    ReleaseSysCache(tuple);
+    return profile;
+  }
+  source = TextDatumGetCString(source_datum);
+
+  if ((strcmp(source, "range_constructor2") == 0 ||
+       strcmp(source, "range_constructor3") == 0) &&
+      !procedure->proretset && !OidIsValid(procedure->provariadic) &&
+      get_typtype(procedure->prorettype) == TYPTYPE_RANGE)
+  {
+    TypeCacheEntry *range_cache = lookup_type_cache(
+      procedure->prorettype, TYPECACHE_RANGE_INFO);
+    Oid subtype = range_cache->rngelemtype == NULL
+                    ? InvalidOid
+                    : range_cache->rngelemtype->type_id;
+    bool constructor2 = strcmp(source, "range_constructor2") == 0;
+    int expected_arguments = constructor2 ? 2 : 3;
+
+    if (OidIsValid(subtype) &&
+        procedure->pronargs == expected_arguments &&
+        procedure->proargtypes.values[0] == subtype &&
+        procedure->proargtypes.values[1] == subtype &&
+        (constructor2 || procedure->proargtypes.values[2] == TEXTOID))
+    {
+      profile = executor_support_profile(
+        EXECUTOR_SUPPORT_COMPARE | EXECUTOR_SUPPORT_RANGE_CANONICAL,
+        false, true);
+    }
+  }
+  else if (strcmp(source, "multirange_constructor2") == 0 &&
+           !procedure->proretset &&
+           get_typtype(procedure->prorettype) == TYPTYPE_MULTIRANGE &&
+           procedure->pronargs == 1)
+  {
+    TypeCacheEntry *multirange_cache = lookup_type_cache(
+      procedure->prorettype, TYPECACHE_MULTIRANGE_INFO);
+    Oid range_type = multirange_cache->rngtype == NULL
+                       ? InvalidOid
+                       : multirange_cache->rngtype->type_id;
+
+    if (OidIsValid(range_type) &&
+        procedure->provariadic == range_type &&
+        get_element_type(procedure->proargtypes.values[0]) == range_type)
+    {
+      profile = executor_support_profile(
+        EXECUTOR_SUPPORT_COMPARE | EXECUTOR_SUPPORT_RANGE_CANONICAL,
+        false, true);
+    }
+  }
+
+  pfree(source);
+  ReleaseSysCache(tuple);
+  return profile;
+}
+
+/*
+ * PostgreSQL's generic array/range/multirange/record executors are declared
+ * immutable even though they resolve element or subtype support at runtime.
+ * Keep that transitive dependency in one version-specific table so every
+ * caller (ordinary functions, operators, and aggregate support) agrees.
+ */
+static ExecutorSupportProfile
+executor_support_profile_for_function(Oid function_oid)
 {
   switch (function_oid)
   {
@@ -4165,61 +4300,217 @@ container_function_support_kind(Oid function_oid,
     case F_ARRAY_NE:
     case F_RECORD_EQ:
     case F_RECORD_NE:
-    case F_RANGE_EQ:
-    case F_RANGE_NE:
-    case F_MULTIRANGE_EQ:
-    case F_MULTIRANGE_NE:
-      *kind = RUNTIME_SUPPORT_EQUAL;
-      return true;
+    case F_ARRAY_POSITION_ANYCOMPATIBLEARRAY_ANYCOMPATIBLE:
+    case F_ARRAY_POSITION_ANYCOMPATIBLEARRAY_ANYCOMPATIBLE_INT4:
+    case F_ARRAY_POSITIONS:
+    case F_ARRAY_REMOVE:
+    case F_ARRAY_REPLACE:
+    case F_ARRAYOVERLAP:
+    case F_ARRAYCONTAINS:
+    case F_ARRAYCONTAINED:
+      return executor_support_profile(
+        EXECUTOR_SUPPORT_EQUAL, true, false);
+
+    case F_BTARRAYCMP:
     case F_ARRAY_LT:
     case F_ARRAY_GT:
     case F_ARRAY_LE:
     case F_ARRAY_GE:
+    case F_ARRAY_LARGER:
+    case F_ARRAY_SMALLER:
+    case F_ARRAY_SORT_ANYARRAY:
+    case F_ARRAY_SORT_ANYARRAY_BOOL:
+    case F_ARRAY_SORT_ANYARRAY_BOOL_BOOL:
+    case F_WIDTH_BUCKET_ANYCOMPATIBLE_ANYCOMPATIBLEARRAY:
     case F_RECORD_LT:
     case F_RECORD_GT:
     case F_RECORD_LE:
     case F_RECORD_GE:
     case F_BTRECORDCMP:
+    case F_RECORD_LARGER:
+    case F_RECORD_SMALLER:
+    case F_RANGE_EQ:
+    case F_RANGE_NE:
+    case F_RANGE_OVERLAPS:
+    case F_RANGE_CONTAINS_ELEM:
+    case F_RANGE_CONTAINS:
+    case F_ELEM_CONTAINED_BY_RANGE:
+    case F_RANGE_CONTAINED_BY:
+    case F_RANGE_BEFORE:
+    case F_RANGE_AFTER:
+    case F_RANGE_OVERLEFT:
+    case F_RANGE_OVERRIGHT:
     case F_RANGE_CMP:
     case F_RANGE_LT:
     case F_RANGE_LE:
     case F_RANGE_GE:
     case F_RANGE_GT:
+    case F_MULTIRANGE_EQ:
+    case F_MULTIRANGE_NE:
+    case F_RANGE_OVERLAPS_MULTIRANGE:
+    case F_MULTIRANGE_OVERLAPS_RANGE:
+    case F_MULTIRANGE_OVERLAPS_MULTIRANGE:
+    case F_MULTIRANGE_CONTAINS_ELEM:
+    case F_MULTIRANGE_CONTAINS_RANGE:
+    case F_MULTIRANGE_CONTAINS_MULTIRANGE:
+    case F_ELEM_CONTAINED_BY_MULTIRANGE:
+    case F_RANGE_CONTAINED_BY_MULTIRANGE:
+    case F_MULTIRANGE_CONTAINED_BY_MULTIRANGE:
+    case F_RANGE_BEFORE_MULTIRANGE:
+    case F_MULTIRANGE_BEFORE_RANGE:
+    case F_MULTIRANGE_BEFORE_MULTIRANGE:
+    case F_RANGE_AFTER_MULTIRANGE:
+    case F_MULTIRANGE_AFTER_RANGE:
+    case F_MULTIRANGE_AFTER_MULTIRANGE:
+    case F_RANGE_OVERLEFT_MULTIRANGE:
+    case F_MULTIRANGE_OVERLEFT_RANGE:
+    case F_MULTIRANGE_OVERLEFT_MULTIRANGE:
+    case F_RANGE_OVERRIGHT_MULTIRANGE:
+    case F_MULTIRANGE_OVERRIGHT_RANGE:
+    case F_MULTIRANGE_OVERRIGHT_MULTIRANGE:
     case F_MULTIRANGE_CMP:
     case F_MULTIRANGE_LT:
     case F_MULTIRANGE_LE:
     case F_MULTIRANGE_GE:
     case F_MULTIRANGE_GT:
-      *kind = RUNTIME_SUPPORT_COMPARE;
-      return true;
+    case F_RANGE_CONTAINS_MULTIRANGE:
+    case F_MULTIRANGE_CONTAINED_BY_RANGE:
+      return executor_support_profile(
+        EXECUTOR_SUPPORT_COMPARE, true, false);
+
+    case F_RANGE_ADJACENT:
+    case F_RANGE_UNION:
+    case F_RANGE_INTERSECT:
+    case F_RANGE_MINUS:
+    case F_RANGE_MERGE_ANYRANGE_ANYRANGE:
+    case F_RANGE_MERGE_ANYMULTIRANGE:
+    case F_RANGE_ADJACENT_MULTIRANGE:
+    case F_MULTIRANGE_ADJACENT_MULTIRANGE:
+    case F_MULTIRANGE_ADJACENT_RANGE:
+    case F_MULTIRANGE_UNION:
+    case F_MULTIRANGE_MINUS:
+    case F_MULTIRANGE_INTERSECT:
+    case F_RANGE_AGG_FINALFN:
+    case F_MULTIRANGE_AGG_FINALFN:
+    case F_RANGE_INTERSECT_AGG_TRANSFN:
+    case F_MULTIRANGE_INTERSECT_AGG_TRANSFN:
+      return executor_support_profile(
+        EXECUTOR_SUPPORT_COMPARE | EXECUTOR_SUPPORT_RANGE_CANONICAL,
+        true, false);
+
+    case F_RANGE_IN:
+    case F_RANGE_RECV:
+    case F_MULTIRANGE_IN:
+    case F_MULTIRANGE_RECV:
+      return executor_support_profile(
+        EXECUTOR_SUPPORT_COMPARE | EXECUTOR_SUPPORT_RANGE_CANONICAL,
+        false, true);
+
+    case F_HASH_ARRAY:
+    case F_HASH_ARRAY_EXTENDED:
+    case F_HASH_RANGE:
+    case F_HASH_RANGE_EXTENDED:
+    case F_HASH_MULTIRANGE:
+    case F_HASH_MULTIRANGE_EXTENDED:
+    case F_HASH_RECORD:
+    case F_HASH_RECORD_EXTENDED:
+      return executor_support_profile(
+        EXECUTOR_SUPPORT_HASH, true, false);
+
     default:
-      return false;
+      return dynamic_container_executor_support_profile(function_oid);
   }
 }
 
 static bool
-container_function_invokes_volatile(Oid function_oid, const List *args)
+range_canonical_support_invokes_volatile(Oid type_oid, int32 typmod)
 {
-  RuntimeTypeSupportKind kind;
-  ListCell *cell;
+  Oid base_type = getBaseTypeAndTypmod(type_oid, &typmod);
+  TypeCacheEntry *type_cache;
+  char type_kind;
 
-  if (!container_function_support_kind(function_oid, &kind))
+  if (!OidIsValid(base_type))
+  {
+    return true;
+  }
+  type_kind = get_typtype(base_type);
+  if (type_kind == TYPTYPE_MULTIRANGE)
+  {
+    type_cache = lookup_type_cache(base_type, TYPECACHE_MULTIRANGE_INFO);
+    return type_cache->rngtype == NULL ||
+           range_canonical_support_invokes_volatile(
+             type_cache->rngtype->type_id, -1);
+  }
+  if (type_kind != TYPTYPE_RANGE)
   {
     return false;
   }
-  foreach(cell, args)
+  type_cache = lookup_type_cache(base_type, TYPECACHE_RANGE_INFO);
+  return OidIsValid(type_cache->rng_canonical_finfo.fn_oid) &&
+         function_is_volatile(type_cache->rng_canonical_finfo.fn_oid);
+}
+
+static bool
+type_executor_support_invokes_volatile(Oid type_oid, int32 typmod,
+                                       int dependencies)
+{
+  RuntimeTypeSupportKind kind;
+
+  for (kind = RUNTIME_SUPPORT_EQUAL;
+       kind <= RUNTIME_SUPPORT_HASH;
+       kind++)
   {
-    const Node *argument = (const Node *) lfirst(cell);
+    int dependency = kind == RUNTIME_SUPPORT_EQUAL
+                       ? EXECUTOR_SUPPORT_EQUAL
+                       : kind == RUNTIME_SUPPORT_COMPARE
+                           ? EXECUTOR_SUPPORT_COMPARE
+                           : EXECUTOR_SUPPORT_HASH;
     RuntimeTypeSupportContext context = {0};
 
-    if (argument == NULL ||
+    if ((dependencies & dependency) != 0 &&
         type_runtime_support_invokes_volatile(
-          exprType(argument), exprTypmod(argument), kind, &context))
+          type_oid, typmod, kind, &context))
     {
       return true;
     }
   }
-  return false;
+  return (dependencies & EXECUTOR_SUPPORT_RANGE_CANONICAL) != 0 &&
+         range_canonical_support_invokes_volatile(type_oid, typmod);
+}
+
+static bool
+executor_support_dependency_invokes_volatile(
+  Oid function_oid, const List *args, bool target_entries,
+  Oid result_type, int32 result_typmod)
+{
+  ExecutorSupportProfile profile = executor_support_profile_for_function(
+    function_oid);
+  ListCell *cell;
+
+  if (profile.dependencies == EXECUTOR_SUPPORT_NONE)
+  {
+    return false;
+  }
+  if (profile.inspect_arguments)
+  {
+    foreach(cell, args)
+    {
+      const Node *argument = target_entries
+                               ? (const Node *) lfirst_node(TargetEntry, cell)->expr
+                               : (const Node *) lfirst(cell);
+
+      if (argument == NULL ||
+          type_executor_support_invokes_volatile(
+            exprType(argument), exprTypmod(argument), profile.dependencies))
+      {
+        return true;
+      }
+    }
+  }
+  return profile.inspect_result &&
+         (!OidIsValid(result_type) ||
+          type_executor_support_invokes_volatile(
+            result_type, result_typmod, profile.dependencies));
 }
 
 static bool
@@ -4747,7 +5038,9 @@ node_invokes_volatile_function(Node *node, const QueryScope *scope)
     {
       Aggref *aggregate = (Aggref *) node;
 
-      return aggregate_invokes_volatile_function(aggregate->aggfnoid) ||
+      return aggregate_invokes_volatile_function(
+               aggregate->aggfnoid, aggregate->args, true,
+               aggregate->aggtype, exprTypmod(node)) ||
              json_aggregate_args_invoke_volatile(
                aggregate->aggfnoid, aggregate->args) ||
              sort_group_clause_list_invokes_volatile_function(
@@ -4761,7 +5054,9 @@ node_invokes_volatile_function(Node *node, const QueryScope *scope)
       WindowFunc *function = (WindowFunc *) node;
 
       return function->winagg
-               ? aggregate_invokes_volatile_function(function->winfnoid)
+               ? aggregate_invokes_volatile_function(
+                   function->winfnoid, function->args, false,
+                   function->wintype, exprTypmod(node))
                : function_is_volatile(function->winfnoid);
     }
     case T_FuncExpr:
@@ -4771,8 +5066,9 @@ node_invokes_volatile_function(Node *node, const QueryScope *scope)
       return function_is_volatile(function->funcid) ||
              json_function_args_invoke_volatile(
                function->funcid, function->args) ||
-             container_function_invokes_volatile(
-               function->funcid, function->args);
+             executor_support_dependency_invokes_volatile(
+               function->funcid, function->args, false,
+               function->funcresulttype, exprTypmod(node));
     }
     case T_JsonConstructorExpr:
       return json_constructor_args_invoke_volatile(
@@ -4802,7 +5098,9 @@ node_invokes_volatile_function(Node *node, const QueryScope *scope)
         node, scope);
 
       return function_is_volatile(function_oid) ||
-             container_function_invokes_volatile(function_oid, expr->args) ||
+             executor_support_dependency_invokes_volatile(
+               function_oid, expr->args, false,
+               expr->opresulttype, exprTypmod(node)) ||
              (inspect_support &&
               (operator_family_support_invokes_volatile_function(expr->opno) ||
                operator_argument_support_invokes_volatile(expr->args)));
@@ -4813,7 +5111,9 @@ node_invokes_volatile_function(Node *node, const QueryScope *scope)
       Oid function_oid = OidIsValid(expr->opfuncid) ? expr->opfuncid : get_opcode(expr->opno);
 
       return function_is_volatile(function_oid) ||
-             container_function_invokes_volatile(function_oid, expr->args) ||
+             executor_support_dependency_invokes_volatile(
+               function_oid, expr->args, false,
+               exprType(node), exprTypmod(node)) ||
              scalar_array_hash_support_invokes_volatile(expr) ||
              (operator_expr_has_execution_relevant_operand(node, scope) &&
               (operator_family_support_invokes_volatile_function(expr->opno) ||
@@ -4827,7 +5127,10 @@ node_invokes_volatile_function(Node *node, const QueryScope *scope)
       bool type_is_varlena;
 
       getTypeInputInfo(expr->resulttype, &function_oid, &type_io_parameter);
-      if (function_is_volatile(function_oid))
+      if (function_is_volatile(function_oid) ||
+          executor_support_dependency_invokes_volatile(
+            function_oid, NIL, false,
+            expr->resulttype, exprTypmod(node)))
       {
         return true;
       }
@@ -4854,7 +5157,9 @@ node_invokes_volatile_function(Node *node, const QueryScope *scope)
         Oid function_oid = get_opcode(operator_oid);
         List *arguments = list_make2(lfirst(left_cell), lfirst(right_cell));
         bool container_invokes_volatile =
-          container_function_invokes_volatile(function_oid, arguments);
+          executor_support_dependency_invokes_volatile(
+            function_oid, arguments, false,
+            BOOLOID, -1);
 
         list_free(arguments);
 
