@@ -169,6 +169,64 @@ test('compiles named parameters in ARRAY constructors and unambiguous subscript 
   )
 })
 
+test('compiles named parameters inside CASE subscript expressions', () => {
+  const cases: readonly {
+    readonly input: string
+    readonly output: string
+    readonly parameterNames: readonly string[]
+  }[] = [
+    {
+      input: 'select values[case when :use_first then 1 else 2 end] from bounds',
+      output: 'select values[case when $1 then 1 else 2 end] from bounds',
+      parameterNames: ['use_first'],
+    },
+    {
+      input: 'select values[case when :use_lower then :lower else 1 end:upper_bound] from bounds',
+      output: 'select values[case when $1 then $2 else 1 end:upper_bound] from bounds',
+      parameterNames: ['use_lower', 'lower'],
+    },
+    {
+      input: 'select values[lower_bound:case when :use_upper then :upper else 3 end] from bounds',
+      output: 'select values[lower_bound:case when $1 then $2 else 3 end] from bounds',
+      parameterNames: ['use_upper', 'upper'],
+    },
+    {
+      input: 'select values[case when :outer then case when :inner then 1 else 2 end else 3 end] from bounds',
+      output: 'select values[case when $1 then case when $2 then 1 else 2 end else 3 end] from bounds',
+      parameterNames: ['outer', 'inner'],
+    },
+    {
+      input: 'select ARRAY[case when :include_value then :value else 0 end]',
+      output: 'select ARRAY[case when $1 then $2 else 0 end]',
+      parameterNames: ['include_value', 'value'],
+    },
+  ]
+
+  for (const { input, output, parameterNames } of cases) {
+    assert.deepEqual(compileNamedParameters(input), {
+      parameterNames,
+      sql: output,
+    })
+  }
+})
+
+test('tracks CASE nesting only from unquoted code tokens', () => {
+  const sql = `select
+    values["CASE":upper_bound],
+    values[lower_bound /* CASE :ignored END */ :upper_bound],
+    values[case when :use_value then ':END' else :fallback end]
+  from bounds`
+
+  assert.deepEqual(compileNamedParameters(sql), {
+    parameterNames: ['use_value', 'fallback'],
+    sql: `select
+    values["CASE":upper_bound],
+    values[lower_bound /* CASE :ignored END */ :upper_bound],
+    values[case when $1 then ':END' else $2 end]
+  from bounds`,
+  })
+})
+
 test('does not scan placeholders inside unterminated protected regions', () => {
   assert.deepEqual(compileNamedParameters("select 'unterminated :ignored"), {
     parameterNames: [],

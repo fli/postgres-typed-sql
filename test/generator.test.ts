@@ -5,6 +5,7 @@ import { join } from 'node:path'
 import test from 'node:test'
 
 import { generateTypedSql } from '../src/generator.js'
+import { PGlite } from '../src/vendor/pglite/index.js'
 import {
   assertTypeScriptBindingIdentifier,
   postgresCheckConstraintTypeBinding,
@@ -105,6 +106,34 @@ from (values (array[10, 20, 30], 2)) as bounds(numbers, upper_bound)
   const output = await readFile(join(root, 'queries/query.typed-sql.ts'), 'utf8')
   assert.match(output, /parameterNames: \[\]/u)
   assert.match(output, /numbers\[1:upper_bound\]/u)
+})
+
+test('generates and executes named parameters inside CASE array subscripts', async () => {
+  const sql = `select numbers[case when :use_first then 1 else 2 end] as picked
+from (values (array[10, 20])) as input(numbers)
+`
+  const root = await createMinimalFixture('select 1;\n', sql)
+  await generateTypedSql({
+    include: ['queries'],
+    rootDir: root,
+    scalarProfile: 'node-postgres',
+    schema: 'schema.sql',
+  })
+
+  const output = await readFile(join(root, 'queries/query.typed-sql.ts'), 'utf8')
+  assert.match(output, /parameterNames: \['use_first'\]/u)
+  assert.match(output, /numbers\[case when \$1 then 1 else 2 end\]/u)
+
+  const database = new PGlite()
+  try {
+    await database.waitReady
+    const compiledSql =
+      'select numbers[case when $1 then 1 else 2 end] as picked from (values (array[10, 20])) input(numbers)'
+    assert.deepEqual((await database.query(compiledSql, [true])).rows, [{ picked: 10 }])
+    assert.deepEqual((await database.query(compiledSql, [false])).rows, [{ picked: 20 }])
+  } finally {
+    await database.close()
+  }
 })
 
 test('requires serialized strings for PostgreSQL arrays whose element delimiter is not a comma', async () => {

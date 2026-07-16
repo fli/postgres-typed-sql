@@ -197,6 +197,7 @@ function isDotCodeToken(token: SqlCodeToken | null): boolean {
 }
 
 interface SqlBracketFrame {
+  caseDepth: number
   readonly kind: 'arrayConstructor' | 'subscript'
   parenthesisDepth: number
   sliceDelimiterSeen: boolean
@@ -217,6 +218,7 @@ function isSubscriptSliceDelimiter(
 ): frame is SqlBracketFrame {
   return (
     frame?.kind === 'subscript' &&
+    frame.caseDepth === 0 &&
     frame.parenthesisDepth === 0 &&
     !frame.sliceDelimiterSeen &&
     sql[index - 1] !== ':' &&
@@ -273,16 +275,24 @@ export function compileNamedParameters(sql: string, sourceFile = 'typed SQL'): C
 
     if (isNamedParameterStart(character)) {
       const identifierEnd = unquotedIdentifierEnd(sql, index)
-      lastCodeToken =
-        sql.slice(index, identifierEnd).toLowerCase() === 'array' && !isDotCodeToken(lastCodeToken)
-          ? 'arrayKeyword'
-          : 'other'
+      const identifier = sql.slice(index, identifierEnd).toLowerCase()
+      const qualified = isDotCodeToken(lastCodeToken)
+      const bracketFrame = bracketFrames.at(-1)
+      if (bracketFrame?.kind === 'subscript' && !qualified) {
+        if (identifier === 'case') {
+          bracketFrame.caseDepth += 1
+        } else if (identifier === 'end' && bracketFrame.caseDepth > 0) {
+          bracketFrame.caseDepth -= 1
+        }
+      }
+      lastCodeToken = identifier === 'array' && !qualified ? 'arrayKeyword' : 'other'
       index = identifierEnd
       continue
     }
 
     if (character === '[') {
       bracketFrames.push({
+        caseDepth: 0,
         kind: lastCodeToken === 'arrayKeyword' ? 'arrayConstructor' : 'subscript',
         parenthesisDepth: 0,
         sliceDelimiterSeen: false,
