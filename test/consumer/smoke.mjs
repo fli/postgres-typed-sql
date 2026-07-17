@@ -6,6 +6,10 @@ import { generateTypedSql, postgresVersion } from 'postgres-typed-sql'
 assert.equal(postgresVersion, '18.3')
 const result = await generateTypedSql({
   include: ['.'],
+  imports: {
+    runtime: 'postgres-typed-sql/runtime',
+    scalars: 'postgres-typed-sql/scalars',
+  },
   naming: {
     resultColumns: 'camelCase',
     structuredJsonFields: 'camelCase',
@@ -19,7 +23,7 @@ assert.equal(result.statementCount, 3)
 const output = await readFile('find-widget.typed-sql.ts', 'utf8')
 assert.match(output, /cardinality: 'optional'/u)
 assert.match(output, /readonly label: string \| null/u)
-assert.match(output, /readonly state: Audit_WidgetState/u)
+assert.match(output, /readonly state: "active" \| "archived"/u)
 assert.match(output, /readonly metrics: PgArray<number>/u)
 assert.match(output, /readonly searchDocument: string/u)
 assert.match(output, /readonly detailsJson:/u)
@@ -35,6 +39,10 @@ assert.match(echoBytes, /readonly payloads: PgArray<Uint8Array> \| null/u)
 
 const conservativeResult = await generateTypedSql({
   include: ['.'],
+  imports: {
+    runtime: 'postgres-typed-sql/runtime',
+    scalars: 'postgres-typed-sql/scalars',
+  },
   rootDir: process.cwd(),
   schema: 'schema.sql',
 })
@@ -46,6 +54,10 @@ assert.match(conservativeInsert, /readonly label: NonNullable<unknown> \| null/u
 
 await generateTypedSql({
   include: ['.'],
+  imports: {
+    runtime: 'postgres-typed-sql/runtime',
+    scalars: 'postgres-typed-sql/scalars',
+  },
   naming: {
     resultColumns: 'camelCase',
     structuredJsonFields: 'camelCase',

@@ -1,7 +1,42 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { resolveConfig, type PostgresTypedSqlConfig } from '../src/config.js'
+import { resolveConfig as resolveConfigBase, type PostgresTypedSqlConfig } from '../src/config.js'
+
+const testImports = {
+  runtime: 'postgres-typed-sql/runtime',
+  scalars: 'postgres-typed-sql/scalars',
+} as const
+
+function resolveConfig(
+  config: Omit<PostgresTypedSqlConfig, 'imports'> & { imports?: PostgresTypedSqlConfig['imports'] }
+) {
+  return resolveConfigBase({ ...config, imports: config.imports ?? testImports })
+}
+
+test('config requires exact generated-code imports and rejects the removed package prefix', () => {
+  assert.throws(
+    () => resolveConfigBase({ schema: 'schema.sql' } as PostgresTypedSqlConfig),
+    /imports option is required/u
+  )
+  assert.throws(
+    () => resolveConfig({ imports: { runtime: '', scalars: 'postgres-typed-sql/scalars' }, schema: 'schema.sql' }),
+    /imports\.runtime must be a non-empty module specifier/u
+  )
+  assert.throws(
+    () => resolveConfig({ imports: { runtime: 'postgres-typed-sql/runtime', scalars: ' ' }, schema: 'schema.sql' }),
+    /imports\.scalars must be a non-empty module specifier/u
+  )
+  assert.throws(
+    () =>
+      resolveConfigBase({
+        imports: testImports,
+        packageImport: '@example/db',
+        schema: 'schema.sql',
+      } as PostgresTypedSqlConfig),
+    /packageImport is no longer supported/u
+  )
+})
 
 test('config defaults to conservative scalars and rejects unknown profiles', () => {
   const resolved = resolveConfig({ schema: 'schema.sql' })

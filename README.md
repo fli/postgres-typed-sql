@@ -20,7 +20,7 @@ Supported extensions are `btree_gin`, `btree_gist`, `pg_trgm`, `pgcrypto`, `plpg
 ## Install
 
 ```sh
-npm install --save-dev postgres-typed-sql
+npm install postgres-typed-sql
 ```
 
 Create `postgres-typed-sql.config.mjs`:
@@ -31,6 +31,10 @@ import { defineConfig } from 'postgres-typed-sql'
 export default defineConfig({
   schema: './db/schema.sql',
   include: ['./src'],
+  imports: {
+    runtime: 'postgres-typed-sql/runtime',
+    scalars: 'postgres-typed-sql/scalars',
+  },
   extensions: ['pgcrypto'],
   scalarProfile: 'node-postgres',
   naming: {
@@ -39,6 +43,10 @@ export default defineConfig({
   },
 })
 ```
+
+`imports` is required because generated statements have a runtime value dependency and a type-only scalar-support dependency. One generation invocation uses the same two exact module specifiers for every output; workspaces that publish different generated-code façades should use separate configurations. The configured modules are two addresses within the ABI owned by this generator version: `runtime` must export `createTypedSqlStatement`, and `scalars` must export the scalar bindings used by the selected profile. No package suffixes are inferred.
+
+The generated catalog defaults to `postgres-typed-sql.types.ts` and can be relocated with `typesOutput`. Statement files do not import that artifact: enum labels and supported CHECK-constraint refinements are rendered directly into their parameter, result, and structured-JSON types. The catalog remains available as a standalone database model for application code that needs it.
 
 Add a script:
 
@@ -82,7 +90,7 @@ import type { TypedSqlRawRow } from 'postgres-typed-sql/runtime'
 const result = await client.query<TypedSqlRawRow>(findAccountByEmail.query({ email }))
 ```
 
-Direct driver execution returns driver-defined raw object rows whose scalar values should be treated as `unknown`, because `query()` controls neither row construction nor scalar parsers. The node-postgres result-row generic is not inferred from a query configuration object, so a direct unannotated `client.query(statement.query(params))` call defaults to `any`; pass `TypedSqlRawRow` explicitly as shown above. The optional runtime helpers under `postgres-typed-sql/runtime` instead request array rows, map them by result-column position, enforce `one`, `optional`, and `many` result shapes, and return the generated row type selected by the configured scalar profile. Positional mapping preserves every unique PostgreSQL result name safely, including names such as `__proto__` that object-row construction cannot represent reliably.
+Direct driver execution returns driver-defined raw object rows whose scalar values should be treated as `unknown`, because `query()` controls neither row construction nor scalar parsers. The node-postgres result-row generic is not inferred from a query configuration object, so a direct unannotated `client.query(statement.query(params))` call defaults to `any`; pass `TypedSqlRawRow` explicitly as shown above. Generated statements use `createTypedSqlStatement` from the configured runtime module. Its optional execution helpers request array rows, map them by result-column position, enforce `one`, `optional`, and `many` result shapes, and return the generated row type selected by the configured scalar profile. Positional mapping preserves every unique PostgreSQL result name safely, including names such as `__proto__` that object-row construction cannot represent reliably.
 
 ## Output naming
 
@@ -91,6 +99,10 @@ Postgres Typed SQL preserves PostgreSQL result and JSON field names by default. 
 ```js
 export default defineConfig({
   schema: './db/schema.sql',
+  imports: {
+    runtime: 'postgres-typed-sql/runtime',
+    scalars: 'postgres-typed-sql/scalars',
+  },
   scalarProfile: 'node-postgres',
   naming: {
     resultColumns: 'camelCase',

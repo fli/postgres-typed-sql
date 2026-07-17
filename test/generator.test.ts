@@ -4,7 +4,8 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
 
-import { generateTypedSql } from '../src/generator.js'
+import type { PostgresTypedSqlConfig } from '../src/config.js'
+import { generateTypedSql as generateTypedSqlBase } from '../src/generator.js'
 import { PGlite } from '../src/vendor/pglite/index.js'
 import {
   assertTypeScriptBindingIdentifier,
@@ -15,6 +16,16 @@ import {
 } from '../src/typescript-names.js'
 
 const fixtureRoot = new URL('./fixtures/', import.meta.url)
+const testImports = {
+  runtime: 'postgres-typed-sql/runtime',
+  scalars: 'postgres-typed-sql/scalars',
+} as const
+
+function generateTypedSql(
+  config: Omit<PostgresTypedSqlConfig, 'imports'> & { imports?: PostgresTypedSqlConfig['imports'] }
+) {
+  return generateTypedSqlBase({ ...config, imports: config.imports ?? testImports })
+}
 
 test('camel-cases only conventional PostgreSQL output identifiers', () => {
   assert.equal(camelCaseOutputProperty('account_id'), 'accountId')
@@ -54,8 +65,9 @@ test('generates PostgreSQL-derived types, nullability, and cardinality', async (
   const account = await readFile(join(root, 'queries/find-account-by-email.typed-sql.ts'), 'utf8')
   assert.match(account, /cardinality: 'optional'/u)
   assert.match(account, /readonly display_name: string \| null/u)
-  assert.match(account, /readonly status: AccountStatus/u)
-  assert.match(account, /readonly role: Accounts__Role/u)
+  assert.match(account, /readonly status: "active" \| "suspended"/u)
+  assert.match(account, /readonly role: 'member' \| 'admin'/u)
+  assert.doesNotMatch(account, /postgres-typed-sql\.types/u)
   assert.match(account, /postgres-typed-sql\/runtime/u)
 
   const joined = await readFile(join(root, 'queries/list-accounts-with-posts.typed-sql.ts'), 'utf8')
@@ -758,10 +770,10 @@ where event_id = :event_id
   assert.doesNotMatch(exact, /import type \{ URL \}/u)
 
   const audit = await readFile(join(root, 'queries/audit-event.typed-sql.ts'), 'utf8')
-  assert.match(audit, /import type \{ Audit_AccountStatus \}/u)
+  assert.doesNotMatch(audit, /Audit_AccountStatus/u)
   assert.match(audit, /readonly event_record: string/u)
   assert.match(audit, /readonly event_id: PgInt8String/u)
-  assert.match(audit, /readonly event_status: Audit_AccountStatus/u)
+  assert.match(audit, /readonly event_status: "queued" \| "complete"/u)
   assert.match(audit, /readonly event_statuses: string/u)
   assert.match(audit, /readonly numeric_values: PgArray<number>/u)
   assert.match(audit, /readonly occurred_at: Date \| number/u)
@@ -773,7 +785,7 @@ where event_id = :event_id
   assert.match(audit, /readonly whole_event: string \| null/u)
   assert.match(audit, /readonly details_json: AuditEventJ12_details_jsonJson/u)
   assert.match(audit, /readonly score: number/u)
-  assert.match(audit, /readonly status: Audit_AccountStatus/u)
+  assert.match(audit, /readonly status: "queued" \| "complete"/u)
   assert.match(audit, /readonly whole_event: DbJsonSelected \| null/u)
   assert.doesNotMatch(audit, /AuditScore|AuditScoreSpan/u)
 
@@ -866,14 +878,15 @@ create type public.collision_params as enum ('one');
     join(importCollisionRoot, 'queries/collision.typed.sql'),
     "select 'one'::public.collision_params as value\n"
   )
-  await assert.rejects(
-    generateTypedSql({
-      include: ['queries'],
-      rootDir: importCollisionRoot,
-      scalarProfile: 'node-postgres',
-      schema: 'schema.sql',
-    }),
-    /generated TypeScript binding CollisionParams for catalog type import collides with parameter interface/u
+  await generateTypedSql({
+    include: ['queries'],
+    rootDir: importCollisionRoot,
+    scalarProfile: 'node-postgres',
+    schema: 'schema.sql',
+  })
+  assert.match(
+    await readFile(join(importCollisionRoot, 'queries/collision.typed-sql.ts'), 'utf8'),
+    /readonly value: "one"/u
   )
 
   const dateCatalogCollisionRoot = await copyFixture()
@@ -922,15 +935,18 @@ create table public.readings (kind public.date not null);
     join(dateStatementCollisionRoot, 'queries/ambient-collision.typed.sql'),
     'select kind, now()::timestamp with time zone as measured_at from public.readings\n'
   )
-  await assert.rejects(
-    generateTypedSql({
-      include: ['queries'],
-      rootDir: dateStatementCollisionRoot,
-      scalarProfile: 'node-postgres',
-      schema: 'schema.sql',
-    }),
-    /generated TypeScript binding Date for catalog type import collides with ambient TypeScript type/u
+  await generateTypedSql({
+    include: ['queries'],
+    rootDir: dateStatementCollisionRoot,
+    scalarProfile: 'node-postgres',
+    schema: 'schema.sql',
+  })
+  const dateStatement = await readFile(
+    join(dateStatementCollisionRoot, 'queries/ambient-collision.typed-sql.ts'),
+    'utf8'
   )
+  assert.match(dateStatement, /readonly kind: "today"/u)
+  assert.match(dateStatement, /readonly measured_at: Date \| number/u)
 })
 
 test('reserves only TypeScript utility, ambient, and scalar bindings used by each generated file', async () => {
@@ -953,40 +969,35 @@ create type public.uint8_array as enum ('ambient_bytes');
     schema: 'schema.sql',
   })
   const unusedCollisionOutput = await readFile(join(unusedCollisionRoot, 'queries/query.typed-sql.ts'), 'utf8')
-  assert.match(unusedCollisionOutput, /import type \{ Date, Record, Uint8Array \}/u)
+  assert.doesNotMatch(unusedCollisionOutput, /import type/u)
+  assert.match(unusedCollisionOutput, /readonly utility_kind: "utility" \| null/u)
+  assert.match(unusedCollisionOutput, /readonly date_kind: "ambient_date" \| null/u)
+  assert.match(unusedCollisionOutput, /readonly bytes_kind: "ambient_bytes" \| null/u)
   assert.doesNotMatch(unusedCollisionOutput, /PgInt8String/u)
   assert.doesNotMatch(unusedCollisionOutput, /Record<string, never>/u)
 
   const cases = [
     {
-      error:
-        /generated TypeScript binding PgInt8String for postgres-typed-sql scalar type import collides with catalog type import/u,
       schema: `create type public.pg_int8_string as enum ('scalar');
 `,
       sql: 'select :kind::public.pg_int8_string as kind, 1::bigint as count\n',
     },
     {
-      error:
-        /generated TypeScript binding PgArrayParameter for postgres-typed-sql scalar type import collides with catalog type import/u,
       schema: `create type public.pg_array_parameter as enum ('scalar');
 `,
       sql: 'select :kind::public.pg_array_parameter as kind, cardinality(:values::integer[]) as count\n',
     },
     {
-      error:
-        /generated TypeScript binding Record for catalog type import collides with TypeScript utility type used by an empty generated object/u,
       schema: `create type public.record as enum ('utility');
 `,
       sql: "select 'utility'::public.record as kind\n",
     },
     {
-      error: /generated TypeScript binding Date for catalog type import collides with ambient TypeScript type/u,
       schema: `create type public.date as enum ('ambient_date');
 `,
       sql: "select 'ambient_date'::public.date as kind, now() as observed_at\n",
     },
     {
-      error: /generated TypeScript binding Uint8Array for catalog type import collides with ambient TypeScript type/u,
       schema: `create type public.uint8_array as enum ('ambient_bytes');
 `,
       sql: "select 'ambient_bytes'::public.uint8_array as kind, decode('', 'hex') as payload\n",
@@ -995,15 +1006,12 @@ create type public.uint8_array as enum ('ambient_bytes');
 
   for (const collision of cases) {
     const root = await createMinimalFixture(collision.schema, collision.sql)
-    await assert.rejects(
-      generateTypedSql({
-        include: ['queries'],
-        rootDir: root,
-        scalarProfile: 'node-postgres',
-        schema: 'schema.sql',
-      }),
-      collision.error
-    )
+    await generateTypedSql({
+      include: ['queries'],
+      rootDir: root,
+      scalarProfile: 'node-postgres',
+      schema: 'schema.sql',
+    })
   }
 
   const catalogScalarCollisionRoot = await createMinimalFixture(
@@ -1043,6 +1051,7 @@ test('encodes arbitrary PostgreSQL identifiers injectively and renders complete 
 create schema a;
 create type public."state-code" as enum ('ok');
 create table public."order-items" (
+  id bigint,
   "display-name" text,
   state public."state-code" not null
 );
@@ -1050,11 +1059,14 @@ create table "a.b".c (d text check (d in ('left')));
 create table a."b.c" (d text check (d in ('right')));
 create table public.empty_table ();
 `,
-    'select "display-name", state from public."order-items"\n'
+    'select id, "display-name", state from public."order-items"\n'
   )
   await generateTypedSql({
     include: ['queries'],
-    packageImport: "package'quoted",
+    imports: {
+      runtime: "package'quoted/typed-sql",
+      scalars: "package'quoted/pg-scalars",
+    },
     rootDir: root,
     scalarProfile: 'node-postgres',
     schema: 'schema.sql',
@@ -1071,8 +1083,36 @@ create table public.empty_table ();
   assert.match(catalog, /export type A_\$Qb\$2e\$c__D = "right"/u)
   assert.ok(catalog.includes('readonly "\\"a.b\\".c": $Qa$2e$b_C'))
   assert.ok(catalog.includes('readonly "a.\\"b.c\\"": A_$Qb$2e$c'))
-  assert.ok(query.includes('from "../types\'o.js"'))
-  assert.ok(query.includes('from "package\'quoted/runtime"'))
+  assert.match(query, /readonly state: "ok"/u)
+  assert.doesNotMatch(query, /types'o\.js/u)
+  assert.ok(query.includes('from "package\'quoted/typed-sql"'))
+  assert.ok(query.includes('from "package\'quoted/pg-scalars"'))
+  assert.ok(catalog.includes('from "package\'quoted/pg-scalars"'))
+})
+
+test('inlines excluded-schema enums instead of referencing undeclared catalog aliases', async () => {
+  const root = await createMinimalFixture(
+    `create type pg_catalog.review_enum as enum ('a', 'b');
+create domain public.review_enum_domain as pg_catalog.review_enum;
+create table public.review_rows (
+  direct_value pg_catalog.review_enum not null,
+  domain_value public.review_enum_domain not null
+);
+`,
+    'select direct_value, domain_value from public.review_rows\n'
+  )
+
+  await generateTypedSql({
+    include: ['queries'],
+    rootDir: root,
+    scalarProfile: 'node-postgres',
+    schema: 'schema.sql',
+  })
+
+  const catalog = await readFile(join(root, 'postgres-typed-sql.types.ts'), 'utf8')
+  assert.match(catalog, /readonly direct_value: "a" \| "b"/u)
+  assert.match(catalog, /readonly domain_value: "a" \| "b"/u)
+  assert.doesNotMatch(catalog, /PgCatalog_ReviewEnum/u)
 })
 
 test('uses authoritative JSON-cast facts and refuses nullable overrides of proven rejecting targets', async () => {
@@ -1413,14 +1453,14 @@ cross join lateral (
 
   await generateTypedSql(config)
   let output = await readFile(outputFile, 'utf8')
-  assert.match(output, /readonly value: OuterCorrelation__Value \| null/u)
-  assert.doesNotMatch(output, /readonly value: InnerCorrelation__Value/u)
+  assert.match(output, /readonly value: 'outer_only' \| null/u)
+  assert.doesNotMatch(output, /readonly value: 'inner_only'/u)
 
   output = await generate(`select value from public.check_left
 union
 select value from public.check_right`)
-  assert.match(output, /readonly value: CheckLeft__Value \| CheckRight__Value \| null/u)
-  assert.match(output, /import type \{ CheckLeft__Value, CheckRight__Value \}/u)
+  assert.match(output, /readonly value: \('left_only' \| 'shared'\) \| \('right_only' \| 'shared'\) \| null/u)
+  assert.doesNotMatch(output, /import type/u)
 
   for (const sql of [
     `select value from public.check_left
@@ -1432,13 +1472,13 @@ select value from public.check_left`,
   ]) {
     output = await generate(sql)
     assert.match(output, /readonly value: string \| null/u)
-    assert.doesNotMatch(output, /CheckLeft__Value/u)
+    assert.doesNotMatch(output, /'left_only' \| 'shared'/u)
   }
 
   output = await generate(`select value from public.check_left
 intersect all
 select value from public.check_right`)
-  assert.match(output, /readonly value: CheckLeft__Value & CheckRight__Value \| null/u)
+  assert.match(output, /readonly value: \('left_only' \| 'shared'\) & \('right_only' \| 'shared'\) \| null/u)
 
   for (const sql of [
     `select value from public.check_left
@@ -1449,25 +1489,28 @@ intersect all
 select value from public.check_left`,
   ]) {
     output = await generate(sql)
-    assert.match(output, /readonly value: CheckLeft__Value \| null/u)
+    assert.match(output, /readonly value: 'left_only' \| 'shared' \| null/u)
   }
 
   output = await generate(`select value from public.check_left
 except all
 select value from public.check_right`)
-  assert.match(output, /readonly value: CheckLeft__Value \| null/u)
+  assert.match(output, /readonly value: 'left_only' \| 'shared' \| null/u)
 
   output = await generate(`select left_value.value from public.check_left left_value
 union all
 select right_value.value from public.check_right right_value`)
-  assert.match(output, /readonly value: CheckLeft__Value \| CheckRight__Value \| null/u)
+  assert.match(output, /readonly value: \('left_only' \| 'shared'\) \| \('right_only' \| 'shared'\) \| null/u)
 
   output = await generate(`(select value from public.check_left
  union
  select value from public.check_right)
 intersect
 select value from public.check_left`)
-  assert.match(output, /readonly value: \(CheckLeft__Value \| CheckRight__Value\) & CheckLeft__Value \| null/u)
+  assert.match(
+    output,
+    /readonly value: \(\('left_only' \| 'shared'\) \| \('right_only' \| 'shared'\)\) & \('left_only' \| 'shared'\) \| null/u
+  )
 
   output = await generate(`select lateral_value.value, lateral_value.nullable_value, lateral_value.payload
 from (
@@ -1493,8 +1536,8 @@ cross join lateral (
     from public.inner_correlation
   ) unrelated_inner
 ) lateral_value`)
-  assert.match(output, /readonly value: CheckLeft__Value \| CheckRight__Value \| null/u)
-  assert.doesNotMatch(output, /readonly value: InnerCorrelation__Value/u)
+  assert.match(output, /readonly value: \('left_only' \| 'shared'\) \| \('right_only' \| 'shared'\) \| null/u)
+  assert.doesNotMatch(output, /readonly value: 'inner_only'/u)
   assert.match(output, /readonly nullable_value: string \| null/u)
   assert.match(output, /interface QueryJ7_payloadJsonJ12_alternative1 \{[\s\S]*readonly outer_left:/u)
   assert.match(output, /interface QueryJ7_payloadJsonJ12_alternative2 \{[\s\S]*readonly outer_right:/u)
@@ -2070,7 +2113,7 @@ select 'active'::public.asserted_status as status
     schema: 'schema.sql',
   })
   const output = await readFile(join(root, 'queries/query.typed-sql.ts'), 'utf8')
-  assert.match(output, /readonly status: AssertedStatus/u)
+  assert.match(output, /readonly status: "active"/u)
 })
 
 test('rejects nullable column assertions because PostgreSQL determines result nullability', async () => {

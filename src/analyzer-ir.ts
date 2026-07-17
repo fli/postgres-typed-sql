@@ -35,7 +35,7 @@ export interface TypedSqlPostgresIrRowBounds {
 }
 
 export interface TypedSqlPostgresIrParam extends PostgresTypeFact {
-  readonly checkConstraintTypeName?: string
+  readonly checkConstraintType?: TypedSqlPostgresIrCheckConstraintTypeExpression
   readonly name: string
   readonly nullAdmission: TypedSqlPostgresIrParamNullAdmission
   readonly nullable: boolean
@@ -54,8 +54,8 @@ export interface TypedSqlPostgresIrColumn extends PostgresTypeFact {
 
 export type TypedSqlPostgresIrCheckConstraintTypeExpression =
   | {
-      readonly kind: 'named'
-      readonly name: string
+      readonly kind: 'literalUnion'
+      readonly labels: readonly string[]
     }
   | {
       readonly kind: 'intersection' | 'union'
@@ -83,7 +83,7 @@ export type TypedSqlPostgresIrJsonShape =
       readonly nullable: boolean
     }
   | (PostgresTypeFact & {
-      readonly checkConstraintTypeName?: string
+      readonly checkConstraintType?: TypedSqlPostgresIrCheckConstraintTypeExpression
       readonly kind: 'scalar'
       readonly nullable: boolean
     })
@@ -1254,8 +1254,8 @@ function checkConstraintTypeForQueryOutput(
 }
 
 function checkConstraintTypeKey(type: TypedSqlPostgresIrCheckConstraintTypeExpression): string {
-  return type.kind === 'named'
-    ? `named:${type.name}`
+  return type.kind === 'literalUnion'
+    ? `literalUnion:${JSON.stringify(type.labels)}`
     : `${type.kind}(${type.members.map(checkConstraintTypeKey).join(',')})`
 }
 
@@ -1300,7 +1300,7 @@ function checkConstraintTypeForExpr(
       })
     )
     if (fact) {
-      return { kind: 'named', name: fact.typeName }
+      return { kind: 'literalUnion', labels: fact.labels }
     }
   }
 
@@ -1311,21 +1311,21 @@ function checkConstraintTypeForExpr(
     : null
 }
 
-function namedCheckConstraintTypeForExpr(
+function literalCheckConstraintTypeForExpr(
   catalog: CatalogFacts,
   scope: QueryScope,
   expr: PgAnalyzerExpr | null | undefined
-): string | null {
+): TypedSqlPostgresIrCheckConstraintTypeExpression | null {
   const type = checkConstraintTypeForExpr(catalog, scope, expr, [])
-  return type?.kind === 'named' ? type.name : null
+  return type?.kind === 'literalUnion' ? type : null
 }
 
 function checkedColumnParamTypes(
   catalog: CatalogFacts,
   queries: readonly PgAnalyzerQuery[],
   paramTypeOids: readonly number[]
-): ReadonlyMap<number, string> {
-  const candidates = new Map<number, Set<string>>()
+): ReadonlyMap<number, TypedSqlPostgresIrCheckConstraintTypeExpression> {
+  const candidates = new Map<number, Map<string, TypedSqlPostgresIrCheckConstraintTypeExpression>>()
   for (const query of queries) {
     walkQueryTree(query, (nested) => {
       for (const target of nested.dmlParameterTargets) {
@@ -1346,19 +1346,21 @@ function checkedColumnParamTypes(
           continue
         }
 
-        const types = candidates.get(target.paramId) ?? new Set<string>()
-        types.add(fact.typeName)
+        const types =
+          candidates.get(target.paramId) ?? new Map<string, TypedSqlPostgresIrCheckConstraintTypeExpression>()
+        const type = { kind: 'literalUnion', labels: fact.labels } as const
+        types.set(checkConstraintTypeKey(type), type)
         candidates.set(target.paramId, types)
       }
     })
   }
 
-  const resolved = new Map<number, string>()
+  const resolved = new Map<number, TypedSqlPostgresIrCheckConstraintTypeExpression>()
   for (const [paramId, types] of candidates) {
     if (types.size === 1) {
-      const [typeName] = types
-      if (typeName) {
-        resolved.set(paramId, typeName)
+      const [type] = types.values()
+      if (type) {
+        resolved.set(paramId, type)
       }
     }
   }
@@ -1615,12 +1617,12 @@ function scalarJsonShapeForExpr(
     }
   }
 
-  const checkConstraintType = namedCheckConstraintTypeForExpr(catalog, scope, expr)
+  const checkConstraintType = literalCheckConstraintTypeForExpr(catalog, scope, expr)
   return {
     kind: 'scalar',
     nullable: expressionNullable(catalog, scope, expr, refinements),
     ...typeFact,
-    ...(checkConstraintType ? { checkConstraintTypeName: checkConstraintType } : {}),
+    ...(checkConstraintType ? { checkConstraintType } : {}),
   }
 }
 
@@ -1845,7 +1847,7 @@ function normalizeCompiledIr(catalog: CatalogFacts, analyzed: AnalyzedCompiledCo
   const params = config.parameterNames.map((name, index): TypedSqlPostgresIrParam => {
     const oid = analysis.paramTypeOids[index]
     const typeFact = typeFactForOid(catalog, oid, config.parameterTypes?.[index])
-    const checkConstraintTypeName = checkConstraintParamTypes.get(index + 1)
+    const checkConstraintType = checkConstraintParamTypes.get(index + 1)
     const nullAdmission = nullAdmissionByParamId.get(index + 1) ?? 'unknown'
     return {
       name,
@@ -1853,7 +1855,7 @@ function normalizeCompiledIr(catalog: CatalogFacts, analyzed: AnalyzedCompiledCo
       nullable: nullAdmission === 'accepts',
       ...typeFact,
       propertyName: name,
-      ...(checkConstraintTypeName ? { checkConstraintTypeName } : {}),
+      ...(checkConstraintType ? { checkConstraintType } : {}),
     }
   })
   const rowBounds = inferRowBounds(catalog, query, resultColumns.length)

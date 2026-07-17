@@ -12,11 +12,18 @@ export interface PostgresTypedSqlNamingConfig {
   readonly structuredJsonFields?: PostgresTypedSqlPropertyNaming
 }
 
+export interface PostgresTypedSqlImportsConfig {
+  /** Exact module specifier for the generated-code runtime exporting createTypedSqlStatement. */
+  readonly runtime: string
+  /** Exact module specifier for PostgreSQL scalar type declarations used by generated code. */
+  readonly scalars: string
+}
+
 export interface PostgresTypedSqlConfig {
   /** Directories recursively searched for *.typed.sql files. Defaults to rootDir. */
   readonly include?: readonly string[]
-  /** Import specifier written into generated files. */
-  readonly packageImport?: string
+  /** Exact module specifiers written into generated TypeScript. */
+  readonly imports: PostgresTypedSqlImportsConfig
   /** Naming conventions for generated result properties. */
   readonly naming?: PostgresTypedSqlNamingConfig
   /** Project directory used to resolve every relative path. Defaults to process.cwd(). */
@@ -38,9 +45,9 @@ export interface ResolvedPostgresTypedSqlNamingConfig {
 
 export interface ResolvedPostgresTypedSqlConfig {
   readonly extensions: readonly SupportedExtension[]
+  readonly imports: PostgresTypedSqlImportsConfig
   readonly include: readonly string[]
   readonly naming: ResolvedPostgresTypedSqlNamingConfig
-  readonly packageImport: string
   readonly rootDir: string
   readonly scalarProfile: PostgresScalarProfile
   readonly schemaFiles: readonly string[]
@@ -55,10 +62,23 @@ function fromRoot(rootDir: string, value: string): string {
   return isAbsolute(value) ? value : resolve(rootDir, value)
 }
 
+function requireModuleSpecifier(value: unknown, option: string): string {
+  if (typeof value !== 'string' || value.trim().length === 0) {
+    throw new Error(`${option} must be a non-empty module specifier.`)
+  }
+  return value
+}
+
 export function resolveConfig(config: PostgresTypedSqlConfig): ResolvedPostgresTypedSqlConfig {
+  if (Object.hasOwn(config, 'packageImport')) {
+    throw new Error('packageImport is no longer supported. Configure imports.runtime and imports.scalars explicitly.')
+  }
+  if (!config.imports || typeof config.imports !== 'object') {
+    throw new Error('The imports option is required and must configure runtime and scalars.')
+  }
   const rootDir = resolve(config.rootDir ?? process.cwd())
   const schema = typeof config.schema === 'string' ? [config.schema] : config.schema
-  if (schema.length === 0) {
+  if (!schema || schema.length === 0) {
     throw new Error('The schema option must name at least one SQL file.')
   }
   const scalarProfile = config.scalarProfile ?? defaultPostgresScalarProfile
@@ -76,12 +96,15 @@ export function resolveConfig(config: PostgresTypedSqlConfig): ResolvedPostgresT
 
   return {
     extensions: config.extensions ?? [],
+    imports: {
+      runtime: requireModuleSpecifier(config.imports.runtime, 'imports.runtime'),
+      scalars: requireModuleSpecifier(config.imports.scalars, 'imports.scalars'),
+    },
     include: (config.include ?? ['.']).map((entry) => fromRoot(rootDir, entry)),
     naming: {
       resultColumns,
       structuredJsonFields,
     },
-    packageImport: config.packageImport ?? 'postgres-typed-sql',
     rootDir,
     scalarProfile,
     schemaFiles: schema.map((entry) => fromRoot(rootDir, entry)),

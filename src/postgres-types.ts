@@ -1,5 +1,3 @@
-import { postgresNamedTypeBinding } from './typescript-names.js'
-
 /**
  * The PostgreSQL type classes that affect TypeScript resolution.
  *
@@ -26,6 +24,8 @@ export interface PostgresTypeFact {
   readonly pgTypeSchema: string
   /** PostgreSQL's JSON conversion invokes a user-defined function cast from this type to json. */
   readonly pgCastsToJson?: boolean
+  /** Ordered labels for a PostgreSQL enum. Present when pgTypeKind is enum. */
+  readonly pgEnumLabels?: readonly string[]
   /** The immediate base type of a domain. Nested domains are intentionally recursive. */
   readonly pgBaseType?: PostgresTypeFact
   /** The immediate element type of an array. Nested arrays are intentionally recursive. */
@@ -36,7 +36,6 @@ export interface PostgresTypeFact {
 
 export interface PostgresTypeScriptResolution {
   readonly ambientBindings: readonly string[]
-  readonly catalogImports: readonly string[]
   readonly scalarImports: readonly string[]
   readonly type: string
 }
@@ -66,13 +65,11 @@ function resolution(
   type: string,
   options: {
     readonly ambientBindings?: readonly string[]
-    readonly catalogImports?: readonly string[]
     readonly scalarImports?: readonly string[]
   } = {}
 ): PostgresTypeScriptResolution {
   return {
     ambientBindings: options.ambientBindings ?? emptyImports,
-    catalogImports: options.catalogImports ?? emptyImports,
     scalarImports: options.scalarImports ?? (scalarImportNames.has(type) ? [type] : emptyImports),
     type,
   }
@@ -91,7 +88,6 @@ function uniqueImports(imports: readonly string[]): readonly string[] {
 function pgResultArrayResolution(element: PostgresTypeScriptResolution): PostgresTypeScriptResolution {
   return resolution(`PgArray<${element.type}>`, {
     ambientBindings: element.ambientBindings,
-    catalogImports: element.catalogImports,
     scalarImports: uniqueImports(['PgArray', ...element.scalarImports]),
   })
 }
@@ -99,7 +95,6 @@ function pgResultArrayResolution(element: PostgresTypeScriptResolution): Postgre
 function pgParameterArrayResolution(element: PostgresTypeScriptResolution): PostgresTypeScriptResolution {
   return resolution(`PgArrayParameter<${element.type}> | string`, {
     ambientBindings: element.ambientBindings,
-    catalogImports: element.catalogImports,
     scalarImports: uniqueImports(['PgArrayParameter', ...element.scalarImports]),
   })
 }
@@ -234,12 +229,10 @@ export function normalizePostgresTypeName(pgType: string): string {
   return pgCatalogTypeAliases.get(pgType) ?? pgType
 }
 
-function catalogTypeResolution(typeFact: PostgresTypeFact): PostgresTypeScriptResolution {
-  if (typeFact.pgTypeSchema === 'pg_catalog') {
-    return stringResolution
-  }
-  const catalogType = postgresNamedTypeBinding(typeFact.pgTypeSchema, typeFact.pgTypeName)
-  return resolution(catalogType, { catalogImports: [catalogType] })
+function enumTypeResolution(typeFact: PostgresTypeFact): PostgresTypeScriptResolution {
+  return typeFact.pgEnumLabels && typeFact.pgEnumLabels.length > 0
+    ? resolution(typeFact.pgEnumLabels.map((label) => JSON.stringify(label)).join(' | '))
+    : stringResolution
 }
 
 /** Resolve a query result decoded through node-postgres' text protocol. */
@@ -257,7 +250,7 @@ export function resolveTypeScriptResultTypeForPostgresType(
       : unknownResolution
   }
   if (typeFact.pgTypeKind === 'enum') {
-    return catalogTypeResolution(typeFact)
+    return enumTypeResolution(typeFact)
   }
 
   if (typeFact.pgTypeOid === 0) {
@@ -294,7 +287,7 @@ export function resolveTypeScriptParameterTypeForPostgresType(
   }
 
   if (typeFact.pgTypeKind === 'enum') {
-    return catalogTypeResolution(typeFact)
+    return enumTypeResolution(typeFact)
   }
 
   const normalizedType = normalizePostgresTypeName(typeFact.pgTypeName)
@@ -395,7 +388,7 @@ export function resolveTypeScriptJsonScalarTypeForPostgresType(
     return resolution('DbJsonSelected')
   }
   if (typeFact.pgTypeKind === 'enum') {
-    return catalogTypeResolution(typeFact)
+    return enumTypeResolution(typeFact)
   }
 
   const normalizedType = normalizePostgresTypeName(typeFact.pgTypeName)

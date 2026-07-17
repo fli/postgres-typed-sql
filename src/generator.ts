@@ -124,7 +124,6 @@ type TypedSqlAccess = 'read' | 'write'
 
 interface ResolvedTypedSql {
   readonly access: TypedSqlAccess
-  readonly catalogTypeImports: readonly string[]
   readonly cardinality: TypedSqlPostgresIrRowCardinality
   readonly columns: readonly ResolvedSqlColumn[]
   readonly command: TypedSqlCommand
@@ -143,7 +142,6 @@ interface ResolvedTypedSql {
 
 interface TypeScriptDependencies {
   readonly ambient: Set<string>
-  readonly catalog: Set<string>
   readonly scalar: Set<string>
 }
 
@@ -201,36 +199,19 @@ function collectTypeResolutionDependencies(
   for (const ambientBinding of resolution.ambientBindings) {
     dependencies.ambient.add(ambientBinding)
   }
-  for (const catalogImport of resolution.catalogImports) {
-    dependencies.catalog.add(catalogImport)
-  }
   for (const scalarImport of resolution.scalarImports) {
     dependencies.scalar.add(scalarImport)
   }
 }
 
-function catalogTypeResolution(type: string): PostgresTypeScriptResolution {
-  return {
-    ambientBindings: [],
-    catalogImports: [type],
-    scalarImports: [],
-    type,
-  }
-}
-
-function tsTypeForCheckConstraintType(
-  type: TypedSqlPostgresIrCheckConstraintTypeExpression,
-  dependencies: TypeScriptDependencies,
-  nested = false
-): string {
-  if (type.kind === 'named') {
-    const resolution = catalogTypeResolution(type.name)
-    collectTypeResolutionDependencies(dependencies, resolution)
-    return resolution.type
+function tsTypeForCheckConstraintType(type: TypedSqlPostgresIrCheckConstraintTypeExpression, nested = false): string {
+  if (type.kind === 'literalUnion') {
+    const rendered = type.labels.map(quoteString).join(' | ')
+    return nested ? `(${rendered})` : rendered
   }
 
   const operator = type.kind === 'union' ? ' | ' : ' & '
-  const rendered = type.members.map((member) => tsTypeForCheckConstraintType(member, dependencies, true)).join(operator)
+  const rendered = type.members.map((member) => tsTypeForCheckConstraintType(member, true)).join(operator)
   return nested ? `(${rendered})` : rendered
 }
 
@@ -743,10 +724,8 @@ function scalarTsTypeForJsonShape(
   shape: Extract<TypedSqlPostgresIrJsonShape, { readonly kind: 'scalar' }>,
   dependencies: TypeScriptDependencies
 ): string {
-  if (shape.checkConstraintTypeName && postgresJsonSupportsStringLiteralRefinement(shape)) {
-    const resolved = catalogTypeResolution(shape.checkConstraintTypeName)
-    collectTypeResolutionDependencies(dependencies, resolved)
-    return resolved.type
+  if (shape.checkConstraintType && postgresJsonSupportsStringLiteralRefinement(shape)) {
+    return tsTypeForCheckConstraintType(shape.checkConstraintType)
   }
 
   const resolved = resolveTypeScriptJsonScalarTypeForPostgresType(shape)
@@ -818,40 +797,21 @@ function tsTypeForJsonShape(
   }
 }
 
-function moduleSpecifier(fromDirectory: string, targetPath: string): string {
-  const withoutExtension = targetPath.replace(/\.tsx?$/u, '')
-  const path = relative(fromDirectory, withoutExtension).replaceAll('\\', '/')
-  return `${path.startsWith('.') ? path : `./${path}`}.js`
-}
-
 function renderImports(configs: readonly ResolvedTypedSql[], generatorConfig: ResolvedPostgresTypedSqlConfig): string {
   const scalarImports = new Set<string>()
-  const catalogTypeImports = new Set<string>()
   for (const config of configs) {
     for (const identifier of config.scalarTypeImports) {
       scalarImports.add(identifier)
-    }
-    for (const identifier of config.catalogTypeImports) {
-      catalogTypeImports.add(identifier)
     }
   }
 
   const lines: string[] = []
   if (scalarImports.size > 0) {
     lines.push(
-      `import type { ${[...scalarImports].toSorted().join(', ')} } from ${quoteString(`${generatorConfig.packageImport}/scalars`)}`
+      `import type { ${[...scalarImports].toSorted().join(', ')} } from ${quoteString(generatorConfig.imports.scalars)}`
     )
   }
-  if (catalogTypeImports.size > 0) {
-    const sourcePath = configs[0]?.sourcePath
-    if (!sourcePath) {
-      throw new Error('Cannot render catalog imports without a source path.')
-    }
-    lines.push(
-      `import type { ${[...catalogTypeImports].toSorted().join(', ')} } from ${quoteString(moduleSpecifier(dirname(sourcePath), generatorConfig.typesOutput))}`
-    )
-  }
-  lines.push(`import { createTypedSqlStatement } from ${quoteString(`${generatorConfig.packageImport}/runtime`)}`)
+  lines.push(`import { createTypedSqlStatement } from ${quoteString(generatorConfig.imports.runtime)}`)
 
   return lines.join('\n')
 }
@@ -1057,7 +1017,6 @@ async function resolveTypedSqlWithAnalyzer(
     const generatedDeclarations: GeneratedJsonTypeDeclaration[] = []
     const typeDependencies: TypeScriptDependencies = {
       ambient: new Set(),
-      catalog: new Set(),
       scalar: new Set(),
     }
     const statementTypeBindings: TypeScriptBinding[] = [
@@ -1101,7 +1060,7 @@ async function resolveTypedSqlWithAnalyzer(
           column.checkConstraintType &&
           postgresResultSupportsStringLiteralRefinement(column, generatorConfig.scalarProfile)
         ) {
-          tsType = tsTypeForCheckConstraintType(column.checkConstraintType, typeDependencies)
+          tsType = tsTypeForCheckConstraintType(column.checkConstraintType)
         } else {
           const resolution = resolveTypeScriptResultTypeForPostgresType(column, generatorConfig.scalarProfile)
           collectTypeResolutionDependencies(typeDependencies, resolution)
@@ -1135,9 +1094,13 @@ async function resolveTypedSqlWithAnalyzer(
       }
 
       const resolution =
-        analyzed.checkConstraintTypeName &&
+        analyzed.checkConstraintType &&
         postgresParameterSupportsStringLiteralRefinement(analyzed, generatorConfig.scalarProfile)
-          ? catalogTypeResolution(analyzed.checkConstraintTypeName)
+          ? {
+              ambientBindings: [],
+              scalarImports: [],
+              type: tsTypeForCheckConstraintType(analyzed.checkConstraintType),
+            }
           : resolveTypeScriptParameterTypeForPostgresType(analyzed, generatorConfig.scalarProfile)
       collectTypeResolutionDependencies(typeDependencies, resolution)
       if (parameter.nullable === true && analyzed.nullAdmission === 'rejects') {
@@ -1169,7 +1132,6 @@ async function resolveTypedSqlWithAnalyzer(
           : []),
         ...[...usedGeneratedTypeNames].map(([name, source]) => ({ name, source })),
         ...[...typeDependencies.ambient].map((name) => ({ name, source: 'ambient TypeScript type' })),
-        ...[...typeDependencies.catalog].map((name) => ({ name, source: 'catalog type import' })),
         ...[...typeDependencies.scalar].map((name) => ({
           name,
           source: 'postgres-typed-sql scalar type import',
@@ -1187,7 +1149,6 @@ async function resolveTypedSqlWithAnalyzer(
       columns,
       access: config.access ?? inferredAccess,
       cardinality: ir.rowCardinality,
-      catalogTypeImports: [...typeDependencies.catalog].toSorted(),
       command: typedSqlCommandFromPostgres(ir.command),
       generatedTypeDeclarations: generatedDeclarations.map(renderGeneratedTypeDeclaration),
       name: config.name,

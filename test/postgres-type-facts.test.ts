@@ -59,6 +59,7 @@ test('catalog facts use PostgreSQL array relationships rather than the array-lik
     assert.equal(array?.pgArrayDelimiter, ',')
     assert.equal(facts.get(row.box_array_oid)?.pgArrayDelimiter, ';')
     assert.equal(facts.get(row.json_cast_oid)?.pgCastsToJson, true)
+    assert.deepEqual(facts.get(row.json_cast_oid)?.pgEnumLabels, ['sad', 'ok'])
     assert.equal(facts.get(26)?.pgCastsToJson, undefined)
   } finally {
     await database.close()

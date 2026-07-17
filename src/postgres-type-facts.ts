@@ -5,6 +5,7 @@ interface TypeCatalogRow {
   readonly array_delimiter: string | null
   readonly base_type_oid: number
   readonly element_type_oid: number
+  readonly enum_labels: readonly string[] | null
   readonly formatted_type: string
   readonly is_array: boolean
   readonly casts_to_json: boolean
@@ -59,6 +60,7 @@ function postgresTypeFact(
     pgTypeOid: row.oid,
     pgTypeSchema: row.type_schema,
     ...(row.casts_to_json ? { pgCastsToJson: true } : {}),
+    ...(row.enum_labels ? { pgEnumLabels: row.enum_labels } : {}),
     ...(baseType ? { pgBaseType: baseType } : {}),
     ...(arrayElementType ? { pgArrayElementType: arrayElementType } : {}),
     ...(row.array_delimiter ? { pgArrayDelimiter: row.array_delimiter } : {}),
@@ -110,6 +112,14 @@ export async function loadPostgresTypeFacts(
         namespace.nspname as type_schema,
         type.typname,
         type.typtype,
+        case
+          when type.typtype = 'e' then (
+            select jsonb_agg(enum_entry.enumlabel order by enum_entry.enumsortorder)
+            from pg_enum enum_entry
+            where enum_entry.enumtypid = type.oid
+          )
+          else null
+        end as enum_labels,
         exists (
           select 1
           from pg_cast cast_entry

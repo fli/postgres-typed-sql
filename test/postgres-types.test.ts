@@ -42,14 +42,12 @@ test('result resolution follows the exact pg-types 2.2.0 text-decoder registrati
     resolveTypeScriptResultTypeForPostgresType(pgCatalog('timestamp with time zone', 'timestamptz', 1184)),
     {
       ambientBindings: ['Date'],
-      catalogImports: [],
       scalarImports: [],
       type: 'Date | number',
     }
   )
   assert.deepEqual(resolveTypeScriptResultTypeForPostgresType(pgCatalog('bytea', 'bytea', 17)), {
     ambientBindings: ['Uint8Array'],
-    catalogImports: [],
     scalarImports: [],
     type: 'Uint8Array',
   })
@@ -112,7 +110,6 @@ test('result resolution follows the exact pg-types 2.2.0 text-decoder registrati
     ),
     {
       ambientBindings: ['Date'],
-      catalogImports: [],
       scalarImports: ['PgArray'],
       type: 'PgArray<Date | number>',
     }
@@ -148,13 +145,14 @@ test('result resolution follows the exact pg-types 2.2.0 text-decoder registrati
   assert.equal(resultType(pgCatalog('integer', 'int4', 23), 'conservative'), 'unknown')
 })
 
-test('result resolution peels domains and refines enum facts to generated catalog aliases', () => {
+test('result resolution peels domains and renders enum facts as self-contained literal unions', () => {
   const enumFact: PostgresTypeFact = {
     pgType: 'audit.account_status',
     pgTypeName: 'account_status',
     pgTypeOid: 16_383,
     pgTypeSchema: 'audit',
     pgTypeKind: 'enum',
+    pgEnumLabels: ['queued', 'complete'],
   }
   const domainFact: PostgresTypeFact = {
     pgType: 'audit.event_id',
@@ -167,13 +165,11 @@ test('result resolution peels domains and refines enum facts to generated catalo
 
   assert.deepEqual(resolveTypeScriptResultTypeForPostgresType(enumFact), {
     ambientBindings: [],
-    catalogImports: ['Audit_AccountStatus'],
     scalarImports: [],
-    type: 'Audit_AccountStatus',
+    type: '"queued" | "complete"',
   })
   assert.deepEqual(resolveTypeScriptResultTypeForPostgresType(domainFact), {
     ambientBindings: [],
-    catalogImports: [],
     scalarImports: ['PgInt8String'],
     type: 'PgInt8String',
   })
@@ -191,6 +187,7 @@ test('parameter resolution is independent of result decoding and recursively use
     pgTypeOid: 16_383,
     pgTypeSchema: 'audit',
     pgTypeKind: 'enum',
+    pgEnumLabels: ['queued', 'complete'],
   }
   const enumArray: PostgresTypeFact = {
     pgType: 'audit.account_status[]',
@@ -224,9 +221,8 @@ test('parameter resolution is independent of result decoding and recursively use
   )
   assert.deepEqual(resolveTypeScriptParameterTypeForPostgresType(enumArray), {
     ambientBindings: [],
-    catalogImports: ['Audit_AccountStatus'],
     scalarImports: ['PgArrayParameter'],
-    type: 'PgArrayParameter<Audit_AccountStatus> | string',
+    type: 'PgArrayParameter<"queued" | "complete"> | string',
   })
   assert.equal(
     parameterType({
@@ -296,7 +292,6 @@ test('parameter resolution is independent of result decoding and recursively use
     ),
     {
       ambientBindings: [],
-      catalogImports: [],
       scalarImports: ['PgArrayParameter', 'PgByteaHexString'],
       type: 'PgArrayParameter<PgByteaHexString> | string',
     }
@@ -334,7 +329,6 @@ test('parameter resolution is independent of result decoding and recursively use
   )
   assert.deepEqual(resolveTypeScriptParameterTypeForPostgresType(pgCatalog('date', 'date', 1082)), {
     ambientBindings: ['Date'],
-    catalogImports: [],
     scalarImports: [],
     type: 'Date | number | string',
   })
@@ -361,7 +355,6 @@ test('parameter resolution is independent of result decoding and recursively use
   )
   assert.deepEqual(resolveTypeScriptParameterTypeForPostgresType(pgCatalog('integer', 'int4', 23), 'conservative'), {
     ambientBindings: ['NonNullable'],
-    catalogImports: [],
     scalarImports: [],
     type: 'NonNullable<unknown>',
   })
@@ -419,12 +412,12 @@ test('nested-JSON resolution follows PostgreSQL conversion rather than node-post
       pgTypeOid: 16_383,
       pgTypeSchema: 'audit',
       pgTypeKind: 'enum',
+      pgEnumLabels: ['queued', 'complete'],
     }),
     {
       ambientBindings: [],
-      catalogImports: ['Audit_AccountStatus'],
       scalarImports: [],
-      type: 'Audit_AccountStatus',
+      type: '"queued" | "complete"',
     }
   )
   assert.equal(resolveTypeScriptJsonScalarTypeForPostgresType(pgCatalog('jsonb', 'jsonb', 3802)).type, 'DbJsonSelected')

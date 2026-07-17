@@ -1,6 +1,7 @@
 export { defineConfig, resolveConfig } from './config.js'
 export type {
   PostgresTypedSqlConfig,
+  PostgresTypedSqlImportsConfig,
   PostgresTypedSqlNamingConfig,
   PostgresTypedSqlPropertyNaming,
   ResolvedPostgresTypedSqlConfig,

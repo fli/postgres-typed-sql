@@ -586,7 +586,10 @@ test('normalizes PostgreSQL statement, nullability, DML, and cardinality facts c
     assert.equal(query('mixedTargetInsert').params[0]?.nullAdmission, 'rejects')
     assert.equal(query('opaqueNullableTargetInsert').params[0]?.nullable, false)
     assert.equal(query('opaqueNullableTargetInsert').params[0]?.nullAdmission, 'unknown')
-    assert.equal(query('checkedRoleInsert').params[1]?.checkConstraintTypeName, 'Accounts__Role')
+    assert.deepEqual(query('checkedRoleInsert').params[1]?.checkConstraintType, {
+      kind: 'literalUnion',
+      labels: ['member', 'admin'],
+    })
 
     const [domainType, arrayDomainType, domainArrayType, enumType] = query('recursiveTypeFacts').resultColumns
     assert.equal(domainType?.pgTypeKind, 'domain')
@@ -615,7 +618,10 @@ test('normalizes PostgreSQL statement, nullability, DML, and cardinality facts c
       assert.equal(roleShape?.kind, 'scalar')
       if (roleShape?.kind === 'scalar') {
         assert.equal(roleShape.pgTypeKind, 'base')
-        assert.equal(roleShape.checkConstraintTypeName, 'Accounts__Role')
+        assert.deepEqual(roleShape.checkConstraintType, {
+          kind: 'literalUnion',
+          labels: ['member', 'admin'],
+        })
       }
       assert.equal(scoresShape?.kind, 'scalar')
       if (scoresShape?.kind === 'scalar') {
@@ -645,7 +651,7 @@ test('normalizes PostgreSQL statement, nullability, DML, and cardinality facts c
     assert.equal(query('rewrittenInsert').isWrite, true)
     assert.equal(query('rewrittenInsert').params[0]?.nullable, false)
     assert.equal(query('rewrittenInsert').params[0]?.nullAdmission, 'rejects')
-    assert.equal(query('rewrittenInsert').params[0]?.checkConstraintTypeName, undefined)
+    assert.equal(query('rewrittenInsert').params[0]?.checkConstraintType, undefined)
 
     assert.equal(query('domainTypedSource').params[0]?.nullAdmission, 'rejects')
     assert.equal(query('domainTypedSource').params[0]?.nullable, false)
@@ -653,7 +659,7 @@ test('normalizes PostgreSQL statement, nullability, DML, and cardinality facts c
     assert.equal(query('rejectingReturningUse').params[0]?.nullable, false)
     assert.equal(query('nullExtendedInsert').params[0]?.nullAdmission, 'accepts')
     assert.equal(query('nullExtendedInsert').params[0]?.nullable, true)
-    assert.equal(query('nullExtendedInsert').params[0]?.checkConstraintTypeName, undefined)
+    assert.equal(query('nullExtendedInsert').params[0]?.checkConstraintType, undefined)
     assert.equal(query('nestedRowLock').isWrite, true)
     assert.equal((await database.query('select 1 as value')).rows.length, 1)
     assert.equal((await database.query('select 1 as value having false')).rows.length, 0)
@@ -792,13 +798,13 @@ test('preserves correlated CHECK metadata and folds CHECK result types through s
     ])
     const queries = new Map(result.queries.map((query) => [query.name, query]))
     const refinement = (name: string) => queries.get(name)?.resultColumns[0]?.checkConstraintType
-    const left = { kind: 'named', name: 'CheckLeft__Value' } as const
-    const right = { kind: 'named', name: 'CheckRight__Value' } as const
+    const left = { kind: 'literalUnion', labels: ['left_only', 'shared'] } as const
+    const right = { kind: 'literalUnion', labels: ['right_only', 'shared'] } as const
 
     assert.equal(queries.get('correlatedLateral')?.resultColumns[0]?.nullable, true)
     assert.deepEqual(refinement('correlatedLateral'), {
-      kind: 'named',
-      name: 'OuterCorrelation__Value',
+      kind: 'literalUnion',
+      labels: ['outer_only'],
     })
     assert.deepEqual(refinement('constrainedUnion'), { kind: 'union', members: [left, right] })
     assert.equal(refinement('constrainedUnknownUnion'), undefined)
@@ -902,16 +908,16 @@ test('resolves correlated derived provenance from the Var owner query scope', as
     const queries = new Map(result.queries.map((query) => [query.name, query]))
     const outerDerived = queries.get('outerDerivedScope')
     const levelTwo = queries.get('levelTwoScope')
-    const left = { kind: 'named', name: 'ScopeOuterLeft__Value' } as const
-    const right = { kind: 'named', name: 'ScopeOuterRight__Value' } as const
+    const left = { kind: 'literalUnion', labels: ['outer_left'] } as const
+    const right = { kind: 'literalUnion', labels: ['outer_right'] } as const
 
     assert.deepEqual(outerDerived?.resultColumns[0]?.checkConstraintType, {
       kind: 'union',
       members: [left, right],
     })
     assert.notDeepEqual(outerDerived?.resultColumns[0]?.checkConstraintType, {
-      kind: 'named',
-      name: 'ScopeInner__Value',
+      kind: 'literalUnion',
+      labels: ['inner'],
     })
     assert.equal(outerDerived?.resultColumns[1]?.nullable, true)
 
@@ -1016,8 +1022,8 @@ test('uses exact PostgreSQL proof objects for uniqueness, inheritance, checks, a
     assert.equal(query('onlyParent').rowCardinality, 'optional')
     assert.equal(query('noInheritCheck').resultColumns[0]?.checkConstraintType, undefined)
     assert.deepEqual(query('inheritedCheck').resultColumns[0]?.checkConstraintType, {
-      kind: 'named',
-      name: 'InheritedCheck__Status',
+      kind: 'literalUnion',
+      labels: ['shared'],
     })
     assert.equal(query('emptyRows').resultColumns.length, 0)
     assert.equal(query('emptyRows').rowCardinality, 'many')

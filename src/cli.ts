@@ -75,19 +75,22 @@ async function main(): Promise<void> {
 
   const rootDir = resolve(parsed.values.root ?? process.cwd())
   const configPath = parsed.values.config ? resolve(rootDir, parsed.values.config) : defaultConfigPath(rootDir)
-  const fileConfig = configPath ? await loadConfig(configPath) : undefined
-  const schema = parsed.values.schema ?? fileConfig?.schema
+  if (!configPath) {
+    throw new Error('No configuration file was found. Create postgres-typed-sql.config.mjs or pass --config.')
+  }
+  const fileConfig = await loadConfig(configPath)
+  const schema = parsed.values.schema ?? fileConfig.schema
   if (!schema) {
-    throw new Error('No schema was provided. Pass --schema or create postgres-typed-sql.config.mjs.')
+    throw new Error('No schema was provided. Configure schema or pass --schema.')
   }
 
   const result = await generateTypedSql({
     ...fileConfig,
-    extensions: (parsed.values.extension as PostgresTypedSqlConfig['extensions'] | undefined) ?? fileConfig?.extensions,
-    include: parsed.values.include ?? fileConfig?.include,
+    extensions: (parsed.values.extension as PostgresTypedSqlConfig['extensions'] | undefined) ?? fileConfig.extensions,
+    include: parsed.values.include ?? fileConfig.include,
     rootDir,
     schema,
-    typesOutput: parsed.values['types-output'] ?? fileConfig?.typesOutput,
+    typesOutput: parsed.values['types-output'] ?? fileConfig.typesOutput,
   })
 
   const removed = result.removedFiles > 0 ? `; removed ${result.removedFiles} stale files` : ''
