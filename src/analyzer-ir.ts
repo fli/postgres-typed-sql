@@ -212,6 +212,7 @@ interface PgAnalyzerCte {
 interface PgAnalyzerRte {
   readonly cteName?: string
   readonly cteLevelSup?: number
+  readonly erefColumnNames?: readonly string[]
   readonly inh?: boolean
   readonly kind: string
   readonly relid?: number | null
@@ -1632,11 +1633,17 @@ function inferQueryOutputJsonShape(
   return foldQueryOutput<TypedSqlPostgresIrJsonShape>(scope, outputIndex, {
     except: (left) => left,
     intersect: (left, right) => combineJsonShapes(left, right, left.nullable && right.nullable, 'INTERSECT'),
-    target: (targetScope, target) =>
-      inferJsonShape(catalog, targetScope, target.expr, undefined, seen) ?? {
-        kind: 'opaque',
-        nullable: expressionNullable(catalog, targetScope, target.expr),
-      },
+    target: (targetScope, target) => {
+      const targetExpr = target.expr
+      if (!targetExpr) {
+        return { kind: 'opaque', nullable: true }
+      }
+      const refinements = collectNonNullVarKeys(targetScope.query.whereQual)
+      return (
+        inferJsonShape(catalog, targetScope, targetExpr, refinements, seen) ??
+        scalarJsonShapeForExpr(catalog, targetScope, targetExpr, refinements)
+      )
+    },
     union: (left, right) => combineJsonShapes(left, right, left.nullable || right.nullable, 'UNION'),
     unknown: () => ({ kind: 'opaque', nullable: true }),
   })
@@ -1669,6 +1676,47 @@ function inferJsonShape(
       kind: 'opaque',
       nullable: expressionNullable(catalog, scope, unwrapped, refinements),
     }
+  }
+
+  if (unwrapped.tag === 'SubLink' && unwrapped.subquery) {
+    const subqueryScope = queryScope(unwrapped.subquery, scope)
+    switch (unwrapped.subLinkType) {
+      case 'EXPR': {
+        const shape = inferQueryOutputJsonShape(catalog, subqueryScope, 0, seen)
+        return jsonShapeWithNullability(shape, expressionNullable(catalog, scope, unwrapped, refinements))
+      }
+      case 'ARRAY':
+        return {
+          element: inferQueryOutputJsonShape(catalog, subqueryScope, 0, seen),
+          kind: 'array',
+          nullable: expressionNullable(catalog, scope, unwrapped, refinements),
+        }
+      case 'ALL':
+      case 'ANY':
+      case 'EXISTS':
+      case 'ROWCOMPARE':
+        return scalarJsonShapeForExpr(catalog, scope, unwrapped, refinements)
+      case 'CTE':
+      case 'MULTIEXPR':
+      default:
+        return null
+    }
+  }
+
+  if (
+    unwrapped.tag === 'FuncExpr' &&
+    (isBuiltinPgProcNamed(catalog, unwrapped.funcid, 'to_json') ||
+      isBuiltinPgProcNamed(catalog, unwrapped.funcid, 'to_jsonb') ||
+      isBuiltinPgProcNamed(catalog, unwrapped.funcid, 'row_to_json'))
+  ) {
+    const value = targetExprFromAggregateArg(unwrapped.args?.[0])
+    const shape = value ? inferJsonShape(catalog, scope, value, refinements, seen) : null
+    return shape
+      ? shape
+      : {
+          kind: 'opaque',
+          nullable: expressionNullable(catalog, scope, unwrapped, refinements),
+        }
   }
 
   if (
@@ -1738,6 +1786,20 @@ function inferJsonShape(
 
     const ownerRte = varOwnerRte(scope, unwrapped)
     const outputScope = ownerRte ? queryScopeForRteOutput(...ownerRte) : null
+    if (ownerRte && outputScope && unwrapped.varattno === 0) {
+      const [, rte] = ownerRte
+      return {
+        fields: resultTargets(outputScope.query).map((target, targetIndex) => {
+          const name = rte.erefColumnNames?.[targetIndex] ?? target.resname ?? `column_${targetIndex + 1}`
+          return {
+            name,
+            shape: inferQueryOutputJsonShape(catalog, outputScope, targetIndex, nestedSeen),
+          }
+        }),
+        kind: 'object',
+        nullable: (unwrapped.varnullingrels?.length ?? 0) > 0,
+      }
+    }
     const shape = outputScope
       ? inferQueryOutputJsonShape(catalog, outputScope, (unwrapped.varattno ?? 1) - 1, nestedSeen)
       : null

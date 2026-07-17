@@ -6,6 +6,10 @@ import { generateTypedSql, postgresVersion } from 'postgres-typed-sql'
 assert.equal(postgresVersion, '18.3')
 const result = await generateTypedSql({
   include: ['.'],
+  naming: {
+    resultColumns: 'camelCase',
+    structuredJsonFields: 'camelCase',
+  },
   rootDir: process.cwd(),
   scalarProfile: 'node-postgres',
   schema: 'schema.sql',
@@ -17,8 +21,10 @@ assert.match(output, /cardinality: 'optional'/u)
 assert.match(output, /readonly label: string \| null/u)
 assert.match(output, /readonly state: Audit_WidgetState/u)
 assert.match(output, /readonly metrics: PgArray<number>/u)
-assert.match(output, /readonly search_document: string/u)
+assert.match(output, /readonly searchDocument: string/u)
+assert.match(output, /readonly detailsJson:/u)
 assert.match(output, /readonly URL: string/u)
+assert.match(output, /readonly displayName: string \| null/u)
 assert.match(output, /readonly count: number/u)
 assert.doesNotMatch(output, /import type \{ URL \}/u)
 
@@ -40,6 +46,10 @@ assert.match(conservativeInsert, /readonly label: NonNullable<unknown> \| null/u
 
 await generateTypedSql({
   include: ['.'],
+  naming: {
+    resultColumns: 'camelCase',
+    structuredJsonFields: 'camelCase',
+  },
   rootDir: process.cwd(),
   scalarProfile: 'node-postgres',
   schema: 'schema.sql',

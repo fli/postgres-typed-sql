@@ -7,16 +7,18 @@ import {
   buildTypedSqlPostgresIrFromCompiledConfigs,
   type TypedSqlPostgresIrCheckConstraintTypeExpression,
   type TypedSqlPostgresIrColumnSource,
+  type TypedSqlPostgresIrJsonField,
   type TypedSqlPostgresIrJsonShape,
   type TypedSqlPostgresIrRowBounds,
   type TypedSqlPostgresIrRowCardinality,
 } from './analyzer-ir.js'
 import { buildCatalogTypes } from './catalog-generator.js'
-import type { ResolvedPostgresTypedSqlConfig } from './config.js'
+import type { PostgresTypedSqlPropertyNaming, ResolvedPostgresTypedSqlConfig } from './config.js'
 import { resolveConfig, type PostgresTypedSqlConfig } from './config.js'
 import type { PostgresQueryable } from './database.js'
 import { createAnalysisDatabase } from './engine.js'
 import {
+  postgresJsonValueMayBeStructured,
   postgresJsonSupportsStringLiteralRefinement,
   postgresParameterSupportsStringLiteralRefinement,
   postgresResultSupportsStringLiteralRefinement,
@@ -29,6 +31,7 @@ import { compileNamedParameters, parseTypedSqlSource } from './sql-source.js'
 import {
   assertTypeScriptBindingIdentifier,
   assertUniqueTypeScriptBindings,
+  camelCaseOutputProperty,
   pascalCaseIdentifier,
   quotePropertyName,
   type TypeScriptBinding,
@@ -103,7 +106,8 @@ interface ResolvedSqlParameter {
 }
 
 interface ResolvedSqlColumn {
-  readonly jsonShape?: TypedSqlPostgresIrJsonShape
+  readonly jsonMapping?: GeneratedJsonMapping
+  readonly jsonShape?: ResolvedJsonShape
   readonly name: string
   readonly nullable: boolean
   readonly pgType: string
@@ -479,6 +483,225 @@ interface GeneratedJsonTypeDeclaration {
   readonly name: string
 }
 
+type ResolvedJsonShape =
+  | {
+      readonly element: ResolvedJsonShape
+      readonly kind: 'array'
+      readonly nullable: boolean
+    }
+  | {
+      readonly fields: readonly ResolvedJsonField[]
+      readonly kind: 'object'
+      readonly nullable: boolean
+    }
+  | Extract<TypedSqlPostgresIrJsonShape, { readonly kind: 'opaque' | 'scalar' }>
+  | {
+      readonly alternatives: readonly ResolvedJsonShape[]
+      readonly kind: 'union'
+      readonly nullable: boolean
+    }
+
+interface ResolvedJsonField {
+  readonly name: string
+  readonly propertyName: string
+  readonly shape: ResolvedJsonShape
+}
+
+interface GeneratedJsonFieldMapping {
+  readonly mapping?: GeneratedJsonMapping
+  readonly name: string
+  readonly propertyName: string
+}
+
+interface GeneratedJsonMapping {
+  readonly arrayElement?: GeneratedJsonMapping
+  readonly fields?: readonly GeneratedJsonFieldMapping[]
+}
+
+function outputPropertyName(name: string, naming: PostgresTypedSqlPropertyNaming): string {
+  return naming === 'camelCase' ? camelCaseOutputProperty(name) : name
+}
+
+function resolveJsonShapeNames(
+  shape: TypedSqlPostgresIrJsonShape,
+  naming: PostgresTypedSqlPropertyNaming,
+  sourceFile: string,
+  context: string
+): ResolvedJsonShape {
+  switch (shape.kind) {
+    case 'array':
+      return {
+        element: resolveJsonShapeNames(shape.element, naming, sourceFile, `${context}[]`),
+        kind: 'array',
+        nullable: shape.nullable,
+      }
+    case 'object': {
+      const fields = shape.fields.map((field) => ({
+        name: field.name,
+        propertyName: outputPropertyName(field.name, naming),
+        shape: resolveJsonShapeNames(field.shape, naming, sourceFile, `${context}.${field.name}`),
+      }))
+      assertUniquePublicNames(
+        fields.map((field) => field.propertyName),
+        `JSON field in ${context}`,
+        sourceFile
+      )
+      return {
+        fields,
+        kind: 'object',
+        nullable: shape.nullable,
+      }
+    }
+    case 'opaque':
+    case 'scalar':
+      return shape
+    case 'union':
+      return {
+        alternatives: shape.alternatives.map((alternative, index) =>
+          resolveJsonShapeNames(alternative, naming, sourceFile, `${context}<alternative ${index + 1}>`)
+        ),
+        kind: 'union',
+        nullable: shape.nullable,
+      }
+  }
+}
+
+function flattenJsonShapeAlternatives(shape: TypedSqlPostgresIrJsonShape): readonly TypedSqlPostgresIrJsonShape[] {
+  return shape.kind === 'union' ? shape.alternatives.flatMap(flattenJsonShapeAlternatives) : [shape]
+}
+
+function isJsonTraversalBarrier(shape: TypedSqlPostgresIrJsonShape): boolean {
+  return shape.kind === 'opaque' || (shape.kind === 'scalar' && postgresJsonValueMayBeStructured(shape))
+}
+
+function applyOpaqueJsonBarriersToAlternatives(
+  shapes: readonly TypedSqlPostgresIrJsonShape[]
+): readonly TypedSqlPostgresIrJsonShape[] {
+  if (shapes.length === 0) {
+    return shapes
+  }
+  const alternatives = shapes.flatMap(flattenJsonShapeAlternatives)
+  if (alternatives.some(isJsonTraversalBarrier)) {
+    return shapes.map((shape) => ({ kind: 'opaque', nullable: shape.nullable }))
+  }
+
+  const arrayElements = alternatives.flatMap((alternative) =>
+    alternative.kind === 'array' ? [alternative.element] : []
+  )
+  const safeArrayElements = applyOpaqueJsonBarriersToAlternatives(arrayElements)
+  let arrayIndex = 0
+
+  const objectFields = new Map<string, TypedSqlPostgresIrJsonField[]>()
+  for (const alternative of alternatives) {
+    if (alternative.kind !== 'object') {
+      continue
+    }
+    for (const field of alternative.fields) {
+      const fields = objectFields.get(field.name) ?? []
+      fields.push(field)
+      objectFields.set(field.name, fields)
+    }
+  }
+  const safeObjectFieldShapes = new Map(
+    [...objectFields].map(([name, fields]) => [
+      name,
+      applyOpaqueJsonBarriersToAlternatives(fields.map((field) => field.shape)),
+    ])
+  )
+  const objectFieldIndexes = new Map<string, number>()
+
+  const rewrite = (shape: TypedSqlPostgresIrJsonShape): TypedSqlPostgresIrJsonShape => {
+    switch (shape.kind) {
+      case 'array': {
+        const element = safeArrayElements[arrayIndex]
+        arrayIndex += 1
+        return { ...shape, element: element ?? shape.element }
+      }
+      case 'object':
+        return {
+          ...shape,
+          fields: shape.fields.map((field) => {
+            const fieldIndex = objectFieldIndexes.get(field.name) ?? 0
+            objectFieldIndexes.set(field.name, fieldIndex + 1)
+            return {
+              ...field,
+              shape: safeObjectFieldShapes.get(field.name)?.[fieldIndex] ?? field.shape,
+            }
+          }),
+        }
+      case 'union':
+        return { ...shape, alternatives: shape.alternatives.map(rewrite) }
+      case 'opaque':
+      case 'scalar':
+        return shape
+    }
+  }
+
+  return shapes.map(rewrite)
+}
+
+function applyOpaqueJsonBarriers(shape: TypedSqlPostgresIrJsonShape): TypedSqlPostgresIrJsonShape {
+  return applyOpaqueJsonBarriersToAlternatives([shape])[0] ?? shape
+}
+
+function flattenResolvedJsonAlternatives(shape: ResolvedJsonShape): readonly ResolvedJsonShape[] {
+  return shape.kind === 'union' ? shape.alternatives.flatMap(flattenResolvedJsonAlternatives) : [shape]
+}
+
+function jsonMappingForAlternatives(shapes: readonly ResolvedJsonShape[]): GeneratedJsonMapping | undefined {
+  const alternatives = shapes.flatMap(flattenResolvedJsonAlternatives)
+  if (alternatives.some((alternative) => alternative.kind === 'opaque')) {
+    return undefined
+  }
+
+  const elementShapes = alternatives.flatMap((alternative) =>
+    alternative.kind === 'array' ? [alternative.element] : []
+  )
+  const arrayElement = elementShapes.length > 0 ? jsonMappingForAlternatives(elementShapes) : undefined
+
+  const fieldsByName = new Map<string, { propertyName: string; shapes: ResolvedJsonShape[] }>()
+  for (const alternative of alternatives) {
+    if (alternative.kind !== 'object') {
+      continue
+    }
+    for (const field of alternative.fields) {
+      const existing = fieldsByName.get(field.name)
+      if (existing) {
+        if (existing.propertyName !== field.propertyName) {
+          throw new Error(`Inconsistent mapped property name for JSON field ${JSON.stringify(field.name)}.`)
+        }
+        existing.shapes.push(field.shape)
+      } else {
+        fieldsByName.set(field.name, { propertyName: field.propertyName, shapes: [field.shape] })
+      }
+    }
+  }
+  const fields = [...fieldsByName].flatMap(
+    ([name, { propertyName, shapes: fieldShapes }]): GeneratedJsonFieldMapping[] => {
+      const mapping = jsonMappingForAlternatives(fieldShapes)
+      return propertyName !== name || mapping
+        ? [
+            {
+              ...(mapping ? { mapping } : {}),
+              name,
+              propertyName,
+            },
+          ]
+        : []
+    }
+  )
+  return arrayElement || fields.length > 0
+    ? {
+        ...(arrayElement ? { arrayElement } : {}),
+        ...(fields.length > 0 ? { fields } : {}),
+      }
+    : undefined
+}
+
+function jsonMappingForShape(shape: ResolvedJsonShape): GeneratedJsonMapping | undefined {
+  return jsonMappingForAlternatives([shape])
+}
+
 function assertUniquePublicNames(names: readonly string[], kind: string, sourceFile: string): void {
   const firstIndexByName = new Map<string, number>()
   for (const [index, name] of names.entries()) {
@@ -532,7 +755,7 @@ function scalarTsTypeForJsonShape(
 }
 
 function tsTypeForJsonShape(
-  shape: TypedSqlPostgresIrJsonShape,
+  shape: ResolvedJsonShape,
   sourceFile: string,
   suggestedName: string,
   declarations: GeneratedJsonTypeDeclaration[],
@@ -552,7 +775,7 @@ function tsTypeForJsonShape(
     case 'object': {
       reserveGeneratedTypeBinding(usedNames, suggestedName, `JSON object ${suggestedName}`, sourceFile)
       assertUniquePublicNames(
-        shape.fields.map((field) => field.name),
+        shape.fields.map((field) => field.propertyName),
         `JSON field in ${suggestedName}`,
         sourceFile
       )
@@ -560,7 +783,7 @@ function tsTypeForJsonShape(
       declarations.push({
         fields: shape.fields.map((field) => ({
           nullable: field.shape.nullable,
-          propertyName: field.name,
+          propertyName: field.propertyName,
           tsType: tsTypeForJsonShape(
             field.shape,
             sourceFile,
@@ -683,7 +906,7 @@ function renderColumnMetadata(columns: readonly ResolvedSqlColumn[]): string {
 ${columns
   .map(
     (column) => `    {
-      name: ${quoteString(column.name)},
+      ${column.jsonMapping ? `jsonMapping: ${JSON.stringify(column.jsonMapping)},\n      ` : ''}name: ${quoteString(column.name)},
       nullable: ${column.nullable},
       pgType: ${quoteString(column.pgType)},
       pgTypeName: ${quoteString(column.pgTypeName)},
@@ -845,13 +1068,28 @@ async function resolveTypedSqlWithAnalyzer(
     const usedGeneratedTypeNames = new Map(statementTypeBindings.map((binding) => [binding.name, binding.source]))
     const columns = ir.resultColumns.map((column, columnIndex): ResolvedSqlColumn => {
       const name = column.name ?? `column_${columnIndex + 1}`
-      const propertyName = name
-      const suggestedJsonTypeName = `${pascalCaseIdentifier(config.name)}${encodedTypeNameSegment(propertyName)}Json`
-      const useStructuredJson = generatorConfig.scalarProfile === 'node-postgres' && column.jsonShape !== undefined
+      const propertyName = outputPropertyName(name, generatorConfig.naming.resultColumns)
+      const suggestedJsonTypeName = `${pascalCaseIdentifier(config.name)}${encodedTypeNameSegment(name)}Json`
+      const safeJsonShape = column.jsonShape ? applyOpaqueJsonBarriers(column.jsonShape) : undefined
+      const resolvedJsonShape = safeJsonShape
+        ? resolveJsonShapeNames(
+            safeJsonShape,
+            generatorConfig.naming.structuredJsonFields,
+            config.sourceFile,
+            `result column ${JSON.stringify(name)}`
+          )
+        : undefined
+      const jsonMapping = resolvedJsonShape ? jsonMappingForShape(resolvedJsonShape) : undefined
+      if (jsonMapping && generatorConfig.scalarProfile !== 'node-postgres') {
+        throw new Error(
+          `${config.sourceFile}: structured JSON field naming for result column ${JSON.stringify(name)} requires scalarProfile: 'node-postgres'.`
+        )
+      }
+      const jsonShape = generatorConfig.scalarProfile === 'node-postgres' ? resolvedJsonShape : undefined
       let tsType: string
-      if (useStructuredJson && column.jsonShape) {
+      if (jsonShape) {
         tsType = tsTypeForJsonShape(
-          column.jsonShape,
+          jsonShape,
           config.sourceFile,
           suggestedJsonTypeName,
           generatedDeclarations,
@@ -871,7 +1109,8 @@ async function resolveTypedSqlWithAnalyzer(
         }
       }
       return {
-        jsonShape: column.jsonShape,
+        ...(jsonShape ? { jsonShape } : {}),
+        ...(jsonMapping ? { jsonMapping } : {}),
         name,
         nullable: column.nullable,
         pgType: column.pgType,

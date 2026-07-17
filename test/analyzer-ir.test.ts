@@ -108,6 +108,154 @@ test('infers build-object shapes only from proven complete argument lists', asyn
   }
 })
 
+test('infers structured JSON from scalar subqueries and derived whole rows', async () => {
+  const database = await createAnalysisDatabase({ schemaFiles: [schemaFile] })
+  try {
+    const result = await buildTypedSqlPostgresIrFromCompiledConfigs(database, [
+      config(
+        'jsonArrayFrom',
+        `select coalesce(
+          (
+            select jsonb_agg(nested_row)
+            from (
+              select account.id as account_id, account.display_name
+              from public.accounts account
+            ) nested_row
+          ),
+          '[]'::jsonb
+        ) as accounts`
+      ),
+      config(
+        'jsonObjectFrom',
+        `select (
+          select to_jsonb(nested_row)
+          from (
+            select account.id as account_id, account.display_name
+            from public.accounts account
+            limit 1
+          ) nested_row
+        ) as account`
+      ),
+      config(
+        'directJsonObject',
+        `select to_jsonb(nested_row) as account
+        from (
+          select account.id as account_id, account.display_name
+          from public.accounts account
+        ) nested_row`
+      ),
+    ])
+
+    const arrayShape = result.queries.find((query) => query.name === 'jsonArrayFrom')?.resultColumns[0]?.jsonShape
+    assert.equal(arrayShape?.kind, 'array')
+    if (arrayShape?.kind === 'array') {
+      assert.equal(arrayShape.nullable, false)
+      assert.equal(arrayShape.element.kind, 'object')
+      if (arrayShape.element.kind === 'object') {
+        assert.deepEqual(
+          arrayShape.element.fields.map((field) => field.name),
+          ['account_id', 'display_name']
+        )
+      }
+    }
+
+    const objectShape = result.queries.find((query) => query.name === 'jsonObjectFrom')?.resultColumns[0]?.jsonShape
+    assert.equal(objectShape?.kind, 'object')
+    if (objectShape?.kind === 'object') {
+      assert.deepEqual(
+        objectShape.fields.map((field) => field.name),
+        ['account_id', 'display_name']
+      )
+    }
+    const directObjectShape = result.queries.find((query) => query.name === 'directJsonObject')?.resultColumns[0]
+      ?.jsonShape
+    assert.equal(directObjectShape?.kind, 'object')
+    assert.equal(directObjectShape?.nullable, false)
+  } finally {
+    await database.close()
+  }
+})
+
+test('models exposed whole-row names, set operations, and each JSON sublink result kind', async () => {
+  const database = await createAnalysisDatabase({ schemaFiles: [schemaFile] })
+  try {
+    const result = await buildTypedSqlPostgresIrFromCompiledConfigs(database, [
+      config('aliasedDerivedRow', 'select to_jsonb(r) as payload from (select 1 as account_id) r(user_id)'),
+      config('aliasedCteRow', 'with r(user_id) as (select 1 as account_id) select to_jsonb(r) as payload from r'),
+      config(
+        'setOperationWholeRow',
+        `select to_jsonb(u) as payload
+        from (
+          select jsonb_build_object('left_key', 1) as details
+          union all
+          select jsonb_build_object('right_key', 2) as details
+        ) u`
+      ),
+      config(
+        'arraySublink',
+        `select to_jsonb(array(
+          select jsonb_build_object('item_id', account.id)
+          from public.accounts account
+        )) as payload`
+      ),
+      config('existsSublink', 'select to_jsonb(exists(select 1)) as payload'),
+      config('anySublink', 'select to_jsonb(1 = any(select account.id from public.accounts account)) as payload'),
+      config('allSublink', 'select to_jsonb(1 = all(select account.id from public.accounts account)) as payload'),
+      config('rowCompareSublink', 'select to_jsonb((1, 2) = (select 1, 2)) as payload'),
+    ])
+    const shape = (name: string) => result.queries.find((query) => query.name === name)?.resultColumns[0]?.jsonShape
+
+    for (const name of ['aliasedDerivedRow', 'aliasedCteRow']) {
+      const rowShape = shape(name)
+      assert.equal(rowShape?.kind, 'object')
+      if (rowShape?.kind === 'object') {
+        assert.deepEqual(
+          rowShape.fields.map((field) => field.name),
+          ['user_id']
+        )
+      }
+    }
+
+    const setShape = shape('setOperationWholeRow')
+    assert.equal(setShape?.kind, 'object')
+    if (setShape?.kind === 'object') {
+      const details = setShape.fields.find((field) => field.name === 'details')?.shape
+      assert.equal(details?.kind, 'union')
+      if (details?.kind === 'union') {
+        assert.deepEqual(
+          details.alternatives.map((alternative) =>
+            alternative.kind === 'object' ? alternative.fields.map((field) => field.name) : alternative.kind
+          ),
+          [['left_key'], ['right_key']]
+        )
+      }
+    }
+
+    const arrayShape = shape('arraySublink')
+    assert.equal(arrayShape?.kind, 'array')
+    assert.equal(arrayShape?.nullable, false)
+    if (arrayShape?.kind === 'array') {
+      assert.equal(arrayShape.element.kind, 'object')
+      if (arrayShape.element.kind === 'object') {
+        assert.deepEqual(
+          arrayShape.element.fields.map((field) => field.name),
+          ['item_id']
+        )
+      }
+    }
+
+    for (const name of ['existsSublink', 'anySublink', 'allSublink', 'rowCompareSublink']) {
+      const predicateShape = shape(name)
+      assert.equal(predicateShape?.kind, 'scalar')
+      if (predicateShape?.kind === 'scalar') {
+        assert.equal(predicateShape.pgTypeName, 'bool')
+      }
+    }
+  } finally {
+    await database.close()
+  }
+})
+
 test('rejects unmodeled PostgreSQL utilities while preserving no-result CALL as a write', async () => {
   const database = await createAnalysisDatabase({ schemaFiles: [schemaFile] })
   try {

@@ -53,6 +53,12 @@ export function camelCaseIdentifier(identifier: string): string {
   return identifier.replaceAll(/_([a-z0-9])/gu, (_match, letter: string) => letter.toUpperCase())
 }
 
+const conventionalOutputIdentifier = /^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$/u
+
+export function camelCaseOutputProperty(identifier: string): string {
+  return conventionalOutputIdentifier.test(identifier) ? camelCaseIdentifier(identifier) : identifier
+}
+
 export function pascalCaseIdentifier(identifier: string): string {
   const camel = camelCaseIdentifier(identifier)
   return `${camel.slice(0, 1).toUpperCase()}${camel.slice(1)}`

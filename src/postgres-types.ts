@@ -360,6 +360,24 @@ export function postgresParameterSupportsStringLiteralRefinement(
 const jsonNumberTypes = new Set(['bigint', 'integer', 'smallint'])
 const jsonNumberOrSpecialStringTypes = new Set(['double precision', 'numeric', 'real'])
 
+/** Whether PostgreSQL JSON conversion may produce an object or array for this value. */
+export function postgresJsonValueMayBeStructured(typeFact: PostgresTypeFact): boolean {
+  if (typeFact.pgTypeKind === 'domain') {
+    return typeFact.pgBaseType ? postgresJsonValueMayBeStructured(typeFact.pgBaseType) : true
+  }
+
+  const normalizedType = normalizePostgresTypeName(typeFact.pgTypeName)
+  return (
+    typeFact.pgTypeKind === 'array' ||
+    typeFact.pgTypeKind === 'composite' ||
+    typeFact.pgTypeKind === 'unknown' ||
+    typeFact.pgArrayElementType !== undefined ||
+    typeFact.pgCastsToJson === true ||
+    normalizedType === 'unknown' ||
+    (typeFact.pgTypeSchema === 'pg_catalog' && (normalizedType === 'json' || normalizedType === 'jsonb'))
+  )
+}
+
 /**
  * Resolve a PostgreSQL value after PostgreSQL itself converts it into a nested
  * json/jsonb value (for example inside json_build_object or json_agg).
@@ -373,10 +391,7 @@ export function resolveTypeScriptJsonScalarTypeForPostgresType(
       : resolution('DbJsonSelected')
   }
 
-  if (typeFact.pgTypeKind === 'array' || typeFact.pgTypeKind === 'composite' || typeFact.pgArrayElementType) {
-    return resolution('DbJsonSelected')
-  }
-  if (typeFact.pgCastsToJson === true) {
+  if (postgresJsonValueMayBeStructured(typeFact)) {
     return resolution('DbJsonSelected')
   }
   if (typeFact.pgTypeKind === 'enum') {
@@ -384,12 +399,6 @@ export function resolveTypeScriptJsonScalarTypeForPostgresType(
   }
 
   const normalizedType = normalizePostgresTypeName(typeFact.pgTypeName)
-  if (normalizedType === 'unknown') {
-    return resolution('DbJsonSelected')
-  }
-  if (typeFact.pgTypeSchema === 'pg_catalog' && (normalizedType === 'json' || normalizedType === 'jsonb')) {
-    return resolution('DbJsonSelected')
-  }
   if (typeFact.pgTypeSchema === 'pg_catalog' && normalizedType === 'boolean') {
     return resolution('boolean')
   }

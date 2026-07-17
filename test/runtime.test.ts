@@ -5,6 +5,7 @@ import {
   createTypedSqlStatement,
   executeTypedSql,
   executeTypedSqlOptional,
+  mapTypedSqlJsonValue,
   mapTypedSqlRow,
   typedSqlRowCount,
   type TypedSqlClient,
@@ -238,5 +239,185 @@ test('runtime public statement contract preserves legacy custom object-row mappi
       {}
     ),
     [{ camelValue: 1 }]
+  )
+})
+
+test('runtime maps nested structured JSON while preserving opaque values and unknown fields', () => {
+  const opaquePayload = {
+    event_type: 'account.created',
+    external_account_id: 'external-1',
+  }
+  const mapped = mapTypedSqlJsonValue(
+    {
+      fields: [
+        {
+          name: 'account_id',
+          propertyName: 'accountId',
+        },
+        {
+          mapping: {
+            arrayElement: {
+              fields: [
+                {
+                  name: 'post_id',
+                  propertyName: 'postId',
+                },
+              ],
+            },
+          },
+          name: 'recent_posts',
+          propertyName: 'recentPosts',
+        },
+        {
+          name: 'webhook_payload',
+          propertyName: 'webhookPayload',
+        },
+      ],
+    },
+    {
+      account_id: 'account-1',
+      extra_field: true,
+      recent_posts: [{ post_id: 'post-1' }, null],
+      webhook_payload: opaquePayload,
+    }
+  )
+
+  assert.deepEqual(mapped, {
+    accountId: 'account-1',
+    extra_field: true,
+    recentPosts: [{ postId: 'post-1' }, null],
+    webhookPayload: opaquePayload,
+  })
+  assert.equal((mapped as { readonly webhookPayload: unknown }).webhookPayload, opaquePayload)
+})
+
+test('runtime mapping treats an opaque union field as an identity-preserving traversal barrier', () => {
+  const opaque = { inner_key: 1, innerKey: 2 }
+  const mapped = mapTypedSqlJsonValue(
+    { fields: [{ name: 'payload_data', propertyName: 'payloadData' }] },
+    { payload_data: opaque }
+  ) as { readonly payloadData: unknown }
+
+  assert.equal(mapped.payloadData, opaque)
+  assert.deepEqual(mapped.payloadData, { inner_key: 1, innerKey: 2 })
+})
+
+test('runtime execution applies generated nested JSON mappings to positional rows', async () => {
+  const statement = createTypedSqlStatement<
+    Record<string, never>,
+    {
+      readonly accountRows: readonly {
+        readonly accountId: number
+        readonly displayName: string
+      }[]
+    }
+  >({
+    columns: [
+      {
+        jsonMapping: {
+          arrayElement: {
+            fields: [
+              {
+                name: 'account_id',
+                propertyName: 'accountId',
+              },
+              {
+                name: 'display_name',
+                propertyName: 'displayName',
+              },
+            ],
+          },
+        },
+        name: 'account_rows',
+        nullable: false,
+        pgType: 'jsonb',
+        pgTypeName: 'jsonb',
+        pgTypeSchema: 'pg_catalog',
+        propertyName: 'accountRows',
+      },
+    ],
+    name: 'nestedRows',
+    parameterNames: [],
+    text: 'select account_rows',
+  })
+
+  const rows = await executeTypedSql(
+    {
+      async query<Row>() {
+        return {
+          rows: [
+            [
+              [
+                {
+                  account_id: 1,
+                  display_name: 'Reader',
+                },
+              ],
+            ],
+          ] as unknown as Row[],
+        }
+      },
+    },
+    statement,
+    {}
+  )
+
+  assert.deepEqual(rows, [
+    {
+      accountRows: [
+        {
+          accountId: 1,
+          displayName: 'Reader',
+        },
+      ],
+    },
+  ])
+})
+
+test('runtime maps prototype-sensitive nested JSON properties safely', () => {
+  const source = JSON.parse('{"__proto__":{"constructor":"preserved"}}') as unknown
+  const mapped = mapTypedSqlJsonValue(
+    {
+      fields: [
+        {
+          mapping: {
+            fields: [
+              {
+                name: 'constructor',
+                propertyName: 'constructorValue',
+              },
+            ],
+          },
+          name: '__proto__',
+          propertyName: '__proto__',
+        },
+      ],
+    },
+    source
+  ) as { readonly __proto__: { readonly constructorValue: string } }
+
+  assert.equal(Object.getPrototypeOf(mapped), Object.prototype)
+  assert.equal(Object.hasOwn(mapped, '__proto__'), true)
+  assert.equal(mapped.__proto__.constructorValue, 'preserved')
+})
+
+test('runtime rejects nested JSON properties that collide after mapping', () => {
+  assert.throws(
+    () =>
+      mapTypedSqlJsonValue(
+        {
+          fields: [
+            {
+              name: 'foo_bar',
+              propertyName: 'fooBar',
+            },
+          ],
+        },
+        {
+          foo_bar: 1,
+          fooBar: 2,
+        }
+      ),
+    /JSON fields collide at mapped property "fooBar"/u
   )
 })

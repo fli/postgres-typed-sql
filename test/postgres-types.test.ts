@@ -3,6 +3,7 @@ import test from 'node:test'
 import { getTypeParser, type TypeId } from 'pg-types'
 
 import {
+  postgresJsonValueMayBeStructured,
   resolveTypeScriptJsonScalarTypeForPostgresType,
   resolveTypeScriptParameterTypeForPostgresType,
   resolveTypeScriptResultTypeForPostgresType,
@@ -446,6 +447,70 @@ test('nested-JSON resolution follows PostgreSQL conversion rather than node-post
     }).type,
     'DbJsonSelected'
   )
+})
+
+test('classifies every PostgreSQL JSON value that may contain arbitrary structure', () => {
+  const integer = pgCatalog('integer', 'int4', 23)
+  const array = pgCatalog('integer[]', '_int4', 1007, {
+    pgArrayElementType: integer,
+    pgTypeKind: 'array',
+  })
+  const composite: PostgresTypeFact = {
+    pgType: 'audit.payload',
+    pgTypeKind: 'composite',
+    pgTypeName: 'payload',
+    pgTypeOid: 16_400,
+    pgTypeSchema: 'audit',
+  }
+  const domain = (baseType?: PostgresTypeFact): PostgresTypeFact => ({
+    pgType: 'audit.value_domain',
+    ...(baseType ? { pgBaseType: baseType } : {}),
+    pgTypeKind: 'domain',
+    pgTypeName: 'value_domain',
+    pgTypeOid: 16_401,
+    pgTypeSchema: 'audit',
+  })
+
+  for (const fact of [
+    array,
+    composite,
+    domain(),
+    domain(array),
+    domain(composite),
+    domain(pgCatalog('jsonb', 'jsonb', 3802)),
+    pgCatalog('json', 'json', 114),
+    pgCatalog('jsonb', 'jsonb', 3802),
+    {
+      ...integer,
+      pgCastsToJson: true,
+    },
+    {
+      pgType: 'oid:99999',
+      pgTypeKind: 'unknown',
+      pgTypeName: 'oid_99999',
+      pgTypeOid: 99_999,
+      pgTypeSchema: 'unknown',
+    } satisfies PostgresTypeFact,
+  ]) {
+    assert.equal(postgresJsonValueMayBeStructured(fact), true, fact.pgType)
+  }
+
+  for (const fact of [
+    integer,
+    pgCatalog('boolean', 'bool', 16),
+    pgCatalog('text', 'text', 25),
+    pgCatalog('date', 'date', 1082),
+    domain(integer),
+    {
+      pgType: 'audit.status',
+      pgTypeKind: 'enum',
+      pgTypeName: 'status',
+      pgTypeOid: 16_402,
+      pgTypeSchema: 'audit',
+    } satisfies PostgresTypeFact,
+  ]) {
+    assert.equal(postgresJsonValueMayBeStructured(fact), false, fact.pgType)
+  }
 })
 
 test('pg-types 2.2.0 parser fixtures match arrays, identity fallback, and infinity behavior', () => {

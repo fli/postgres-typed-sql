@@ -3,11 +3,22 @@ import { isAbsolute, resolve } from 'node:path'
 import type { SupportedExtension } from './engine.js'
 import { defaultPostgresScalarProfile, type PostgresScalarProfile } from './postgres-types.js'
 
+export type PostgresTypedSqlPropertyNaming = 'camelCase' | 'preserve'
+
+export interface PostgresTypedSqlNamingConfig {
+  /** Naming convention for top-level result-row properties. Defaults to preserve. */
+  readonly resultColumns?: PostgresTypedSqlPropertyNaming
+  /** Naming convention for fields in statically modeled JSON results. Defaults to preserve. */
+  readonly structuredJsonFields?: PostgresTypedSqlPropertyNaming
+}
+
 export interface PostgresTypedSqlConfig {
   /** Directories recursively searched for *.typed.sql files. Defaults to rootDir. */
   readonly include?: readonly string[]
   /** Import specifier written into generated files. */
   readonly packageImport?: string
+  /** Naming conventions for generated result properties. */
+  readonly naming?: PostgresTypedSqlNamingConfig
   /** Project directory used to resolve every relative path. Defaults to process.cwd(). */
   readonly rootDir?: string
   /** Ordered SQL files used to construct the analysis schema. */
@@ -20,9 +31,15 @@ export interface PostgresTypedSqlConfig {
   readonly typesOutput?: string
 }
 
+export interface ResolvedPostgresTypedSqlNamingConfig {
+  readonly resultColumns: PostgresTypedSqlPropertyNaming
+  readonly structuredJsonFields: PostgresTypedSqlPropertyNaming
+}
+
 export interface ResolvedPostgresTypedSqlConfig {
   readonly extensions: readonly SupportedExtension[]
   readonly include: readonly string[]
+  readonly naming: ResolvedPostgresTypedSqlNamingConfig
   readonly packageImport: string
   readonly rootDir: string
   readonly scalarProfile: PostgresScalarProfile
@@ -48,10 +65,22 @@ export function resolveConfig(config: PostgresTypedSqlConfig): ResolvedPostgresT
   if (scalarProfile !== 'conservative' && scalarProfile !== 'node-postgres') {
     throw new Error(`Unsupported scalar profile ${JSON.stringify(scalarProfile)}.`)
   }
+  const resultColumns = config.naming?.resultColumns ?? 'preserve'
+  if (resultColumns !== 'preserve' && resultColumns !== 'camelCase') {
+    throw new Error(`Unsupported result-column naming ${JSON.stringify(resultColumns)}.`)
+  }
+  const structuredJsonFields = config.naming?.structuredJsonFields ?? 'preserve'
+  if (structuredJsonFields !== 'preserve' && structuredJsonFields !== 'camelCase') {
+    throw new Error(`Unsupported structured-JSON field naming ${JSON.stringify(structuredJsonFields)}.`)
+  }
 
   return {
     extensions: config.extensions ?? [],
     include: (config.include ?? ['.']).map((entry) => fromRoot(rootDir, entry)),
+    naming: {
+      resultColumns,
+      structuredJsonFields,
+    },
     packageImport: config.packageImport ?? 'postgres-typed-sql',
     rootDir,
     scalarProfile,

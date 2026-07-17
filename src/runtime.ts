@@ -29,6 +29,34 @@ function isTypedSqlArrayRow(row: TypedSqlArrayRow | TypedSqlRawRow): row is Type
 
 export type TypedSqlRowNameSource = 'property' | 'sql'
 
+export interface TypedSqlJsonFieldMappingMetadata {
+  readonly mapping?: TypedSqlJsonMappingMetadata
+  readonly name: string
+  readonly propertyName: string
+}
+
+export interface TypedSqlJsonMappingMetadata {
+  readonly arrayElement?: TypedSqlJsonMappingMetadata
+  readonly fields?: readonly TypedSqlJsonFieldMappingMetadata[]
+}
+
+const typedSqlJsonFieldMappings = new WeakMap<
+  TypedSqlJsonMappingMetadata,
+  ReadonlyMap<string, TypedSqlJsonFieldMappingMetadata>
+>()
+
+function jsonFieldMappings(
+  mapping: TypedSqlJsonMappingMetadata
+): ReadonlyMap<string, TypedSqlJsonFieldMappingMetadata> {
+  const cached = typedSqlJsonFieldMappings.get(mapping)
+  if (cached) {
+    return cached
+  }
+  const fields = new Map(mapping.fields?.map((field) => [field.name, field]))
+  typedSqlJsonFieldMappings.set(mapping, fields)
+  return fields
+}
+
 export type TypedSqlColumnSourceMetadata =
   | {
       readonly kind: 'derivedVar'
@@ -53,6 +81,7 @@ export type TypedSqlColumnSourceMetadata =
     }
 
 export interface TypedSqlColumnMetadata {
+  readonly jsonMapping?: TypedSqlJsonMappingMetadata
   readonly name: string
   readonly nullable: boolean
   readonly pgType: string
@@ -198,16 +227,50 @@ export function mapTypedSqlRow<Params extends TypedSqlParams, Row>(
         `Typed SQL statement ${statement.name} expected result column ${columnIndex + 1} from an array row.`
       )
     }
+    const rawValue = isTypedSqlArrayRow(row) ? row[columnIndex] : row[rowKey]
     Object.defineProperty(mapped, column.propertyName, {
       configurable: true,
       enumerable: true,
-      value: isTypedSqlArrayRow(row) ? row[columnIndex] : row[rowKey],
+      value: column.jsonMapping ? mapTypedSqlJsonValue(column.jsonMapping, rawValue) : rawValue,
       writable: true,
     })
   }
 
   // oxlint-disable-next-line typescript/no-unsafe-type-assertion -- Generated statement metadata maps each SQL result column to the generated Row property.
   return mapped as Row
+}
+
+export function mapTypedSqlJsonValue(mapping: TypedSqlJsonMappingMetadata, value: unknown): unknown {
+  if (value === null) {
+    return null
+  }
+
+  if (Array.isArray(value)) {
+    const elementMapping = mapping.arrayElement
+    return elementMapping ? value.map((element) => mapTypedSqlJsonValue(elementMapping, element)) : value
+  }
+
+  if (typeof value !== 'object' || !mapping.fields) {
+    return value
+  }
+
+  const fieldMappingByName = jsonFieldMappings(mapping)
+  const mapped: Record<string, unknown> = {}
+  for (const [name, fieldValue] of Object.entries(value)) {
+    const fieldMapping = fieldMappingByName.get(name)
+    const propertyName = fieldMapping?.propertyName ?? name
+    if (Object.hasOwn(mapped, propertyName)) {
+      throw new Error(`Typed SQL JSON fields collide at mapped property ${JSON.stringify(propertyName)}.`)
+    }
+    Object.defineProperty(mapped, propertyName, {
+      configurable: true,
+      enumerable: true,
+      value: fieldMapping?.mapping ? mapTypedSqlJsonValue(fieldMapping.mapping, fieldValue) : fieldValue,
+      writable: true,
+    })
+  }
+
+  return mapped
 }
 
 export function mapTypedSqlRows<Params extends TypedSqlParams, Row>(

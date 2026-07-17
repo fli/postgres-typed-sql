@@ -33,6 +33,10 @@ export default defineConfig({
   include: ['./src'],
   extensions: ['pgcrypto'],
   scalarProfile: 'node-postgres',
+  naming: {
+    resultColumns: 'camelCase',
+    structuredJsonFields: 'camelCase',
+  },
 })
 ```
 
@@ -79,6 +83,29 @@ const result = await client.query<TypedSqlRawRow>(findAccountByEmail.query({ ema
 ```
 
 Direct driver execution returns driver-defined raw object rows whose scalar values should be treated as `unknown`, because `query()` controls neither row construction nor scalar parsers. The node-postgres result-row generic is not inferred from a query configuration object, so a direct unannotated `client.query(statement.query(params))` call defaults to `any`; pass `TypedSqlRawRow` explicitly as shown above. The optional runtime helpers under `postgres-typed-sql/runtime` instead request array rows, map them by result-column position, enforce `one`, `optional`, and `many` result shapes, and return the generated row type selected by the configured scalar profile. Positional mapping preserves every unique PostgreSQL result name safely, including names such as `__proto__` that object-row construction cannot represent reliably.
+
+## Output naming
+
+Postgres Typed SQL preserves PostgreSQL result and JSON field names by default. Configure application-facing camel-case names independently for top-level result columns and statically modeled JSON fields:
+
+```js
+export default defineConfig({
+  schema: './db/schema.sql',
+  scalarProfile: 'node-postgres',
+  naming: {
+    resultColumns: 'camelCase',
+    structuredJsonFields: 'camelCase',
+  },
+})
+```
+
+For example, `account_id` becomes `accountId`, and a modeled JSON value such as `jsonb_build_object('display_name', display_name)` exposes `displayName`. The structured JSON policy applies recursively through inferred objects, arrays, unions, `json_agg`/`jsonb_agg`, and JSON object or array projections from derived subqueries. Opaque JSON values—including selected JSON columns and dynamically keyed objects—are not traversed, so their internal keys and object identity are preserved.
+
+Naming is deterministic and conservative: conventional lower-snake-case identifiers are camel-cased, already camel-case names stay unchanged, and unusual names such as `URL`, `__proto__`, spaces, and hyphens are preserved. Generation rejects result or modeled JSON fields that collide after transformation and asks the query author to alias them.
+
+The generated row type describes mapped execution through `executeTypedSql`, `executeTypedSqlOne`, and `executeTypedSqlOptional`. Direct `client.query(statement.query(params))` execution remains raw and returns driver/PostgreSQL names because the driver constructs those object rows. Named parameters, generated catalog types, and opaque JSON contents are unaffected.
+
+Structured JSON field naming requires `scalarProfile: 'node-postgres'` when a query needs a nested mapping, because the runtime must know that `json` and `jsonb` values are decoded into JavaScript objects and arrays.
 
 ## Scalar profiles
 

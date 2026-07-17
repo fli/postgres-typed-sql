@@ -8,12 +8,23 @@ import { generateTypedSql } from '../src/generator.js'
 import { PGlite } from '../src/vendor/pglite/index.js'
 import {
   assertTypeScriptBindingIdentifier,
+  camelCaseOutputProperty,
   postgresCheckConstraintTypeBinding,
   postgresIdentifierTypeSegment,
   postgresNamedTypeBinding,
 } from '../src/typescript-names.js'
 
 const fixtureRoot = new URL('./fixtures/', import.meta.url)
+
+test('camel-cases only conventional PostgreSQL output identifiers', () => {
+  assert.equal(camelCaseOutputProperty('account_id'), 'accountId')
+  assert.equal(camelCaseOutputProperty('api_v2_url'), 'apiV2Url')
+  assert.equal(camelCaseOutputProperty('column_1'), 'column1')
+  assert.equal(camelCaseOutputProperty('displayName'), 'displayName')
+  assert.equal(camelCaseOutputProperty('__proto__'), '__proto__')
+  assert.equal(camelCaseOutputProperty('outer-key'), 'outer-key')
+  assert.equal(camelCaseOutputProperty('URL'), 'URL')
+})
 
 async function copyFixture(): Promise<string> {
   const root = await mkdtemp(join(tmpdir(), 'postgres-typed-sql-'))
@@ -1689,6 +1700,289 @@ test('models the last value for duplicate PostgreSQL JSON object keys', async ()
   const output = await readFile(join(root, 'queries/query.typed-sql.ts'), 'utf8')
   assert.match(output, /readonly value: string/u)
   assert.doesNotMatch(output, /readonly value: number/u)
+})
+
+test('maps configured result and structured JSON names to camel case', async () => {
+  const root = await createMinimalFixture(
+    'select 1;\n',
+    `select
+  1 as account_id,
+  jsonb_build_object(
+    'display_name', 'Reader'::text,
+    'recent_posts', jsonb_agg(jsonb_build_object('post_id', 2, 'published_at', null::text)),
+    'webhook_payload', '{"event_type":"account.created"}'::jsonb
+  ) as account_details
+from (values (1)) source(n)
+`
+  )
+  await generateTypedSql({
+    include: ['queries'],
+    naming: {
+      resultColumns: 'camelCase',
+      structuredJsonFields: 'camelCase',
+    },
+    rootDir: root,
+    scalarProfile: 'node-postgres',
+    schema: 'schema.sql',
+  })
+
+  const output = await readFile(join(root, 'queries/query.typed-sql.ts'), 'utf8')
+  assert.match(output, /readonly accountId: number/u)
+  assert.match(output, /readonly accountDetails: QueryJ15_account_detailsJson/u)
+  assert.match(output, /readonly displayName: string/u)
+  assert.match(output, /readonly recentPosts: readonly/u)
+  assert.match(output, /readonly postId: number/u)
+  assert.match(output, /readonly publishedAt: string \| null/u)
+  assert.match(output, /readonly webhookPayload: DbJsonSelected/u)
+  assert.match(output, /name: 'account_id',[\s\S]*?propertyName: 'accountId'/u)
+  assert.match(
+    output,
+    /jsonMapping: \{"fields":\[\{"name":"display_name","propertyName":"displayName"\},\{"mapping":\{"arrayElement":\{"fields":\[\{"name":"post_id","propertyName":"postId"\},\{"name":"published_at","propertyName":"publishedAt"\}\]\}\},"name":"recent_posts","propertyName":"recentPosts"\},\{"name":"webhook_payload","propertyName":"webhookPayload"\}\]\}/u
+  )
+})
+
+test('maps JSON array-from and object-from derived row shapes to camel case', async () => {
+  const root = await createMinimalFixture(
+    'select 1;\n',
+    `select
+  coalesce(
+    (
+      select jsonb_agg(nested_row)
+      from (
+        select 1 as account_id, 'Reader'::text as display_name
+      ) nested_row
+    ),
+    '[]'::jsonb
+  ) as account_rows,
+  (
+    select to_jsonb(nested_row)
+    from (
+      select 2 as account_id, 'Writer'::text as display_name
+    ) nested_row
+  ) as account_row
+`
+  )
+  await generateTypedSql({
+    include: ['queries'],
+    naming: {
+      resultColumns: 'camelCase',
+      structuredJsonFields: 'camelCase',
+    },
+    rootDir: root,
+    scalarProfile: 'node-postgres',
+    schema: 'schema.sql',
+  })
+
+  const output = await readFile(join(root, 'queries/query.typed-sql.ts'), 'utf8')
+  assert.match(output, /readonly accountRows: readonly \(QueryJ12_account_rowsJsonJ7_element\)\[\]/u)
+  assert.match(output, /readonly accountRow: QueryJ11_account_rowJson \| null/u)
+  assert.match(output, /readonly accountId: number/u)
+  assert.match(output, /readonly displayName: string/u)
+  assert.match(output, /propertyName: 'accountRows'/u)
+  assert.match(output, /propertyName: 'accountRow'/u)
+  assert.match(output, /"name":"account_id","propertyName":"accountId"/u)
+  assert.match(output, /"name":"display_name","propertyName":"displayName"/u)
+})
+
+test('uses exposed aliases and folds whole-row set operations for structured JSON naming', async () => {
+  const root = await createMinimalFixture(
+    'select 1;\n',
+    `select
+  to_jsonb(aliased_row) as aliased_payload,
+  to_jsonb(union_row) as union_payload
+from (select 1 as account_id) aliased_row(user_id)
+cross join (
+  select jsonb_build_object('left_key', 1) as details
+  union all
+  select jsonb_build_object('right_key', 2) as details
+) union_row
+`
+  )
+  await generateTypedSql({
+    include: ['queries'],
+    naming: { structuredJsonFields: 'camelCase' },
+    rootDir: root,
+    scalarProfile: 'node-postgres',
+    schema: 'schema.sql',
+  })
+
+  const output = await readFile(join(root, 'queries/query.typed-sql.ts'), 'utf8')
+  assert.match(output, /readonly userId: number/u)
+  assert.doesNotMatch(output, /readonly accountId: number/u)
+  assert.match(output, /readonly leftKey: number/u)
+  assert.match(output, /readonly rightKey: number/u)
+  assert.match(output, /"name":"user_id","propertyName":"userId"/u)
+  assert.match(output, /"name":"left_key","propertyName":"leftKey"/u)
+  assert.match(output, /"name":"right_key","propertyName":"rightKey"/u)
+})
+
+test('maps ARRAY sublink elements while preserving opaque union paths', async () => {
+  const root = await createMinimalFixture(
+    'create table public.json_values (payload jsonb not null);\n',
+    `select to_jsonb(array(select jsonb_build_object('item_id', 1))) as items
+union all
+select jsonb_build_object(
+  'payload_data',
+  jsonb_build_object('foo_bar', 1, 'fooBar', 2)
+)
+union all
+select jsonb_build_object('payload_data', payload)
+from public.json_values
+`
+  )
+  await generateTypedSql({
+    include: ['queries'],
+    naming: { structuredJsonFields: 'camelCase' },
+    rootDir: root,
+    scalarProfile: 'node-postgres',
+    schema: 'schema.sql',
+  })
+
+  const output = await readFile(join(root, 'queries/query.typed-sql.ts'), 'utf8')
+  assert.match(output, /readonly itemId: number/u)
+  assert.match(output, /readonly payloadData: DbJsonSelected/u)
+  assert.doesNotMatch(output, /readonly fooBar: number/u)
+  assert.match(output, /"name":"item_id","propertyName":"itemId"/u)
+  assert.match(output, /"name":"payload_data","propertyName":"payloadData"/u)
+  assert.doesNotMatch(output, /"name":"foo_bar","propertyName":"fooBar"/u)
+})
+
+test('treats composite JSON alternatives as opaque traversal barriers', async () => {
+  const root = await createMinimalFixture(
+    'create type public.opaque_payload as (inner_key integer);\n',
+    `select jsonb_build_object(
+  'payload_data',
+  jsonb_build_object('inner_key', 1)
+) as payload
+union all
+select jsonb_build_object(
+  'payload_data',
+  row(2)::public.opaque_payload
+) as payload
+`
+  )
+  await generateTypedSql({
+    include: ['queries'],
+    naming: { structuredJsonFields: 'camelCase' },
+    rootDir: root,
+    scalarProfile: 'node-postgres',
+    schema: 'schema.sql',
+  })
+
+  const output = await readFile(join(root, 'queries/query.typed-sql.ts'), 'utf8')
+  assert.match(output, /readonly payloadData: DbJsonSelected/u)
+  assert.doesNotMatch(output, /readonly innerKey: number/u)
+  assert.match(output, /"name":"payload_data","propertyName":"payloadData"/u)
+  assert.doesNotMatch(output, /"name":"inner_key","propertyName":"innerKey"/u)
+})
+
+test('keeps nested mappings when the other JSON alternative is primitive', async () => {
+  const root = await createMinimalFixture(
+    'select 1;\n',
+    `select jsonb_build_object(
+  'payload_data',
+  jsonb_build_object('inner_key', 1)
+) as payload
+union all
+select jsonb_build_object('payload_data', 2) as payload
+`
+  )
+  await generateTypedSql({
+    include: ['queries'],
+    naming: { structuredJsonFields: 'camelCase' },
+    rootDir: root,
+    scalarProfile: 'node-postgres',
+    schema: 'schema.sql',
+  })
+
+  const output = await readFile(join(root, 'queries/query.typed-sql.ts'), 'utf8')
+  assert.match(output, /readonly payloadData:/u)
+  assert.match(output, /readonly innerKey: number/u)
+  assert.match(output, /"name":"payload_data","propertyName":"payloadData"/u)
+  assert.match(output, /"name":"inner_key","propertyName":"innerKey"/u)
+})
+
+test('rejects configured output naming collisions at every modeled object level', async () => {
+  const topLevelRoot = await createMinimalFixture('select 1;\n', 'select 1 as foo_bar, 2 as "fooBar"\n')
+  await assert.rejects(
+    generateTypedSql({
+      include: ['queries'],
+      naming: {
+        resultColumns: 'camelCase',
+      },
+      rootDir: topLevelRoot,
+      scalarProfile: 'node-postgres',
+      schema: 'schema.sql',
+    }),
+    /duplicate result column name "fooBar"/u
+  )
+
+  const nestedRoot = await createMinimalFixture(
+    'select 1;\n',
+    `select jsonb_build_object('foo_bar', 1, 'fooBar', 2) as payload
+`
+  )
+  await assert.rejects(
+    generateTypedSql({
+      include: ['queries'],
+      naming: {
+        structuredJsonFields: 'camelCase',
+      },
+      rootDir: nestedRoot,
+      scalarProfile: 'node-postgres',
+      schema: 'schema.sql',
+    }),
+    /duplicate JSON field in result column "payload" name "fooBar"/u
+  )
+})
+
+test('merges camel-case runtime mappings across structured JSON unions', async () => {
+  const root = await createMinimalFixture(
+    'select 1;\n',
+    `select payload
+from (
+  select jsonb_build_object('outer_left', 1) as payload
+  union all
+  select jsonb_build_object('outer_right', 'two'::text)
+) alternatives
+`
+  )
+  await generateTypedSql({
+    include: ['queries'],
+    naming: {
+      structuredJsonFields: 'camelCase',
+    },
+    rootDir: root,
+    scalarProfile: 'node-postgres',
+    schema: 'schema.sql',
+  })
+
+  const output = await readFile(join(root, 'queries/query.typed-sql.ts'), 'utf8')
+  assert.match(output, /readonly outerLeft: number/u)
+  assert.match(output, /readonly outerRight: string/u)
+  assert.match(
+    output,
+    /jsonMapping: \{"fields":\[\{"name":"outer_left","propertyName":"outerLeft"\},\{"name":"outer_right","propertyName":"outerRight"\}\]\}/u
+  )
+})
+
+test('requires structural JSON decoding when configured JSON field naming is used', async () => {
+  const root = await createMinimalFixture(
+    'select 1;\n',
+    `select jsonb_build_object('display_name', 'Reader') as payload
+`
+  )
+  await assert.rejects(
+    generateTypedSql({
+      include: ['queries'],
+      naming: {
+        structuredJsonFields: 'camelCase',
+      },
+      rootDir: root,
+      schema: 'schema.sql',
+    }),
+    /structured JSON field naming for result column "payload" requires scalarProfile: 'node-postgres'/u
+  )
 })
 
 test('uses collision-free JSON binding paths for arrays and nested keys', async () => {
