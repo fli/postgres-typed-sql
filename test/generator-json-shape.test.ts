@@ -1,0 +1,95 @@
+import assert from 'node:assert/strict'
+import { readFile, writeFile } from 'node:fs/promises'
+import { join } from 'node:path'
+import test from 'node:test'
+
+import { createMinimalFixture, generateTypedSql } from './generator-test-support.js'
+
+test('renders a CASE-authored JSON state machine as a precise discriminated union', async () => {
+  const root = await createMinimalFixture(
+    `create table public.playback_values (
+  publication_public_id text,
+  manifest_object_key text
+);
+`,
+    `select case
+  when playback.publication_public_id is not null
+   and playback.manifest_object_key is not null
+  then jsonb_build_object(
+    'state', 'playable',
+    'publicationPublicId', playback.publication_public_id,
+    'manifestType', 'hls',
+    'manifestObjectKey', playback.manifest_object_key
+  )
+  else jsonb_build_object('state', 'unavailable')
+end as playback
+from (values (1)) seed(value)
+left join lateral (
+  select publication_public_id, manifest_object_key
+  from public.playback_values
+  limit 1
+) playback on true
+`
+  )
+  await generateTypedSql({
+    include: ['queries'],
+    rootDir: root,
+    scalarProfile: 'node-postgres',
+    schema: 'schema.sql',
+  })
+
+  const output = await readFile(join(root, 'queries/query.typed-sql.ts'), 'utf8')
+  assert.match(output, /interface QueryJ8_playbackJsonJ12_alternative1 \{[\s\S]*readonly state: 'playable'/u)
+  assert.match(output, /readonly publicationPublicId: string\n/u)
+  assert.match(output, /readonly manifestType: 'hls'\n/u)
+  assert.match(output, /readonly manifestObjectKey: string\n/u)
+  assert.match(output, /interface QueryJ8_playbackJsonJ12_alternative2 \{[\s\S]*readonly state: 'unavailable'/u)
+  assert.match(
+    output,
+    /readonly playback: QueryJ8_playbackJsonJ12_alternative1 \| QueryJ8_playbackJsonJ12_alternative2\n/u
+  )
+  assert.doesNotMatch(output, /readonly playback: DbJsonSelected/u)
+  assert.doesNotMatch(output, /readonly publicationPublicId: string \| null/u)
+  assert.doesNotMatch(output, /readonly manifestObjectKey: string \| null/u)
+})
+
+test('keeps I/O-cast JSON shapes opaque and strict conversion results nullable', async () => {
+  const root = await createMinimalFixture(
+    'select 1;\n',
+    `select (case when true
+  then '{"a":1}'
+  else '{"b":2}'
+end)::jsonb as payload
+`
+  )
+  const config = {
+    include: ['queries'],
+    rootDir: root,
+    scalarProfile: 'node-postgres' as const,
+    schema: 'schema.sql',
+  }
+  const queryFile = join(root, 'queries/query.typed.sql')
+  const outputFile = join(root, 'queries/query.typed-sql.ts')
+
+  await generateTypedSql(config)
+  let output = await readFile(outputFile, 'utf8')
+  assert.match(output, /readonly payload: DbJsonSelected\n/u)
+  assert.doesNotMatch(output, /'\{"a":1\}'/u)
+  assert.doesNotMatch(output, /'\{"b":2\}'/u)
+
+  await writeFile(
+    queryFile,
+    'select row_to_json(source_row, null::boolean) as payload from (values (1)) source_row(value)\n'
+  )
+  await generateTypedSql(config)
+  output = await readFile(outputFile, 'utf8')
+  assert.match(output, /readonly payload: QueryJ7_payloadJson \| null/u)
+  assert.match(output, /name: 'payload',[\s\S]*?nullable: true/u)
+
+  await writeFile(queryFile, 'select row_to_json(source_row, false) as payload from (values (1)) source_row(value)\n')
+  await generateTypedSql(config)
+  output = await readFile(outputFile, 'utf8')
+  assert.match(output, /readonly payload: QueryJ7_payloadJson\n/u)
+  assert.doesNotMatch(output, /readonly payload: QueryJ7_payloadJson \| null/u)
+  assert.match(output, /name: 'payload',[\s\S]*?nullable: false/u)
+})

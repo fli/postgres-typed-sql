@@ -5,116 +5,44 @@ import {
   loadCheckConstraintLiteralUnionFacts,
   type CheckConstraintLiteralUnionFact,
 } from './check-constraint-type-facts.js'
+import {
+  checkConstraintTypeKey,
+  intersectJsonShapes,
+  joinJsonShapes,
+  jsonShapeWithNullability,
+  unionJsonShapes,
+  type TypedSqlPostgresIr,
+  type TypedSqlPostgresIrCheckConstraintTypeExpression,
+  type TypedSqlPostgresIrColumn,
+  type TypedSqlPostgresIrColumnSource,
+  type TypedSqlPostgresIrCompiledConfig,
+  type TypedSqlPostgresIrJsonField,
+  type TypedSqlPostgresIrJsonShape,
+  type TypedSqlPostgresIrParam,
+  type TypedSqlPostgresIrParamNullAdmission,
+  type TypedSqlPostgresIrRowBounds,
+  type TypedSqlPostgresIrRowCardinality,
+} from './analyzer-ir-model.js'
 import type { PostgresQueryable } from './database.js'
 import { loadPostgresTypeFacts } from './postgres-type-facts.js'
-import type { PostgresTypeFact } from './postgres-types.js'
+import { postgresJsonSupportsStringLiteralRefinement, type PostgresTypeFact } from './postgres-types.js'
+
+export type {
+  TypedSqlPostgresIr,
+  TypedSqlPostgresIrCheckConstraintTypeExpression,
+  TypedSqlPostgresIrColumn,
+  TypedSqlPostgresIrColumnSource,
+  TypedSqlPostgresIrCompiledConfig,
+  TypedSqlPostgresIrJsonField,
+  TypedSqlPostgresIrJsonShape,
+  TypedSqlPostgresIrParam,
+  TypedSqlPostgresIrParamNullAdmission,
+  TypedSqlPostgresIrRowBounds,
+  TypedSqlPostgresIrRowCardinality,
+} from './analyzer-ir-model.js'
 
 const ANALYZER_SCHEMA_VERSION = 6
 const ANALYZER_SQL_FUNCTION = 'pg_temp.postgres_typed_sql_analyze'
-
-export interface TypedSqlPostgresIr {
-  readonly analyzerSchemaVersion: number
-  readonly command: string
-  readonly hasDataModifyingCte: boolean
-  readonly isWrite: boolean
-  readonly name: string
-  readonly params: readonly TypedSqlPostgresIrParam[]
-  readonly postgresVersionNum: number
-  readonly resultColumns: readonly TypedSqlPostgresIrColumn[]
-  readonly rowBounds: TypedSqlPostgresIrRowBounds
-  readonly rowCardinality: TypedSqlPostgresIrRowCardinality
-  readonly sourceFile: string
-}
-
-export type TypedSqlPostgresIrRowCardinality = 'many' | 'none' | 'one' | 'optional'
-
-export interface TypedSqlPostgresIrRowBounds {
-  readonly max: number | null
-  readonly min: number
-  readonly proof: string
-}
-
-export interface TypedSqlPostgresIrParam extends PostgresTypeFact {
-  readonly checkConstraintType?: TypedSqlPostgresIrCheckConstraintTypeExpression
-  readonly name: string
-  readonly nullAdmission: TypedSqlPostgresIrParamNullAdmission
-  readonly nullable: boolean
-  readonly propertyName: string
-}
-
-export type TypedSqlPostgresIrParamNullAdmission = 'accepts' | 'rejects' | 'unknown'
-
-export interface TypedSqlPostgresIrColumn extends PostgresTypeFact {
-  readonly checkConstraintType?: TypedSqlPostgresIrCheckConstraintTypeExpression
-  readonly jsonShape?: TypedSqlPostgresIrJsonShape
-  readonly name: string | null
-  readonly nullable: boolean
-  readonly source: TypedSqlPostgresIrColumnSource
-}
-
-export type TypedSqlPostgresIrCheckConstraintTypeExpression =
-  | {
-      readonly kind: 'literalUnion'
-      readonly labels: readonly string[]
-    }
-  | {
-      readonly kind: 'intersection' | 'union'
-      readonly members: readonly TypedSqlPostgresIrCheckConstraintTypeExpression[]
-    }
-
-export type TypedSqlPostgresIrJsonShape =
-  | {
-      readonly kind: 'array'
-      readonly element: TypedSqlPostgresIrJsonShape
-      readonly nullable: boolean
-    }
-  | {
-      readonly fields: readonly TypedSqlPostgresIrJsonField[]
-      readonly kind: 'object'
-      readonly nullable: boolean
-    }
-  | {
-      readonly kind: 'opaque'
-      readonly nullable: boolean
-    }
-  | {
-      readonly alternatives: readonly TypedSqlPostgresIrJsonShape[]
-      readonly kind: 'union'
-      readonly nullable: boolean
-    }
-  | (PostgresTypeFact & {
-      readonly checkConstraintType?: TypedSqlPostgresIrCheckConstraintTypeExpression
-      readonly kind: 'scalar'
-      readonly nullable: boolean
-    })
-
-export interface TypedSqlPostgresIrJsonField {
-  readonly name: string
-  readonly shape: TypedSqlPostgresIrJsonShape
-}
-
-export type TypedSqlPostgresIrColumnSource =
-  | {
-      readonly attname?: string
-      readonly kind: 'derivedVar' | 'tableColumn'
-      readonly relname?: string | null
-      readonly varattno: number
-      readonly varlevelsup: number
-      readonly varno: number
-      readonly varnullingrels: readonly number[]
-    }
-  | {
-      readonly kind: 'expression'
-      readonly tag: string
-    }
-
-export interface TypedSqlPostgresIrCompiledConfig {
-  readonly name: string
-  readonly parameterNames: readonly string[]
-  readonly parameterTypes?: readonly (string | undefined)[]
-  readonly sourceFile: string
-  readonly sql: string
-}
 
 interface PgAnalyzerResult {
   readonly paramTypeOids: readonly number[]
@@ -393,13 +321,24 @@ function resultTargets(query: PgAnalyzerQuery): readonly PgAnalyzerTarget[] {
   return targets.filter((target) => target.resjunk !== true)
 }
 
+type VarKey = string
+type NonNullFacts = ReadonlyMap<PgAnalyzerQuery, ReadonlySet<VarKey>>
+
+interface VarLocation {
+  readonly key: VarKey
+  readonly query: PgAnalyzerQuery
+}
+
+const noNonNullFacts: NonNullFacts = new Map()
+
 interface QueryScope {
+  readonly nonNullVars: NonNullFacts
   readonly parent: QueryScope | null
   readonly query: PgAnalyzerQuery
 }
 
 function queryScope(query: PgAnalyzerQuery, parent: QueryScope | null = null): QueryScope {
-  return { parent, query }
+  return scopeWithQual({ nonNullVars: parent?.nonNullVars ?? noNonNullFacts, parent, query }, query.whereQual)
 }
 
 function queryScopeAtLevel(scope: QueryScope, levelsUp: number): QueryScope | null {
@@ -483,7 +422,7 @@ function rowCardinalityFromBounds(bounds: TypedSqlPostgresIrRowBounds): TypedSql
 }
 
 function constNonNegativeSafeInteger(catalog: CatalogFacts, expr: PgAnalyzerExpr | null | undefined): number | null {
-  const unwrapped = unwrapTransparentExpr(expr)
+  const unwrapped = unwrapCoercionExpr(expr)
   if (
     unwrapped?.tag === 'FuncExpr' &&
     isBuiltinPgProcNamed(catalog, unwrapped.funcid, 'int8') &&
@@ -510,7 +449,7 @@ function limitFact(catalog: CatalogFacts, query: PgAnalyzerQuery): LimitFact {
     return { kind: 'absent' }
   }
 
-  const unwrapped = unwrapTransparentExpr(query.limitCount)
+  const unwrapped = unwrapCoercionExpr(query.limitCount)
   if (unwrapped?.tag === 'Const' && unwrapped.constIsNull === true) {
     return { kind: 'unbounded' }
   }
@@ -1190,47 +1129,103 @@ function typeFactForOid(
   }
 }
 
-function exprKey(expr: PgAnalyzerExpr | null | undefined): string | null {
+function varLocation(scope: QueryScope, expr: PgAnalyzerExpr | null | undefined): VarLocation | null {
   if (!expr || expr.tag !== 'Var' || expr.varno === undefined || expr.varattno === undefined) {
     return null
   }
-  return `${expr.varno}:${expr.varattno}:${expr.varlevelsup ?? 0}`
+  const ownerScope = queryScopeAtLevel(scope, expr.varlevelsup ?? 0)
+  return ownerScope ? { key: `${expr.varno}:${expr.varattno}`, query: ownerScope.query } : null
 }
 
-interface VisitedVar {
-  readonly key: string
-  readonly query: PgAnalyzerQuery
-}
-
-function visitVar(seen: readonly VisitedVar[], scope: QueryScope, expr: PgAnalyzerExpr): readonly VisitedVar[] | null {
-  const key = exprKey(expr)
-  if (!key || seen.some((visited) => visited.query === scope.query && visited.key === key)) {
+function visitVar(
+  seen: readonly VarLocation[],
+  scope: QueryScope,
+  expr: PgAnalyzerExpr
+): readonly VarLocation[] | null {
+  const location = varLocation(scope, expr)
+  if (!location || seen.some((visited) => visited.query === location.query && visited.key === location.key)) {
     return null
   }
-  return [...seen, { key, query: scope.query }]
+  return [...seen, location]
 }
 
-function collectNonNullVarKeys(expr: PgAnalyzerExpr | null | undefined): ReadonlySet<string> {
+interface CaseArm {
+  readonly result: PgAnalyzerExpr
+  readonly scope: QueryScope
+}
+
+function mergeNonNullFacts(left: NonNullFacts, right: NonNullFacts): NonNullFacts {
+  if (right.size === 0) {
+    return left
+  }
+  const merged = new Map(left)
+  for (const [query, rightKeys] of right) {
+    merged.set(query, new Set([...(merged.get(query) ?? []), ...rightKeys]))
+  }
+  return merged
+}
+
+function intersectNonNullFacts(facts: readonly NonNullFacts[]): NonNullFacts {
+  const [first, ...rest] = facts
+  if (!first) {
+    return noNonNullFacts
+  }
+  const intersection = new Map<PgAnalyzerQuery, ReadonlySet<VarKey>>()
+  for (const [query, keys] of first) {
+    const shared = new Set([...keys].filter((key) => rest.every((candidate) => candidate.get(query)?.has(key))))
+    if (shared.size > 0) {
+      intersection.set(query, shared)
+    }
+  }
+  return intersection
+}
+
+function collectNonNullVarFacts(scope: QueryScope, expr: PgAnalyzerExpr | null | undefined): NonNullFacts {
   if (expr?.tag === 'NullTest' && expr.nullTestType === 'IS_NOT_NULL') {
-    const key = exprKey(expr.arg)
-    return key ? new Set([key]) : new Set()
+    const location = varLocation(scope, unwrapValuePreservingExpr(expr.arg))
+    return location ? new Map([[location.query, new Set([location.key])]]) : noNonNullFacts
   }
 
   if (expr?.tag !== 'BoolExpr' || expr.boolOp === 'NOT') {
-    return new Set()
+    return noNonNullFacts
   }
 
-  const branches = exprChildren(expr).map(collectNonNullVarKeys)
+  const branches = exprChildren(expr).map((child) => collectNonNullVarFacts(scope, child))
   if (expr.boolOp === 'AND') {
-    return new Set(branches.flatMap((branch) => [...branch]))
+    return branches.reduce(mergeNonNullFacts, noNonNullFacts)
   }
 
   if (expr.boolOp === 'OR' && branches.length > 0) {
-    const [first, ...rest] = branches
-    return new Set([...(first ?? [])].filter((key) => rest.every((branch) => branch.has(key))))
+    return intersectNonNullFacts(branches)
   }
 
-  return new Set()
+  return noNonNullFacts
+}
+
+function scopeWithQual(scope: QueryScope, qual: PgAnalyzerExpr | null | undefined): QueryScope {
+  const nonNullVars = mergeNonNullFacts(scope.nonNullVars, collectNonNullVarFacts(scope, qual))
+  return nonNullVars === scope.nonNullVars ? scope : { ...scope, nonNullVars }
+}
+
+function scopeProvesNonNull(scope: QueryScope, expr: PgAnalyzerExpr): boolean {
+  const location = varLocation(scope, expr)
+  return Boolean(location && scope.nonNullVars.get(location.query)?.has(location.key))
+}
+
+function caseArms(scope: QueryScope, expr: PgAnalyzerExpr): readonly CaseArm[] {
+  const arms: CaseArm[] = []
+  for (const whenClause of expr.whenClauses ?? []) {
+    if (whenClause.result) {
+      arms.push({
+        result: whenClause.result,
+        scope: scopeWithQual(scope, whenClause.condition),
+      })
+    }
+  }
+  if (expr.defresult) {
+    arms.push({ result: expr.defresult, scope })
+  }
+  return arms
 }
 
 function cteByName(query: PgAnalyzerQuery, name: string | undefined): PgAnalyzerCte | undefined {
@@ -1241,7 +1236,7 @@ function checkConstraintTypeForQueryOutput(
   catalog: CatalogFacts,
   scope: QueryScope,
   outputIndex: number,
-  seen: readonly VisitedVar[]
+  seen: readonly VarLocation[]
 ): TypedSqlPostgresIrCheckConstraintTypeExpression | null {
   return foldQueryOutput<TypedSqlPostgresIrCheckConstraintTypeExpression | null>(scope, outputIndex, {
     except: (left) => left,
@@ -1251,12 +1246,6 @@ function checkConstraintTypeForQueryOutput(
     union: (left, right) => (left && right ? combineCheckConstraintTypes('union', left, right) : null),
     unknown: () => null,
   })
-}
-
-function checkConstraintTypeKey(type: TypedSqlPostgresIrCheckConstraintTypeExpression): string {
-  return type.kind === 'literalUnion'
-    ? `literalUnion:${JSON.stringify(type.labels)}`
-    : `${type.kind}(${type.members.map(checkConstraintTypeKey).join(',')})`
 }
 
 function combineCheckConstraintTypes(
@@ -1280,7 +1269,7 @@ function checkConstraintTypeForExpr(
   catalog: CatalogFacts,
   scope: QueryScope,
   expr: PgAnalyzerExpr | null | undefined,
-  seen: readonly VisitedVar[]
+  seen: readonly VarLocation[]
 ): TypedSqlPostgresIrCheckConstraintTypeExpression | null {
   const unwrapped = unwrapValuePreservingExpr(expr)
   if (!unwrapped || unwrapped.tag !== 'Var') {
@@ -1371,12 +1360,12 @@ function queryOutputNullable(
   catalog: CatalogFacts,
   scope: QueryScope,
   outputIndex: number,
-  seen: readonly VisitedVar[] = []
+  seen: readonly VarLocation[] = []
 ): boolean {
   return foldQueryOutput<boolean>(scope, outputIndex, {
     except: (left) => left,
     intersect: (left, right) => left && right,
-    target: (targetScope, target) => expressionNullable(catalog, targetScope, target.expr, undefined, seen),
+    target: (targetScope, target) => expressionNullable(catalog, targetScope, target.expr, seen),
     union: (left, right) => left || right,
     unknown: () => true,
   })
@@ -1386,19 +1375,21 @@ function expressionNullable(
   catalog: CatalogFacts,
   scope: QueryScope,
   expr: PgAnalyzerExpr | null | undefined,
-  refinements = collectNonNullVarKeys(scope.query.whereQual),
-  seen: readonly VisitedVar[] = []
+  seen: readonly VarLocation[] = []
 ): boolean {
   if (!expr || expr.truncated === true) {
     return true
   }
 
   if (expr.tag === 'Var') {
+    if (scopeProvesNonNull(scope, expr)) {
+      return false
+    }
+    if (expr.varattno === 0) {
+      return (expr.varnullingrels?.length ?? 0) > 0
+    }
     if ((expr.varnullingrels ?? []).length > 0) {
       return true
-    }
-    if (refinements.has(exprKey(expr) ?? '')) {
-      return false
     }
     if (expr.relid && expr.varattno) {
       const column = catalog.columns.get(`${expr.relid}:${expr.varattno}`)
@@ -1407,7 +1398,7 @@ function expressionNullable(
       }
     }
 
-    if (!exprKey(expr)) {
+    if (!varLocation(scope, expr)) {
       return true
     }
     const nestedSeen = visitVar(seen, scope, expr)
@@ -1439,23 +1430,27 @@ function expressionNullable(
     return !isBuiltinPgProcNamed(catalog, expr.aggfnoid, 'count')
   }
   if (expr.tag === 'CoalesceExpr') {
-    return !exprChildren(expr).some((child) => !expressionNullable(catalog, scope, child, refinements, seen))
+    return !exprChildren(expr).some((child) => !expressionNullable(catalog, scope, child, seen))
   }
   if (expr.tag === 'CaseExpr') {
-    const results = [...(expr.whenClauses ?? []).map((whenClause) => whenClause.result), expr.defresult].filter(
-      (child): child is PgAnalyzerExpr => Boolean(child)
-    )
-    return (
-      results.length === 0 || results.some((result) => expressionNullable(catalog, scope, result, refinements, seen))
-    )
+    const arms = caseArms(scope, expr)
+    return arms.length === 0 || arms.some((arm) => expressionNullable(catalog, arm.scope, arm.result, seen))
   }
   if (expr.tag === 'BoolExpr') {
-    return exprChildren(expr).some((child) => expressionNullable(catalog, scope, child, refinements, seen))
+    return exprChildren(expr).some((child) => expressionNullable(catalog, scope, child, seen))
   }
   if (expr.tag === 'ArrayExpr') {
     return false
   }
   if (expr.tag === 'FuncExpr') {
+    if (
+      isBuiltinPgProcNamed(catalog, expr.funcid, 'to_json') ||
+      isBuiltinPgProcNamed(catalog, expr.funcid, 'to_jsonb') ||
+      isBuiltinPgProcNamed(catalog, expr.funcid, 'row_to_json')
+    ) {
+      const args = expr.args?.map(targetExprFromAggregateArg)
+      return !args || args.length === 0 || args.some((arg) => expressionNullable(catalog, scope, arg, seen))
+    }
     if (
       isBuiltinPgProcNamed(catalog, expr.funcid, 'jsonb_build_object') ||
       isBuiltinPgProcNamed(catalog, expr.funcid, 'json_build_object')
@@ -1464,11 +1459,11 @@ function expressionNullable(
         return false
       }
       const args = expr.args?.map(targetExprFromAggregateArg)
-      return args?.length === 1 ? expressionNullable(catalog, scope, args[0], refinements, seen) : true
+      return args?.length === 1 ? expressionNullable(catalog, scope, args[0], seen) : true
     }
   }
-  if (expr.tag === 'RelabelType' || expr.tag === 'CoerceViaIO') {
-    return expressionNullable(catalog, scope, expr.arg, refinements, seen)
+  if (expr.tag === 'RelabelType' || expr.tag === 'CoerceViaIO' || expr.tag === 'CoerceToDomain') {
+    return expressionNullable(catalog, scope, expr.arg, seen)
   }
 
   return true
@@ -1506,7 +1501,7 @@ function unwrapValuePreservingExpr(expr: PgAnalyzerExpr | null | undefined): PgA
   return current
 }
 
-function unwrapTransparentExpr(expr: PgAnalyzerExpr | null | undefined): PgAnalyzerExpr | null | undefined {
+function unwrapCoercionExpr(expr: PgAnalyzerExpr | null | undefined): PgAnalyzerExpr | null | undefined {
   let current = expr
   while (current?.tag === 'RelabelType' || current?.tag === 'CoerceViaIO' || current?.tag === 'CoerceToDomain') {
     current = current.arg
@@ -1515,7 +1510,7 @@ function unwrapTransparentExpr(expr: PgAnalyzerExpr | null | undefined): PgAnaly
 }
 
 function constStringValue(expr: PgAnalyzerExpr | null | undefined): string | null {
-  const unwrapped = unwrapTransparentExpr(expr)
+  const unwrapped = unwrapCoercionExpr(expr)
   if (!unwrapped || unwrapped.tag !== 'Const' || unwrapped.constIsNull === true) {
     return null
   }
@@ -1523,7 +1518,7 @@ function constStringValue(expr: PgAnalyzerExpr | null | undefined): string | nul
 }
 
 function isEmptyJsonArrayConst(expr: PgAnalyzerExpr | null | undefined): boolean {
-  const unwrapped = unwrapTransparentExpr(expr)
+  const unwrapped = unwrapCoercionExpr(expr)
   return unwrapped?.constEmptyJsonArray === true || constStringValue(unwrapped) === '[]'
 }
 
@@ -1538,7 +1533,7 @@ function jsonBuildObjectArguments(expr: PgAnalyzerExpr): readonly PgAnalyzerExpr
     if (objectArgs.length !== 1) {
       return null
     }
-    const array = unwrapTransparentExpr(objectArgs[0])
+    const array = unwrapCoercionExpr(objectArgs[0])
     if (!array || array.tag !== 'ArrayExpr' || array.multidims === true || !array.elements) {
       return null
     }
@@ -1557,115 +1552,98 @@ function targetExprFromAggregateArg(
   return 'tag' in arg ? arg : arg.expr
 }
 
-function jsonShapeWithNullability(shape: TypedSqlPostgresIrJsonShape, nullable: boolean): TypedSqlPostgresIrJsonShape {
-  switch (shape.kind) {
-    case 'array':
-      return { ...shape, nullable }
-    case 'object':
-      return { ...shape, nullable }
-    case 'opaque':
-      return { ...shape, nullable }
-    case 'union':
-      return { ...shape, nullable }
-    case 'scalar':
-      return { ...shape, nullable }
-  }
-}
-
-function flattenJsonShapeAlternatives(shape: TypedSqlPostgresIrJsonShape): readonly TypedSqlPostgresIrJsonShape[] {
-  return shape.kind === 'union' ? shape.alternatives.flatMap(flattenJsonShapeAlternatives) : [shape]
-}
-
-function combineJsonShapes(
-  left: TypedSqlPostgresIrJsonShape,
-  right: TypedSqlPostgresIrJsonShape,
-  nullable: boolean,
-  operation: 'INTERSECT' | 'UNION'
-): TypedSqlPostgresIrJsonShape {
-  if (operation === 'UNION' && (left.kind === 'opaque' || right.kind === 'opaque')) {
-    return { kind: 'opaque', nullable }
-  }
-  if (operation === 'INTERSECT') {
-    if (left.kind === 'opaque') {
-      return jsonShapeWithNullability(right, nullable)
-    }
-    if (right.kind === 'opaque') {
-      return jsonShapeWithNullability(left, nullable)
-    }
-  }
-
-  const alternatives = [...flattenJsonShapeAlternatives(left), ...flattenJsonShapeAlternatives(right)].filter(
-    (shape, index, shapes) =>
-      shapes.findIndex((candidate) => JSON.stringify(candidate) === JSON.stringify(shape)) === index
-  )
-  return alternatives.length === 1
-    ? jsonShapeWithNullability(alternatives[0] as TypedSqlPostgresIrJsonShape, nullable)
-    : { alternatives, kind: 'union', nullable }
-}
-
-function scalarJsonShapeForExpr(
+function jsonLeafShapeForExpr(
   catalog: CatalogFacts,
   scope: QueryScope,
   expr: PgAnalyzerExpr,
-  refinements: ReadonlySet<string>
+  seen: readonly VarLocation[]
 ): TypedSqlPostgresIrJsonShape {
   const typeFact = typeFactForOid(catalog, expr.typeOid, expr.typeName)
+  const constantExpr = unwrapValuePreservingExpr(expr)
+  if (
+    postgresJsonSupportsStringLiteralRefinement(typeFact) &&
+    constantExpr?.tag === 'Const' &&
+    constantExpr.constIsNull !== true &&
+    typeof constantExpr.constString === 'string'
+  ) {
+    return { kind: 'stringLiteral', nullable: false, value: constantExpr.constString }
+  }
   if (isJsonType(typeFact.pgTypeName)) {
     return {
       kind: 'opaque',
-      nullable: expressionNullable(catalog, scope, expr, refinements),
+      nullable: expressionNullable(catalog, scope, expr, seen),
     }
   }
 
   const checkConstraintType = literalCheckConstraintTypeForExpr(catalog, scope, expr)
   return {
     kind: 'scalar',
-    nullable: expressionNullable(catalog, scope, expr, refinements),
+    nullable: expressionNullable(catalog, scope, expr, seen),
     ...typeFact,
     ...(checkConstraintType ? { checkConstraintType } : {}),
   }
+}
+
+function jsonShapeForExpr(
+  catalog: CatalogFacts,
+  scope: QueryScope,
+  expr: PgAnalyzerExpr,
+  seen: readonly VarLocation[]
+): TypedSqlPostgresIrJsonShape {
+  return inferStructuredJsonShape(catalog, scope, expr, seen) ?? jsonLeafShapeForExpr(catalog, scope, expr, seen)
+}
+
+function jsonShapeForCaseArm(
+  catalog: CatalogFacts,
+  arm: CaseArm,
+  seen: readonly VarLocation[]
+): TypedSqlPostgresIrJsonShape | null {
+  const unwrapped = unwrapCoercionExpr(arm.result)
+  return unwrapped?.tag === 'Const' && unwrapped.constIsNull === true
+    ? null
+    : jsonShapeForExpr(catalog, arm.scope, arm.result, seen)
 }
 
 function inferQueryOutputJsonShape(
   catalog: CatalogFacts,
   scope: QueryScope,
   outputIndex: number,
-  seen: readonly VisitedVar[]
+  seen: readonly VarLocation[]
 ): TypedSqlPostgresIrJsonShape {
   return foldQueryOutput<TypedSqlPostgresIrJsonShape>(scope, outputIndex, {
     except: (left) => left,
-    intersect: (left, right) => combineJsonShapes(left, right, left.nullable && right.nullable, 'INTERSECT'),
+    intersect: (left, right) => intersectJsonShapes(left, right),
     target: (targetScope, target) => {
       const targetExpr = target.expr
-      if (!targetExpr) {
-        return { kind: 'opaque', nullable: true }
-      }
-      const refinements = collectNonNullVarKeys(targetScope.query.whereQual)
-      return (
-        inferJsonShape(catalog, targetScope, targetExpr, refinements, seen) ??
-        scalarJsonShapeForExpr(catalog, targetScope, targetExpr, refinements)
-      )
+      return targetExpr ? jsonShapeForExpr(catalog, targetScope, targetExpr, seen) : { kind: 'opaque', nullable: true }
     },
-    union: (left, right) => combineJsonShapes(left, right, left.nullable || right.nullable, 'UNION'),
+    union: (left, right) => unionJsonShapes(left, right),
     unknown: () => ({ kind: 'opaque', nullable: true }),
   })
 }
 
-function inferJsonShape(
+function inferStructuredJsonShape(
   catalog: CatalogFacts,
   scope: QueryScope,
   expr: PgAnalyzerExpr | null | undefined,
-  refinements = collectNonNullVarKeys(scope.query.whereQual),
-  seen: readonly VisitedVar[] = []
+  seen: readonly VarLocation[] = []
 ): TypedSqlPostgresIrJsonShape | null {
-  const unwrapped = unwrapTransparentExpr(expr)
+  const unwrapped = unwrapValuePreservingExpr(expr)
   if (!unwrapped || unwrapped.truncated === true) {
     return null
   }
 
+  if (unwrapped.tag === 'CaseExpr') {
+    const arms = caseArms(scope, unwrapped)
+    return joinJsonShapes(
+      arms.map((arm) => jsonShapeForCaseArm(catalog, arm, seen)),
+      jsonLeafShapeForExpr(catalog, scope, unwrapped, seen)
+    )
+  }
+
   if (unwrapped.tag === 'CoalesceExpr') {
     const children = exprChildren(unwrapped)
-    const firstShape = inferJsonShape(catalog, scope, children[0], refinements, seen)
+    const firstShape = inferStructuredJsonShape(catalog, scope, children[0], seen)
     if (!firstShape) {
       return null
     }
@@ -1676,7 +1654,7 @@ function inferJsonShape(
 
     return {
       kind: 'opaque',
-      nullable: expressionNullable(catalog, scope, unwrapped, refinements),
+      nullable: expressionNullable(catalog, scope, unwrapped, seen),
     }
   }
 
@@ -1685,19 +1663,19 @@ function inferJsonShape(
     switch (unwrapped.subLinkType) {
       case 'EXPR': {
         const shape = inferQueryOutputJsonShape(catalog, subqueryScope, 0, seen)
-        return jsonShapeWithNullability(shape, expressionNullable(catalog, scope, unwrapped, refinements))
+        return jsonShapeWithNullability(shape, expressionNullable(catalog, scope, unwrapped, seen))
       }
       case 'ARRAY':
         return {
           element: inferQueryOutputJsonShape(catalog, subqueryScope, 0, seen),
           kind: 'array',
-          nullable: expressionNullable(catalog, scope, unwrapped, refinements),
+          nullable: expressionNullable(catalog, scope, unwrapped, seen),
         }
       case 'ALL':
       case 'ANY':
       case 'EXISTS':
       case 'ROWCOMPARE':
-        return scalarJsonShapeForExpr(catalog, scope, unwrapped, refinements)
+        return jsonLeafShapeForExpr(catalog, scope, unwrapped, seen)
       case 'CTE':
       case 'MULTIEXPR':
       default:
@@ -1712,12 +1690,13 @@ function inferJsonShape(
       isBuiltinPgProcNamed(catalog, unwrapped.funcid, 'row_to_json'))
   ) {
     const value = targetExprFromAggregateArg(unwrapped.args?.[0])
-    const shape = value ? inferJsonShape(catalog, scope, value, refinements, seen) : null
+    const shape = value ? inferStructuredJsonShape(catalog, scope, value, seen) : null
+    const nullable = expressionNullable(catalog, scope, unwrapped, seen)
     return shape
-      ? shape
+      ? jsonShapeWithNullability(shape, nullable)
       : {
           kind: 'opaque',
-          nullable: expressionNullable(catalog, scope, unwrapped, refinements),
+          nullable,
         }
   }
 
@@ -1730,7 +1709,7 @@ function inferJsonShape(
     if (!args) {
       return {
         kind: 'opaque',
-        nullable: expressionNullable(catalog, scope, unwrapped, refinements),
+        nullable: expressionNullable(catalog, scope, unwrapped, seen),
       }
     }
     const fields = new Map<string, TypedSqlPostgresIrJsonField>()
@@ -1742,22 +1721,20 @@ function inferJsonShape(
       if (key === null || !value) {
         return {
           kind: 'opaque',
-          nullable: expressionNullable(catalog, scope, unwrapped, refinements),
+          nullable: expressionNullable(catalog, scope, unwrapped, seen),
         }
       }
 
       fields.set(key, {
         name: key,
-        shape:
-          inferJsonShape(catalog, scope, value, refinements, seen) ??
-          scalarJsonShapeForExpr(catalog, scope, value, refinements),
+        shape: jsonShapeForExpr(catalog, scope, value, seen),
       })
     }
 
     return {
       fields: [...fields.values()],
       kind: 'object',
-      nullable: expressionNullable(catalog, scope, unwrapped, refinements),
+      nullable: expressionNullable(catalog, scope, unwrapped, seen),
     }
   }
 
@@ -1772,11 +1749,9 @@ function inferJsonShape(
     }
 
     return {
-      element:
-        inferJsonShape(catalog, scope, valueExpr, refinements, seen) ??
-        scalarJsonShapeForExpr(catalog, scope, valueExpr, refinements),
+      element: jsonShapeForExpr(catalog, scope, valueExpr, seen),
       kind: 'array',
-      nullable: expressionNullable(catalog, scope, unwrapped, refinements),
+      nullable: expressionNullable(catalog, scope, unwrapped, seen),
     }
   }
 
@@ -1799,19 +1774,19 @@ function inferJsonShape(
           }
         }),
         kind: 'object',
-        nullable: (unwrapped.varnullingrels?.length ?? 0) > 0,
+        nullable: expressionNullable(catalog, scope, unwrapped, seen),
       }
     }
     const shape = outputScope
       ? inferQueryOutputJsonShape(catalog, outputScope, (unwrapped.varattno ?? 1) - 1, nestedSeen)
       : null
-    return shape ? jsonShapeWithNullability(shape, expressionNullable(catalog, scope, unwrapped, refinements)) : null
+    return shape ? jsonShapeWithNullability(shape, expressionNullable(catalog, scope, unwrapped, seen)) : null
   }
 
   if (isJsonType(unwrapped.typeName)) {
     return {
       kind: 'opaque',
-      nullable: expressionNullable(catalog, scope, unwrapped, refinements),
+      nullable: expressionNullable(catalog, scope, unwrapped, seen),
     }
   }
 
@@ -1826,12 +1801,15 @@ function normalizeCompiledIr(catalog: CatalogFacts, analyzed: AnalyzedCompiledCo
     const expr = target.expr
     const typeFact = typeFactForOid(catalog, expr?.typeOid, expr?.typeName)
     const checkConstraintType = checkConstraintTypeForQueryOutput(catalog, rootScope, outputIndex, [])
+    const nullable = queryOutputNullable(catalog, rootScope, outputIndex)
+    const inferredJsonShape = isJsonType(typeFact.pgTypeName)
+      ? inferQueryOutputJsonShape(catalog, rootScope, outputIndex, [])
+      : undefined
+    const jsonShape = inferredJsonShape ? jsonShapeWithNullability(inferredJsonShape, nullable) : undefined
     return {
-      jsonShape: isJsonType(typeFact.pgTypeName)
-        ? inferQueryOutputJsonShape(catalog, rootScope, outputIndex, [])
-        : undefined,
+      jsonShape,
       name: target.resname ?? null,
-      nullable: queryOutputNullable(catalog, rootScope, outputIndex),
+      nullable,
       ...typeFact,
       source: sourceForExpr(expr),
       ...(checkConstraintType ? { checkConstraintType } : {}),

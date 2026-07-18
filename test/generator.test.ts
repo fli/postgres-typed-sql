@@ -1,11 +1,8 @@
 import assert from 'node:assert/strict'
-import { cp, mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
+import { readFile, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import test from 'node:test'
 
-import type { PostgresTypedSqlConfig } from '../src/config.js'
-import { generateTypedSql as generateTypedSqlBase } from '../src/generator.js'
 import { PGlite } from '../src/vendor/pglite/index.js'
 import {
   assertTypeScriptBindingIdentifier,
@@ -15,17 +12,7 @@ import {
   postgresNamedTypeBinding,
 } from '../src/typescript-names.js'
 
-const fixtureRoot = new URL('./fixtures/', import.meta.url)
-const testImports = {
-  runtime: 'postgres-typed-sql/runtime',
-  scalars: 'postgres-typed-sql/scalars',
-} as const
-
-function generateTypedSql(
-  config: Omit<PostgresTypedSqlConfig, 'imports'> & { imports?: PostgresTypedSqlConfig['imports'] }
-) {
-  return generateTypedSqlBase({ ...config, imports: config.imports ?? testImports })
-}
+import { copyFixture, createMinimalFixture, generateTypedSql } from './generator-test-support.js'
 
 test('camel-cases only conventional PostgreSQL output identifiers', () => {
   assert.equal(camelCaseOutputProperty('account_id'), 'accountId')
@@ -36,20 +23,6 @@ test('camel-cases only conventional PostgreSQL output identifiers', () => {
   assert.equal(camelCaseOutputProperty('outer-key'), 'outer-key')
   assert.equal(camelCaseOutputProperty('URL'), 'URL')
 })
-
-async function copyFixture(): Promise<string> {
-  const root = await mkdtemp(join(tmpdir(), 'postgres-typed-sql-'))
-  await cp(fixtureRoot, root, { recursive: true })
-  return root
-}
-
-async function createMinimalFixture(schema: string, sql: string): Promise<string> {
-  const root = await mkdtemp(join(tmpdir(), 'postgres-typed-sql-minimal-'))
-  await mkdir(join(root, 'queries'))
-  await writeFile(join(root, 'schema.sql'), schema)
-  await writeFile(join(root, 'queries/query.typed.sql'), sql)
-  return root
-}
 
 test('generates PostgreSQL-derived types, nullability, and cardinality', async () => {
   const root = await copyFixture()
@@ -782,11 +755,11 @@ where event_id = :event_id
   assert.match(audit, /readonly score_history: string/u)
   assert.match(audit, /readonly score_span: string/u)
   assert.match(audit, /readonly search_document: string/u)
-  assert.match(audit, /readonly whole_event: string \| null/u)
+  assert.match(audit, /readonly whole_event: string/u)
   assert.match(audit, /readonly details_json: AuditEventJ12_details_jsonJson/u)
   assert.match(audit, /readonly score: number/u)
   assert.match(audit, /readonly status: "queued" \| "complete"/u)
-  assert.match(audit, /readonly whole_event: DbJsonSelected \| null/u)
+  assert.match(audit, /readonly whole_event: DbJsonSelected/u)
   assert.doesNotMatch(audit, /AuditScore|AuditScoreSpan/u)
 
   const catalog = await readFile(join(root, 'postgres-typed-sql.types.ts'), 'utf8')
@@ -923,16 +896,10 @@ create table public.bytea_probe (payload bytea);
     /generated TypeScript binding Uint8Array for enum public\.uint8_array collides with ambient TypeScript type/u
   )
 
-  const dateStatementCollisionRoot = await mkdtemp(join(tmpdir(), 'postgres-typed-sql-ambient-'))
-  await mkdir(join(dateStatementCollisionRoot, 'queries'))
-  await writeFile(
-    join(dateStatementCollisionRoot, 'schema.sql'),
+  const dateStatementCollisionRoot = await createMinimalFixture(
     `create type public.date as enum ('today');
 create table public.readings (kind public.date not null);
-`
-  )
-  await writeFile(
-    join(dateStatementCollisionRoot, 'queries/ambient-collision.typed.sql'),
+`,
     'select kind, now()::timestamp with time zone as measured_at from public.readings\n'
   )
   await generateTypedSql({
@@ -941,10 +908,7 @@ create table public.readings (kind public.date not null);
     scalarProfile: 'node-postgres',
     schema: 'schema.sql',
   })
-  const dateStatement = await readFile(
-    join(dateStatementCollisionRoot, 'queries/ambient-collision.typed-sql.ts'),
-    'utf8'
-  )
+  const dateStatement = await readFile(join(dateStatementCollisionRoot, 'queries/query.typed-sql.ts'), 'utf8')
   assert.match(dateStatement, /readonly kind: "today"/u)
   assert.match(dateStatement, /readonly measured_at: Date \| number/u)
 })
@@ -1564,7 +1528,7 @@ from (
 
   const output = await readFile(join(root, 'queries/query.typed-sql.ts'), 'utf8')
   assert.match(output, /interface QueryJ7_payloadJsonJ12_alternative1 \{[\s\S]*readonly a: number/u)
-  assert.match(output, /interface QueryJ7_payloadJsonJ12_alternative2 \{[\s\S]*readonly b: string/u)
+  assert.match(output, /interface QueryJ7_payloadJsonJ12_alternative2 \{[\s\S]*readonly b: 'two'/u)
   assert.match(output, /readonly payload: QueryJ7_payloadJsonJ12_alternative1 \| QueryJ7_payloadJsonJ12_alternative2/u)
   assert.doesNotMatch(output, /readonly payload: DbJsonSelected/u)
 })
@@ -1586,7 +1550,7 @@ test('generates build-object contracts only from proven complete argument lists'
 
   await generateTypedSql(config)
   let output = await readFile(outputFile, 'utf8')
-  assert.match(output, /interface QueryJ7_payloadJson \{[\s\S]*readonly answer: string/u)
+  assert.match(output, /interface QueryJ7_payloadJson \{[\s\S]*readonly answer: '42'/u)
   assert.match(output, /readonly payload: QueryJ7_payloadJson/u)
   assert.doesNotMatch(output, /readonly payload: QueryJ7_payloadJson \| null/u)
   assert.doesNotMatch(output, /readonly payload: DbJsonSelected/u)
@@ -1741,7 +1705,7 @@ test('models the last value for duplicate PostgreSQL JSON object keys', async ()
   })
 
   const output = await readFile(join(root, 'queries/query.typed-sql.ts'), 'utf8')
-  assert.match(output, /readonly value: string/u)
+  assert.match(output, /readonly value: 'last'/u)
   assert.doesNotMatch(output, /readonly value: number/u)
 })
 
@@ -1772,7 +1736,7 @@ from (values (1)) source(n)
   const output = await readFile(join(root, 'queries/query.typed-sql.ts'), 'utf8')
   assert.match(output, /readonly accountId: number/u)
   assert.match(output, /readonly accountDetails: QueryJ15_account_detailsJson/u)
-  assert.match(output, /readonly displayName: string/u)
+  assert.match(output, /readonly displayName: 'Reader'/u)
   assert.match(output, /readonly recentPosts: readonly/u)
   assert.match(output, /readonly postId: number/u)
   assert.match(output, /readonly publishedAt: string \| null/u)
@@ -1820,7 +1784,8 @@ test('maps JSON array-from and object-from derived row shapes to camel case', as
   assert.match(output, /readonly accountRows: readonly \(QueryJ12_account_rowsJsonJ7_element\)\[\]/u)
   assert.match(output, /readonly accountRow: QueryJ11_account_rowJson \| null/u)
   assert.match(output, /readonly accountId: number/u)
-  assert.match(output, /readonly displayName: string/u)
+  assert.match(output, /readonly displayName: 'Reader'/u)
+  assert.match(output, /readonly displayName: 'Writer'/u)
   assert.match(output, /propertyName: 'accountRows'/u)
   assert.match(output, /propertyName: 'accountRow'/u)
   assert.match(output, /"name":"account_id","propertyName":"accountId"/u)
@@ -2002,7 +1967,7 @@ from (
 
   const output = await readFile(join(root, 'queries/query.typed-sql.ts'), 'utf8')
   assert.match(output, /readonly outerLeft: number/u)
-  assert.match(output, /readonly outerRight: string/u)
+  assert.match(output, /readonly outerRight: 'two'/u)
   assert.match(
     output,
     /jsonMapping: \{"fields":\[\{"name":"outer_left","propertyName":"outerLeft"\},\{"name":"outer_right","propertyName":"outerRight"\}\]\}/u

@@ -3,6 +3,7 @@ import test from 'node:test'
 import { getTypeParser, type TypeId } from 'pg-types'
 
 import {
+  postgresJsonSupportsStringLiteralRefinement,
   postgresJsonValueMayBeStructured,
   resolveTypeScriptJsonScalarTypeForPostgresType,
   resolveTypeScriptParameterTypeForPostgresType,
@@ -504,6 +505,17 @@ test('classifies every PostgreSQL JSON value that may contain arbitrary structur
   ]) {
     assert.equal(postgresJsonValueMayBeStructured(fact), false, fact.pgType)
   }
+})
+
+test('recognizes exact unknown constants as JSON string literals', () => {
+  assert.equal(
+    postgresJsonSupportsStringLiteralRefinement(
+      pgCatalog('unknown', 'unknown', 705, {
+        pgTypeKind: 'pseudo',
+      })
+    ),
+    true
+  )
 })
 
 test('pg-types 2.2.0 parser fixtures match arrays, identity fallback, and infinity behavior', () => {

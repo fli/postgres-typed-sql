@@ -3,15 +3,16 @@ import { readFileSync } from 'node:fs'
 import { lstat, mkdir, readFile, readdir, realpath, rename, rm, writeFile } from 'node:fs/promises'
 import { basename, dirname, join, relative } from 'node:path'
 
+import { buildTypedSqlPostgresIrFromCompiledConfigs } from './analyzer-ir.js'
 import {
-  buildTypedSqlPostgresIrFromCompiledConfigs,
+  flattenJsonShapeAlternatives,
   type TypedSqlPostgresIrCheckConstraintTypeExpression,
   type TypedSqlPostgresIrColumnSource,
   type TypedSqlPostgresIrJsonField,
   type TypedSqlPostgresIrJsonShape,
   type TypedSqlPostgresIrRowBounds,
   type TypedSqlPostgresIrRowCardinality,
-} from './analyzer-ir.js'
+} from './analyzer-ir-model.js'
 import { buildCatalogTypes } from './catalog-generator.js'
 import type { PostgresTypedSqlPropertyNaming, ResolvedPostgresTypedSqlConfig } from './config.js'
 import { resolveConfig, type PostgresTypedSqlConfig } from './config.js'
@@ -475,7 +476,7 @@ type ResolvedJsonShape =
       readonly kind: 'object'
       readonly nullable: boolean
     }
-  | Extract<TypedSqlPostgresIrJsonShape, { readonly kind: 'opaque' | 'scalar' }>
+  | Extract<TypedSqlPostgresIrJsonShape, { readonly kind: 'opaque' | 'scalar' | 'stringLiteral' }>
   | {
       readonly alternatives: readonly ResolvedJsonShape[]
       readonly kind: 'union'
@@ -535,6 +536,7 @@ function resolveJsonShapeNames(
     }
     case 'opaque':
     case 'scalar':
+    case 'stringLiteral':
       return shape
     case 'union':
       return {
@@ -545,10 +547,6 @@ function resolveJsonShapeNames(
         nullable: shape.nullable,
       }
   }
-}
-
-function flattenJsonShapeAlternatives(shape: TypedSqlPostgresIrJsonShape): readonly TypedSqlPostgresIrJsonShape[] {
-  return shape.kind === 'union' ? shape.alternatives.flatMap(flattenJsonShapeAlternatives) : [shape]
 }
 
 function isJsonTraversalBarrier(shape: TypedSqlPostgresIrJsonShape): boolean {
@@ -614,6 +612,7 @@ function applyOpaqueJsonBarriersToAlternatives(
         return { ...shape, alternatives: shape.alternatives.map(rewrite) }
       case 'opaque':
       case 'scalar':
+      case 'stringLiteral':
         return shape
     }
   }
@@ -794,6 +793,8 @@ function tsTypeForJsonShape(
         .join(' | ')
     case 'scalar':
       return scalarTsTypeForJsonShape(shape, dependencies)
+    case 'stringLiteral':
+      return quoteString(shape.value)
   }
 }
 

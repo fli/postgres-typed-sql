@@ -407,7 +407,7 @@ export function resolveTypeScriptJsonScalarTypeForPostgresType(
   return stringResolution
 }
 
-/** Whether a CHECK-derived textual literal union matches PostgreSQL's nested-JSON representation. */
+/** Whether a textual literal refinement matches PostgreSQL's nested-JSON representation. */
 export function postgresJsonSupportsStringLiteralRefinement(typeFact: PostgresTypeFact): boolean {
   if (
     typeFact.pgTypeKind === 'array' ||
@@ -419,6 +419,9 @@ export function postgresJsonSupportsStringLiteralRefinement(typeFact: PostgresTy
   }
   if (typeFact.pgTypeKind === 'domain' && typeFact.pgBaseType) {
     return postgresJsonSupportsStringLiteralRefinement(typeFact.pgBaseType)
+  }
+  if (typeFact.pgTypeSchema === 'pg_catalog' && normalizePostgresTypeName(typeFact.pgTypeName) === 'unknown') {
+    return true
   }
   return postgresTypeSupportsCheckLiteralRefinement(typeFact)
 }

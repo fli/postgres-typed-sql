@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.1.0-beta.5
+
+- Added precise, statically inferred discriminated unions for `CASE`-authored JSON objects, including exact string-literal discriminants and branch-scoped non-null facts, without query directives or annotations.
+- Preserved representation-changing PostgreSQL I/O coercions as type-analysis boundaries so casts such as `CASE ... END::jsonb` retain their runtime JSON representation.
+- Kept SQL result nullability independent from JSON shape nullability, including strict-function null propagation across every argument to `row_to_json`.
+- Consolidated structured-JSON inference around a canonical shared shape model, semantic normalization, and a single owner for root SQL nullability, with focused regression coverage for composition and ordering.
+
+## 0.1.0-beta.4
+
+- Breaking beta.3 migration: generator configuration now requires exact `imports.runtime` and `imports.scalars` module specifiers; the ambiguous `packageImport` option was removed.
+- Generated statement modules no longer import the generated catalog. Enum and CHECK-constraint refinements are emitted directly into statement types, while the generated catalog remains a standalone artifact.
+- Generated runtime imports now make `postgres-typed-sql` a normal consumer dependency rather than a development-only dependency.
+
 ## 0.1.0-beta.3
 
 - Added opt-in `camelCase` naming for generated result-column properties and recursively modeled structured JSON fields while preserving PostgreSQL names in query and runtime metadata.
