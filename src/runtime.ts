@@ -13,7 +13,6 @@ export interface TypedSqlRowBounds {
 
 export interface TypedSqlQueryConfig {
   readonly name?: string
-  readonly rowMode?: 'array'
   readonly text: string
   readonly values: unknown[]
 }
@@ -113,18 +112,13 @@ export interface TypedSqlStatement<
   readonly name: string
   readonly parameterNames: readonly (keyof Params & string)[]
   readonly parameters: readonly TypedSqlParameterMetadata[]
-  readonly resultRowMode?: 'array'
+  /** Positional rows are required when generated column metadata is present. */
+  readonly resultRowMapping?: 'positional'
   readonly rowBounds: TypedSqlRowBounds
   readonly text: string
   readonly [typedSqlStatementRow]?: Row
   query(params: Params): TypedSqlQueryConfig
   values(params: Params): readonly unknown[]
-}
-
-export interface TypedSqlClient {
-  query<Row = TypedSqlRawRow>(
-    config: TypedSqlQueryConfig
-  ): Promise<{ readonly rowCount?: number | null; readonly rows: Row[] }>
 }
 
 export interface TypedSqlDefinition<
@@ -177,7 +171,7 @@ export function createTypedSqlStatement<
     name: definition.name,
     parameterNames: definition.parameterNames,
     parameters: definition.parameters ?? [],
-    resultRowMode: definition.columns !== undefined ? 'array' : undefined,
+    resultRowMapping: definition.columns !== undefined ? 'positional' : undefined,
     rowBounds: definition.rowBounds ?? {
       max: null,
       min: 0,
@@ -329,60 +323,4 @@ export function typedSqlAffectedRowCount(result: unknown): number {
       numericProperty(result, 'numAffectedRows') ??
       numericProperty(result, 'count')
   )
-}
-
-export async function executeTypedSql<Params extends TypedSqlParams, Row>(
-  client: TypedSqlClient,
-  statement: TypedSqlStatement<Params, Row>,
-  params: Params
-): Promise<Row[]> {
-  if (statement.resultRowMode === 'array') {
-    const result = await client.query<TypedSqlArrayRow>({
-      name: statement.name,
-      rowMode: 'array',
-      text: statement.text,
-      values: [...statement.values(params)],
-    })
-    return mapTypedSqlRows(statement, result.rows)
-  }
-
-  const result = await client.query<TypedSqlRawRow>({
-    name: statement.name,
-    text: statement.text,
-    values: [...statement.values(params)],
-  })
-  return mapTypedSqlRows(statement, result.rows)
-}
-
-export async function executeTypedSqlOptional<Params extends TypedSqlParams, Row>(
-  client: TypedSqlClient,
-  statement: TypedSqlStatement<Params, Row>,
-  params: Params
-): Promise<Row | null> {
-  const rows = await executeTypedSql(client, statement, params)
-  if (rows.length > 1) {
-    throw new Error(`Typed SQL statement ${statement.name} returned ${rows.length} rows; expected zero or one.`)
-  }
-  return rows[0] ?? null
-}
-
-export async function executeTypedSqlOne<Params extends TypedSqlParams, Row>(
-  client: TypedSqlClient,
-  statement: TypedSqlStatement<Params, Row>,
-  params: Params
-): Promise<Row> {
-  const row = await executeTypedSqlOptional(client, statement, params)
-  if (row === null) {
-    throw new Error(`Typed SQL statement ${statement.name} returned no rows; expected exactly one.`)
-  }
-  return row
-}
-
-export async function executeTypedSqlCommand<Params extends TypedSqlParams, Row>(
-  client: TypedSqlClient,
-  statement: TypedSqlStatement<Params, Row>,
-  params: Params
-): Promise<number> {
-  const result = await client.query(statement.query(params))
-  return typedSqlRowCount(result.rowCount)
 }

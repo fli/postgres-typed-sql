@@ -1,6 +1,6 @@
 {
   "name": "postgres-typed-sql",
-  "version": "0.1.0-beta.5",
+  "version": "0.1.0-beta.6",
   "description": "PostgreSQL-native typed SQL generation for TypeScript",
   "type": "module",
   "license": "MIT",
@@ -36,6 +36,10 @@
     "./runtime": {
       "types": "./dist/runtime.d.ts",
       "import": "./dist/runtime.js"
+    },
+    "./adapters/node-postgres": {
+      "types": "./dist/adapters/node-postgres.d.ts",
+      "import": "./dist/adapters/node-postgres.js"
     },
     "./scalars": {
       "types": "./dist/scalars.d.ts",

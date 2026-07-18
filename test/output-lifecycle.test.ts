@@ -11,7 +11,7 @@ function generate(root: string, include: readonly string[] = ['queries']) {
   return generateTypedSql({
     include,
     rootDir: root,
-    scalarProfile: 'node-postgres',
+    codecProfile: 'node-postgres',
     schema: 'schema.sql',
   })
 }
@@ -81,7 +81,7 @@ test('stale cleanup preserves a catalog output located under an include root', a
   const result = await generateTypedSql({
     include: ['queries'],
     rootDir: root,
-    scalarProfile: 'node-postgres',
+    codecProfile: 'node-postgres',
     schema: 'schema.sql',
     typesOutput: catalogPath,
   })
@@ -160,7 +160,7 @@ test('catalog and statement outputs cannot claim the same destination', async ()
     generateTypedSql({
       include: ['queries'],
       rootDir: root,
-      scalarProfile: 'node-postgres',
+      codecProfile: 'node-postgres',
       schema: 'schema.sql',
       typesOutput: conflictingPath,
     }),
@@ -178,7 +178,7 @@ test('uses canonical destination identity through symlinked parent directories',
   const config = {
     include: ['queries', 'query-link'],
     rootDir: root,
-    scalarProfile: 'node-postgres' as const,
+    codecProfile: 'node-postgres' as const,
     schema: 'schema.sql',
     typesOutput: 'query-link/catalog.typed-sql.ts',
   }
@@ -201,7 +201,7 @@ test('uses canonical destination identity through symlinked parent directories',
     generateTypedSql({
       include: ['queries'],
       rootDir: collisionRoot,
-      scalarProfile: 'node-postgres',
+      codecProfile: 'node-postgres',
       schema: 'schema.sql',
       typesOutput: 'query-link/find-account-by-email.typed-sql.ts',
     }),
@@ -227,7 +227,7 @@ test('uses the destination filesystem rather than the host platform for case ide
   const generation = generateTypedSql({
     include: ['queries'],
     rootDir: root,
-    scalarProfile: 'node-postgres',
+    codecProfile: 'node-postgres',
     schema: 'schema.sql',
     typesOutput: 'queries/FIND-ACCOUNT-BY-EMAIL.typed-sql.ts',
   })

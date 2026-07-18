@@ -33,14 +33,14 @@ test('config requires exact generated-code imports and rejects the removed packa
         imports: testImports,
         packageImport: '@example/db',
         schema: 'schema.sql',
-      } as PostgresTypedSqlConfig),
+      } as unknown as PostgresTypedSqlConfig),
     /packageImport is no longer supported/u
   )
 })
 
 test('config defaults to conservative scalars and rejects unknown profiles', () => {
   const resolved = resolveConfig({ schema: 'schema.sql' })
-  assert.equal(resolved.scalarProfile, 'conservative')
+  assert.equal(resolved.codecProfile.name, 'conservative')
   assert.deepEqual(resolved.naming, {
     resultColumns: 'preserve',
     structuredJsonFields: 'preserve',
@@ -48,10 +48,21 @@ test('config defaults to conservative scalars and rejects unknown profiles', () 
   assert.throws(
     () =>
       resolveConfig({
-        scalarProfile: 'custom-driver' as PostgresTypedSqlConfig['scalarProfile'],
+        codecProfile: 'custom-driver' as PostgresTypedSqlConfig['codecProfile'],
         schema: 'schema.sql',
       }),
-    /Unsupported scalar profile "custom-driver"/u
+    /Unsupported PostgreSQL codec profile "custom-driver"/u
+  )
+})
+
+test('config rejects the removed scalarProfile option with migration guidance', () => {
+  assert.throws(
+    () =>
+      resolveConfig({
+        scalarProfile: 'node-postgres',
+        schema: 'schema.sql',
+      } as unknown as PostgresTypedSqlConfig),
+    /scalarProfile is no longer supported\. Configure codecProfile instead/u
   )
 })
 

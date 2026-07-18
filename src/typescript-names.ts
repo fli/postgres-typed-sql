@@ -99,8 +99,20 @@ export function quotePropertyName(propertyName: string): string {
   return /^[A-Za-z_$][A-Za-z0-9_$]*$/u.test(propertyName) ? propertyName : JSON.stringify(propertyName)
 }
 
-export function assertTypeScriptBindingIdentifier(identifier: string, context: string): void {
-  if (!/^[A-Za-z_$][A-Za-z0-9_$]*$/u.test(identifier) || reservedBindingIdentifiers.has(identifier)) {
+export function renderTypeScriptLineCommentValue(value: string): string {
+  return value
+    .replaceAll('\r', '\\r')
+    .replaceAll('\n', '\\n')
+    .replaceAll('\u2028', '\\u2028')
+    .replaceAll('\u2029', '\\u2029')
+}
+
+export function assertTypeScriptBindingIdentifier(identifier: unknown, context: string): asserts identifier is string {
+  if (
+    typeof identifier !== 'string' ||
+    !/^[A-Za-z_$][A-Za-z0-9_$]*$/u.test(identifier) ||
+    reservedBindingIdentifiers.has(identifier)
+  ) {
     throw new Error(`${context}: ${JSON.stringify(identifier)} is not a legal non-reserved TypeScript binding.`)
   }
 }

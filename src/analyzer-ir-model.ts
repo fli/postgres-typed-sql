@@ -70,11 +70,11 @@ export type TypedSqlPostgresIrJsonShape =
       readonly kind: 'union'
       readonly nullable: boolean
     }
-  | {
+  | (PostgresTypeFact & {
       readonly kind: 'stringLiteral'
       readonly nullable: boolean
       readonly value: string
-    }
+    })
   | (PostgresTypeFact & {
       readonly checkConstraintType?: TypedSqlPostgresIrCheckConstraintTypeExpression
       readonly kind: 'scalar'
@@ -152,7 +152,14 @@ function jsonShapeKey(shape: TypedSqlPostgresIrJsonShape): string {
         pgTypeOid: shape.pgTypeOid,
       })
     case 'stringLiteral':
-      return JSON.stringify({ kind: shape.kind, nullable: shape.nullable, value: shape.value })
+      return JSON.stringify({
+        kind: shape.kind,
+        nullable: shape.nullable,
+        pgType: shape.pgType,
+        pgTypeKind: shape.pgTypeKind,
+        pgTypeOid: shape.pgTypeOid,
+        value: shape.value,
+      })
     case 'union':
       return JSON.stringify({
         alternatives: shape.alternatives.map(jsonShapeKey).toSorted(),

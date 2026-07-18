@@ -215,15 +215,18 @@ test('infers CASE JSON unions with scoped branch facts and exact string constant
         const playableFields = new Map(playable.fields.map((field) => [field.name, field.shape]))
         const state = playableFields.get('state')
         const manifestType = playableFields.get('manifestType')
-        assert.deepEqual(state, { kind: 'stringLiteral', nullable: false, value: 'playable' })
-        assert.deepEqual(manifestType, { kind: 'stringLiteral', nullable: false, value: 'hls' })
+        assert.equal(state?.kind, 'stringLiteral')
+        assert.equal(state?.nullable, false)
+        assert.equal(state?.kind === 'stringLiteral' ? state.value : null, 'playable')
+        assert.equal(manifestType?.kind, 'stringLiteral')
+        assert.equal(manifestType?.nullable, false)
+        assert.equal(manifestType?.kind === 'stringLiteral' ? manifestType.value : null, 'hls')
         assert.equal(playableFields.get('publicationPublicId')?.nullable, false)
         assert.equal(playableFields.get('manifestObjectKey')?.nullable, false)
-        assert.deepEqual(unavailable.fields[0]?.shape, {
-          kind: 'stringLiteral',
-          nullable: false,
-          value: 'unavailable',
-        })
+        const unavailableState = unavailable.fields[0]?.shape
+        assert.equal(unavailableState?.kind, 'stringLiteral')
+        assert.equal(unavailableState?.nullable, false)
+        assert.equal(unavailableState?.kind === 'stringLiteral' ? unavailableState.value : null, 'unavailable')
       }
     }
 

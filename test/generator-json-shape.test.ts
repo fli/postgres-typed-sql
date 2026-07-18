@@ -3,6 +3,8 @@ import { readFile, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import test from 'node:test'
 
+import { definePostgresCodecProfile, postgresTypeScriptType } from '../src/index.js'
+
 import { createMinimalFixture, generateTypedSql } from './generator-test-support.js'
 
 test('renders a CASE-authored JSON state machine as a precise discriminated union', async () => {
@@ -34,7 +36,7 @@ left join lateral (
   await generateTypedSql({
     include: ['queries'],
     rootDir: root,
-    scalarProfile: 'node-postgres',
+    codecProfile: 'node-postgres',
     schema: 'schema.sql',
   })
 
@@ -65,7 +67,7 @@ end)::jsonb as payload
   const config = {
     include: ['queries'],
     rootDir: root,
-    scalarProfile: 'node-postgres' as const,
+    codecProfile: 'node-postgres' as const,
     schema: 'schema.sql',
   }
   const queryFile = join(root, 'queries/query.typed.sql')
@@ -92,4 +94,37 @@ end)::jsonb as payload
   assert.match(output, /readonly payload: QueryJ7_payloadJson\n/u)
   assert.doesNotMatch(output, /readonly payload: QueryJ7_payloadJson \| null/u)
   assert.match(output, /name: 'payload',[\s\S]*?nullable: false/u)
+})
+
+test('uses the codec JSON scalar type when exact string-literal refinement is disabled', async () => {
+  const root = await createMinimalFixture(
+    'select 1;\n',
+    "select jsonb_build_object('state', 'active'::text) as payload\n"
+  )
+  const codecProfile = definePostgresCodecProfile({
+    extends: 'node-postgres',
+    name: 'decoded-json-text',
+    jsonScalarType({ type }, fallback) {
+      return type.pgTypeSchema === 'pg_catalog' && type.pgTypeName === 'text'
+        ? postgresTypeScriptType('DecodedJsonText', { scalarImports: ['DecodedJsonText'] })
+        : fallback()
+    },
+    supportsStringLiteralRefinement({ position, type }, fallback) {
+      return position === 'json' && type.pgTypeSchema === 'pg_catalog' && type.pgTypeName === 'text'
+        ? false
+        : fallback()
+    },
+  })
+
+  await generateTypedSql({
+    codecProfile,
+    include: ['queries'],
+    rootDir: root,
+    schema: 'schema.sql',
+  })
+
+  const output = await readFile(join(root, 'queries/query.typed-sql.ts'), 'utf8')
+  assert.match(output, /import type \{ DecodedJsonText \} from 'postgres-typed-sql\/scalars'/u)
+  assert.match(output, /readonly state: DecodedJsonText/u)
+  assert.doesNotMatch(output, /readonly state: 'active'/u)
 })
