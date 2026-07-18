@@ -52,6 +52,7 @@ test('infers build-object shapes only from proven complete argument lists', asyn
         'select jsonb_build_object(variadic required_entries) as payload from public.json_variadic_inputs'
       ),
       config('flatNullableJson', "select jsonb_build_object('answer', null::text) as payload"),
+      config('dynamicFieldJson', "select jsonb_build_object('answer', $1::text) as payload", ['answer']),
       config('oddBuildObject', "select jsonb_build_object('unpaired') as payload"),
     ])
     const query = (name: string): TypedSqlPostgresIr => {
@@ -61,10 +62,10 @@ test('infers build-object shapes only from proven complete argument lists', asyn
     }
 
     const literalShape = query('literalVariadicJson').resultColumns[0]?.jsonShape
-    assert.equal(query('literalVariadicJson').resultColumns[0]?.nullable, false)
+    assert.equal(query('literalVariadicJson').resultColumns[0]?.nullability.kind, 'nonNull')
     assert.equal(literalShape?.kind, 'object')
     if (literalShape?.kind === 'object') {
-      assert.equal(literalShape.nullable, false)
+      assert.equal(literalShape.nullability.kind, 'nonNull')
       assert.equal(literalShape.fields.length, 1)
       assert.equal(literalShape.fields[0]?.name, 'answer')
       assert.equal(literalShape.fields[0]?.shape.kind, 'stringLiteral')
@@ -73,17 +74,25 @@ test('infers build-object shapes only from proven complete argument lists', asyn
       }
     }
     const dynamicColumn = query('dynamicVariadicJson').resultColumns[0]
-    assert.equal(dynamicColumn?.nullable, true)
+    assert.equal(dynamicColumn?.nullability.kind, 'unknown')
     assert.equal(dynamicColumn?.jsonShape?.kind, 'opaque')
-    assert.equal(dynamicColumn?.jsonShape?.nullable, true)
-    assert.equal(query('nullVariadicJson').resultColumns[0]?.nullable, true)
-    assert.equal(query('nullVariadicJson').resultColumns[0]?.jsonShape?.nullable, true)
-    assert.equal(query('nullableVarVariadicJson').resultColumns[0]?.nullable, true)
-    assert.equal(query('nullableVarVariadicJson').resultColumns[0]?.jsonShape?.nullable, true)
-    assert.equal(query('requiredVarVariadicJson').resultColumns[0]?.nullable, false)
-    assert.equal(query('requiredVarVariadicJson').resultColumns[0]?.jsonShape?.nullable, false)
-    assert.equal(query('flatNullableJson').resultColumns[0]?.nullable, false)
-    assert.equal(query('flatNullableJson').resultColumns[0]?.jsonShape?.nullable, false)
+    assert.equal(dynamicColumn?.jsonShape?.nullability.kind, 'unknown')
+    assert.equal(query('nullVariadicJson').resultColumns[0]?.nullability.kind, 'nullable')
+    assert.equal(query('nullVariadicJson').resultColumns[0]?.jsonShape?.nullability.kind, 'nullable')
+    assert.equal(query('nullableVarVariadicJson').resultColumns[0]?.nullability.kind, 'nullable')
+    assert.equal(query('nullableVarVariadicJson').resultColumns[0]?.jsonShape?.nullability.kind, 'nullable')
+    assert.equal(query('requiredVarVariadicJson').resultColumns[0]?.nullability.kind, 'nonNull')
+    assert.equal(query('requiredVarVariadicJson').resultColumns[0]?.jsonShape?.nullability.kind, 'nonNull')
+    assert.equal(query('flatNullableJson').resultColumns[0]?.nullability.kind, 'nonNull')
+    assert.equal(query('flatNullableJson').resultColumns[0]?.jsonShape?.nullability.kind, 'nonNull')
+    const dynamicFieldShape = query('dynamicFieldJson').resultColumns[0]?.jsonShape
+    assert.equal(dynamicFieldShape?.kind, 'object')
+    if (dynamicFieldShape?.kind === 'object') {
+      assert.deepEqual(dynamicFieldShape.fields[0]?.shape.nullability, {
+        kind: 'unknown',
+        reason: 'parameter',
+      })
+    }
     assert.equal(query('oddBuildObject').resultColumns[0]?.jsonShape?.kind, 'opaque')
     assert.deepEqual(
       (await database.query("select json_build_object(variadic array['answer', '42']) as payload")).rows,
@@ -204,8 +213,11 @@ test('infers CASE JSON unions with scoped branch facts and exact string constant
 
     const playback = shape('playbackCase')
     assert.equal(playback?.kind, 'union')
-    assert.equal(playback?.nullable, false)
-    assert.equal(result.queries.find((query) => query.name === 'playbackCase')?.resultColumns[0]?.nullable, false)
+    assert.equal(playback?.nullability.kind, 'nonNull')
+    assert.equal(
+      result.queries.find((query) => query.name === 'playbackCase')?.resultColumns[0]?.nullability.kind,
+      'nonNull'
+    )
     if (playback?.kind === 'union') {
       assert.equal(playback.alternatives.length, 2)
       const [playable, unavailable] = playback.alternatives
@@ -216,16 +228,16 @@ test('infers CASE JSON unions with scoped branch facts and exact string constant
         const state = playableFields.get('state')
         const manifestType = playableFields.get('manifestType')
         assert.equal(state?.kind, 'stringLiteral')
-        assert.equal(state?.nullable, false)
+        assert.equal(state?.nullability.kind, 'nonNull')
         assert.equal(state?.kind === 'stringLiteral' ? state.value : null, 'playable')
         assert.equal(manifestType?.kind, 'stringLiteral')
-        assert.equal(manifestType?.nullable, false)
+        assert.equal(manifestType?.nullability.kind, 'nonNull')
         assert.equal(manifestType?.kind === 'stringLiteral' ? manifestType.value : null, 'hls')
-        assert.equal(playableFields.get('publicationPublicId')?.nullable, false)
-        assert.equal(playableFields.get('manifestObjectKey')?.nullable, false)
+        assert.equal(playableFields.get('publicationPublicId')?.nullability.kind, 'nonNull')
+        assert.equal(playableFields.get('manifestObjectKey')?.nullability.kind, 'nonNull')
         const unavailableState = unavailable.fields[0]?.shape
         assert.equal(unavailableState?.kind, 'stringLiteral')
-        assert.equal(unavailableState?.nullable, false)
+        assert.equal(unavailableState?.nullability.kind, 'nonNull')
         assert.equal(unavailableState?.kind === 'stringLiteral' ? unavailableState.value : null, 'unavailable')
       }
     }
@@ -238,7 +250,7 @@ test('infers CASE JSON unions with scoped branch facts and exact string constant
       if (presentRow?.kind === 'object') {
         const nestedRow = presentRow.fields[0]?.shape
         assert.equal(nestedRow?.kind, 'object')
-        assert.equal(nestedRow?.nullable, false)
+        assert.equal(nestedRow?.nullability.kind, 'nonNull')
       }
     }
 
@@ -249,8 +261,8 @@ test('infers CASE JSON unions with scoped branch facts and exact string constant
       assert.equal(refined?.kind, 'object')
       if (refined?.kind === 'object') {
         const fields = new Map(refined.fields.map((field) => [field.name, field.shape]))
-        assert.equal(fields.get('outer')?.nullable, false)
-        assert.equal(fields.get('inner')?.nullable, true)
+        assert.equal(fields.get('outer')?.nullability.kind, 'nonNull')
+        assert.equal(fields.get('inner')?.nullability.kind, 'nullable')
       }
     }
 
@@ -259,7 +271,7 @@ test('infers CASE JSON unions with scoped branch facts and exact string constant
     if (nullArm?.kind === 'object') {
       const state = nullArm.fields[0]?.shape
       assert.equal(state?.kind, 'stringLiteral')
-      assert.equal(state?.nullable, true)
+      assert.equal(state?.nullability.kind, 'nullable')
       assert.equal(state?.kind === 'stringLiteral' ? state.value : null, 'playable')
     }
 
@@ -282,26 +294,36 @@ test('infers CASE JSON unions with scoped branch facts and exact string constant
 
     const ioCast = shape('ioCastCase')
     assert.equal(ioCast?.kind, 'opaque')
-    assert.equal(ioCast?.nullable, false)
+    assert.equal(ioCast?.nullability.kind, 'nonNull')
 
     const nullableRow = shape('nullableRowToJson')
     assert.equal(nullableRow?.kind, 'object')
-    assert.equal(nullableRow?.nullable, true)
-    assert.equal(result.queries.find((query) => query.name === 'nullableRowToJson')?.resultColumns[0]?.nullable, true)
+    assert.equal(nullableRow?.nullability.kind, 'nullable')
+    assert.equal(
+      result.queries.find((query) => query.name === 'nullableRowToJson')?.resultColumns[0]?.nullability.kind,
+      'nullable'
+    )
 
     const requiredRow = shape('requiredRowToJson')
     assert.equal(requiredRow?.kind, 'object')
-    assert.equal(requiredRow?.nullable, false)
-    assert.equal(result.queries.find((query) => query.name === 'requiredRowToJson')?.resultColumns[0]?.nullable, false)
+    assert.equal(requiredRow?.nullability.kind, 'nonNull')
+    assert.equal(
+      result.queries.find((query) => query.name === 'requiredRowToJson')?.resultColumns[0]?.nullability.kind,
+      'nonNull'
+    )
 
     const nullableToJson = shape('nullableToJson')
     assert.equal(nullableToJson?.kind, 'opaque')
-    assert.equal(nullableToJson?.nullable, true)
+    assert.equal(nullableToJson?.nullability.kind, 'nullable')
 
     for (const query of result.queries) {
       for (const column of query.resultColumns) {
         if (column.jsonShape) {
-          assert.equal(column.nullable, column.jsonShape.nullable, `${query.name}.${column.name} nullability`)
+          assert.equal(
+            column.nullability.kind,
+            column.jsonShape.nullability.kind,
+            `${query.name}.${column.name} nullability`
+          )
         }
       }
     }

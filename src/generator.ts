@@ -6,12 +6,14 @@ import { basename, dirname, join, relative } from 'node:path'
 import { buildTypedSqlPostgresIrFromCompiledConfigs } from './analyzer-ir.js'
 import {
   flattenJsonShapeAlternatives,
+  resultNullabilityAllowsNull,
+  type TypedSqlPostgresIrAccessConcern,
+  type TypedSqlPostgresIrAccessEvidence,
   type TypedSqlPostgresIrCheckConstraintTypeExpression,
   type TypedSqlPostgresIrColumnSource,
   type TypedSqlPostgresIrJsonField,
   type TypedSqlPostgresIrJsonShape,
   type TypedSqlPostgresIrRowBounds,
-  type TypedSqlPostgresIrRowCardinality,
 } from './analyzer-ir-model.js'
 import { buildCatalogTypes } from './catalog-generator.js'
 import type { PostgresTypedSqlPropertyNaming, ResolvedPostgresTypedSqlConfig } from './config.js'
@@ -30,6 +32,7 @@ import {
 } from './postgres-codecs.js'
 import { postgresJsonValueMayBeStructured } from './postgres-types.js'
 import { compileNamedParameters, parseTypedSqlSource } from './sql-source.js'
+import type { TypedSqlCardinality } from './runtime.js'
 import {
   assertTypeScriptBindingIdentifier,
   assertUniqueTypeScriptBindings,
@@ -127,7 +130,7 @@ type TypedSqlAccess = 'read' | 'write'
 
 interface ResolvedTypedSql {
   readonly access: TypedSqlAccess
-  readonly cardinality: TypedSqlPostgresIrRowCardinality
+  readonly cardinality: TypedSqlCardinality
   readonly columns: readonly ResolvedSqlColumn[]
   readonly command: TypedSqlCommand
   readonly generatedTypeDeclarations: readonly string[]
@@ -235,8 +238,36 @@ function typedSqlCommandFromPostgres(command: string): TypedSqlCommand {
   }
 }
 
-function typedSqlAccessForCommand(command: TypedSqlCommand): TypedSqlAccess {
-  return command === 'select' ? 'read' : 'write'
+function typedSqlCardinalityFromRowBounds(bounds: TypedSqlPostgresIrRowBounds): TypedSqlCardinality {
+  if (bounds.min === 0 && bounds.max === 0) {
+    return 'none'
+  }
+  if (bounds.min === 1 && bounds.max === 1) {
+    return 'one'
+  }
+  if (bounds.min === 0 && bounds.max === 1) {
+    return 'optional'
+  }
+  return 'many'
+}
+
+function typedSqlAccessFromEvidence(evidence: TypedSqlPostgresIrAccessEvidence): TypedSqlAccess {
+  return evidence.kind === 'provenReadOnly' ? 'read' : 'write'
+}
+
+function accessConcernDescription(concern: TypedSqlPostgresIrAccessConcern): string {
+  switch (concern.kind) {
+    case 'definiteDml':
+      return `direct ${concern.command} DML`
+    case 'dataModifyingCte':
+      return 'a data-modifying CTE'
+    case 'rowLock':
+      return 'a row lock that is incompatible with read-only execution'
+    case 'volatileExecution':
+      return 'an execution-reachable volatile path that prevents a read-only proof'
+    case 'procedureCall':
+      return 'an opaque procedure call whose read-only behavior cannot be proved'
+  }
 }
 
 function parseDirectivePgType(pgType: string | undefined): {
@@ -467,6 +498,13 @@ interface GeneratedJsonTypeDeclaration {
   readonly name: string
 }
 
+type ResolvedJsonLeafShape<Kind extends 'opaque' | 'scalar' | 'stringLiteral'> = Omit<
+  Extract<TypedSqlPostgresIrJsonShape, { readonly kind: Kind }>,
+  'nullability'
+> & {
+  readonly nullable: boolean
+}
+
 type ResolvedJsonShape =
   | {
       readonly element: ResolvedJsonShape
@@ -478,7 +516,9 @@ type ResolvedJsonShape =
       readonly kind: 'object'
       readonly nullable: boolean
     }
-  | Extract<TypedSqlPostgresIrJsonShape, { readonly kind: 'opaque' | 'scalar' | 'stringLiteral' }>
+  | ResolvedJsonLeafShape<'opaque'>
+  | ResolvedJsonLeafShape<'scalar'>
+  | ResolvedJsonLeafShape<'stringLiteral'>
   | {
       readonly alternatives: readonly ResolvedJsonShape[]
       readonly kind: 'union'
@@ -517,7 +557,7 @@ function resolveJsonShapeNames(
       return {
         element: resolveJsonShapeNames(shape.element, naming, sourceFile, `${context}[]`),
         kind: 'array',
-        nullable: shape.nullable,
+        nullable: resultNullabilityAllowsNull(shape.nullability),
       }
     case 'object': {
       const fields = shape.fields.map((field) => ({
@@ -533,20 +573,25 @@ function resolveJsonShapeNames(
       return {
         fields,
         kind: 'object',
-        nullable: shape.nullable,
+        nullable: resultNullabilityAllowsNull(shape.nullability),
       }
     }
     case 'opaque':
     case 'scalar':
-    case 'stringLiteral':
-      return shape
+    case 'stringLiteral': {
+      const { nullability, ...value } = shape
+      return {
+        ...value,
+        nullable: resultNullabilityAllowsNull(nullability),
+      }
+    }
     case 'union':
       return {
         alternatives: shape.alternatives.map((alternative, index) =>
           resolveJsonShapeNames(alternative, naming, sourceFile, `${context}<alternative ${index + 1}>`)
         ),
         kind: 'union',
-        nullable: shape.nullable,
+        nullable: resultNullabilityAllowsNull(shape.nullability),
       }
   }
 }
@@ -563,7 +608,7 @@ function applyOpaqueJsonBarriersToAlternatives(
   }
   const alternatives = shapes.flatMap(flattenJsonShapeAlternatives)
   if (alternatives.some(isJsonTraversalBarrier)) {
-    return shapes.map((shape) => ({ kind: 'opaque', nullable: shape.nullable }))
+    return shapes.map((shape) => ({ kind: 'opaque', nullability: shape.nullability }))
   }
 
   const arrayElements = alternatives.flatMap((alternative) =>
@@ -722,7 +767,7 @@ function encodedTypeNameSegment(value: string): string {
 }
 
 function scalarTsTypeForJsonShape(
-  shape: Extract<TypedSqlPostgresIrJsonShape, { readonly kind: 'scalar' }>,
+  shape: Extract<ResolvedJsonShape, { readonly kind: 'scalar' }>,
   dependencies: TypeScriptDependencies,
   codecProfile: ResolvedPostgresCodecProfile
 ): string {
@@ -1088,7 +1133,7 @@ async function resolveTypedSqlWithAnalyzer(
         ...(jsonShape ? { jsonShape } : {}),
         ...(jsonMapping ? { jsonMapping } : {}),
         name,
-        nullable: column.nullable,
+        nullable: resultNullabilityAllowsNull(column.nullability),
         pgType: column.pgType,
         pgTypeName: column.pgTypeName,
         pgTypeOid: column.pgTypeOid,
@@ -1160,15 +1205,21 @@ async function resolveTypedSqlWithAnalyzer(
       config.sourceFile
     )
 
-    const inferredAccess = ir.isWrite ? 'write' : typedSqlAccessForCommand(typedSqlCommandFromPostgres(ir.command))
+    const inferredAccess = typedSqlAccessFromEvidence(ir.accessEvidence)
     if (config.access === 'read' && inferredAccess === 'write') {
-      throw new Error(`${config.sourceFile}: @access read conflicts with PostgreSQL's write classification.`)
+      const reasons =
+        ir.accessEvidence.kind === 'notProvenReadOnly'
+          ? ir.accessEvidence.reasons.map(accessConcernDescription).join('; ')
+          : 'an unknown analyzer result'
+      throw new Error(
+        `${config.sourceFile}: @access read requires analyzer-proved read-only execution; PostgreSQL analysis found ${reasons}.`
+      )
     }
 
     resolvedQueries.push({
       columns,
       access: config.access ?? inferredAccess,
-      cardinality: ir.rowCardinality,
+      cardinality: typedSqlCardinalityFromRowBounds(ir.rowBounds),
       command: typedSqlCommandFromPostgres(ir.command),
       generatedTypeDeclarations: generatedDeclarations.map(renderGeneratedTypeDeclaration),
       name: config.name,

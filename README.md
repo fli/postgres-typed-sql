@@ -76,8 +76,8 @@ Running `npm run generate:sql` creates `find-account-by-email.typed-sql.ts` cont
 
 - parameter and result-row interfaces
 - PostgreSQL types and nullability
-- inferred row cardinality and its proof
-- read/write classification
+- a conservative row contract and the analyzer's canonical row bounds
+- conservative read/write execution routing
 - stable parameter ordering
 - the compiled `$1`, `$2`, … SQL text
 - metadata for runtime row mapping
@@ -203,11 +203,13 @@ Directives are SQL comments at the beginning of a `.typed.sql` file:
 ```
 
 - `@name` overrides the lower-camel-case name derived from the filename.
-- `@access` can explicitly declare `read` or `write`.
+- `@access` can explicitly declare `read` or `write`. `read` is an assertion that analysis can prove read-only-compatible execution; it is not a trust override. `write` selects the conservative write execution route and does not necessarily claim that the statement mutates data.
 - `@param` provides a PostgreSQL type when PostgreSQL cannot infer one. A trailing `?` permits a nullable input when NULL admission is otherwise unknown; generation rejects it when PostgreSQL proves that the parameter type, an evaluated use, or a DML target rejects NULL.
 - `@column` asserts that a result column exists and optionally asserts its PostgreSQL type.
 
 PostgreSQL still performs the authoritative parse, name resolution, type inference, rewriting, function/operator resolution, and catalog lookup.
+
+Generated cardinality is derived from the analyzer's row bounds. A `rowBounds.max` value of `null` means that analysis proved no finite upper bound, not that execution is known to produce multiple rows; the public contract remains conservatively `many`.
 
 ## Schema input
 

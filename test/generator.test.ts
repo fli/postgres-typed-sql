@@ -332,11 +332,51 @@ test('does not allow directives to downgrade PostgreSQL write access', async () 
       codecProfile: 'node-postgres',
       schema: 'schema.sql',
     }),
-    /@access read conflicts with PostgreSQL's write classification/u
+    /@access read requires analyzer-proved read-only execution; PostgreSQL analysis found direct DELETE DML/u
   )
 })
 
-test('classifies volatile PostgreSQL function calls conservatively as writes', async () => {
+test('reports every applicable access concern without calling conservative routing mutation proof', async () => {
+  const root = await createMinimalFixture(
+    `create sequence public.access_sequence;
+create table public.access_values (value integer);
+create procedure public.access_procedure()
+language plpgsql
+as $$ begin null; end $$;
+`,
+    `-- @access read
+update public.access_values
+set value = nextval('public.access_sequence')
+`
+  )
+  const config = {
+    include: ['queries'],
+    rootDir: root,
+    codecProfile: 'node-postgres' as const,
+    schema: 'schema.sql',
+  }
+
+  await assert.rejects(
+    generateTypedSql(config),
+    /PostgreSQL analysis found direct UPDATE DML; an execution-reachable volatile path that prevents a read-only proof/u
+  )
+
+  await writeFile(
+    join(root, 'queries/query.typed.sql'),
+    `-- @access read
+with inserted as (
+  insert into public.access_values(value) values (1)
+)
+select 1
+`
+  )
+  await assert.rejects(generateTypedSql(config), /PostgreSQL analysis found a data-modifying CTE/u)
+
+  await writeFile(join(root, 'queries/query.typed.sql'), '-- @access read\ncall public.access_procedure()\n')
+  await assert.rejects(generateTypedSql(config), /an opaque procedure call whose read-only behavior cannot be proved/u)
+})
+
+test('write-routes volatile execution and row locks with cause-specific read assertions', async () => {
   const root = await createMinimalFixture(
     `create sequence public.event_sequence;
 create table public.lock_values (value integer);
@@ -365,7 +405,7 @@ select 1 as value limit nextval('public.event_sequence')
     codecProfile: 'node-postgres' as const,
     schema: 'schema.sql',
   }
-  await assert.rejects(generateTypedSql(config), /@access read conflicts with PostgreSQL's write classification/u)
+  await assert.rejects(generateTypedSql(config), /execution-reachable volatile path that prevents a read-only proof/u)
 
   await writeFile(
     join(root, 'queries/query.typed.sql'),
@@ -373,7 +413,7 @@ select 1 as value limit nextval('public.event_sequence')
 select public.volatile_sum(value) from (values (1), (2), (3)) input(value)
 `
   )
-  await assert.rejects(generateTypedSql(config), /@access read conflicts with PostgreSQL's write classification/u)
+  await assert.rejects(generateTypedSql(config), /execution-reachable volatile path that prevents a read-only proof/u)
 
   await writeFile(
     join(root, 'queries/query.typed.sql'),
@@ -381,7 +421,7 @@ select public.volatile_sum(value) from (values (1), (2), (3)) input(value)
 select value from public.lock_values for update
 `
   )
-  await assert.rejects(generateTypedSql(config), /@access read conflicts with PostgreSQL's write classification/u)
+  await assert.rejects(generateTypedSql(config), /a row lock that is incompatible with read-only execution/u)
 
   await writeFile(
     join(root, 'queries/query.typed.sql'),
@@ -396,7 +436,7 @@ join public.lock_values right_value on exists (
 )
 `
   )
-  await assert.rejects(generateTypedSql(config), /@access read conflicts with PostgreSQL's write classification/u)
+  await assert.rejects(generateTypedSql(config), /a row lock that is incompatible with read-only execution/u)
 })
 
 test('rejects read access for volatile btree comparator execution hidden behind ORDER BY', async () => {
@@ -489,7 +529,7 @@ order by value
       codecProfile: 'node-postgres',
       schema: 'schema.sql',
     }),
-    /@access read conflicts with PostgreSQL's write classification/u
+    /execution-reachable volatile path that prevents a read-only proof/u
   )
 })
 

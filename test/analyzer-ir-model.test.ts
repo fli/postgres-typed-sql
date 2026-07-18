@@ -5,6 +5,7 @@ import {
   checkConstraintTypeKey,
   intersectJsonShapes,
   joinJsonShapes,
+  resultNullabilityAllowsNull,
   unionJsonShapes,
   type TypedSqlPostgresIrJsonShape,
 } from '../src/analyzer-ir-model.js'
@@ -17,25 +18,28 @@ const textType = {
   pgTypeSchema: 'pg_catalog',
 } as const
 
+const nonNull = { basis: 'test', kind: 'nonNull' } as const
+const nullable = { evidence: 'test', kind: 'nullable' } as const
+
 function stringLiteral(
   value: string,
-  nullable = false,
+  allowsNull = false,
   type: Omit<
     Extract<TypedSqlPostgresIrJsonShape, { readonly kind: 'stringLiteral' }>,
-    'kind' | 'nullable' | 'value'
+    'kind' | 'nullability' | 'value'
   > = textType
 ): TypedSqlPostgresIrJsonShape {
-  return { ...type, kind: 'stringLiteral', nullable, value }
+  return { ...type, kind: 'stringLiteral', nullability: allowsNull ? nullable : nonNull, value }
 }
 
 function objectShape(
   fields: readonly (readonly [name: string, shape: TypedSqlPostgresIrJsonShape])[],
-  nullable = false
+  allowsNull = false
 ): TypedSqlPostgresIrJsonShape {
   return {
     fields: fields.map(([name, shape]) => ({ name, shape })),
     kind: 'object',
-    nullable,
+    nullability: allowsNull ? nullable : nonNull,
   }
 }
 
@@ -74,48 +78,63 @@ test('joins JSON alternatives by value shape while keeping SQL nullability at th
 
   const nullable = joinJsonShapes([ordered, null], ordered)
   assert.equal(nullable.kind, 'object')
-  assert.equal(nullable.nullable, true)
+  assert.equal(resultNullabilityAllowsNull(nullable.nullability), true)
 
-  assert.deepEqual(joinJsonShapes([ordered, { kind: 'opaque', nullable: false }], ordered), {
+  assert.deepEqual(joinJsonShapes([ordered, { kind: 'opaque', nullability: nonNull }], ordered), {
     kind: 'opaque',
-    nullable: false,
+    nullability: { basis: 'json_join', kind: 'nonNull' },
   })
+
+  const differentBasis = objectShape([
+    [
+      'state',
+      {
+        ...stringLiteral('ready'),
+        nullability: { basis: 'different_non_null_proof', kind: 'nonNull' },
+      },
+    ],
+    ['kind', stringLiteral('video')],
+  ])
+  assert.equal(joinJsonShapes([ordered, differentBasis], ordered).kind, 'object')
 })
 
 test('normalizes set-operation alternative nullability instead of leaking it into nested members', () => {
   const left: TypedSqlPostgresIrJsonShape = {
     alternatives: [stringLiteral('left', true), stringLiteral('shared')],
     kind: 'union',
-    nullable: true,
+    nullability: nullable,
   }
   const right = stringLiteral('shared')
 
   const union = unionJsonShapes(left, right)
   assert.equal(union.kind, 'union')
-  assert.equal(union.nullable, true)
+  assert.equal(resultNullabilityAllowsNull(union.nullability), true)
   if (union.kind === 'union') {
     assert.deepEqual(
-      union.alternatives.map((alternative) => alternative.nullable),
-      [false, false]
+      union.alternatives.map((alternative) => alternative.nullability.kind),
+      ['nonNull', 'nonNull']
     )
   }
 
   const intersection = intersectJsonShapes(left, right)
-  assert.equal(intersection.nullable, false)
+  assert.equal(resultNullabilityAllowsNull(intersection.nullability), false)
   if (intersection.kind === 'union') {
     assert.deepEqual(
-      intersection.alternatives.map((alternative) => alternative.nullable),
-      [false, false]
+      intersection.alternatives.map((alternative) => alternative.nullability.kind),
+      ['nonNull', 'nonNull']
     )
   }
 
-  assert.deepEqual(intersectJsonShapes({ kind: 'opaque', nullable: true }, right), right)
+  assert.deepEqual(intersectJsonShapes({ kind: 'opaque', nullability: nullable }, right), {
+    ...right,
+    nullability: { basis: 'json_intersection', kind: 'nonNull' },
+  })
 })
 
 test('does not collapse unresolved scalar types that have distinct canonical names', () => {
   const scalar = (pgType: string): TypedSqlPostgresIrJsonShape => ({
     kind: 'scalar',
-    nullable: false,
+    nullability: nonNull,
     pgType,
     pgTypeKind: 'unknown',
     pgTypeName: 'unknown',
