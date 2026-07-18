@@ -50,7 +50,6 @@ export interface TypedSqlPostgresIrParam extends PostgresTypeFact {
   readonly checkConstraintType?: TypedSqlPostgresIrCheckConstraintTypeExpression
   readonly name: string
   readonly nullAdmission: TypedSqlPostgresIrParamNullAdmission
-  readonly propertyName: string
 }
 
 export type TypedSqlPostgresIrParamNullAdmission = 'accepts' | 'rejects' | 'unknown'

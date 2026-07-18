@@ -32,10 +32,10 @@ findWidget.query({ code: 'widget-code', metrics: [[1], [2, 3]] })
 // @ts-expect-error SQL NULL array elements are accepted, but NULL subarrays are not representable.
 findWidget.query({ code: 'widget-code', metrics: [[1], null] })
 
-insertWidget.query({ code: 'widget-code', label: null })
+insertWidget.query({ code: 'widget-code', widgetLabel: null })
 
 // @ts-expect-error PostgreSQL rejects SQL NULL for the NOT NULL code column.
-insertWidget.query({ code: null, label: null })
+insertWidget.query({ code: null, widgetLabel: null })
 
 // @ts-expect-error SQL parameters do not accept JavaScript undefined.
-insertWidget.query({ code: 'widget-code', label: undefined })
+insertWidget.query({ code: 'widget-code', widgetLabel: undefined })

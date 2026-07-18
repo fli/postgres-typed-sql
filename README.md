@@ -38,6 +38,7 @@ export default defineConfig({
   extensions: ['pgcrypto'],
   codecProfile: 'node-postgres',
   naming: {
+    parameterProperties: 'camelCase',
     resultColumns: 'camelCase',
     structuredJsonFields: 'camelCase',
   },
@@ -69,6 +70,8 @@ select id, email, display_name
 from public.accounts
 where email = :email
 ```
+
+Named parameter tokens retain their exact spelling for SQL compilation, `@param` directives, diagnostics, and runtime metadata. Generated parameter-object properties are application-facing and use conservative camel case by default, so `:platform_slug` is supplied as `{ platformSlug }`. Repeated uses of one raw token still share one positional placeholder and one public property. Set `naming.parameterProperties` to `'preserve'` only when callers deliberately use the raw token spelling.
 
 Inside PostgreSQL expression subscripts, an unparenthesized top-level colon remains the native array-slice delimiter. Use `items[(:index)]` for a named subscript, and use `items[1 : :upper]` or `items[1:(:upper)]` for a named slice bound. `ARRAY[:value]` continues to treat `:value` as a named parameter because `ARRAY[...]` is an array constructor rather than a subscript.
 
@@ -102,9 +105,9 @@ const account = await executeTypedSqlOptional(client, findAccountByEmail, { emai
 
 The node-postgres adapter requests array rows for generated statements, maps them by result-column position, enforces `one`, `optional`, and `many` result shapes, and returns the generated row type selected by the configured codec profile. Positional mapping preserves every unique PostgreSQL result name safely, including names such as `__proto__` that object-row construction cannot represent reliably. Other drivers can consume statement `text`, `values(params)`, `columns`, and `resultRowMapping` and use the core mapping functions without importing any node-postgres contract.
 
-## Output naming
+## Generated property naming
 
-Postgres Typed SQL preserves PostgreSQL result and JSON field names by default. Configure application-facing camel-case names independently for top-level result columns and statically modeled JSON fields:
+Postgres Typed SQL uses application-facing camel-case parameter properties by default while preserving PostgreSQL result and JSON field names by default. Configure the three boundaries independently:
 
 ```js
 export default defineConfig({
@@ -115,17 +118,20 @@ export default defineConfig({
   },
   codecProfile: 'node-postgres',
   naming: {
+    parameterProperties: 'camelCase',
     resultColumns: 'camelCase',
     structuredJsonFields: 'camelCase',
   },
 })
 ```
 
-For example, `account_id` becomes `accountId`, and a modeled JSON value such as `jsonb_build_object('display_name', display_name)` exposes `displayName`. The structured JSON policy applies recursively through inferred objects, arrays, unions, `json_agg`/`jsonb_agg`, and JSON object or array projections from derived subqueries. Opaque JSON values—including selected JSON columns and dynamically keyed objects—are not traversed, so their internal keys and object identity are preserved.
+For example, the raw token `:account_id` is compiled to a positional placeholder but exposed to callers as `accountId`. Parameter metadata retains `name: 'account_id'` and records `propertyName: 'accountId'`; runtime `parameterNames` and `values(params)` lookup use only the public `accountId` property. `@param account_id ...` remains keyed by the raw token.
 
-Naming is deterministic and conservative: conventional lower-snake-case identifiers are camel-cased, already camel-case names stay unchanged, and unusual names such as `URL`, `__proto__`, spaces, and hyphens are preserved. Generation rejects result or modeled JSON fields that collide after transformation and asks the query author to alias them.
+For result values, a PostgreSQL column `account_id` becomes the mapped row property `accountId`. A modeled JSON value such as `jsonb_build_object('display_name', display_name)` exposes `displayName`. The structured JSON policy applies recursively through inferred objects, arrays, unions, `json_agg`/`jsonb_agg`, and JSON object or array projections from derived subqueries. Opaque JSON values—including selected JSON columns and dynamically keyed objects—are not traversed, so their internal keys and object identity are preserved.
 
-The generated row type describes mapped execution through the node-postgres adapter's `executeTypedSql`, `executeTypedSqlOne`, and `executeTypedSqlOptional`. Direct `client.query(statement.query(params))` execution remains raw and returns driver/PostgreSQL names because the driver constructs those object rows. Named parameters, generated catalog types, and opaque JSON contents are unaffected.
+Naming is deterministic and conservative: conventional lower-snake-case identifiers are camel-cased, already camel-case names stay unchanged, and unusual names such as `URL`, `__proto__`, leading or repeated underscores, spaces, and hyphens are preserved. Generation rejects parameter, result, or modeled JSON properties that collide after transformation. Parameter collisions must be resolved by choosing distinct SQL tokens or explicitly selecting `'preserve'`; they never fall back, receive suffixes, or overwrite one another.
+
+The generated row type describes mapped execution through the node-postgres adapter's `executeTypedSql`, `executeTypedSqlOne`, and `executeTypedSqlOptional`. Direct `client.query(statement.query(params))` execution remains raw and returns driver/PostgreSQL result names because the driver constructs those object rows. Parameter-object lookup still uses the generated public property names. Generated catalog types and opaque JSON contents are unaffected.
 
 Structured JSON field naming requires a codec profile with `structuredJson: true` when a query needs a nested mapping, because the runtime must know that `json` and `jsonb` values are decoded into JavaScript objects and arrays. The built-in `node-postgres` profile provides this capability.
 

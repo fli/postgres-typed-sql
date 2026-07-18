@@ -2,6 +2,7 @@
 
 ## 0.1.0-beta.6
 
+- Breaking: generated parameter-object properties now use conservative camel case by default while SQL tokens, `@param` directives, analyzer labels, and parameter metadata retain their raw spelling. Configure `naming.parameterProperties: 'preserve'` only for a deliberate exact-name API; post-transform collisions are rejected.
 - Replaced the closed `scalarProfile` switch with composable codec profiles. Applications can now define exact result-OID mappings or portable schema/name hooks, independently model result, parameter, and nested-JSON representations, inherit built-in behavior, declare structured-JSON capability, and expose custom scalar imports.
 - Added the selected codec profile name to generated statement and catalog headers, and applied codec behavior consistently to catalog columns, JSON shape rendering, enum/CHECK literal refinement, parameters, and results.
 - Moved node-postgres query options, client typing, and execution helpers from `postgres-typed-sql/runtime` to `postgres-typed-sql/adapters/node-postgres`. The core runtime now contains only driver-neutral statement and mapping behavior. Replace `scalarProfile` with `codecProfile`, import execution helpers from the adapter, and regenerate checked-in output.

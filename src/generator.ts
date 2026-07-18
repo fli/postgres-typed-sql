@@ -36,7 +36,7 @@ import type { TypedSqlCardinality } from './runtime.js'
 import {
   assertTypeScriptBindingIdentifier,
   assertUniqueTypeScriptBindings,
-  camelCaseOutputProperty,
+  camelCasePropertyName,
   pascalCaseIdentifier,
   quotePropertyName,
   renderTypeScriptLineCommentValue,
@@ -63,10 +63,13 @@ const ignoredDiscoveryDirectories = new Set([
   'test-results',
 ])
 
-interface SqlParameter {
+interface SqlParameterDeclaration {
   readonly name: string
   readonly nullable?: boolean
   readonly pgType?: string
+}
+
+interface SqlParameter extends SqlParameterDeclaration {
   readonly propertyName: string
 }
 
@@ -74,7 +77,6 @@ interface SqlColumn {
   readonly name: string
   readonly nullable?: boolean
   readonly pgType?: string
-  readonly propertyName: string
 }
 
 interface TypedSqlConfig {
@@ -82,7 +84,7 @@ interface TypedSqlConfig {
   readonly columns: readonly SqlColumn[]
   readonly name: string
   readonly outputPath: string
-  readonly parameters: readonly SqlParameter[]
+  readonly parameters: readonly SqlParameterDeclaration[]
   readonly sourceFile: string
   readonly sourcePath: string
   readonly sql: string
@@ -94,8 +96,6 @@ interface CompiledTypedSql {
   readonly name: string
   readonly outputPath: string
   readonly parameters: readonly SqlParameter[]
-  readonly parameterNames: readonly string[]
-  readonly parameterTypes: readonly (string | undefined)[]
   readonly sourceFile: string
   readonly sourcePath: string
   readonly sql: string
@@ -137,8 +137,6 @@ interface ResolvedTypedSql {
   readonly name: string
   readonly outputPath: string
   readonly parameters: readonly ResolvedSqlParameter[]
-  readonly parameterNames: readonly string[]
-  readonly parameterTypes: readonly string[]
   readonly rowBounds: TypedSqlPostgresIrRowBounds
   readonly scalarTypeImports: readonly string[]
   readonly sourceFile: string
@@ -346,7 +344,7 @@ async function readTypedSqlConfigs(generatorConfig: ResolvedPostgresTypedSqlConf
     const defaultName = lowerCamelCaseFromPathBase(basename(sourceFile, typedSqlSourceSuffix))
     let access: TypedSqlAccess | undefined
     let name = defaultName
-    const parameters: SqlParameter[] = []
+    const parameters: SqlParameterDeclaration[] = []
     const columns: SqlColumn[] = []
     let firstAccessLocation: string | undefined
     let firstNameLocation: string | undefined
@@ -412,7 +410,6 @@ async function readTypedSqlConfigs(generatorConfig: ResolvedPostgresTypedSqlConf
         name: identifier,
         nullable: parsedPgType.nullable,
         pgType,
-        propertyName: identifier,
       }
 
       if (kind === 'param') {
@@ -448,23 +445,21 @@ function assertUniqueTypedSqlNames(configs: readonly TypedSqlConfig[]): void {
   }
 }
 
-function compileTypedSql(config: TypedSqlConfig): CompiledTypedSql {
+function compileTypedSql(config: TypedSqlConfig, parameterNaming: PostgresTypedSqlPropertyNaming): CompiledTypedSql {
   const parametersByName = new Map(config.parameters.map((parameter) => [parameter.name, parameter]))
   const compiled = compileNamedParameters(config.sql, config.sourceFile)
-  const parameterTypes: (string | undefined)[] = []
-  const parameters: SqlParameter[] = []
-  const parameterNames = compiled.parameterNames.map((name) => {
-    const parameter =
-      parametersByName.get(name) ??
-      ({
-        name,
-        propertyName: name,
-      } satisfies SqlParameter)
-
-    parameters.push(parameter)
-    parameterTypes.push(parameter.pgType)
-    return parameter.propertyName
+  const parameters = compiled.parameterNames.map((name): SqlParameter => {
+    const declaration = parametersByName.get(name) ?? { name }
+    return {
+      ...declaration,
+      propertyName: propertyNameForNaming(name, parameterNaming),
+    }
   })
+  assertUniquePublicNames(
+    parameters.map((parameter) => parameter.propertyName),
+    'parameter property',
+    config.sourceFile
+  )
 
   const unusedParameters = config.parameters.filter(
     (parameter) => !parameters.some((used) => used.name === parameter.name)
@@ -481,8 +476,6 @@ function compileTypedSql(config: TypedSqlConfig): CompiledTypedSql {
     name: config.name,
     outputPath: config.outputPath,
     parameters,
-    parameterNames,
-    parameterTypes,
     sourceFile: config.sourceFile,
     sourcePath: config.sourcePath,
     sql: compiled.sql,
@@ -542,8 +535,8 @@ interface GeneratedJsonMapping {
   readonly fields?: readonly GeneratedJsonFieldMapping[]
 }
 
-function outputPropertyName(name: string, naming: PostgresTypedSqlPropertyNaming): string {
-  return naming === 'camelCase' ? camelCaseOutputProperty(name) : name
+function propertyNameForNaming(name: string, naming: PostgresTypedSqlPropertyNaming): string {
+  return naming === 'camelCase' ? camelCasePropertyName(name) : name
 }
 
 function resolveJsonShapeNames(
@@ -562,7 +555,7 @@ function resolveJsonShapeNames(
     case 'object': {
       const fields = shape.fields.map((field) => ({
         name: field.name,
-        propertyName: outputPropertyName(field.name, naming),
+        propertyName: propertyNameForNaming(field.name, naming),
         shape: resolveJsonShapeNames(field.shape, naming, sourceFile, `${context}.${field.name}`),
       }))
       assertUniquePublicNames(
@@ -963,7 +956,7 @@ ${parameters
 function renderStatement(config: ResolvedTypedSql): string {
   const paramsName = `${pascalCaseIdentifier(config.name)}Params`
   const rowName = `${pascalCaseIdentifier(config.name)}Row`
-  const parameterNames = config.parameterNames.map(quoteString).join(', ')
+  const parameterNames = config.parameters.map((parameter) => quoteString(parameter.propertyName)).join(', ')
   const generatedTypeDeclarations =
     config.generatedTypeDeclarations.length > 0 ? `${config.generatedTypeDeclarations.join('\n\n')}\n\n` : ''
 
@@ -1061,8 +1054,8 @@ async function resolveTypedSqlWithAnalyzer(
     client,
     configs.map((config) => ({
       name: config.name,
-      parameterNames: config.parameterNames,
-      parameterTypes: config.parameterTypes,
+      parameterNames: config.parameters.map((parameter) => parameter.name),
+      parameterTypes: config.parameters.map((parameter) => parameter.pgType),
       sourceFile: config.sourceFile,
       sql: config.sql,
     }))
@@ -1088,7 +1081,7 @@ async function resolveTypedSqlWithAnalyzer(
     const usedGeneratedTypeNames = new Map(statementTypeBindings.map((binding) => [binding.name, binding.source]))
     const columns = ir.resultColumns.map((column, columnIndex): ResolvedSqlColumn => {
       const name = column.name ?? `column_${columnIndex + 1}`
-      const propertyName = outputPropertyName(name, generatorConfig.naming.resultColumns)
+      const propertyName = propertyNameForNaming(name, generatorConfig.naming.resultColumns)
       const suggestedJsonTypeName = `${pascalCaseIdentifier(config.name)}${encodedTypeNameSegment(name)}Json`
       const safeJsonShape = column.jsonShape ? applyOpaqueJsonBarriers(column.jsonShape) : undefined
       const resolvedJsonShape = safeJsonShape
@@ -1180,11 +1173,6 @@ async function resolveTypedSqlWithAnalyzer(
         tsType: resolution.type,
       }
     })
-    assertUniquePublicNames(
-      parameters.map((parameter) => parameter.propertyName),
-      'parameter',
-      config.sourceFile
-    )
     const usesRecordUtilityType =
       parameters.length === 0 || columns.length === 0 || generatedDeclarations.some(({ fields }) => fields.length === 0)
     const ambientBindings = new Set(typeDependencies.ambient)
@@ -1225,8 +1213,6 @@ async function resolveTypedSqlWithAnalyzer(
       name: config.name,
       outputPath: config.outputPath,
       parameters,
-      parameterNames: config.parameterNames,
-      parameterTypes: parameters.map((parameter) => parameter.pgType),
       rowBounds: ir.rowBounds,
       scalarTypeImports: [...typeDependencies.scalar].toSorted(),
       sourceFile: config.sourceFile,
@@ -1549,7 +1535,7 @@ export async function generateTypedSql(config: PostgresTypedSqlConfig): Promise<
     const catalogContents = await buildCatalogTypes(database, resolvedConfig)
     const rawConfigs = await readTypedSqlConfigs(resolvedConfig)
     assertUniqueTypedSqlNames(rawConfigs)
-    const configs = rawConfigs.map(compileTypedSql)
+    const configs = rawConfigs.map((config) => compileTypedSql(config, resolvedConfig.naming.parameterProperties))
     const resolvedConfigs = await resolveTypedSqlWithAnalyzer(configs, database, resolvedConfig)
 
     const staleFiles = await findStaleGeneratedFiles(resolvedConfigs, resolvedConfig)

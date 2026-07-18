@@ -84,6 +84,30 @@ test('runtime binds named parameters in generated order', async () => {
   assert.deepEqual(row, { email: 'reader@example.test' })
 })
 
+test('runtime looks up public parameter properties independently of raw SQL metadata names', () => {
+  const statement = createTypedSqlStatement<{ readonly platformSlug: string }, Record<string, never>>({
+    name: 'findPlatform',
+    parameterNames: ['platformSlug'],
+    parameters: [
+      {
+        name: 'platform_slug',
+        nullable: false,
+        pgType: 'text',
+        pgTypeName: 'text',
+        pgTypeSchema: 'pg_catalog',
+        propertyName: 'platformSlug',
+      },
+    ],
+    text: 'select $1::text',
+  })
+
+  assert.deepEqual(statement.values({ platformSlug: 'web' }), ['web'])
+  assert.throws(
+    () => statement.values({ platform_slug: 'web' } as unknown as { readonly platformSlug: string }),
+    /expected an own parameter property "platformSlug"/u
+  )
+})
+
 test('node-postgres adapter reports command row counts without adding a driver client to the core runtime', async () => {
   const statement = createTypedSqlStatement<{ readonly id: number }, Record<string, never>>({
     command: 'delete',

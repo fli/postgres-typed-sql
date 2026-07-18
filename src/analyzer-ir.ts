@@ -1886,7 +1886,6 @@ function normalizeCompiledIr(catalog: CatalogFacts, analyzed: AnalyzedCompiledCo
       name,
       nullAdmission,
       ...typeFact,
-      propertyName: name,
       ...(checkConstraintType ? { checkConstraintType } : {}),
     }
   })

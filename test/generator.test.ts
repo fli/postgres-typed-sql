@@ -7,7 +7,7 @@ import { PGlite } from '../src/vendor/pglite/index.js'
 import { definePostgresCodecProfile, postgresResultTypesByOid, postgresTypeScriptType } from '../src/index.js'
 import {
   assertTypeScriptBindingIdentifier,
-  camelCaseOutputProperty,
+  camelCasePropertyName,
   postgresCheckConstraintTypeBinding,
   postgresIdentifierTypeSegment,
   postgresNamedTypeBinding,
@@ -16,14 +16,87 @@ import {
 
 import { copyFixture, createMinimalFixture, generateTypedSql } from './generator-test-support.js'
 
-test('camel-cases only conventional PostgreSQL output identifiers', () => {
-  assert.equal(camelCaseOutputProperty('account_id'), 'accountId')
-  assert.equal(camelCaseOutputProperty('api_v2_url'), 'apiV2Url')
-  assert.equal(camelCaseOutputProperty('column_1'), 'column1')
-  assert.equal(camelCaseOutputProperty('displayName'), 'displayName')
-  assert.equal(camelCaseOutputProperty('__proto__'), '__proto__')
-  assert.equal(camelCaseOutputProperty('outer-key'), 'outer-key')
-  assert.equal(camelCaseOutputProperty('URL'), 'URL')
+test('camel-cases only conventional generated property names', () => {
+  assert.equal(camelCasePropertyName('account_id'), 'accountId')
+  assert.equal(camelCasePropertyName('api_v2_url'), 'apiV2Url')
+  assert.equal(camelCasePropertyName('column_1'), 'column1')
+  assert.equal(camelCasePropertyName('displayName'), 'displayName')
+  assert.equal(camelCasePropertyName('__proto__'), '__proto__')
+  assert.equal(camelCasePropertyName('outer-key'), 'outer-key')
+  assert.equal(camelCasePropertyName('URL'), 'URL')
+})
+
+test('camel-cases parameter properties by default while preserving raw SQL metadata', async () => {
+  const root = await createMinimalFixture(
+    'select 1;\n',
+    `-- @param platform_slug text?
+select
+  :platform_slug::text is not distinct from :platform_slug::text
+  and :alreadyCamel::text is not null
+  and :URL::text is not null
+  and :__proto__::text is not null
+  and :_leading::text is not null
+  and :foo__bar::text is not null
+  and :class::text is not null
+  as matches
+`
+  )
+  await generateTypedSql({
+    include: ['queries'],
+    rootDir: root,
+    codecProfile: 'node-postgres',
+    schema: 'schema.sql',
+  })
+
+  const output = await readFile(join(root, 'queries/query.typed-sql.ts'), 'utf8')
+  assert.match(output, /readonly platformSlug: string \| null/u)
+  assert.match(output, /readonly alreadyCamel: string/u)
+  assert.match(output, /readonly URL: string/u)
+  assert.match(output, /readonly __proto__: string/u)
+  assert.match(output, /readonly _leading: string/u)
+  assert.match(output, /readonly foo__bar: string/u)
+  assert.match(output, /readonly class: string/u)
+  assert.match(
+    output,
+    /parameterNames: \['platformSlug', 'alreadyCamel', 'URL', '__proto__', '_leading', 'foo__bar', 'class'\]/u
+  )
+  assert.match(output, /name: 'platform_slug',[\s\S]*?propertyName: 'platformSlug'/u)
+  assert.match(output, /text: '[^']*\$1[^']*\$1/u)
+})
+
+test('supports explicit parameter-property preservation', async () => {
+  const root = await createMinimalFixture('select 1;\n', 'select :platform_slug::text as value\n')
+  await generateTypedSql({
+    include: ['queries'],
+    naming: {
+      parameterProperties: 'preserve',
+    },
+    rootDir: root,
+    codecProfile: 'node-postgres',
+    schema: 'schema.sql',
+  })
+
+  const output = await readFile(join(root, 'queries/query.typed-sql.ts'), 'utf8')
+  assert.match(output, /readonly platform_slug: string \| null/u)
+  assert.match(output, /parameterNames: \['platform_slug'\]/u)
+  assert.match(output, /name: 'platform_slug',[\s\S]*?propertyName: 'platform_slug'/u)
+})
+
+test('rejects parameter properties that collide after camel-case transformation', async () => {
+  const root = await createMinimalFixture(
+    'select 1;\n',
+    'select :foo_bar::text is not distinct from :fooBar::text as matches\n'
+  )
+
+  await assert.rejects(
+    generateTypedSql({
+      include: ['queries'],
+      rootDir: root,
+      codecProfile: 'node-postgres',
+      schema: 'schema.sql',
+    }),
+    /duplicate parameter property name "fooBar" at positions 1 and 2/u
+  )
 })
 
 test('escapes every ECMAScript line terminator in generated line-comment values', () => {
@@ -207,7 +280,7 @@ from (values (array[10, 20])) as input(numbers)
   })
 
   const output = await readFile(join(root, 'queries/query.typed-sql.ts'), 'utf8')
-  assert.match(output, /parameterNames: \['use_first'\]/u)
+  assert.match(output, /parameterNames: \['useFirst'\]/u)
   assert.match(output, /numbers\[case when \$1 then 1 else 2 end\]/u)
 
   const database = new PGlite()
@@ -621,9 +694,9 @@ where account.id = :account_id
 
   assert.equal(result.statementCount, 5)
   const output = await readFile(join(root, 'queries/mixed-parameter-oids.typed-sql.ts'), 'utf8')
-  assert.match(output, /parameterNames: \['label', 'account_id'\]/u)
+  assert.match(output, /parameterNames: \['label', 'accountId'\]/u)
   assert.match(output, /readonly label: string/u)
-  assert.match(output, /readonly account_id: bigint \| number \| string/u)
+  assert.match(output, /readonly accountId: bigint \| number \| string/u)
   assert.match(output, /name: 'label',[\s\S]*?pgType: 'text'/u)
   assert.match(output, /name: 'account_id',[\s\S]*?pgType: 'bigint'/u)
 })
@@ -739,8 +812,8 @@ select :value
 
   const nativeFacts = await readFile(join(root, 'queries/native-dml-facts.typed-sql.ts'), 'utf8')
   assert.match(nativeFacts, /readonly email: string\n/u)
-  assert.match(nativeFacts, /readonly display_name: string \| null/u)
-  assert.match(nativeFacts, /readonly second_email: string\n/u)
+  assert.match(nativeFacts, /readonly displayName: string \| null/u)
+  assert.match(nativeFacts, /readonly secondEmail: string\n/u)
 
   const mixedTarget = await readFile(join(root, 'queries/mixed-dml-target.typed-sql.ts'), 'utf8')
   assert.match(mixedTarget, /readonly value: string\n/u)
@@ -749,13 +822,13 @@ select :value
   const modifyingCte = await readFile(join(root, 'queries/modifying-cte.typed-sql.ts'), 'utf8')
   assert.match(modifyingCte, /access: 'write'/u)
   assert.match(modifyingCte, /readonly email: string\n/u)
-  assert.match(modifyingCte, /readonly display_name: string \| null/u)
+  assert.match(modifyingCte, /readonly displayName: string \| null/u)
 
   const domainNullability = await readFile(join(root, 'queries/domain-nullability.typed-sql.ts'), 'utf8')
-  assert.match(domainNullability, /readonly maybe_value: string \| null/u)
-  assert.match(domainNullability, /readonly checked_value: string \| null/u)
-  assert.match(domainNullability, /readonly required_value: string\n/u)
-  assert.match(domainNullability, /readonly nested_required_value: string\n/u)
+  assert.match(domainNullability, /readonly maybeValue: string \| null/u)
+  assert.match(domainNullability, /readonly checkedValue: string \| null/u)
+  assert.match(domainNullability, /readonly requiredValue: string\n/u)
+  assert.match(domainNullability, /readonly nestedRequiredValue: string\n/u)
 
   const mixedDomainPath = await readFile(join(root, 'queries/mixed-domain-path.typed-sql.ts'), 'utf8')
   assert.match(mixedDomainPath, /readonly value: string\n/u)
@@ -843,6 +916,9 @@ where event_id = :event_id
 
   const result = await generateTypedSql({
     include: ['queries'],
+    naming: {
+      parameterProperties: 'preserve',
+    },
     rootDir: root,
     codecProfile: 'node-postgres',
     schema: 'schema.sql',
