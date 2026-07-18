@@ -25,7 +25,7 @@ import {
 } from './analyzer-ir-model.js'
 import type { PostgresQueryable } from './database.js'
 import { loadPostgresTypeFacts } from './postgres-type-facts.js'
-import { postgresJsonSupportsStringLiteralRefinement, type PostgresTypeFact } from './postgres-types.js'
+import { postgresJsonSupportsTextualLiteralRefinement, type PostgresTypeFact } from './postgres-types.js'
 
 export type {
   TypedSqlPostgresIr,
@@ -1561,12 +1561,12 @@ function jsonLeafShapeForExpr(
   const typeFact = typeFactForOid(catalog, expr.typeOid, expr.typeName)
   const constantExpr = unwrapValuePreservingExpr(expr)
   if (
-    postgresJsonSupportsStringLiteralRefinement(typeFact) &&
+    postgresJsonSupportsTextualLiteralRefinement(typeFact) &&
     constantExpr?.tag === 'Const' &&
     constantExpr.constIsNull !== true &&
     typeof constantExpr.constString === 'string'
   ) {
-    return { kind: 'stringLiteral', nullable: false, value: constantExpr.constString }
+    return { ...typeFact, kind: 'stringLiteral', nullable: false, value: constantExpr.constString }
   }
   if (isJsonType(typeFact.pgTypeName)) {
     return {

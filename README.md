@@ -36,7 +36,7 @@ export default defineConfig({
     scalars: 'postgres-typed-sql/scalars',
   },
   extensions: ['pgcrypto'],
-  scalarProfile: 'node-postgres',
+  codecProfile: 'node-postgres',
   naming: {
     resultColumns: 'camelCase',
     structuredJsonFields: 'camelCase',
@@ -90,7 +90,17 @@ import type { TypedSqlRawRow } from 'postgres-typed-sql/runtime'
 const result = await client.query<TypedSqlRawRow>(findAccountByEmail.query({ email }))
 ```
 
-Direct driver execution returns driver-defined raw object rows whose scalar values should be treated as `unknown`, because `query()` controls neither row construction nor scalar parsers. The node-postgres result-row generic is not inferred from a query configuration object, so a direct unannotated `client.query(statement.query(params))` call defaults to `any`; pass `TypedSqlRawRow` explicitly as shown above. Generated statements use `createTypedSqlStatement` from the configured runtime module. Its optional execution helpers request array rows, map them by result-column position, enforce `one`, `optional`, and `many` result shapes, and return the generated row type selected by the configured scalar profile. Positional mapping preserves every unique PostgreSQL result name safely, including names such as `__proto__` that object-row construction cannot represent reliably.
+Direct driver execution returns driver-defined raw object rows whose scalar values should be treated as `unknown`, because `query()` controls neither row construction nor scalar parsers. The node-postgres result-row generic is not inferred from a query configuration object, so a direct unannotated `client.query(statement.query(params))` call defaults to `any`; pass `TypedSqlRawRow` explicitly as shown above.
+
+The core runtime is driver-neutral. It owns statement construction, named-parameter ordering, result metadata, positional/object row mapping, structured-JSON mapping, and affected-row-count normalization. Driver query options and execution live in adapters. For node-postgres:
+
+```ts
+import { executeTypedSqlOptional } from 'postgres-typed-sql/adapters/node-postgres'
+
+const account = await executeTypedSqlOptional(client, findAccountByEmail, { email })
+```
+
+The node-postgres adapter requests array rows for generated statements, maps them by result-column position, enforces `one`, `optional`, and `many` result shapes, and returns the generated row type selected by the configured codec profile. Positional mapping preserves every unique PostgreSQL result name safely, including names such as `__proto__` that object-row construction cannot represent reliably. Other drivers can consume statement `text`, `values(params)`, `columns`, and `resultRowMapping` and use the core mapping functions without importing any node-postgres contract.
 
 ## Output naming
 
@@ -103,7 +113,7 @@ export default defineConfig({
     runtime: 'postgres-typed-sql/runtime',
     scalars: 'postgres-typed-sql/scalars',
   },
-  scalarProfile: 'node-postgres',
+  codecProfile: 'node-postgres',
   naming: {
     resultColumns: 'camelCase',
     structuredJsonFields: 'camelCase',
@@ -115,17 +125,70 @@ For example, `account_id` becomes `accountId`, and a modeled JSON value such as 
 
 Naming is deterministic and conservative: conventional lower-snake-case identifiers are camel-cased, already camel-case names stay unchanged, and unusual names such as `URL`, `__proto__`, spaces, and hyphens are preserved. Generation rejects result or modeled JSON fields that collide after transformation and asks the query author to alias them.
 
-The generated row type describes mapped execution through `executeTypedSql`, `executeTypedSqlOne`, and `executeTypedSqlOptional`. Direct `client.query(statement.query(params))` execution remains raw and returns driver/PostgreSQL names because the driver constructs those object rows. Named parameters, generated catalog types, and opaque JSON contents are unaffected.
+The generated row type describes mapped execution through the node-postgres adapter's `executeTypedSql`, `executeTypedSqlOne`, and `executeTypedSqlOptional`. Direct `client.query(statement.query(params))` execution remains raw and returns driver/PostgreSQL names because the driver constructs those object rows. Named parameters, generated catalog types, and opaque JSON contents are unaffected.
 
-Structured JSON field naming requires `scalarProfile: 'node-postgres'` when a query needs a nested mapping, because the runtime must know that `json` and `jsonb` values are decoded into JavaScript objects and arrays.
+Structured JSON field naming requires a codec profile with `structuredJson: true` when a query needs a nested mapping, because the runtime must know that `json` and `jsonb` values are decoded into JavaScript objects and arrays. The built-in `node-postgres` profile provides this capability.
 
-## Scalar profiles
+## Codec profiles
 
 Drivers choose how PostgreSQL values become JavaScript values, and applications can replace those parsers. Postgres Typed SQL therefore does not claim one universal decoded scalar type.
 
 The default `conservative` profile emits `unknown` for parameter and result scalar values. It is safe when the generator does not know the driver's conversion rules.
 
-Set `scalarProfile: 'node-postgres'` only when execution uses the `pg-types` 2.2.0 default text-parser contract used by the supported node-postgres 8.x releases. This profile models parsed JSON, JavaScript numbers for the built-in integer and floating-point parsers, structural objects for `point`, `circle`, and `interval`, strings for scalar `bigint` and `numeric` values, and `Date | number` for `date`/`timestamp`/`timestamptz` because PostgreSQL infinity values decode to numeric infinities. In contrast to scalar `numeric`, the registered `numeric[]` parser applies `parseFloat` to each non-NULL element, so generated `numeric[]` results contain JavaScript numbers and can lose decimal precision. Registered built-in array results use a recursive `PgArray<T>` type that includes multidimensional arrays and SQL `NULL` elements. Unregistered result OIDs—including user-defined enum and domain arrays, composites, and ranges—use node-postgres's raw-string fallback; scalar enums are narrowed to their database labels. PostgreSQL reports scalar domains using their recursively resolved base result type, so a domain over `integer` is a number while a domain over `integer[]` uses the registered array parser. Comma-delimited array parameters use `PgArrayParameter<T> | string`: the array form accepts one-dimensional JavaScript arrays and SQL `NULL` elements, while a serialized PostgreSQL array-literal string is the escape hatch for valid multidimensional values. Nested JavaScript arrays are excluded because TypeScript cannot prove that their dimensions are rectangular or rule out `NULL` subarrays. Non-comma-delimited arrays use serialized strings, domains over arrays use one serialized string per outer element, and `bytea[]` elements use `PgByteaHexString` for compatibility across supported node-postgres 8.x releases. Interval objects and temporal infinity numbers can be passed back as parameters. Root `json`/`jsonb` parameters follow node-postgres serialization: objects are JSON-stringified, while JSON arrays, JSON strings, and JSON null should be supplied as serialized JSON text because root JavaScript arrays and `null` mean PostgreSQL arrays and SQL `NULL`. If the application installs custom type parsers, uses binary result mode, or uses a node-postgres release with a different default parser table, use the conservative profile unless those parser results still match the generated contract.
+Set `codecProfile: 'node-postgres'` only when execution uses the `pg-types` 2.2.0 default text-parser contract used by the supported node-postgres 8.x releases. This profile models parsed JSON, JavaScript numbers for the built-in integer and floating-point parsers, structural objects for `point`, `circle`, and `interval`, strings for scalar `bigint` and `numeric` values, and `Date | number` for `date`/`timestamp`/`timestamptz` because PostgreSQL infinity values decode to numeric infinities. In contrast to scalar `numeric`, the registered `numeric[]` parser applies `parseFloat` to each non-NULL element, so generated `numeric[]` results contain JavaScript numbers and can lose decimal precision. Registered built-in array results use a recursive `PgArray<T>` type that includes multidimensional arrays and SQL `NULL` elements. Unregistered result OIDs—including user-defined enum and domain arrays, composites, and ranges—use node-postgres's raw-string fallback; scalar enums are narrowed to their database labels. PostgreSQL reports scalar domains using their recursively resolved base result type, so a domain over `integer` is a number while a domain over `integer[]` uses the registered array parser. Comma-delimited array parameters use `PgArrayParameter<T> | string`: the array form accepts one-dimensional JavaScript arrays and SQL `NULL` elements, while a serialized PostgreSQL array-literal string is the escape hatch for valid multidimensional values. Nested JavaScript arrays are excluded because TypeScript cannot prove that their dimensions are rectangular or rule out `NULL` subarrays. Non-comma-delimited arrays use serialized strings, domains over arrays use one serialized string per outer element, and `bytea[]` elements use `PgByteaHexString` for compatibility across supported node-postgres 8.x releases. Interval objects and temporal infinity numbers can be passed back as parameters. Root `json`/`jsonb` parameters follow node-postgres serialization: objects are JSON-stringified, while JSON arrays, JSON strings, and JSON null should be supplied as serialized JSON text because root JavaScript arrays and `null` mean PostgreSQL arrays and SQL `NULL`. If the application installs custom type parsers, uses binary result mode, or uses a node-postgres release with a different default parser table, use the conservative profile unless those parser results still match the generated contract.
+
+### Custom codecs and OIDs
+
+Applications can extend either built-in profile. A profile has a stable `name`, an `extends` fallback, and independent hooks for result decoding, parameter encoding, and scalar values nested inside PostgreSQL JSON conversion:
+
+```ts
+import {
+  defineConfig,
+  definePostgresCodecProfile,
+  postgresResultTypesByOid,
+  postgresTypeScriptType,
+} from 'postgres-typed-sql'
+
+const moneyOid = 81_234
+const moneyArrayOid = 81_235
+
+const applicationCodecs = definePostgresCodecProfile({
+  name: 'application-codecs-v1',
+  extends: 'node-postgres',
+
+  resultType: postgresResultTypesByOid({
+    [moneyOid]: postgresTypeScriptType('Money', { scalarImports: ['Money'] }),
+    [moneyArrayOid]: postgresTypeScriptType('PgArray<Money>', {
+      scalarImports: ['Money', 'PgArray'],
+    }),
+  }),
+
+  parameterType({ type }, fallback) {
+    return type.pgTypeSchema === 'billing' && type.pgTypeName === 'money'
+      ? postgresTypeScriptType('MoneyInput', { scalarImports: ['MoneyInput'] })
+      : fallback()
+  },
+
+  jsonScalarType({ type }, fallback) {
+    return type.pgTypeSchema === 'billing' && type.pgTypeName === 'money'
+      ? postgresTypeScriptType('MoneyJson', { scalarImports: ['MoneyJson'] })
+      : fallback()
+  },
+})
+
+export default defineConfig({
+  codecProfile: applicationCodecs,
+  // schema, include, and imports omitted
+})
+```
+
+Every hook must either return `postgresTypeScriptType(...)` or call its `fallback`. Names listed in `scalarImports` are emitted as type-only imports from `imports.scalars`, so the configured scalar façade must export them. `ambientBindings` is available for global TypeScript names such as `Date` and `Uint8Array`.
+
+Result OIDs are intentionally exact. Registering a custom parser for scalar OID `81_234` says nothing about array OID `81_235`; node-postgres can register and invoke those parsers independently. Define both entries when both runtime parsers are installed. Parameter hooks are different: the node-postgres fallback recursively asks the active custom profile for array element input types because JavaScript array parameters are serialized element by element. JSON hooks describe values after PostgreSQL has converted them into JSON, which is a third representation boundary and should not be inferred from either the result or parameter hook.
+
+OID matching is ideal when the runtime parser registration is itself keyed by OID. For extension or application types whose OIDs vary between databases, hooks can instead match `pgTypeSchema` and `pgTypeName`. A result hook receives both `declaredType` and `decoderType`: `declaredType` preserves the SQL expression's domain identity, while `decoderType` reflects PostgreSQL text-protocol domain flattening. Generated statement and catalog headers record the resolved profile name so checked-in output makes its decoder contract visible.
+
+A profile that decodes `json`/`jsonb` into traversable objects and arrays may set `structuredJson: true`. If it does, provide `opaqueJsonType` when the inherited opaque type is not accurate. `supportsStringLiteralRefinement` can additionally enable or disable enum, CHECK-constraint, and exact JSON-string refinements when a custom conversion preserves—or changes—their textual representation.
 
 ## Directives
 

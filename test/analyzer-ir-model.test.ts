@@ -9,8 +9,23 @@ import {
   type TypedSqlPostgresIrJsonShape,
 } from '../src/analyzer-ir-model.js'
 
-function stringLiteral(value: string, nullable = false): TypedSqlPostgresIrJsonShape {
-  return { kind: 'stringLiteral', nullable, value }
+const textType = {
+  pgType: 'text',
+  pgTypeKind: 'base',
+  pgTypeName: 'text',
+  pgTypeOid: 25,
+  pgTypeSchema: 'pg_catalog',
+} as const
+
+function stringLiteral(
+  value: string,
+  nullable = false,
+  type: Omit<
+    Extract<TypedSqlPostgresIrJsonShape, { readonly kind: 'stringLiteral' }>,
+    'kind' | 'nullable' | 'value'
+  > = textType
+): TypedSqlPostgresIrJsonShape {
+  return { ...type, kind: 'stringLiteral', nullable, value }
 }
 
 function objectShape(
@@ -109,6 +124,21 @@ test('does not collapse unresolved scalar types that have distinct canonical nam
   })
 
   const joined = unionJsonShapes(scalar('first_type'), scalar('second_type'))
+  assert.equal(joined.kind, 'union')
+  assert.equal(joined.kind === 'union' ? joined.alternatives.length : 0, 2)
+})
+
+test('does not collapse equal JSON literals whose PostgreSQL types have different codec identities', () => {
+  const left = stringLiteral('same')
+  const right = stringLiteral('same', false, {
+    pgType: 'audit.status',
+    pgTypeKind: 'enum',
+    pgTypeName: 'status',
+    pgTypeOid: 84_001,
+    pgTypeSchema: 'audit',
+  })
+
+  const joined = unionJsonShapes(left, right)
   assert.equal(joined.kind, 'union')
   assert.equal(joined.kind === 'union' ? joined.alternatives.length : 0, 2)
 })

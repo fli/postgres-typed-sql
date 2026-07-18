@@ -4,12 +4,14 @@ import { join } from 'node:path'
 import test from 'node:test'
 
 import { PGlite } from '../src/vendor/pglite/index.js'
+import { definePostgresCodecProfile, postgresResultTypesByOid, postgresTypeScriptType } from '../src/index.js'
 import {
   assertTypeScriptBindingIdentifier,
   camelCaseOutputProperty,
   postgresCheckConstraintTypeBinding,
   postgresIdentifierTypeSegment,
   postgresNamedTypeBinding,
+  renderTypeScriptLineCommentValue,
 } from '../src/typescript-names.js'
 
 import { copyFixture, createMinimalFixture, generateTypedSql } from './generator-test-support.js'
@@ -24,13 +26,17 @@ test('camel-cases only conventional PostgreSQL output identifiers', () => {
   assert.equal(camelCaseOutputProperty('URL'), 'URL')
 })
 
+test('escapes every ECMAScript line terminator in generated line-comment values', () => {
+  assert.equal(renderTypeScriptLineCommentValue('before\r\n\u2028\u2029after'), 'before\\r\\n\\u2028\\u2029after')
+})
+
 test('generates PostgreSQL-derived types, nullability, and cardinality', async () => {
   const root = await copyFixture()
   const result = await generateTypedSql({
     extensions: ['pgcrypto'],
     include: ['queries'],
     rootDir: root,
-    scalarProfile: 'node-postgres',
+    codecProfile: 'node-postgres',
     schema: 'schema.sql',
   })
 
@@ -72,12 +78,96 @@ test('defaults to conservative unknown driver scalar values', async () => {
   assert.match(catalog, /readonly status: unknown/u)
 })
 
+test('applies custom codec hooks to parameters, results, structured JSON, catalog types, and artifact metadata', async () => {
+  const root = await createMinimalFixture(
+    `create type public.item_state as enum ('active', 'archived');
+create table public.items (id integer primary key, state public.item_state not null);
+`,
+    `select
+  :value::integer as direct_value,
+  jsonb_build_object('nested_value', :value::integer) as payload,
+  'active'::public.item_state as state
+`
+  )
+  const codecProfile = definePostgresCodecProfile({
+    extends: 'node-postgres',
+    name: 'application-codecs',
+    opaqueJsonType: postgresTypeScriptType('ApplicationJson', { scalarImports: ['ApplicationJson'] }),
+    parameterType({ type }, fallback) {
+      return type.pgTypeOid === 23
+        ? postgresTypeScriptType('ApplicationIntInput', { scalarImports: ['ApplicationIntInput'] })
+        : fallback()
+    },
+    resultType: (() => {
+      const byOid = postgresResultTypesByOid({
+        23: postgresTypeScriptType('ApplicationInt', { scalarImports: ['ApplicationInt'] }),
+      })
+      return (context, fallback) =>
+        context.declaredType.pgTypeSchema === 'public' && context.declaredType.pgTypeName === 'item_state'
+          ? postgresTypeScriptType('ApplicationItemState', { scalarImports: ['ApplicationItemState'] })
+          : byOid(context, fallback)
+    })(),
+    jsonScalarType({ type }, fallback) {
+      return type.pgTypeOid === 23
+        ? postgresTypeScriptType('ApplicationJsonInt', { scalarImports: ['ApplicationJsonInt'] })
+        : fallback()
+    },
+  })
+
+  await generateTypedSql({
+    codecProfile,
+    include: ['queries'],
+    rootDir: root,
+    schema: 'schema.sql',
+  })
+
+  const output = await readFile(join(root, 'queries/query.typed-sql.ts'), 'utf8')
+  assert.match(output, /\/\/ Codec profile: application-codecs/u)
+  assert.match(output, /readonly value: ApplicationIntInput/u)
+  assert.match(output, /readonly direct_value: ApplicationInt \| null/u)
+  assert.match(output, /readonly nested_value: ApplicationJsonInt \| null/u)
+  assert.match(output, /readonly state: ApplicationItemState/u)
+  assert.match(
+    output,
+    /import type \{ ApplicationInt, ApplicationIntInput, ApplicationItemState, ApplicationJsonInt \} from 'postgres-typed-sql\/scalars'/u
+  )
+
+  const catalog = await readFile(join(root, 'postgres-typed-sql.types.ts'), 'utf8')
+  assert.match(catalog, /\/\/ Codec profile: application-codecs/u)
+  assert.match(catalog, /readonly id: ApplicationInt/u)
+  assert.match(catalog, /readonly state: ApplicationItemState/u)
+})
+
+test('deduplicates Record when generated empty objects and codec types use the same ambient dependency', async () => {
+  const root = await createMinimalFixture('select 1;\n', 'select 1::integer as value\n')
+  const codecProfile = definePostgresCodecProfile({
+    extends: 'node-postgres',
+    name: 'ambient-record-result',
+    resultType({ decoderType }, fallback) {
+      return decoderType.pgTypeOid === 23
+        ? postgresTypeScriptType('Record<string, unknown>', { ambientBindings: ['Record'] })
+        : fallback()
+    },
+  })
+
+  await generateTypedSql({
+    codecProfile,
+    include: ['queries'],
+    rootDir: root,
+    schema: 'schema.sql',
+  })
+
+  const output = await readFile(join(root, 'queries/query.typed-sql.ts'), 'utf8')
+  assert.match(output, /export type QueryParams = Record<string, never>/u)
+  assert.match(output, /readonly value: Record<string, unknown>/u)
+})
+
 test('generates nullable parameters when a direct SELECT use proves NULL is accepted', async () => {
   const root = await createMinimalFixture('select 1;\n', 'select :value::text as value\n')
   await generateTypedSql({
     include: ['queries'],
     rootDir: root,
-    scalarProfile: 'node-postgres',
+    codecProfile: 'node-postgres',
     schema: 'schema.sql',
   })
 
@@ -95,7 +185,7 @@ from (values (array[10, 20, 30], 2)) as bounds(numbers, upper_bound)
   await generateTypedSql({
     include: ['queries'],
     rootDir: root,
-    scalarProfile: 'node-postgres',
+    codecProfile: 'node-postgres',
     schema: 'schema.sql',
   })
 
@@ -112,7 +202,7 @@ from (values (array[10, 20])) as input(numbers)
   await generateTypedSql({
     include: ['queries'],
     rootDir: root,
-    scalarProfile: 'node-postgres',
+    codecProfile: 'node-postgres',
     schema: 'schema.sql',
   })
 
@@ -143,7 +233,7 @@ test('requires serialized strings for PostgreSQL arrays whose element delimiter 
   await generateTypedSql({
     include: ['queries'],
     rootDir: root,
-    scalarProfile: 'node-postgres',
+    codecProfile: 'node-postgres',
     schema: 'schema.sql',
   })
 
@@ -163,7 +253,7 @@ test('imports every scalar dependency used by bytea array parameters', async () 
   await generateTypedSql({
     include: ['queries'],
     rootDir: root,
-    scalarProfile: 'node-postgres',
+    codecProfile: 'node-postgres',
     schema: 'schema.sql',
   })
 
@@ -187,7 +277,7 @@ test('surfaces native PostgreSQL diagnostics for invalid SQL', async () => {
     generateTypedSql({
       include: ['queries'],
       rootDir: root,
-      scalarProfile: 'node-postgres',
+      codecProfile: 'node-postgres',
       schema: 'schema.sql',
     }),
     /column "missing_column" does not exist/u
@@ -217,7 +307,7 @@ test('rejects unresolved parameter types instead of generating a phantom Unknown
     generateTypedSql({
       include: ['queries'],
       rootDir: root,
-      scalarProfile: 'node-postgres',
+      codecProfile: 'node-postgres',
       schema: 'schema.sql',
     }),
     /could not determine data type of parameter \$1/u
@@ -239,7 +329,7 @@ test('does not allow directives to downgrade PostgreSQL write access', async () 
     generateTypedSql({
       include: ['queries'],
       rootDir: root,
-      scalarProfile: 'node-postgres',
+      codecProfile: 'node-postgres',
       schema: 'schema.sql',
     }),
     /@access read conflicts with PostgreSQL's write classification/u
@@ -272,7 +362,7 @@ select 1 as value limit nextval('public.event_sequence')
   const config = {
     include: ['queries'],
     rootDir: root,
-    scalarProfile: 'node-postgres' as const,
+    codecProfile: 'node-postgres' as const,
     schema: 'schema.sql',
   }
   await assert.rejects(generateTypedSql(config), /@access read conflicts with PostgreSQL's write classification/u)
@@ -396,7 +486,7 @@ order by value
     generateTypedSql({
       include: ['queries'],
       rootDir: root,
-      scalarProfile: 'node-postgres',
+      codecProfile: 'node-postgres',
       schema: 'schema.sql',
     }),
     /@access read conflicts with PostgreSQL's write classification/u
@@ -427,7 +517,7 @@ where account.email = :email
   const result = await generateTypedSql({
     include: ['queries'],
     rootDir: root,
-    scalarProfile: 'node-postgres',
+    codecProfile: 'node-postgres',
     schema: 'schema.sql',
   })
 
@@ -485,7 +575,7 @@ where account.id = :account_id
   const result = await generateTypedSql({
     include: ['queries'],
     rootDir: root,
-    scalarProfile: 'node-postgres',
+    codecProfile: 'node-postgres',
     schema: 'schema.sql',
   })
 
@@ -601,7 +691,7 @@ select :value
   const result = await generateTypedSql({
     include: ['queries'],
     rootDir: root,
-    scalarProfile: 'node-postgres',
+    codecProfile: 'node-postgres',
     schema: 'schema.sql',
   })
 
@@ -714,7 +804,7 @@ where event_id = :event_id
   const result = await generateTypedSql({
     include: ['queries'],
     rootDir: root,
-    scalarProfile: 'node-postgres',
+    codecProfile: 'node-postgres',
     schema: 'schema.sql',
   })
 
@@ -810,10 +900,37 @@ test('rejects duplicate, reserved, and colliding generated names before emission
       generateTypedSql({
         include: ['queries'],
         rootDir: root,
-        scalarProfile: 'node-postgres',
+        codecProfile: 'node-postgres',
         schema: 'schema.sql',
       }),
       invalid.error
+    )
+  }
+
+  for (const scalarImport of ['createTypedSqlStatement', 'query']) {
+    const root = await createMinimalFixture('select 1;\n', 'select 1::integer as value\n')
+    const codecProfile = definePostgresCodecProfile({
+      extends: 'node-postgres',
+      name: `colliding-${scalarImport}`,
+      resultType({ decoderType }, fallback) {
+        return decoderType.pgTypeOid === 23
+          ? postgresTypeScriptType(scalarImport, { scalarImports: [scalarImport] })
+          : fallback()
+      },
+    })
+    await assert.rejects(
+      generateTypedSql({
+        codecProfile,
+        include: ['queries'],
+        rootDir: root,
+        schema: 'schema.sql',
+      }),
+      new RegExp(
+        `generated TypeScript binding ${scalarImport} for postgres-typed-sql scalar type import collides with ${
+          scalarImport === 'createTypedSqlStatement' ? 'generated runtime import' : 'exported statement constant'
+        }`,
+        'u'
+      )
     )
   }
 
@@ -831,7 +948,7 @@ create type a.status as enum ('schema');
   await generateTypedSql({
     include: ['queries'],
     rootDir: root,
-    scalarProfile: 'node-postgres',
+    codecProfile: 'node-postgres',
     schema: 'schema.sql',
   })
   const injectiveCatalog = await readFile(join(root, 'postgres-typed-sql.types.ts'), 'utf8')
@@ -854,7 +971,7 @@ create type public.collision_params as enum ('one');
   await generateTypedSql({
     include: ['queries'],
     rootDir: importCollisionRoot,
-    scalarProfile: 'node-postgres',
+    codecProfile: 'node-postgres',
     schema: 'schema.sql',
   })
   assert.match(
@@ -870,7 +987,7 @@ create type public.collision_params as enum ('one');
     generateTypedSql({
       include: ['queries'],
       rootDir: dateCatalogCollisionRoot,
-      scalarProfile: 'node-postgres',
+      codecProfile: 'node-postgres',
       schema: 'schema.sql',
     }),
     /generated TypeScript binding Date for enum public\.date collides with ambient TypeScript type/u
@@ -890,7 +1007,7 @@ create table public.bytea_probe (payload bytea);
     generateTypedSql({
       include: ['queries'],
       rootDir: byteaCatalogCollisionRoot,
-      scalarProfile: 'node-postgres',
+      codecProfile: 'node-postgres',
       schema: 'schema.sql',
     }),
     /generated TypeScript binding Uint8Array for enum public\.uint8_array collides with ambient TypeScript type/u
@@ -905,7 +1022,7 @@ create table public.readings (kind public.date not null);
   await generateTypedSql({
     include: ['queries'],
     rootDir: dateStatementCollisionRoot,
-    scalarProfile: 'node-postgres',
+    codecProfile: 'node-postgres',
     schema: 'schema.sql',
   })
   const dateStatement = await readFile(join(dateStatementCollisionRoot, 'queries/query.typed-sql.ts'), 'utf8')
@@ -929,7 +1046,7 @@ create type public.uint8_array as enum ('ambient_bytes');
   await generateTypedSql({
     include: ['queries'],
     rootDir: unusedCollisionRoot,
-    scalarProfile: 'node-postgres',
+    codecProfile: 'node-postgres',
     schema: 'schema.sql',
   })
   const unusedCollisionOutput = await readFile(join(unusedCollisionRoot, 'queries/query.typed-sql.ts'), 'utf8')
@@ -973,7 +1090,7 @@ create type public.uint8_array as enum ('ambient_bytes');
     await generateTypedSql({
       include: ['queries'],
       rootDir: root,
-      scalarProfile: 'node-postgres',
+      codecProfile: 'node-postgres',
       schema: 'schema.sql',
     })
   }
@@ -988,7 +1105,7 @@ create table public.binding_values (id bigint not null);
     generateTypedSql({
       include: ['queries'],
       rootDir: catalogScalarCollisionRoot,
-      scalarProfile: 'node-postgres',
+      codecProfile: 'node-postgres',
       schema: 'schema.sql',
     }),
     /generated TypeScript binding PgInt8String for enum public\.pg_int8_string collides with postgres-typed-sql scalar type import/u
@@ -1032,7 +1149,7 @@ create table public.empty_table ();
       scalars: "package'quoted/pg-scalars",
     },
     rootDir: root,
-    scalarProfile: 'node-postgres',
+    codecProfile: 'node-postgres',
     schema: 'schema.sql',
     typesOutput: "types'o.ts",
   })
@@ -1069,7 +1186,7 @@ create table public.review_rows (
   await generateTypedSql({
     include: ['queries'],
     rootDir: root,
-    scalarProfile: 'node-postgres',
+    codecProfile: 'node-postgres',
     schema: 'schema.sql',
   })
 
@@ -1096,7 +1213,7 @@ as assignment;
   await generateTypedSql({
     include: ['queries'],
     rootDir: jsonCastRoot,
-    scalarProfile: 'node-postgres',
+    codecProfile: 'node-postgres',
     schema: 'schema.sql',
   })
   const jsonCastOutput = await readFile(join(jsonCastRoot, 'queries/query.typed-sql.ts'), 'utf8')
@@ -1114,7 +1231,7 @@ insert into public.required_values(value) values (:value)
     generateTypedSql({
       include: ['queries'],
       rootDir: rejectingOverrideRoot,
-      scalarProfile: 'node-postgres',
+      codecProfile: 'node-postgres',
       schema: 'schema.sql',
     }),
     /@param value cannot be nullable because PostgreSQL proves that one of its uses rejects NULL/u
@@ -1136,7 +1253,7 @@ from (values (1), (2)) input(value)
   const config = {
     include: ['queries'],
     rootDir: root,
-    scalarProfile: 'node-postgres' as const,
+    codecProfile: 'node-postgres' as const,
     schema: 'schema.sql',
   }
   const queryFile = join(root, 'queries/query.typed.sql')
@@ -1215,7 +1332,7 @@ test('narrows CHECK parameters only for direct value-preserving assignments', as
   const config = {
     include: ['queries'],
     rootDir: root,
-    scalarProfile: 'node-postgres' as const,
+    codecProfile: 'node-postgres' as const,
     schema: 'schema.sql',
   }
   await generateTypedSql(config)
@@ -1260,7 +1377,7 @@ create table public.intersect_accounts (
   const config = {
     include: ['queries'],
     rootDir: root,
-    scalarProfile: 'node-postgres' as const,
+    codecProfile: 'node-postgres' as const,
     schema: 'schema.sql',
   }
 
@@ -1294,7 +1411,7 @@ from public.char_values
   await generateTypedSql({
     include: ['queries'],
     rootDir: root,
-    scalarProfile: 'node-postgres',
+    codecProfile: 'node-postgres',
     schema: 'schema.sql',
   })
 
@@ -1327,7 +1444,7 @@ from public.checked_text_values
   const config = {
     include: ['queries'],
     rootDir: root,
-    scalarProfile: 'node-postgres' as const,
+    codecProfile: 'node-postgres' as const,
     schema: 'schema.sql',
   }
   await generateTypedSql(config)
@@ -1366,7 +1483,7 @@ from public.json_values
   await generateTypedSql({
     include: ['queries'],
     rootDir: root,
-    scalarProfile: 'node-postgres',
+    codecProfile: 'node-postgres',
     schema: 'schema.sql',
   })
 
@@ -1404,7 +1521,7 @@ cross join lateral (
   const config = {
     include: ['queries'],
     rootDir: root,
-    scalarProfile: 'node-postgres' as const,
+    codecProfile: 'node-postgres' as const,
     schema: 'schema.sql',
   }
   const queryFile = join(root, 'queries/query.typed.sql')
@@ -1522,7 +1639,7 @@ from (
   await generateTypedSql({
     include: ['queries'],
     rootDir: root,
-    scalarProfile: 'node-postgres',
+    codecProfile: 'node-postgres',
     schema: 'schema.sql',
   })
 
@@ -1542,7 +1659,7 @@ test('generates build-object contracts only from proven complete argument lists'
   const config = {
     include: ['queries'],
     rootDir: root,
-    scalarProfile: 'node-postgres' as const,
+    codecProfile: 'node-postgres' as const,
     schema: 'schema.sql',
   }
   const queryFile = join(root, 'queries/query.typed.sql')
@@ -1601,7 +1718,7 @@ call public.generator_no_result(:value)
   const config = {
     include: ['queries'],
     rootDir: root,
-    scalarProfile: 'node-postgres' as const,
+    codecProfile: 'node-postgres' as const,
     schema: 'schema.sql',
   }
   const queryFile = join(root, 'queries/query.typed.sql')
@@ -1643,7 +1760,7 @@ select value from walk
   const config = {
     include: ['queries'],
     rootDir: root,
-    scalarProfile: 'node-postgres' as const,
+    codecProfile: 'node-postgres' as const,
     schema: 'schema.sql',
   }
   const queryFile = join(root, 'queries/query.typed.sql')
@@ -1680,7 +1797,7 @@ test('encodes arbitrary JSON result and field names only in generated type bindi
   await generateTypedSql({
     include: ['queries'],
     rootDir: root,
-    scalarProfile: 'node-postgres',
+    codecProfile: 'node-postgres',
     schema: 'schema.sql',
   })
 
@@ -1700,7 +1817,7 @@ test('models the last value for duplicate PostgreSQL JSON object keys', async ()
   await generateTypedSql({
     include: ['queries'],
     rootDir: root,
-    scalarProfile: 'node-postgres',
+    codecProfile: 'node-postgres',
     schema: 'schema.sql',
   })
 
@@ -1729,7 +1846,7 @@ from (values (1)) source(n)
       structuredJsonFields: 'camelCase',
     },
     rootDir: root,
-    scalarProfile: 'node-postgres',
+    codecProfile: 'node-postgres',
     schema: 'schema.sql',
   })
 
@@ -1776,7 +1893,7 @@ test('maps JSON array-from and object-from derived row shapes to camel case', as
       structuredJsonFields: 'camelCase',
     },
     rootDir: root,
-    scalarProfile: 'node-postgres',
+    codecProfile: 'node-postgres',
     schema: 'schema.sql',
   })
 
@@ -1810,7 +1927,7 @@ cross join (
     include: ['queries'],
     naming: { structuredJsonFields: 'camelCase' },
     rootDir: root,
-    scalarProfile: 'node-postgres',
+    codecProfile: 'node-postgres',
     schema: 'schema.sql',
   })
 
@@ -1842,7 +1959,7 @@ from public.json_values
     include: ['queries'],
     naming: { structuredJsonFields: 'camelCase' },
     rootDir: root,
-    scalarProfile: 'node-postgres',
+    codecProfile: 'node-postgres',
     schema: 'schema.sql',
   })
 
@@ -1873,7 +1990,7 @@ select jsonb_build_object(
     include: ['queries'],
     naming: { structuredJsonFields: 'camelCase' },
     rootDir: root,
-    scalarProfile: 'node-postgres',
+    codecProfile: 'node-postgres',
     schema: 'schema.sql',
   })
 
@@ -1899,7 +2016,7 @@ select jsonb_build_object('payload_data', 2) as payload
     include: ['queries'],
     naming: { structuredJsonFields: 'camelCase' },
     rootDir: root,
-    scalarProfile: 'node-postgres',
+    codecProfile: 'node-postgres',
     schema: 'schema.sql',
   })
 
@@ -1919,7 +2036,7 @@ test('rejects configured output naming collisions at every modeled object level'
         resultColumns: 'camelCase',
       },
       rootDir: topLevelRoot,
-      scalarProfile: 'node-postgres',
+      codecProfile: 'node-postgres',
       schema: 'schema.sql',
     }),
     /duplicate result column name "fooBar"/u
@@ -1937,7 +2054,7 @@ test('rejects configured output naming collisions at every modeled object level'
         structuredJsonFields: 'camelCase',
       },
       rootDir: nestedRoot,
-      scalarProfile: 'node-postgres',
+      codecProfile: 'node-postgres',
       schema: 'schema.sql',
     }),
     /duplicate JSON field in result column "payload" name "fooBar"/u
@@ -1961,7 +2078,7 @@ from (
       structuredJsonFields: 'camelCase',
     },
     rootDir: root,
-    scalarProfile: 'node-postgres',
+    codecProfile: 'node-postgres',
     schema: 'schema.sql',
   })
 
@@ -1989,7 +2106,7 @@ test('requires structural JSON decoding when configured JSON field naming is use
       rootDir: root,
       schema: 'schema.sql',
     }),
-    /structured JSON field naming for result column "payload" requires scalarProfile: 'node-postgres'/u
+    /structured JSON field naming for result column "payload" requires a codec profile that decodes structured JSON/u
   )
 })
 
@@ -2008,7 +2125,7 @@ from (values (1)) source(n)
   await generateTypedSql({
     include: ['queries'],
     rootDir: root,
-    scalarProfile: 'node-postgres',
+    codecProfile: 'node-postgres',
     schema: 'schema.sql',
   })
 
@@ -2032,7 +2149,7 @@ as $$ select 'null'::jsonb $$;
   await generateTypedSql({
     include: ['queries'],
     rootDir: root,
-    scalarProfile: 'node-postgres',
+    codecProfile: 'node-postgres',
     schema: 'schema.sql',
   })
 
@@ -2054,7 +2171,7 @@ from public.json_values
   await generateTypedSql({
     include: ['queries'],
     rootDir: root,
-    scalarProfile: 'node-postgres',
+    codecProfile: 'node-postgres',
     schema: 'schema.sql',
   })
 
@@ -2074,7 +2191,7 @@ select 'active'::public.asserted_status as status
   await generateTypedSql({
     include: ['queries'],
     rootDir: root,
-    scalarProfile: 'node-postgres',
+    codecProfile: 'node-postgres',
     schema: 'schema.sql',
   })
   const output = await readFile(join(root, 'queries/query.typed-sql.ts'), 'utf8')
@@ -2092,7 +2209,7 @@ test('rejects nullable column assertions because PostgreSQL determines result nu
     generateTypedSql({
       include: ['queries'],
       rootDir: root,
-      scalarProfile: 'node-postgres',
+      codecProfile: 'node-postgres',
       schema: 'schema.sql',
     }),
     /queries\/invalid-column-nullability\.typed\.sql:1: @column does not support \?; PostgreSQL determines result nullability/u

@@ -19,15 +19,16 @@ import { resolveConfig, type PostgresTypedSqlConfig } from './config.js'
 import type { PostgresQueryable } from './database.js'
 import { createAnalysisDatabase } from './engine.js'
 import {
-  postgresJsonValueMayBeStructured,
   postgresJsonSupportsStringLiteralRefinement,
   postgresParameterSupportsStringLiteralRefinement,
   postgresResultSupportsStringLiteralRefinement,
   resolveTypeScriptJsonScalarTypeForPostgresType,
   resolveTypeScriptParameterTypeForPostgresType,
   resolveTypeScriptResultTypeForPostgresType,
+  type ResolvedPostgresCodecProfile,
   type PostgresTypeScriptResolution,
-} from './postgres-types.js'
+} from './postgres-codecs.js'
+import { postgresJsonValueMayBeStructured } from './postgres-types.js'
 import { compileNamedParameters, parseTypedSqlSource } from './sql-source.js'
 import {
   assertTypeScriptBindingIdentifier,
@@ -35,6 +36,7 @@ import {
   camelCaseOutputProperty,
   pascalCaseIdentifier,
   quotePropertyName,
+  renderTypeScriptLineCommentValue,
   type TypeScriptBinding,
 } from './typescript-names.js'
 
@@ -721,13 +723,14 @@ function encodedTypeNameSegment(value: string): string {
 
 function scalarTsTypeForJsonShape(
   shape: Extract<TypedSqlPostgresIrJsonShape, { readonly kind: 'scalar' }>,
-  dependencies: TypeScriptDependencies
+  dependencies: TypeScriptDependencies,
+  codecProfile: ResolvedPostgresCodecProfile
 ): string {
-  if (shape.checkConstraintType && postgresJsonSupportsStringLiteralRefinement(shape)) {
+  if (shape.checkConstraintType && postgresJsonSupportsStringLiteralRefinement(shape, codecProfile)) {
     return tsTypeForCheckConstraintType(shape.checkConstraintType)
   }
 
-  const resolved = resolveTypeScriptJsonScalarTypeForPostgresType(shape)
+  const resolved = resolveTypeScriptJsonScalarTypeForPostgresType(shape, codecProfile)
   collectTypeResolutionDependencies(dependencies, resolved)
   return resolved.type
 }
@@ -738,7 +741,8 @@ function tsTypeForJsonShape(
   suggestedName: string,
   declarations: GeneratedJsonTypeDeclaration[],
   usedNames: Map<string, string>,
-  dependencies: TypeScriptDependencies
+  dependencies: TypeScriptDependencies,
+  codecProfile: ResolvedPostgresCodecProfile
 ): string {
   switch (shape.kind) {
     case 'array':
@@ -748,7 +752,8 @@ function tsTypeForJsonShape(
         `${suggestedName}${encodedTypeNameSegment('element')}`,
         declarations,
         usedNames,
-        dependencies
+        dependencies,
+        codecProfile
       )}${shape.element.nullable ? ' | null' : ''})[]`
     case 'object': {
       reserveGeneratedTypeBinding(usedNames, suggestedName, `JSON object ${suggestedName}`, sourceFile)
@@ -768,7 +773,8 @@ function tsTypeForJsonShape(
             `${name}${encodedTypeNameSegment(field.name)}`,
             declarations,
             usedNames,
-            dependencies
+            dependencies,
+            codecProfile
           ),
         })),
         name,
@@ -776,8 +782,8 @@ function tsTypeForJsonShape(
       return name
     }
     case 'opaque':
-      dependencies.scalar.add('DbJsonSelected')
-      return 'DbJsonSelected'
+      collectTypeResolutionDependencies(dependencies, codecProfile.opaqueJsonType)
+      return codecProfile.opaqueJsonType.type
     case 'union':
       return shape.alternatives
         .map((alternative, index) =>
@@ -787,14 +793,21 @@ function tsTypeForJsonShape(
             `${suggestedName}${encodedTypeNameSegment(`alternative${index + 1}`)}`,
             declarations,
             usedNames,
-            dependencies
+            dependencies,
+            codecProfile
           )
         )
         .join(' | ')
     case 'scalar':
-      return scalarTsTypeForJsonShape(shape, dependencies)
-    case 'stringLiteral':
-      return quoteString(shape.value)
+      return scalarTsTypeForJsonShape(shape, dependencies, codecProfile)
+    case 'stringLiteral': {
+      if (postgresJsonSupportsStringLiteralRefinement(shape, codecProfile)) {
+        return quoteString(shape.value)
+      }
+      const resolved = resolveTypeScriptJsonScalarTypeForPostgresType(shape, codecProfile)
+      collectTypeResolutionDependencies(dependencies, resolved)
+      return resolved.type
+    }
   }
 }
 
@@ -932,9 +945,11 @@ export const ${config.name} = createTypedSqlStatement<
 }
 
 function renderTypedSql(config: ResolvedTypedSql, generatorConfig: ResolvedPostgresTypedSqlConfig): string {
-  const sourcePath = `./${basename(config.sourcePath)}`
+  const sourcePath = renderTypeScriptLineCommentValue(`./${basename(config.sourcePath)}`)
+  const codecProfileName = renderTypeScriptLineCommentValue(generatorConfig.codecProfile.name)
   return `// ${generatedByMarker}
 // Source: ${sourcePath}
+// Codec profile: ${codecProfileName}
 // DO NOT EDIT MANUALLY
 
 ${renderImports([config], generatorConfig)}
@@ -1040,12 +1055,12 @@ async function resolveTypedSqlWithAnalyzer(
           )
         : undefined
       const jsonMapping = resolvedJsonShape ? jsonMappingForShape(resolvedJsonShape) : undefined
-      if (jsonMapping && generatorConfig.scalarProfile !== 'node-postgres') {
+      if (jsonMapping && !generatorConfig.codecProfile.structuredJson) {
         throw new Error(
-          `${config.sourceFile}: structured JSON field naming for result column ${JSON.stringify(name)} requires scalarProfile: 'node-postgres'.`
+          `${config.sourceFile}: structured JSON field naming for result column ${JSON.stringify(name)} requires a codec profile that decodes structured JSON.`
         )
       }
-      const jsonShape = generatorConfig.scalarProfile === 'node-postgres' ? resolvedJsonShape : undefined
+      const jsonShape = generatorConfig.codecProfile.structuredJson ? resolvedJsonShape : undefined
       let tsType: string
       if (jsonShape) {
         tsType = tsTypeForJsonShape(
@@ -1054,16 +1069,17 @@ async function resolveTypedSqlWithAnalyzer(
           suggestedJsonTypeName,
           generatedDeclarations,
           usedGeneratedTypeNames,
-          typeDependencies
+          typeDependencies,
+          generatorConfig.codecProfile
         )
       } else {
         if (
           column.checkConstraintType &&
-          postgresResultSupportsStringLiteralRefinement(column, generatorConfig.scalarProfile)
+          postgresResultSupportsStringLiteralRefinement(column, generatorConfig.codecProfile)
         ) {
           tsType = tsTypeForCheckConstraintType(column.checkConstraintType)
         } else {
-          const resolution = resolveTypeScriptResultTypeForPostgresType(column, generatorConfig.scalarProfile)
+          const resolution = resolveTypeScriptResultTypeForPostgresType(column, generatorConfig.codecProfile)
           collectTypeResolutionDependencies(typeDependencies, resolution)
           tsType = resolution.type
         }
@@ -1096,13 +1112,13 @@ async function resolveTypedSqlWithAnalyzer(
 
       const resolution =
         analyzed.checkConstraintType &&
-        postgresParameterSupportsStringLiteralRefinement(analyzed, generatorConfig.scalarProfile)
+        postgresParameterSupportsStringLiteralRefinement(analyzed, generatorConfig.codecProfile)
           ? {
               ambientBindings: [],
               scalarImports: [],
               type: tsTypeForCheckConstraintType(analyzed.checkConstraintType),
             }
-          : resolveTypeScriptParameterTypeForPostgresType(analyzed, generatorConfig.scalarProfile)
+          : resolveTypeScriptParameterTypeForPostgresType(analyzed, generatorConfig.codecProfile)
       collectTypeResolutionDependencies(typeDependencies, resolution)
       if (parameter.nullable === true && analyzed.nullAdmission === 'rejects') {
         throw new Error(
@@ -1126,13 +1142,16 @@ async function resolveTypedSqlWithAnalyzer(
     )
     const usesRecordUtilityType =
       parameters.length === 0 || columns.length === 0 || generatedDeclarations.some(({ fields }) => fields.length === 0)
+    const ambientBindings = new Set(typeDependencies.ambient)
+    if (usesRecordUtilityType) {
+      ambientBindings.add('Record')
+    }
     assertUniqueTypeScriptBindings(
       [
-        ...(usesRecordUtilityType
-          ? [{ name: 'Record', source: 'TypeScript utility type used by an empty generated object' }]
-          : []),
+        { name: 'createTypedSqlStatement', source: 'generated runtime import' },
+        { name: config.name, source: 'exported statement constant' },
         ...[...usedGeneratedTypeNames].map(([name, source]) => ({ name, source })),
-        ...[...typeDependencies.ambient].map((name) => ({ name, source: 'ambient TypeScript type' })),
+        ...[...ambientBindings].map((name) => ({ name, source: 'ambient TypeScript type' })),
         ...[...typeDependencies.scalar].map((name) => ({
           name,
           source: 'postgres-typed-sql scalar type import',

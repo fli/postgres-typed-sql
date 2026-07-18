@@ -3,14 +3,20 @@ import test from 'node:test'
 import { getTypeParser, type TypeId } from 'pg-types'
 
 import {
-  postgresJsonSupportsStringLiteralRefinement,
-  postgresJsonValueMayBeStructured,
-  resolveTypeScriptJsonScalarTypeForPostgresType,
-  resolveTypeScriptParameterTypeForPostgresType,
-  resolveTypeScriptResultTypeForPostgresType,
-  type PostgresScalarProfile,
-  type PostgresTypeFact,
-} from '../src/postgres-types.js'
+  definePostgresCodecProfile,
+  postgresJsonSupportsStringLiteralRefinement as postgresJsonSupportsStringLiteralRefinementBase,
+  postgresResultTypesByOid,
+  postgresTypeScriptType,
+  resolvePostgresCodecProfile,
+  resolveTypeScriptJsonScalarTypeForPostgresType as resolveTypeScriptJsonScalarTypeForPostgresTypeBase,
+  resolveTypeScriptParameterTypeForPostgresType as resolveTypeScriptParameterTypeForPostgresTypeBase,
+  resolveTypeScriptResultTypeForPostgresType as resolveTypeScriptResultTypeForPostgresTypeBase,
+  type PostgresCodecProfile,
+  type PostgresResultTypeContext,
+  type PostgresTypeScriptResolutionFallback,
+  type ResolvedPostgresCodecProfile,
+} from '../src/postgres-codecs.js'
+import { postgresJsonValueMayBeStructured, type PostgresTypeFact } from '../src/postgres-types.js'
 
 const pgCatalog = (
   pgType: string,
@@ -26,11 +32,248 @@ const pgCatalog = (
   ...facts,
 })
 
-const resultType = (fact: PostgresTypeFact, profile?: PostgresScalarProfile): string =>
+const resolveTypeScriptResultTypeForPostgresType = (
+  fact: PostgresTypeFact,
+  profile: PostgresCodecProfile = 'node-postgres'
+) => resolveTypeScriptResultTypeForPostgresTypeBase(fact, profile)
+
+const resolveTypeScriptParameterTypeForPostgresType = (
+  fact: PostgresTypeFact,
+  profile: PostgresCodecProfile = 'node-postgres'
+) => resolveTypeScriptParameterTypeForPostgresTypeBase(fact, profile)
+
+const resolveTypeScriptJsonScalarTypeForPostgresType = (
+  fact: PostgresTypeFact,
+  profile: PostgresCodecProfile = 'node-postgres'
+) => resolveTypeScriptJsonScalarTypeForPostgresTypeBase(fact, profile)
+
+const postgresJsonSupportsStringLiteralRefinement = (
+  fact: PostgresTypeFact,
+  profile: PostgresCodecProfile = 'node-postgres'
+) => postgresJsonSupportsStringLiteralRefinementBase(fact, profile)
+
+const resultType = (fact: PostgresTypeFact, profile?: PostgresCodecProfile): string =>
   resolveTypeScriptResultTypeForPostgresType(fact, profile).type
 
-const parameterType = (fact: PostgresTypeFact, profile?: PostgresScalarProfile): string =>
+const parameterType = (fact: PostgresTypeFact, profile?: PostgresCodecProfile): string =>
   resolveTypeScriptParameterTypeForPostgresType(fact, profile).type
+
+test('custom codec profiles override exact result OIDs without conflating scalar and array parsers', () => {
+  const scalarProfile = definePostgresCodecProfile({
+    extends: 'node-postgres',
+    name: 'custom-int4',
+    resultType: postgresResultTypesByOid({
+      23: postgresTypeScriptType('CustomInt4', { scalarImports: ['CustomInt4'] }),
+    }),
+  })
+  const integer = pgCatalog('integer', 'int4', 23)
+  const integerArray = pgCatalog('integer[]', '_int4', 1007, {
+    pgArrayElementType: integer,
+    pgTypeKind: 'array',
+  })
+
+  assert.deepEqual(resolveTypeScriptResultTypeForPostgresType(integer, scalarProfile), {
+    ambientBindings: [],
+    scalarImports: ['CustomInt4'],
+    type: 'CustomInt4',
+  })
+  assert.equal(resultType(integerArray, scalarProfile), 'PgArray<number>')
+
+  const scalarAndArrayProfile = definePostgresCodecProfile({
+    extends: scalarProfile,
+    name: 'custom-int4-and-array',
+    resultType: postgresResultTypesByOid({
+      1007: postgresTypeScriptType('PgArray<CustomInt4>', {
+        scalarImports: ['PgArray', 'CustomInt4'],
+      }),
+    }),
+  })
+  assert.equal(resultType(integerArray, scalarAndArrayProfile), 'PgArray<CustomInt4>')
+})
+
+test('custom codec profiles preserve prototype hooks and their original receiver', () => {
+  class ClassCodecProfile {
+    readonly #resultTypeName = 'ClassInt4'
+    readonly name = 'class-codec-profile'
+
+    get extends(): PostgresCodecProfile {
+      return 'node-postgres'
+    }
+
+    resultType({ decoderType }: PostgresResultTypeContext, fallback: PostgresTypeScriptResolutionFallback) {
+      return decoderType.pgTypeOid === 23
+        ? postgresTypeScriptType(this.#resultTypeName, { scalarImports: [this.#resultTypeName] })
+        : fallback()
+    }
+  }
+
+  assert.deepEqual(
+    resolveTypeScriptResultTypeForPostgresType(pgCatalog('integer', 'int4', 23), new ClassCodecProfile()),
+    {
+      ambientBindings: [],
+      scalarImports: ['ClassInt4'],
+      type: 'ClassInt4',
+    }
+  )
+})
+
+test('custom codec hooks can match portable type identity and model each conversion boundary independently', () => {
+  const customProfile = definePostgresCodecProfile({
+    extends: 'node-postgres',
+    name: 'portable-domain-codecs',
+    resultType({ declaredType }, fallback) {
+      return declaredType.pgTypeSchema === 'billing' && declaredType.pgTypeName === 'amount'
+        ? postgresTypeScriptType('Amount', { scalarImports: ['Amount'] })
+        : fallback()
+    },
+    parameterType({ type }, fallback) {
+      return type.pgTypeOid === 23 ? postgresTypeScriptType('Int4Input', { scalarImports: ['Int4Input'] }) : fallback()
+    },
+    jsonScalarType({ type }, fallback) {
+      return type.pgTypeOid === 23 ? postgresTypeScriptType('Int4Json', { scalarImports: ['Int4Json'] }) : fallback()
+    },
+  })
+  const integer = pgCatalog('integer', 'int4', 23)
+  const amount: PostgresTypeFact = {
+    pgBaseType: integer,
+    pgType: 'billing.amount',
+    pgTypeKind: 'domain',
+    pgTypeName: 'amount',
+    pgTypeOid: 84_001,
+    pgTypeSchema: 'billing',
+  }
+  const integerArray = pgCatalog('integer[]', '_int4', 1007, {
+    pgArrayDelimiter: ',',
+    pgArrayElementType: integer,
+    pgTypeKind: 'array',
+  })
+
+  assert.equal(resultType(amount, customProfile), 'Amount')
+  assert.equal(parameterType(integer, customProfile), 'Int4Input')
+  assert.equal(parameterType(integerArray, customProfile), 'PgArrayParameter<Int4Input> | string')
+  assert.equal(resolveTypeScriptJsonScalarTypeForPostgresType(integer, customProfile).type, 'Int4Json')
+})
+
+test('custom parameter hooks receive domain array elements before built-in domain fallback', () => {
+  const bigint = pgCatalog('bigint', 'int8', 20)
+  const money: PostgresTypeFact = {
+    pgBaseType: bigint,
+    pgType: 'billing.money',
+    pgTypeKind: 'domain',
+    pgTypeName: 'money',
+    pgTypeOid: 84_001,
+    pgTypeSchema: 'billing',
+  }
+  const moneyArray: PostgresTypeFact = {
+    pgArrayDelimiter: ',',
+    pgArrayElementType: money,
+    pgType: 'billing.money[]',
+    pgTypeKind: 'array',
+    pgTypeName: '_money',
+    pgTypeOid: 84_002,
+    pgTypeSchema: 'billing',
+  }
+  const profile = definePostgresCodecProfile({
+    extends: 'node-postgres',
+    name: 'money-input',
+    parameterType({ type }, fallback) {
+      return type.pgTypeSchema === 'billing' && type.pgTypeName === 'money'
+        ? postgresTypeScriptType('MoneyInput', { scalarImports: ['MoneyInput'] })
+        : fallback()
+    },
+  })
+
+  assert.deepEqual(resolveTypeScriptParameterTypeForPostgresType(moneyArray, profile), {
+    ambientBindings: [],
+    scalarImports: ['PgArrayParameter', 'MoneyInput'],
+    type: 'PgArrayParameter<MoneyInput> | string',
+  })
+  assert.equal(parameterType(moneyArray), 'PgArrayParameter<bigint | number | string> | string')
+})
+
+test('custom codec profiles expose structured JSON capabilities, opaque types, inheritance, and validation', () => {
+  const structuredProfile = definePostgresCodecProfile({
+    extends: 'conservative',
+    name: 'structured-json-only',
+    opaqueJsonType: postgresTypeScriptType('AppJson', { scalarImports: ['AppJson'] }),
+    structuredJson: true,
+  })
+  const resolved = resolvePostgresCodecProfile(structuredProfile)
+  assert.equal(resolved.name, 'structured-json-only')
+  assert.equal(resolved.structuredJson, true)
+  assert.deepEqual(resolved.opaqueJsonType, {
+    ambientBindings: [],
+    scalarImports: ['AppJson'],
+    type: 'AppJson',
+  })
+  assert.equal(resolved.resolveResultType(pgCatalog('integer', 'int4', 23)).type, 'unknown')
+
+  assert.throws(() => postgresResultTypesByOid({ 0: postgresTypeScriptType('never') }), /positive safe integer/u)
+
+  const cyclicDefinition: { extends: PostgresCodecProfile; name: string } = {
+    extends: 'conservative',
+    name: 'cycle',
+  }
+  cyclicDefinition.extends = cyclicDefinition
+  assert.throws(() => resolvePostgresCodecProfile(cyclicDefinition), /cyclic extends chain/u)
+  for (const lineTerminator of ['\r', '\n', '\u2028', '\u2029']) {
+    assert.throws(
+      () =>
+        resolvePostgresCodecProfile({
+          extends: 'conservative',
+          name: `invalid${lineTerminator}profile`,
+        }),
+      /single-line string/u
+    )
+  }
+})
+
+test('structurally resolved codec profiles are normalized, validated, and cached', () => {
+  const externalResolvedProfile: ResolvedPostgresCodecProfile = {
+    name: 'external-resolved-profile',
+    opaqueJsonType: postgresTypeScriptType('ExternalJson', { scalarImports: ['ExternalJson'] }),
+    structuredJson: true,
+    resolveJsonScalarType: () => postgresTypeScriptType('ExternalJsonScalar'),
+    resolveParameterType: () => postgresTypeScriptType('ExternalParameter'),
+    resolveResultType: () => postgresTypeScriptType('ExternalResult', { scalarImports: ['ExternalResult'] }),
+    supportsStringLiteralRefinement: () => false,
+  }
+
+  const normalized = resolvePostgresCodecProfile(externalResolvedProfile)
+  assert.notEqual(normalized, externalResolvedProfile)
+  assert.equal(resolvePostgresCodecProfile(externalResolvedProfile), normalized)
+  assert.equal(resolvePostgresCodecProfile(normalized), normalized)
+  assert.deepEqual(normalized.resolveResultType(pgCatalog('integer', 'int4', 23)), {
+    ambientBindings: [],
+    scalarImports: ['ExternalResult'],
+    type: 'ExternalResult',
+  })
+})
+
+test('codec resolutions reject non-string dependency bindings from JavaScript profiles', () => {
+  for (const [dependency, resolution] of [
+    ['scalar import', { ambientBindings: [], scalarImports: [false], type: 'BadScalarImport' }],
+    ['ambient binding', { ambientBindings: [null], scalarImports: [], type: 'BadAmbientBinding' }],
+  ] as const) {
+    const profile = definePostgresCodecProfile({
+      extends: 'node-postgres',
+      name: `invalid-${dependency.replace(' ', '-')}`,
+      resultType: () => resolution as unknown as ReturnType<ResolvedPostgresCodecProfile['resolveResultType']>,
+    })
+    assert.throws(
+      () => resolveTypeScriptResultTypeForPostgresType(pgCatalog('integer', 'int4', 23), profile),
+      new RegExp(`${dependency}.*is not a legal non-reserved TypeScript binding`, 'u')
+    )
+  }
+})
+
+test('public codec resolution helpers default to the conservative profile', () => {
+  const integer = pgCatalog('integer', 'int4', 23)
+  assert.equal(resolveTypeScriptResultTypeForPostgresTypeBase(integer).type, 'unknown')
+  assert.equal(resolveTypeScriptParameterTypeForPostgresTypeBase(integer).type, 'NonNullable<unknown>')
+  assert.equal(resolveTypeScriptJsonScalarTypeForPostgresTypeBase(integer).type, 'unknown')
+  assert.equal(postgresJsonSupportsStringLiteralRefinementBase(pgCatalog('text', 'text', 25)), false)
+})
 
 test('result resolution follows the exact pg-types 2.2.0 text-decoder registrations', () => {
   assert.equal(resultType(pgCatalog('integer', 'int4', 23)), 'number')

@@ -1,12 +1,16 @@
 import { echoBytes } from './echo-bytes.typed-sql.js'
 import { findWidget } from './find-widget.typed-sql.js'
 import { insertWidget } from './insert-widget.typed-sql.js'
+import type { NodePostgresTypedSqlClient } from 'postgres-typed-sql/adapters/node-postgres'
 import type { PgArray, PgArrayParameter } from 'postgres-typed-sql/scalars'
+
+declare const client: NodePostgresTypedSqlClient
 
 const query = findWidget.query({ code: 'widget-code', metrics: [] })
 const values: readonly unknown[] = query.values
 
 void values
+void client.query(query)
 
 echoBytes.query({ payloads: [] })
 

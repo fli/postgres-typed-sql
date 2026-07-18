@@ -2,8 +2,10 @@ import assert from 'node:assert/strict'
 import { readFile } from 'node:fs/promises'
 
 import { generateTypedSql, postgresVersion } from 'postgres-typed-sql'
+import { executeTypedSqlOptional } from 'postgres-typed-sql/adapters/node-postgres'
 
 assert.equal(postgresVersion, '18.3')
+assert.equal(typeof executeTypedSqlOptional, 'function')
 const result = await generateTypedSql({
   include: ['.'],
   imports: {
@@ -15,7 +17,7 @@ const result = await generateTypedSql({
     structuredJsonFields: 'camelCase',
   },
   rootDir: process.cwd(),
-  scalarProfile: 'node-postgres',
+  codecProfile: 'node-postgres',
   schema: 'schema.sql',
 })
 assert.equal(result.statementCount, 3)
@@ -63,6 +65,6 @@ await generateTypedSql({
     structuredJsonFields: 'camelCase',
   },
   rootDir: process.cwd(),
-  scalarProfile: 'node-postgres',
+  codecProfile: 'node-postgres',
   schema: 'schema.sql',
 })

@@ -2,15 +2,18 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import {
-  createTypedSqlStatement,
   executeTypedSql,
+  executeTypedSqlCommand,
   executeTypedSqlOptional,
+  type NodePostgresTypedSqlClient,
+  type NodePostgresTypedSqlQueryConfig,
+} from '../src/adapters/node-postgres.js'
+import {
+  createTypedSqlStatement,
   mapTypedSqlJsonValue,
   mapTypedSqlRow,
   typedSqlRowCount,
-  type TypedSqlClient,
   type TypedSqlQueryConfig,
-  type TypedSqlRawRow,
   type TypedSqlStatement,
 } from '../src/runtime.js'
 
@@ -48,8 +51,10 @@ test('runtime binds named parameters in generated order', async () => {
 
   // @ts-expect-error A direct query config cannot claim the generated result row type.
   void rawQuery.type
+  // @ts-expect-error Driver query options belong to adapters, not the core query config.
+  void rawQuery.rowMode
 
-  const directClient: TypedSqlClient = {
+  const directClient: NodePostgresTypedSqlClient = {
     async query() {
       return { rows: [] }
     },
@@ -57,17 +62,17 @@ test('runtime binds named parameters in generated order', async () => {
   const directResult = directClient.query(rawQuery)
   type DirectRow = Awaited<typeof directResult>['rows'][number]
   void directResult
-  const directUsesUnknownValuedRows: IsExactly<DirectRow, TypedSqlRawRow> = true
-  assert.equal(directUsesUnknownValuedRows, true)
+  const adapterDoesNotClaimDriverRows: IsExactly<DirectRow, unknown> = true
+  assert.equal(adapterDoesNotClaimDriverRows, true)
 
   const row = await executeTypedSqlOptional(
     {
-      async query<Row>(config: TypedSqlQueryConfig) {
+      async query(config: NodePostgresTypedSqlQueryConfig) {
         assert.deepEqual(config.values, ['reader@example.test'])
         assert.equal(config.rowMode, 'array')
         return {
           rowCount: 1,
-          rows: [['reader@example.test']] as unknown as Row[],
+          rows: [['reader@example.test']],
         }
       },
     },
@@ -77,6 +82,79 @@ test('runtime binds named parameters in generated order', async () => {
   const helperUsesDeclaredRow: IsExactly<typeof row, { readonly email: string } | null> = true
   assert.equal(helperUsesDeclaredRow, true)
   assert.deepEqual(row, { email: 'reader@example.test' })
+})
+
+test('node-postgres adapter reports command row counts without adding a driver client to the core runtime', async () => {
+  const statement = createTypedSqlStatement<{ readonly id: number }, Record<string, never>>({
+    command: 'delete',
+    name: 'deleteAccount',
+    parameterNames: ['id'],
+    text: 'delete from accounts where id = $1',
+  })
+
+  const affected = await executeTypedSqlCommand(
+    {
+      async query(config) {
+        assert.deepEqual(config, {
+          name: 'deleteAccount',
+          text: 'delete from accounts where id = $1',
+          values: [42],
+        })
+        return { rowCount: 1, rows: [] }
+      },
+    },
+    statement,
+    { id: 42 }
+  )
+  assert.equal(affected, 1)
+})
+
+test('node-postgres adapter rejects rows that do not match the requested mapping representation', async () => {
+  const positional = createTypedSqlStatement<Record<string, never>, { readonly value: number }>({
+    columns: [
+      {
+        name: 'value',
+        nullable: false,
+        pgType: 'integer',
+        pgTypeName: 'int4',
+        pgTypeSchema: 'pg_catalog',
+        propertyName: 'value',
+      },
+    ],
+    name: 'positionalRows',
+    parameterNames: [],
+    text: 'select 1 as value',
+  })
+  await assert.rejects(
+    executeTypedSql(
+      {
+        async query() {
+          return { rows: [{ value: 1 }] }
+        },
+      },
+      positional,
+      {}
+    ),
+    /expected node-postgres row 1 to use rowMode: 'array'/u
+  )
+
+  const object = createTypedSqlStatement<Record<string, never>, { readonly value: number }>({
+    name: 'objectRows',
+    parameterNames: [],
+    text: 'select 1 as value',
+  })
+  await assert.rejects(
+    executeTypedSql(
+      {
+        async query() {
+          return { rows: [[1]] }
+        },
+      },
+      object,
+      {}
+    ),
+    /expected node-postgres row 1 to be an object/u
+  )
 })
 
 test('runtime accepts only nonnegative safe integer row counts', () => {
@@ -134,9 +212,9 @@ test('runtime preserves an exact __proto__ output property from array rows witho
 
   const executed = await executeTypedSqlOptional(
     {
-      async query<Row>(config: TypedSqlQueryConfig) {
+      async query(config: NodePostgresTypedSqlQueryConfig) {
         assert.equal(config.rowMode, 'array')
-        return { rows: [['executed']] as unknown as Row[] }
+        return { rows: [['executed']] }
       },
     },
     statement,
@@ -158,15 +236,15 @@ test('runtime maps zero-column array rows to empty row objects', async () => {
   })
 
   assert.deepEqual(mapTypedSqlRow(statement, []), {})
-  assert.equal(statement.resultRowMode, 'array')
+  assert.equal(statement.resultRowMapping, 'positional')
   const legacyObjectRow = { preserved: true }
   assert.equal(mapTypedSqlRow(statement, legacyObjectRow), legacyObjectRow)
   assert.deepEqual(
     await executeTypedSql(
       {
-        async query<Row>(config: TypedSqlQueryConfig) {
+        async query(config: NodePostgresTypedSqlQueryConfig) {
           assert.equal(config.rowMode, 'array')
-          return { rows: [[], []] as unknown as Row[] }
+          return { rows: [[], []] }
         },
       },
       statement,
@@ -184,12 +262,12 @@ test('runtime preserves object rows when result-column metadata is omitted', asy
   })
 
   assert.deepEqual(statement.columns, [])
-  assert.equal(statement.resultRowMode, undefined)
+  assert.equal(statement.resultRowMapping, undefined)
   const rows = await executeTypedSql(
     {
-      async query<Row>(config: TypedSqlQueryConfig) {
+      async query(config: NodePostgresTypedSqlQueryConfig) {
         assert.equal(config.rowMode, undefined)
-        return { rows: [{ value: 1 }] as unknown as Row[] }
+        return { rows: [{ value: 1 }] }
       },
     },
     statement,
@@ -226,13 +304,13 @@ test('runtime public statement contract preserves legacy custom object-row mappi
     values: () => [],
   }
 
-  assert.equal(customStatement.resultRowMode, undefined)
+  assert.equal(customStatement.resultRowMapping, undefined)
   assert.deepEqual(
     await executeTypedSql(
       {
-        async query<Row>(config: TypedSqlQueryConfig) {
+        async query(config: NodePostgresTypedSqlQueryConfig) {
           assert.equal(config.rowMode, undefined)
-          return { rows: [{ camel_value: 1 }] as unknown as Row[] }
+          return { rows: [{ camel_value: 1 }] }
         },
       },
       customStatement,
@@ -343,7 +421,7 @@ test('runtime execution applies generated nested JSON mappings to positional row
 
   const rows = await executeTypedSql(
     {
-      async query<Row>() {
+      async query() {
         return {
           rows: [
             [
@@ -354,7 +432,7 @@ test('runtime execution applies generated nested JSON mappings to positional row
                 },
               ],
             ],
-          ] as unknown as Row[],
+          ],
         }
       },
     },
