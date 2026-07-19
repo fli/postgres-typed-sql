@@ -56,10 +56,11 @@ export type TypedSqlPostgresIrParamNullAdmission = 'accepts' | 'rejects' | 'unkn
 
 export interface TypedSqlPostgresIrColumn extends PostgresTypeFact {
   readonly checkConstraintType?: TypedSqlPostgresIrCheckConstraintTypeExpression
+  /** The immediate analyzed expression source, not ultimate column lineage. */
+  readonly expressionSource: TypedSqlPostgresIrColumnExpressionSource
   readonly jsonShape?: TypedSqlPostgresIrJsonShape
   readonly name: string | null
   readonly nullability: TypedSqlPostgresIrResultNullability
-  readonly source: TypedSqlPostgresIrColumnSource
 }
 
 export type TypedSqlPostgresIrResultNullability =
@@ -122,7 +123,7 @@ export interface TypedSqlPostgresIrJsonField {
   readonly shape: TypedSqlPostgresIrJsonShape
 }
 
-export type TypedSqlPostgresIrColumnSource =
+export type TypedSqlPostgresIrColumnExpressionSource =
   | {
       readonly attname?: string
       readonly kind: 'derivedVar' | 'tableColumn'

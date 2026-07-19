@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Breaking: public analyzer IR and generated runtime result-column metadata now expose the required `expressionSource` field instead of the ambiguous `source`. It describes only the immediate analyzed expression—a direct table column, derived `Var`, or expression tag—and does not claim ultimate lineage.
 - Breaking: generated parameter properties are now non-null by default. `@param name ?` requests nullable caller input with an inferred PostgreSQL type, while `@param name type?` combines the request with an explicit type; both forms require analyzer-proved `accepts` NULL admission. PostgreSQL admission no longer widens caller types implicitly, and generated parameter metadata now requires `nullable` to describe only the resolved caller contract.
 
 ## 0.1.0-beta.6

@@ -10,7 +10,7 @@ import {
   type TypedSqlPostgresIrAccessConcern,
   type TypedSqlPostgresIrAccessEvidence,
   type TypedSqlPostgresIrCheckConstraintTypeExpression,
-  type TypedSqlPostgresIrColumnSource,
+  type TypedSqlPostgresIrColumnExpressionSource,
   type TypedSqlPostgresIrJsonField,
   type TypedSqlPostgresIrJsonShape,
   type TypedSqlPostgresIrRowBounds,
@@ -111,6 +111,7 @@ interface ResolvedSqlParameter {
 }
 
 interface ResolvedSqlColumn {
+  readonly expressionSource: TypedSqlPostgresIrColumnExpressionSource
   readonly jsonMapping?: GeneratedJsonMapping
   readonly jsonShape?: ResolvedJsonShape
   readonly name: string
@@ -120,7 +121,6 @@ interface ResolvedSqlColumn {
   readonly pgTypeOid: number
   readonly pgTypeSchema: string
   readonly propertyName: string
-  readonly source: TypedSqlPostgresIrColumnSource | null
   readonly tsType: string
 }
 
@@ -893,20 +893,20 @@ function renderGeneratedTypeDeclaration(declaration: GeneratedJsonTypeDeclaratio
   return renderInterface(declaration.name, declaration.fields)
 }
 
-function renderColumnSourceMetadata(source: TypedSqlPostgresIrColumnSource): string {
-  if (source.kind !== 'tableColumn') {
-    return JSON.stringify(source)
+function renderColumnExpressionSourceMetadata(expressionSource: TypedSqlPostgresIrColumnExpressionSource): string {
+  if (expressionSource.kind !== 'tableColumn') {
+    return JSON.stringify(expressionSource)
   }
 
-  const stableSource = {
-    attname: source.attname,
-    kind: source.kind,
-    relname: source.relname,
-    varlevelsup: source.varlevelsup,
-    varno: source.varno,
-    varnullingrels: source.varnullingrels,
+  const stableExpressionSource = {
+    attname: expressionSource.attname,
+    kind: expressionSource.kind,
+    relname: expressionSource.relname,
+    varlevelsup: expressionSource.varlevelsup,
+    varno: expressionSource.varno,
+    varnullingrels: expressionSource.varnullingrels,
   }
-  return JSON.stringify(stableSource)
+  return JSON.stringify(stableExpressionSource)
 }
 
 function renderColumnMetadata(columns: readonly ResolvedSqlColumn[]): string {
@@ -918,14 +918,13 @@ function renderColumnMetadata(columns: readonly ResolvedSqlColumn[]): string {
 ${columns
   .map(
     (column) => `    {
+      expressionSource: ${renderColumnExpressionSourceMetadata(column.expressionSource)},
       ${column.jsonMapping ? `jsonMapping: ${JSON.stringify(column.jsonMapping)},\n      ` : ''}name: ${quoteString(column.name)},
       nullable: ${column.nullable},
       pgType: ${quoteString(column.pgType)},
       pgTypeName: ${quoteString(column.pgTypeName)},
       pgTypeSchema: ${quoteString(column.pgTypeSchema)},
-      propertyName: ${quoteString(column.propertyName)}${
-        column.source ? `,\n      source: ${renderColumnSourceMetadata(column.source)}` : ''
-      },
+      propertyName: ${quoteString(column.propertyName)},
     }`
   )
   .join(',\n')},
@@ -1123,6 +1122,7 @@ async function resolveTypedSqlWithAnalyzer(
         }
       }
       return {
+        expressionSource: column.expressionSource,
         ...(jsonShape ? { jsonShape } : {}),
         ...(jsonMapping ? { jsonMapping } : {}),
         name,
@@ -1132,7 +1132,6 @@ async function resolveTypedSqlWithAnalyzer(
         pgTypeOid: column.pgTypeOid,
         pgTypeSchema: column.pgTypeSchema,
         propertyName,
-        source: column.source,
         tsType,
       }
     })

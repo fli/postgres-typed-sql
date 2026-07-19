@@ -2,9 +2,29 @@ import { echoBytes } from './echo-bytes.typed-sql.js'
 import { findWidget } from './find-widget.typed-sql.js'
 import { insertWidget } from './insert-widget.typed-sql.js'
 import type { NodePostgresTypedSqlClient } from 'postgres-typed-sql/adapters/node-postgres'
+import type { TypedSqlColumnMetadata } from 'postgres-typed-sql/runtime'
 import type { PgArray, PgArrayParameter } from 'postgres-typed-sql/scalars'
 
 declare const client: NodePostgresTypedSqlClient
+
+type IsExactly<Left, Right> =
+  (<Value>() => Value extends Left ? 1 : 2) extends <Value>() => Value extends Right ? 1 : 2 ? true : false
+type AssertTrue<Value extends true> = Value
+type PublicMetadataHasNoSource = AssertTrue<IsExactly<Extract<keyof TypedSqlColumnMetadata, 'source'>, never>>
+
+const publicColumnMetadata: TypedSqlColumnMetadata = {
+  expressionSource: { kind: 'expression', tag: 'Const' },
+  name: 'value',
+  nullable: false,
+  pgType: 'integer',
+  pgTypeName: 'int4',
+  pgTypeSchema: 'pg_catalog',
+  propertyName: 'value',
+}
+const publicMetadataHasNoSource: PublicMetadataHasNoSource = true
+
+void publicColumnMetadata.expressionSource
+void publicMetadataHasNoSource
 
 const query = findWidget.query({ code: 'widget-code', metrics: [] })
 const values: readonly unknown[] = query.values
