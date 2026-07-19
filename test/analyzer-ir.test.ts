@@ -282,6 +282,201 @@ test('resolves immediate JOIN, GROUP, VALUES, CTE, and opaque RTE sources once f
   }
 })
 
+test('composes canonical row bounds with scalar EXPR subquery output nullability', async () => {
+  const database = await createAnalysisDatabase({ schemaFiles: [schemaFile] })
+  try {
+    const result = await buildTypedSqlPostgresIrFromCompiledConfigs(database, [
+      config('zeroValues', '(values (1)) limit 0'),
+      config('oneValue', 'values (1)'),
+      config('manyValues', 'values (1), (2), (3)'),
+      config('projectedValues', 'select value from (values (1), (2)) source(value)'),
+      config('guaranteedSelect', 'select 1 as value'),
+      config('qualifiedSelect', 'select 1 as value where $1', ['include']),
+      config('globalAggregate', 'select count(*) as value from public.accounts'),
+      config('qualifiedGlobalAggregate', 'select count(*) as value from public.accounts having $1', ['include']),
+      config('groupedValues', 'select value from (values (1), (2)) source(value) group by value'),
+      config('unionAllValues', 'select 1 as value union all select 2'),
+      config('unionValues', 'select 1 as value union select 2'),
+      config('intersectValues', 'select 1 as value intersect select 1'),
+      config('exceptValues', 'select 1 as value except select 2'),
+      config('exceptEmpty', 'select 1 as value except (select 2 limit 0)'),
+      config('limitedValues', '(values (1), (2)) limit 1'),
+      config('offsetValues', '(values (1), (2)) offset 1'),
+      config('dynamicLimitedValues', '(values (1), (2)) limit $1', ['limit']),
+      config(
+        'projectedSetOutput',
+        `select value
+         from (select 1 as value union all select null::integer) source`
+      ),
+      config('emptyScalar', 'select (select 1 limit 0) as value'),
+      config('nonNullScalar', 'select (select 1) as value'),
+      config('nullableScalar', 'select (select null::integer) as value'),
+      config('unknownScalar', 'select (select $1::integer) as value', ['value']),
+      config('unresolvedNonNullScalar', 'select (select 1 from public.accounts limit 1) as value'),
+      config('unresolvedNullableScalar', 'select (select display_name from public.accounts limit 1) as value'),
+      config('unresolvedUnknownScalar', 'select (select $1::text from public.accounts limit 1) as value', ['value']),
+      config('possibleMultipleRowsScalar', 'select (values (1), (2)) as value'),
+      config(
+        'nestedSetScalar',
+        `select (
+           select value
+           from (select 1 as value union all select null::integer) source
+         ) as value`
+      ),
+    ])
+    const queries = new Map(result.queries.map((query) => [query.name, query]))
+    const query = (name: string): TypedSqlPostgresIr => {
+      const value = queries.get(name)
+      assert.ok(value, `missing normalized query ${name}`)
+      return value
+    }
+    const nullability = (name: string) => query(name).resultColumns[0]?.nullability
+
+    assert.deepEqual(query('zeroValues').rowBounds, {
+      max: 0,
+      min: 0,
+      proof: 'values_1_rows+constant_limit_0',
+    })
+    assert.deepEqual(query('oneValue').rowBounds, { max: 1, min: 1, proof: 'values_1_rows' })
+    assert.deepEqual(query('manyValues').rowBounds, { max: 3, min: 3, proof: 'values_3_rows' })
+    assert.deepEqual(query('projectedValues').rowBounds, {
+      max: 2,
+      min: 2,
+      proof: 'subquery_projection:values_2_rows',
+    })
+    assert.deepEqual(query('guaranteedSelect').rowBounds, {
+      max: 1,
+      min: 1,
+      proof: 'select_without_from',
+    })
+    assert.deepEqual(query('qualifiedSelect').rowBounds, {
+      max: 1,
+      min: 0,
+      proof: 'select_without_from_with_qual',
+    })
+    assert.deepEqual(query('globalAggregate').rowBounds, { max: 1, min: 1, proof: 'global_aggregate' })
+    assert.deepEqual(query('qualifiedGlobalAggregate').rowBounds, {
+      max: 1,
+      min: 0,
+      proof: 'global_aggregate_with_having',
+    })
+    assert.deepEqual(query('groupedValues').rowBounds, {
+      max: 2,
+      min: 1,
+      proof: 'subquery_grouping:values_2_rows',
+    })
+    assert.deepEqual(query('unionAllValues').rowBounds, {
+      max: 2,
+      min: 2,
+      proof: 'union_all(select_without_from,select_without_from)',
+    })
+    assert.deepEqual(query('unionValues').rowBounds, {
+      max: 2,
+      min: 1,
+      proof: 'union(select_without_from,select_without_from)',
+    })
+    assert.deepEqual(query('intersectValues').rowBounds, {
+      max: 1,
+      min: 0,
+      proof: 'intersect(select_without_from,select_without_from)',
+    })
+    assert.deepEqual(query('exceptValues').rowBounds, {
+      max: 1,
+      min: 0,
+      proof: 'except(select_without_from,select_without_from)',
+    })
+    assert.deepEqual(query('exceptEmpty').rowBounds, {
+      max: 1,
+      min: 1,
+      proof: 'except(select_without_from,select_without_from+constant_limit_0)',
+    })
+    assert.deepEqual(query('limitedValues').rowBounds, {
+      max: 1,
+      min: 1,
+      proof: 'values_2_rows+constant_limit_1',
+    })
+    assert.deepEqual(query('offsetValues').rowBounds, {
+      max: 2,
+      min: 0,
+      proof: 'values_2_rows+offset_can_drop_rows',
+    })
+    assert.deepEqual(query('dynamicLimitedValues').rowBounds, {
+      max: 2,
+      min: 0,
+      proof: 'values_2_rows+dynamic_limit_can_drop_rows',
+    })
+    assert.deepEqual(query('projectedSetOutput').rowBounds, {
+      max: 2,
+      min: 2,
+      proof: 'subquery_projection:union_all(select_without_from,select_without_from)',
+    })
+    assert.equal(nullability('projectedSetOutput')?.kind, 'nullable')
+
+    assert.deepEqual(nullability('emptyScalar'), {
+      evidence: 'scalar_sublink_empty_query',
+      kind: 'nullable',
+    })
+    assert.equal(nullability('nonNullScalar')?.kind, 'nonNull')
+    assert.equal(nullability('nullableScalar')?.kind, 'nullable')
+    assert.equal(nullability('unknownScalar')?.kind, 'unknown')
+    assert.deepEqual(nullability('unresolvedNonNullScalar'), {
+      kind: 'unknown',
+      reason: 'scalar_sublink_row_presence_unresolved',
+    })
+    assert.equal(nullability('unresolvedNullableScalar')?.kind, 'nullable')
+    assert.deepEqual(nullability('unresolvedUnknownScalar'), {
+      kind: 'unknown',
+      reason: 'scalar_sublink_row_presence_unresolved',
+    })
+    assert.equal(nullability('possibleMultipleRowsScalar')?.kind, 'nonNull')
+    assert.equal(nullability('nestedSetScalar')?.kind, 'nullable')
+  } finally {
+    await database.close()
+  }
+})
+
+test('throws on malformed and cyclic scalar EXPR subquery ownership', async () => {
+  const database = await createAnalysisDatabase({ schemaFiles: [schemaFile] })
+  try {
+    const cases: readonly {
+      readonly corrupt: (analysis: MutableEnvelopeObject) => void
+      readonly error: RegExp
+      readonly name: string
+    }[] = [
+      {
+        corrupt(analysis) {
+          const query = firstEnvelopeQuery(analysis)
+          const target = envelopeObject(envelopeArray(query.targetList)[0])
+          const subquery = envelopeObject(envelopeObject(target.expr).subquery)
+          subquery.targetList = []
+        },
+        error: /EXPR SubLink query has 0 result outputs; expected exactly 1/u,
+        name: 'missingScalarOutput',
+      },
+      {
+        corrupt(analysis) {
+          const query = firstEnvelopeQuery(analysis)
+          const target = envelopeObject(envelopeArray(query.targetList)[0])
+          envelopeObject(target.expr).subquery = query
+        },
+        error: /cyclic nested-query ownership/u,
+        name: 'cyclicScalarQuery',
+      },
+    ]
+
+    for (const fixture of cases) {
+      await assert.rejects(
+        buildTypedSqlPostgresIrFromCompiledConfigs(corruptAnalyzerEnvelope(database, fixture.corrupt), [
+          config(fixture.name, 'select (select 1) as value'),
+        ]),
+        fixture.error
+      )
+    }
+  } finally {
+    await database.close()
+  }
+})
+
 test('throws when a positive base Var is missing its required catalog column fact', async () => {
   const database = await createAnalysisDatabase({ schemaFiles: [schemaFile] })
   try {

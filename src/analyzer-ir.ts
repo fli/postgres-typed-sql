@@ -574,7 +574,6 @@ interface QueryOutputSemantics<T> {
   readonly intersect: (left: T, right: T) => T
   readonly target: (scope: QueryScope, target: PgAnalyzerTarget) => T
   readonly union: (left: T, right: T) => T
-  readonly unknown: () => T
 }
 
 function foldQueryOutput<T>(scope: QueryScope, outputIndex: number, semantics: QueryOutputSemantics<T>): T {
@@ -582,7 +581,12 @@ function foldQueryOutput<T>(scope: QueryScope, outputIndex: number, semantics: Q
   const foldSetOperation = (operation: PgAnalyzerSetOperation): T => {
     if (operation.kind === 'leaf') {
       const leafQuery = query.rtable?.[operation.rtindex - 1]?.subquery
-      return leafQuery ? foldQueryOutput(queryScope(leafQuery, scope), outputIndex, semantics) : semantics.unknown()
+      if (!leafQuery) {
+        throw new Error(
+          `internal analyzer envelope inconsistency: set-operation leaf RTE ${operation.rtindex} is missing its query`
+        )
+      }
+      return foldQueryOutput(queryScope(leafQuery, scope), outputIndex, semantics)
     }
 
     const left = foldSetOperation(operation.left)
@@ -602,7 +606,12 @@ function foldQueryOutput<T>(scope: QueryScope, outputIndex: number, semantics: Q
   }
 
   const target = resultTargets(query)[outputIndex]
-  return target ? semantics.target(scope, target) : semantics.unknown()
+  if (!target) {
+    throw new Error(
+      `internal analyzer envelope inconsistency: ${query.commandType} query has no result output ${outputIndex + 1}`
+    )
+  }
+  return semantics.target(scope, target)
 }
 
 function constNonNegativeSafeInteger(catalog: CatalogFacts, expr: PgAnalyzerExpr | null | undefined): number | null {
@@ -854,7 +863,11 @@ function uniqueIndexRowBounds(catalog: CatalogFacts, query: PgAnalyzerQuery): Ty
   }
 }
 
-function projectionSourceRowBounds(catalog: CatalogFacts, query: PgAnalyzerQuery): TypedSqlPostgresIrRowBounds | null {
+function projectionSourceRowBounds(
+  catalog: CatalogFacts,
+  query: PgAnalyzerQuery,
+  seen: readonly PgAnalyzerQuery[]
+): TypedSqlPostgresIrRowBounds | null {
   if (
     query.commandType !== 'SELECT' ||
     query.hasAggs === true ||
@@ -890,7 +903,7 @@ function projectionSourceRowBounds(catalog: CatalogFacts, query: PgAnalyzerQuery
     return null
   }
 
-  const sourceBounds = inferRowBounds(catalog, sourceQuery, resultTargets(sourceQuery).length)
+  const sourceBounds = inferRowBounds(catalog, sourceQuery, seen)
   return {
     max: sourceBounds.max,
     min: query.whereQual ? 0 : sourceBounds.min,
@@ -898,30 +911,168 @@ function projectionSourceRowBounds(catalog: CatalogFacts, query: PgAnalyzerQuery
   }
 }
 
+function exactValuesRowBounds(query: PgAnalyzerQuery): TypedSqlPostgresIrRowBounds | null {
+  if (
+    query.commandType !== 'SELECT' ||
+    query.hasAggs === true ||
+    query.hasSetOperations === true ||
+    query.hasTargetSRFs === true ||
+    query.hasWindowFuncs === true ||
+    query.whereQual ||
+    query.hasHavingQual === true ||
+    (query.groupClauseCount ?? 0) > 0 ||
+    (query.groupingSetsCount ?? 0) > 0 ||
+    (query.distinctClauseCount ?? 0) > 0
+  ) {
+    return null
+  }
+
+  const values = query.rtable?.length === 1 ? query.rtable[0] : undefined
+  if (values?.kind !== 'VALUES' || !values.valuesLists) {
+    return null
+  }
+  const count = values.valuesLists.length
+  return { max: count, min: count, proof: `values_${count}_rows` }
+}
+
+function groupedSourceRowBounds(
+  catalog: CatalogFacts,
+  query: PgAnalyzerQuery,
+  seen: readonly PgAnalyzerQuery[]
+): TypedSqlPostgresIrRowBounds | null {
+  if (
+    query.commandType !== 'SELECT' ||
+    (query.groupClauseCount ?? 0) === 0 ||
+    (query.groupingSetsCount ?? 0) > 0 ||
+    query.hasSetOperations === true ||
+    query.hasTargetSRFs === true ||
+    query.hasWindowFuncs === true ||
+    query.hasHavingQual === true ||
+    (query.distinctClauseCount ?? 0) > 0
+  ) {
+    return null
+  }
+
+  const rowSources = (query.rtable ?? []).filter((rte) => rte.kind !== 'GROUP')
+  const source = rowSources.length === 1 ? rowSources[0] : undefined
+  let sourceQuery: PgAnalyzerQuery | undefined
+  let sourceKind: string
+  if (source?.kind === 'SUBQUERY') {
+    sourceQuery = source.subquery
+    sourceKind = 'subquery'
+  } else if (source?.kind === 'CTE') {
+    const cte = cteByName(query, source.cteName)
+    if (cte?.recursive === true) {
+      return null
+    }
+    sourceQuery = cte?.query
+    sourceKind = 'cte'
+  } else if (source?.kind === 'VALUES' && source.valuesLists) {
+    const count = source.valuesLists.length
+    const min = query.whereQual || count === 0 ? 0 : 1
+    return { max: count, min, proof: `values_grouping_${count}_rows${query.whereQual ? '+qual_can_filter' : ''}` }
+  } else {
+    return null
+  }
+  if (!sourceQuery) {
+    return null
+  }
+
+  const sourceBounds = inferRowBounds(catalog, sourceQuery, seen)
+  return {
+    max: sourceBounds.max,
+    min: query.whereQual || sourceBounds.min === 0 ? 0 : 1,
+    proof: `${sourceKind}_grouping:${sourceBounds.proof}${query.whereQual ? '+qual_can_filter' : ''}`,
+  }
+}
+
+function addBound(left: number | null, right: number | null): number | null {
+  if (left === null || right === null) {
+    return null
+  }
+  const sum = left + right
+  return Number.isSafeInteger(sum) ? sum : null
+}
+
+function setOperationRowBounds(
+  catalog: CatalogFacts,
+  query: PgAnalyzerQuery,
+  operation: PgAnalyzerSetOperation,
+  seen: readonly PgAnalyzerQuery[]
+): TypedSqlPostgresIrRowBounds {
+  if (operation.kind === 'leaf') {
+    const leafQuery = query.rtable?.[operation.rtindex - 1]?.subquery
+    if (!leafQuery) {
+      throw new Error(
+        `internal analyzer envelope inconsistency: set-operation leaf RTE ${operation.rtindex} is missing its query`
+      )
+    }
+    return inferRowBounds(catalog, leafQuery, seen)
+  }
+
+  const left = setOperationRowBounds(catalog, query, operation.left, seen)
+  const right = setOperationRowBounds(catalog, query, operation.right, seen)
+  switch (operation.operation) {
+    case 'UNION':
+      return {
+        max: addBound(left.max, right.max),
+        min: operation.all
+          ? (addBound(left.min, right.min) ?? Math.max(left.min, right.min))
+          : left.min > 0 || right.min > 0
+            ? 1
+            : 0,
+        proof: `${operation.all ? 'union_all' : 'union'}(${left.proof},${right.proof})`,
+      }
+    case 'INTERSECT':
+      return {
+        max: left.max === null ? right.max : right.max === null ? left.max : Math.min(left.max, right.max),
+        min: 0,
+        proof: `${operation.all ? 'intersect_all' : 'intersect'}(${left.proof},${right.proof})`,
+      }
+    case 'EXCEPT':
+      return {
+        max: left.max,
+        min: right.max === 0 ? (operation.all ? left.min : left.min > 0 ? 1 : 0) : 0,
+        proof: `${operation.all ? 'except_all' : 'except'}(${left.proof},${right.proof})`,
+      }
+  }
+}
+
 function inferBaseRowBounds(
   catalog: CatalogFacts,
   query: PgAnalyzerQuery,
-  resultColumnCount: number
+  seen: readonly PgAnalyzerQuery[]
 ): TypedSqlPostgresIrRowBounds {
-  if (resultColumnCount === 0 && query.commandType !== 'SELECT') {
+  if (resultTargets(query).length === 0 && query.commandType !== 'SELECT') {
     return { max: 0, min: 0, proof: 'no_result_columns' }
   }
 
-  if (query.hasTargetSRFs === true || query.hasSetOperations === true) {
-    return {
-      max: null,
-      min: 0,
-      proof: query.hasTargetSRFs === true ? 'target_srf' : 'set_operations',
-    }
+  if (query.hasTargetSRFs === true) {
+    return { max: null, min: 0, proof: 'target_srf' }
+  }
+  if (query.setOperation) {
+    return setOperationRowBounds(catalog, query, query.setOperation, seen)
+  }
+  if (query.hasSetOperations === true) {
+    throw new Error('internal analyzer envelope inconsistency: query has set operations without a set-operation tree')
+  }
+
+  const valuesBounds = exactValuesRowBounds(query)
+  if (valuesBounds) {
+    return valuesBounds
   }
 
   const uniqueBounds = uniqueIndexRowBounds(catalog, query)
   if (uniqueBounds) {
     return uniqueBounds
   }
-  const projectionBounds = projectionSourceRowBounds(catalog, query)
+  const projectionBounds = projectionSourceRowBounds(catalog, query, seen)
   if (projectionBounds) {
     return projectionBounds
+  }
+  const groupedBounds = groupedSourceRowBounds(catalog, query, seen)
+  if (groupedBounds) {
+    return groupedBounds
   }
 
   if (query.commandType === 'SELECT') {
@@ -948,9 +1099,13 @@ function inferBaseRowBounds(
 function inferRowBounds(
   catalog: CatalogFacts,
   query: PgAnalyzerQuery,
-  resultColumnCount: number
+  seen: readonly PgAnalyzerQuery[] = []
 ): TypedSqlPostgresIrRowBounds {
-  return applyLimitBounds(catalog, query, inferBaseRowBounds(catalog, query, resultColumnCount))
+  if (seen.includes(query)) {
+    throw new Error('internal analyzer envelope inconsistency: cyclic query row-bound ownership')
+  }
+  const nestedSeen = [...seen, query]
+  return applyLimitBounds(catalog, query, inferBaseRowBounds(catalog, query, nestedSeen))
 }
 
 function isDataModifyingCommand(
@@ -977,21 +1132,29 @@ function walkDirectQueryExpressions(query: PgAnalyzerQuery, visitExpr: (expr: Pg
   walkExpr(query.limitCount, visitExpr)
 }
 
-function walkQueryTree(query: PgAnalyzerQuery, visitQuery: (query: PgAnalyzerQuery) => void): void {
+function walkQueryTree(
+  query: PgAnalyzerQuery,
+  visitQuery: (query: PgAnalyzerQuery) => void,
+  owners: readonly PgAnalyzerQuery[] = []
+): void {
+  if (owners.includes(query)) {
+    throw new Error('internal analyzer envelope inconsistency: cyclic nested-query ownership')
+  }
+  const nestedOwners = [...owners, query]
   visitQuery(query)
   for (const rte of query.rtable ?? []) {
     if (rte.subquery) {
-      walkQueryTree(rte.subquery, visitQuery)
+      walkQueryTree(rte.subquery, visitQuery, nestedOwners)
     }
   }
   for (const cte of query.cteList ?? []) {
     if (cte.query) {
-      walkQueryTree(cte.query, visitQuery)
+      walkQueryTree(cte.query, visitQuery, nestedOwners)
     }
   }
   walkDirectQueryExpressions(query, (expr) => {
     if (expr.subquery) {
-      walkQueryTree(expr.subquery, visitQuery)
+      walkQueryTree(expr.subquery, visitQuery, nestedOwners)
     }
   })
 }
@@ -1436,7 +1599,6 @@ function checkConstraintTypeForQueryOutput(
       left && right ? combineCheckConstraintTypes('intersection', left, right) : (left ?? right),
     target: (targetScope, target) => checkConstraintTypeForExpr(catalog, targetScope, target.expr, seen),
     union: (left, right) => (left && right ? combineCheckConstraintTypes('union', left, right) : null),
-    unknown: () => null,
   })
 }
 
@@ -1571,8 +1733,36 @@ function queryOutputNullability(
     intersect: (left, right) => intersectResultNullabilities(left, right, 'query_intersection'),
     target: (targetScope, target) => expressionNullability(catalog, targetScope, target.expr, seen),
     union: (left, right) => unionResultNullabilities([left, right], 'query_union'),
-    unknown: () => ({ kind: 'unknown', reason: 'missing_query_output' }),
   })
+}
+
+function scalarSubqueryNullability(
+  catalog: CatalogFacts,
+  scope: QueryScope,
+  expr: PgAnalyzerExpr,
+  seen: readonly VarLocation[]
+): TypedSqlPostgresIrResultNullability {
+  const subquery = expr.subquery
+  if (!subquery) {
+    throw new Error('internal analyzer envelope inconsistency: EXPR SubLink is missing its query')
+  }
+  const outputs = resultTargets(subquery)
+  if (outputs.length !== 1) {
+    throw new Error(
+      `internal analyzer envelope inconsistency: EXPR SubLink query has ${outputs.length} result outputs; expected exactly 1`
+    )
+  }
+
+  const subqueryScope = queryScope(subquery, scope)
+  const output = queryOutputNullability(catalog, subqueryScope, 0, seen)
+  const bounds = inferRowBounds(catalog, subquery)
+  if (bounds.max === 0) {
+    return { evidence: 'scalar_sublink_empty_query', kind: 'nullable' }
+  }
+  if (bounds.min > 0 || output.kind === 'nullable') {
+    return output
+  }
+  return { kind: 'unknown', reason: 'scalar_sublink_row_presence_unresolved' }
 }
 
 function expressionNullability(
@@ -1663,6 +1853,9 @@ function expressionNullability(
   if (expr.tag === 'SubLink') {
     if (expr.subLinkType === 'EXISTS' || expr.subLinkType === 'ARRAY') {
       return { basis: `${expr.subLinkType.toLowerCase()}_sublink`, kind: 'nonNull' }
+    }
+    if (expr.subLinkType === 'EXPR') {
+      return scalarSubqueryNullability(catalog, scope, expr, seen)
     }
     return {
       evidence: `${(expr.subLinkType ?? 'unknown').toLowerCase()}_sublink_can_return_null`,
@@ -1892,7 +2085,6 @@ function inferQueryOutputJsonShape(
         : { kind: 'opaque', nullability: { kind: 'unknown', reason: 'missing_json_target' } }
     },
     union: (left, right) => unionJsonShapes(left, right),
-    unknown: () => ({ kind: 'opaque', nullability: { kind: 'unknown', reason: 'missing_json_output' } }),
   })
 }
 
@@ -2126,7 +2318,7 @@ function normalizeCompiledIr(catalog: CatalogFacts, analyzed: AnalyzedCompiledCo
       ...(checkConstraintType ? { checkConstraintType } : {}),
     }
   })
-  const rowBounds = inferRowBounds(catalog, query, resultColumns.length)
+  const rowBounds = inferRowBounds(catalog, query)
 
   return {
     accessEvidence: accessEvidence(rewrittenQueries),
