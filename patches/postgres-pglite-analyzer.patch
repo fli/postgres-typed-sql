@@ -1,3 +1,67 @@
+diff --git a/build-with-docker.sh b/build-with-docker.sh
+index 0db48f3a39..a5f272ee12 100755
+--- a/build-with-docker.sh
++++ b/build-with-docker.sh
+@@ -1,5 +1,5 @@
+-# although we could use any path inside docker, using the same path as on the host
+-# allows the DWARF info (when building in DEBUG) to contain the correct file paths
+-DOCKER_WORKSPACE=$(pwd)
++# A stable container path makes release-build intermediates relocatable between
++# private copy-on-write worktree clones.
++DOCKER_WORKSPACE=/workspace
+ echo "PGLITE_VERSION=${PGLITE_VERSION}"
+ echo "DEBUG=${DEBUG}"
+diff --git a/pglite/build-postgis.sh b/pglite/build-postgis.sh
+index c3915c4..39580bb 100755
+--- a/pglite/build-postgis.sh
++++ b/pglite/build-postgis.sh
+@@ -1,25 +1,27 @@
+ #!/bin/bash
+ echo "=== Building postgis ==="
+ pushd other_extensions/postgis
+-# hack - building loader/pgsql2shp.wasm fails, we don't need it anyway
+-sed -i 's/SUBDIRS += @RASTER@ loader/SUBDIRS += @RASTER@/' GNUmakefile.in
+-# hack - building raster loader fails, but anyway, we don't need it
+-sed -i 's/$(MAKE) @RT_LOADER@/#$(MAKE) @RT_LOADER@/' ./raster/Makefile.in
+-sed -i 's/$(MAKE) -C loader install/#$(MAKE) -C loader install/' ./raster/Makefile.in
+-./autogen.sh
+-# LDFLAGS="-L/install/libs/lib" emconfigure ./configure --with-pic --with-xml2config=/install/libs/bin/xml2-config --with-geosconfig=/install/libs/bin/geos-config --with-projdir=/install/libs/ --with-jsondir=/install/libs/ --without-protobuf --with-gdalconfig=/install/libs/bin/gdal-config
+-# emconfigure ./configure --with-pic --with-geosconfig=/install/libs/bin/geos-config --with-projdir=/install/libs/ --with-xml2config=/install/libs/bin/xml2-config --with-jsondir=/install/libs/ --without-protobuf --without-raster --enable-static=no --enable-shared=yes
+-PROJ_VERSION=9.7.0 LDFLAGS="-L/install/libs/lib $PGLITE_CFLAGS" CFLAGS="${PGLITE_CFLAGS} -fPIC" CXXFLAGS="${PGLITE_CFLAGS} -fPIC" emconfigure ./configure \
+---with-pic \
+---without-protobuf \
+---enable-static=no \
+---enable-shared=yes \
+---with-geosconfig=/install/libs/bin/geos-config \
+---with-xml2config=/install/libs/bin/xml2-config \
+---with-gdalconfig=/install/libs/bin/gdal-config \
+---with-projdir=/install/libs \
+---with-jsondir=/install/libs \
+---host=wasm32-unknown-linux-gnu
++if [ ! -f config.status ]; then
++  # hack - building loader/pgsql2shp.wasm fails, we don't need it anyway
++  sed -i 's/SUBDIRS += @RASTER@ loader/SUBDIRS += @RASTER@/' GNUmakefile.in
++  # hack - building raster loader fails, but anyway, we don't need it
++  sed -i 's/$(MAKE) @RT_LOADER@/#$(MAKE) @RT_LOADER@/' ./raster/Makefile.in
++  sed -i 's/$(MAKE) -C loader install/#$(MAKE) -C loader install/' ./raster/Makefile.in
++  ./autogen.sh
++  # LDFLAGS="-L/install/libs/lib" emconfigure ./configure --with-pic --with-xml2config=/install/libs/bin/xml2-config --with-geosconfig=/install/libs/bin/geos-config --with-projdir=/install/libs/ --with-jsondir=/install/libs/ --without-protobuf --with-gdalconfig=/install/libs/bin/gdal-config
++  # emconfigure ./configure --with-pic --with-geosconfig=/install/libs/bin/geos-config --with-projdir=/install/libs/ --with-xml2config=/install/libs/bin/xml2-config --with-jsondir=/install/libs/ --without-protobuf --without-raster --enable-static=no --enable-shared=yes
++  PROJ_VERSION=9.7.0 LDFLAGS="-L/install/libs/lib $PGLITE_CFLAGS" CFLAGS="${PGLITE_CFLAGS} -fPIC" CXXFLAGS="${PGLITE_CFLAGS} -fPIC" emconfigure ./configure \
++  --with-pic \
++  --without-protobuf \
++  --enable-static=no \
++  --enable-shared=yes \
++  --with-geosconfig=/install/libs/bin/geos-config \
++  --with-xml2config=/install/libs/bin/xml2-config \
++  --with-gdalconfig=/install/libs/bin/gdal-config \
++  --with-projdir=/install/libs \
++  --with-jsondir=/install/libs \
++  --host=wasm32-unknown-linux-gnu
++fi
+ emmake make raster-sql || true
+ # these flags are used in pgxs.mk (postgresql extension makefile) and passed to the build process of that extension
+ emmake make LDFLAGS_SL="$PGLITE_CFLAGS-sWASM_BIGINT -sSIDE_MODULE=1 -Wl,--whole-archive -lstdc++ -lsqlite3 -lgeos -ljson-c -lgdal -Wl,--no-whole-archive" \
 diff --git a/pglite/other_extensions/Makefile b/pglite/other_extensions/Makefile
 index 5ad7ef5bd3..e377ea6898 100644
 --- a/pglite/other_extensions/Makefile
