@@ -73,6 +73,8 @@ where email = :email
 
 Named parameter tokens retain their exact spelling for SQL compilation, `@param` directives, diagnostics, and runtime metadata. Generated parameter-object properties are application-facing and use conservative camel case by default, so `:platform_slug` is supplied as `{ platformSlug }`. Repeated uses of one raw token still share one positional placeholder and one public property. Set `naming.parameterProperties` to `'preserve'` only when callers deliberately use the raw token spelling.
 
+Parameters are non-null to callers by default, independently of whether PostgreSQL can evaluate the statement with SQL `NULL`. Use `-- @param name ?` to request top-level SQL `NULL` while retaining PostgreSQL type inference, or append `?` to an explicit parameter type. Generation accepts either nullable form only when PostgreSQL analysis proves that every use admits `NULL`; proven rejection or incomplete evidence is an error.
+
 Inside PostgreSQL expression subscripts, an unparenthesized top-level colon remains the native array-slice delimiter. Use `items[(:index)]` for a named subscript, and use `items[1 : :upper]` or `items[1:(:upper)]` for a named slice bound. `ARRAY[:value]` continues to treat `:value` as a named parameter because `ARRAY[...]` is an array constructor rather than a subscript.
 
 Running `npm run generate:sql` creates `find-account-by-email.typed-sql.ts` containing:
@@ -204,16 +206,22 @@ Directives are SQL comments at the beginning of a `.typed.sql` file:
 -- @name findAccount
 -- @access read
 -- @param email text
+-- @param inferred_cutoff ?
 -- @param display_name text?
 -- @column id bigint
 ```
 
 - `@name` overrides the lower-camel-case name derived from the filename.
 - `@access` can explicitly declare `read` or `write`. `read` is an assertion that analysis can prove read-only-compatible execution; it is not a trust override. `write` selects the conservative write execution route and does not necessarily claim that the statement mutates data.
-- `@param` provides a PostgreSQL type when PostgreSQL cannot infer one. A trailing `?` permits a nullable input when NULL admission is otherwise unknown; generation rejects it when PostgreSQL proves that the parameter type, an evaluated use, or a DML target rejects NULL.
+- `@param name type` supplies a PostgreSQL type when PostgreSQL cannot infer one. Parameters are non-null to callers by default.
+- `@param name ?` requests a nullable caller input while retaining PostgreSQL type inference. `@param name type?` combines the same request with an explicit PostgreSQL type. Either form is proof-gated: generation succeeds only when canonical PostgreSQL evidence is `accepts`, and fails for `rejects` or `unknown`.
 - `@column` asserts that a result column exists and optionally asserts its PostgreSQL type.
 
 PostgreSQL still performs the authoritative parse, name resolution, type inference, rewriting, function/operator resolution, and catalog lookup.
+
+Caller permission and PostgreSQL admission are deliberately different facts. An accepting PostgreSQL use never widens the generated caller API without `?`; a nullable directive states the intended application contract and asks generation to verify it. Generated parameter metadata records the resolved contract as a required `nullable` boolean and does not expose analyzer admission.
+
+Top-level SQL `NULL` is also distinct from values nested inside a parameter. `PgArrayParameter<T>` continues to permit NULL array elements without making the outer array nullable. JSON objects may contain JSON null, and serialized JSON text such as `'null'` remains a non-null SQL parameter value; only an accepted nullable directive adds top-level SQL `null` to the generated property.
 
 Generated cardinality is derived from the analyzer's row bounds. A `rowBounds.max` value of `null` means that analysis did not prove a finite upper bound, not that execution is known to produce multiple rows; the public contract remains conservatively `many`.
 

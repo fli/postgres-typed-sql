@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Breaking: generated parameter properties are now non-null by default. `@param name ?` requests nullable caller input with an inferred PostgreSQL type, while `@param name type?` combines the request with an explicit type; both forms require analyzer-proved `accepts` NULL admission. PostgreSQL admission no longer widens caller types implicitly, and generated parameter metadata now requires `nullable` to describe only the resolved caller contract.
+
 ## 0.1.0-beta.6
 
 - Breaking: generated parameter-object properties now use conservative camel case by default while SQL tokens, `@param` directives, analyzer labels, and parameter metadata retain their raw spelling. Configure `naming.parameterProperties: 'preserve'` only for a deliberate exact-name API; post-transform collisions are rejected.
