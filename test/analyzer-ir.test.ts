@@ -7,6 +7,7 @@ import {
   type TypedSqlPostgresIr,
   type TypedSqlPostgresIrCompiledConfig,
 } from '../src/analyzer-ir.js'
+import type { PostgresQueryable } from '../src/database.js'
 import { createAnalysisDatabase } from '../src/engine.js'
 
 const schemaFile = resolve(import.meta.dirname, 'fixtures/schema.sql')
@@ -25,6 +26,144 @@ function config(
     sql,
   }
 }
+
+test('loads every referenced relation attribute consistently in large and focused batches', async () => {
+  const database = await createAnalysisDatabase({ schemaFiles: [schemaFile] })
+  try {
+    const stressColumnCount = 1_501
+    const stressColumns = Array.from(
+      { length: stressColumnCount },
+      (_, index) => `column_${index + 1} integer not null`
+    )
+    await database.query(`create table public.catalog_column_stress (${stressColumns.join(', ')})`)
+
+    const representative = config(
+      'batchStableRepresentative',
+      `select
+         account.id,
+         account.role,
+         account.display_name,
+         jsonb_build_object('role', account.role) as payload
+       from public.accounts account
+       where account.display_name is not null`
+    )
+    const stress = config(
+      'catalogColumnStress',
+      `select ${Array.from({ length: stressColumnCount }, (_, index) => `column_${index + 1}`).join(', ')}
+       from public.catalog_column_stress`
+    )
+
+    const focused = await buildTypedSqlPostgresIrFromCompiledConfigs(database, [representative])
+    const columnCatalogQueries: { readonly params?: readonly unknown[]; readonly text: string }[] = []
+    const observedClient: PostgresQueryable = {
+      async query<Row>(text: string, params?: readonly unknown[]) {
+        if (text.includes('a.attnotnull')) {
+          columnCatalogQueries.push({ params, text })
+        }
+        return database.query<Row>(text, params)
+      },
+    }
+    const batched = await buildTypedSqlPostgresIrFromCompiledConfigs(observedClient, [representative, stress])
+    const expectedColumns = await database.query<{ readonly count: number }>(
+      `select count(*)::int as count
+       from pg_attribute
+       where attrelid = any(array['public.accounts'::regclass, 'public.catalog_column_stress'::regclass])
+         and attnum > 0
+         and not attisdropped`
+    )
+
+    assert.equal(columnCatalogQueries.length, 1)
+    assert.match(columnCatalogQueries[0]?.text ?? '', /where c\.oid = any\(\$1::oid\[\]\)/u)
+    assert.equal(columnCatalogQueries[0]?.params?.length, 1)
+    assert.equal((columnCatalogQueries[0]?.params?.[0] as readonly unknown[] | undefined)?.length, 2)
+    assert.equal(batched.catalogFacts.columns, expectedColumns.rows[0]?.count)
+    assert.deepEqual(batched.queries[0], focused.queries[0])
+    assert.equal(batched.queries[1]?.resultColumns.length, stressColumnCount)
+    assert.ok(batched.queries[1]?.resultColumns.every((column) => column.nullability.kind === 'nonNull'))
+
+    const [id, role, displayName, payload] = focused.queries[0]?.resultColumns ?? []
+    assert.equal(id?.nullability.kind, 'nonNull')
+    assert.equal(id?.source.kind, 'tableColumn')
+    assert.deepEqual(role?.checkConstraintType, {
+      kind: 'literalUnion',
+      labels: ['member', 'admin'],
+    })
+    assert.equal(displayName?.nullability.kind, 'nonNull')
+    assert.equal(payload?.jsonShape?.kind, 'object')
+  } finally {
+    await database.close()
+  }
+})
+
+test('preserves base alias, outer-join, whole-row, and system-attribute distinctions', async () => {
+  const database = await createAnalysisDatabase({ schemaFiles: [schemaFile] })
+  try {
+    const result = await buildTypedSqlPostgresIrFromCompiledConfigs(database, [
+      config('directAlias', 'select account.id from public.accounts account'),
+      config(
+        'qualifiedOuterJoin',
+        `select account.id as account_id, post.id as post_id
+         from public.accounts account
+         left join public.posts post
+           on post.account_id = account.id`
+      ),
+      config('wholeRowAndSystemAttribute', 'select account as account_row, account.ctid from public.accounts account'),
+    ])
+    const queries = new Map(result.queries.map((query) => [query.name, query]))
+
+    assert.equal(queries.get('directAlias')?.resultColumns[0]?.nullability.kind, 'nonNull')
+    assert.equal(queries.get('qualifiedOuterJoin')?.resultColumns[0]?.nullability.kind, 'nonNull')
+    assert.deepEqual(queries.get('qualifiedOuterJoin')?.resultColumns[1]?.nullability, {
+      evidence: 'outer_join_column',
+      kind: 'nullable',
+    })
+    assert.deepEqual(queries.get('wholeRowAndSystemAttribute')?.resultColumns[0]?.nullability, {
+      basis: 'whole_row',
+      kind: 'nonNull',
+    })
+    assert.deepEqual(queries.get('wholeRowAndSystemAttribute')?.resultColumns[1]?.nullability, {
+      kind: 'unknown',
+      reason: 'system_attribute:-1',
+    })
+  } finally {
+    await database.close()
+  }
+})
+
+test('throws when a positive base Var is missing its required catalog column fact', async () => {
+  const database = await createAnalysisDatabase({ schemaFiles: [schemaFile] })
+  try {
+    const missingPostIdClient: PostgresQueryable = {
+      async query<Row>(text: string, params?: readonly unknown[]) {
+        const result = await database.query<Row>(text, params)
+        if (!text.includes('a.attnotnull') || !text.includes('from pg_class c')) {
+          return result
+        }
+        return {
+          rows: result.rows.filter((row) => {
+            const column = row as { readonly attname?: string; readonly relname?: string }
+            return column.relname !== 'posts' || column.attname !== 'id'
+          }),
+        }
+      },
+    }
+
+    await assert.rejects(
+      buildTypedSqlPostgresIrFromCompiledConfigs(missingPostIdClient, [
+        config(
+          'missingOuterJoinedColumnFact',
+          `select post.id
+           from public.accounts account
+           left join public.posts post
+             on post.account_id = account.id`
+        ),
+      ]),
+      /queries\/missingOuterJoinedColumnFact\.typed\.sql: failed to build typed SQL IR missingOuterJoinedColumnFact: internal analyzer catalog inconsistency: missing positive base-column fact for relation OID \d+, attribute number 1 in SELECT query/u
+    )
+  } finally {
+    await database.close()
+  }
+})
 
 test('infers structured JSON from scalar subqueries and derived whole rows', async () => {
   const database = await createAnalysisDatabase({ schemaFiles: [schemaFile] })
