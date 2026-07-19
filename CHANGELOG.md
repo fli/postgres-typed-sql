@@ -1,9 +1,14 @@
 # Changelog
 
-## Unreleased
+## 0.1.0-beta.7
 
 - Breaking: public analyzer IR and generated runtime result-column metadata now expose the required `expressionSource` field instead of the ambiguous `source`. It describes only the immediate analyzed expression—a direct table column, derived `Var`, or expression tag—and does not claim ultimate lineage.
 - Breaking: generated parameter properties are now non-null by default. `@param name ?` requests nullable caller input with an inferred PostgreSQL type, while `@param name type?` combines the request with an explicit type; both forms require analyzer-proved `accepts` NULL admission. PostgreSQL admission no longer widens caller types implicitly, and generated parameter metadata now requires `nullable` to describe only the resolved caller contract.
+- Replaced nullable-by-default analysis with explicit proof states for result nullability, statement access, parameter NULL admission, and row bounds. Missing required analyzer or catalog facts now fail generation, while genuinely opaque PostgreSQL boundaries remain safely unknown.
+- Made referenced relation OIDs the canonical source for batched relation-column catalog facts and made PostgreSQL RTE output expressions the canonical immediate source for base relations, subqueries, CTEs, joins, groups, `VALUES`, lateral and correlated scopes, whole rows, and special attributes.
+- Added one canonical recursive row-bound analysis for structural query forms and composed scalar-subquery nullability from nested row bounds and selected-output nullability.
+- Added schema-8 coercion evidence and sound nullability composition for value-preserving relabels, domains, audited PostgreSQL casts and type I/O, arrays, and rowtype conversions while leaving unsupported and user-defined semantics unknown.
+- Added immutable native-engine cache identities and a faster worktree bootstrap path without weakening native artifact verification.
 
 ## 0.1.0-beta.6
 
