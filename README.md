@@ -215,7 +215,7 @@ Directives are SQL comments at the beginning of a `.typed.sql` file:
 
 PostgreSQL still performs the authoritative parse, name resolution, type inference, rewriting, function/operator resolution, and catalog lookup.
 
-Generated cardinality is derived from the analyzer's row bounds. A `rowBounds.max` value of `null` means that analysis proved no finite upper bound, not that execution is known to produce multiple rows; the public contract remains conservatively `many`.
+Generated cardinality is derived from the analyzer's row bounds. A `rowBounds.max` value of `null` means that analysis did not prove a finite upper bound, not that execution is known to produce multiple rows; the public contract remains conservatively `many`.
 
 ## Schema input
 
