@@ -57,6 +57,7 @@
     "build": "pnpm run clean && tsc -p tsconfig.build.json && node scripts/stage-engine.mjs",
     "build:engine": "sh scripts/build-engine.sh",
     "clean": "rm -rf dist",
+    "engine:prepare": "sh scripts/prepare-engine.sh",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "lint": "eslint .",
@@ -65,6 +66,7 @@
     "test:build": "tsc -p tsconfig.test.json && node scripts/stage-test-engine.mjs",
     "test:all": "pnpm run scan:independence && pnpm run typecheck && pnpm run lint && pnpm run format:check && pnpm run build && pnpm run test:build && pnpm test && pnpm run pack:check",
     "scan:independence": "node scripts/check-independence.mjs",
+    "setup:worktree": "pnpm install --frozen-lockfile --ignore-scripts && pnpm run engine:prepare",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "devDependencies": {

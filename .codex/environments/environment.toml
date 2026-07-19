@@ -1,0 +1,5 @@
+version = 1
+name = "postgres-typed-sql"
+
+[setup]
+script = "pnpm run setup:worktree"
