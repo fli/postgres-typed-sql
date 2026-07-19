@@ -5,12 +5,26 @@ import test from 'node:test'
 import {
   buildTypedSqlPostgresIrFromCompiledConfigs,
   type TypedSqlPostgresIr,
+  type TypedSqlPostgresIrColumn,
   type TypedSqlPostgresIrCompiledConfig,
 } from '../src/analyzer-ir.js'
 import type { PostgresQueryable } from '../src/database.js'
 import { createAnalysisDatabase } from '../src/engine.js'
 
 const schemaFile = resolve(import.meta.dirname, 'fixtures/schema.sql')
+
+type IsExactly<Left, Right> =
+  (<Value>() => Value extends Left ? 1 : 2) extends <Value>() => Value extends Right ? 1 : 2 ? true : false
+type AssertTrue<Value extends true> = Value
+type AnalyzerExpressionSourceIsRequired = AssertTrue<
+  IsExactly<
+    Pick<TypedSqlPostgresIrColumn, 'expressionSource'>,
+    Required<Pick<TypedSqlPostgresIrColumn, 'expressionSource'>>
+  >
+>
+type AnalyzerSourceIsAbsent = AssertTrue<IsExactly<Extract<keyof TypedSqlPostgresIrColumn, 'source'>, never>>
+
+const analyzerSourceTypeAssertions: [AnalyzerExpressionSourceIsRequired, AnalyzerSourceIsAbsent] = [true, true]
 
 function config(
   name: string,
@@ -119,13 +133,93 @@ test('loads every referenced relation attribute consistently in large and focuse
 
     const [id, role, displayName, payload] = focused.queries[0]?.resultColumns ?? []
     assert.equal(id?.nullability.kind, 'nonNull')
-    assert.equal(id?.source.kind, 'tableColumn')
+    assert.equal(id?.expressionSource.kind, 'tableColumn')
     assert.deepEqual(role?.checkConstraintType, {
       kind: 'literalUnion',
       labels: ['member', 'admin'],
     })
     assert.equal(displayName?.nullability.kind, 'nonNull')
     assert.equal(payload?.jsonShape?.kind, 'object')
+  } finally {
+    await database.close()
+  }
+})
+
+test('exposes only immediate expressionSource metadata for direct, derived, and multi-source expressions', async () => {
+  const database = await createAnalysisDatabase({ schemaFiles: [schemaFile] })
+  try {
+    const result = await buildTypedSqlPostgresIrFromCompiledConfigs(database, [
+      config('direct', 'select account.id from public.accounts account'),
+      config('derived', 'select value from (select account.id as value from public.accounts account) derived'),
+      config(
+        'unioned',
+        `select value
+         from (
+           select account.id as value from public.accounts account
+           union all
+           select post.id from public.posts post
+         ) combined`
+      ),
+      config(
+        'joined',
+        `select value
+         from (select 1 as value) left_side
+         join (select 1 as value) right_side using (value)`
+      ),
+      config('casted', 'select account.id::text as value from public.accounts account'),
+      config(
+        'coalesced',
+        `select coalesce(account.display_name, post.title) as value
+         from public.accounts account
+         left join public.posts post on post.account_id = account.id`
+      ),
+      config(
+        'multiSourceOperator',
+        `select account.email || coalesce(post.title, account.display_name) as value
+         from public.accounts account
+         left join public.posts post on post.account_id = account.id`
+      ),
+    ])
+    const queries = new Map(result.queries.map((query) => [query.name, query]))
+    assert.deepEqual(analyzerSourceTypeAssertions, [true, true])
+    const column = (name: string) => {
+      const value = queries.get(name)?.resultColumns[0]
+      assert.ok(value, `missing result column for ${name}`)
+      assert.equal(Object.hasOwn(value, 'source'), false)
+      return value
+    }
+
+    assert.deepEqual(column('direct').expressionSource, {
+      attname: 'id',
+      kind: 'tableColumn',
+      relname: 'accounts',
+      varattno: 1,
+      varlevelsup: 0,
+      varno: 1,
+      varnullingrels: [],
+    })
+    for (const name of ['derived', 'unioned', 'joined']) {
+      assert.deepEqual(column(name).expressionSource, {
+        kind: 'derivedVar',
+        relname: null,
+        varattno: 1,
+        varlevelsup: 0,
+        varno: 1,
+        varnullingrels: [],
+      })
+    }
+    assert.deepEqual(column('casted').expressionSource, {
+      kind: 'expression',
+      tag: 'CoerceViaIO',
+    })
+    assert.deepEqual(column('coalesced').expressionSource, {
+      kind: 'expression',
+      tag: 'CoalesceExpr',
+    })
+    assert.deepEqual(column('multiSourceOperator').expressionSource, {
+      kind: 'expression',
+      tag: 'OpExpr',
+    })
   } finally {
     await database.close()
   }
@@ -282,6 +376,369 @@ test('resolves immediate JOIN, GROUP, VALUES, CTE, and opaque RTE sources once f
   }
 })
 
+test('composes canonical row bounds with scalar EXPR subquery output nullability', async () => {
+  const database = await createAnalysisDatabase({ schemaFiles: [schemaFile] })
+  try {
+    const result = await buildTypedSqlPostgresIrFromCompiledConfigs(database, [
+      config('zeroValues', '(values (1)) limit 0'),
+      config('oneValue', 'values (1)'),
+      config('manyValues', 'values (1), (2), (3)'),
+      config('projectedValues', 'select value from (values (1), (2)) source(value)'),
+      config('guaranteedSelect', 'select 1 as value'),
+      config('qualifiedSelect', 'select 1 as value where $1', ['include']),
+      config('globalAggregate', 'select count(*) as value from public.accounts'),
+      config('qualifiedGlobalAggregate', 'select count(*) as value from public.accounts having $1', ['include']),
+      config('groupedValues', 'select value from (values (1), (2)) source(value) group by value'),
+      config('unionAllValues', 'select 1 as value union all select 2'),
+      config('unionValues', 'select 1 as value union select 2'),
+      config('intersectValues', 'select 1 as value intersect select 1'),
+      config('exceptValues', 'select 1 as value except select 2'),
+      config('exceptEmpty', 'select 1 as value except (select 2 limit 0)'),
+      config('limitedValues', '(values (1), (2)) limit 1'),
+      config(
+        'fetchWithTiesValues',
+        `select value
+         from (values (1), (2), (3), (4), (5)) source(value)
+         order by value
+         fetch first 2 rows with ties`
+      ),
+      config('offsetValues', '(values (1), (2)) offset 1'),
+      config('dynamicLimitedValues', '(values (1), (2)) limit $1', ['limit']),
+      config(
+        'projectedSetOutput',
+        `select value
+         from (select 1 as value union all select null::integer) source`
+      ),
+      config('emptyScalar', 'select (select 1 limit 0) as value'),
+      config('nonNullScalar', 'select (select 1) as value'),
+      config('nullableScalar', 'select (select null::integer) as value'),
+      config('unknownScalar', 'select (select $1::integer) as value', ['value']),
+      config('unresolvedNonNullScalar', 'select (select 1 from public.accounts limit 1) as value'),
+      config('unresolvedNullableScalar', 'select (select display_name from public.accounts limit 1) as value'),
+      config('unresolvedUnknownScalar', 'select (select $1::text from public.accounts limit 1) as value', ['value']),
+      config('possibleMultipleRowsScalar', 'select (values (1), (2)) as value'),
+      config(
+        'nestedSetScalar',
+        `select (
+           select value
+           from (select 1 as value union all select null::integer) source
+         ) as value`
+      ),
+    ])
+    const queries = new Map(result.queries.map((query) => [query.name, query]))
+    const query = (name: string): TypedSqlPostgresIr => {
+      const value = queries.get(name)
+      assert.ok(value, `missing normalized query ${name}`)
+      return value
+    }
+    const nullability = (name: string) => query(name).resultColumns[0]?.nullability
+
+    assert.deepEqual(query('zeroValues').rowBounds, {
+      max: 0,
+      min: 0,
+      proof: 'values_1_rows+constant_limit_0',
+    })
+    assert.deepEqual(query('oneValue').rowBounds, { max: 1, min: 1, proof: 'values_1_rows' })
+    assert.deepEqual(query('manyValues').rowBounds, { max: 3, min: 3, proof: 'values_3_rows' })
+    assert.deepEqual(query('projectedValues').rowBounds, {
+      max: 2,
+      min: 2,
+      proof: 'subquery_projection:values_2_rows',
+    })
+    assert.deepEqual(query('guaranteedSelect').rowBounds, {
+      max: 1,
+      min: 1,
+      proof: 'select_without_from',
+    })
+    assert.deepEqual(query('qualifiedSelect').rowBounds, {
+      max: 1,
+      min: 0,
+      proof: 'select_without_from_with_qual',
+    })
+    assert.deepEqual(query('globalAggregate').rowBounds, { max: 1, min: 1, proof: 'global_aggregate' })
+    assert.deepEqual(query('qualifiedGlobalAggregate').rowBounds, {
+      max: 1,
+      min: 0,
+      proof: 'global_aggregate_with_having',
+    })
+    assert.deepEqual(query('groupedValues').rowBounds, {
+      max: 2,
+      min: 1,
+      proof: 'subquery_grouping:values_2_rows',
+    })
+    assert.deepEqual(query('unionAllValues').rowBounds, {
+      max: 2,
+      min: 2,
+      proof: 'union_all(select_without_from,select_without_from)',
+    })
+    assert.deepEqual(query('unionValues').rowBounds, {
+      max: 2,
+      min: 1,
+      proof: 'union(select_without_from,select_without_from)',
+    })
+    assert.deepEqual(query('intersectValues').rowBounds, {
+      max: 1,
+      min: 0,
+      proof: 'intersect(select_without_from,select_without_from)',
+    })
+    assert.deepEqual(query('exceptValues').rowBounds, {
+      max: 1,
+      min: 0,
+      proof: 'except(select_without_from,select_without_from)',
+    })
+    assert.deepEqual(query('exceptEmpty').rowBounds, {
+      max: 1,
+      min: 1,
+      proof: 'except(select_without_from,select_without_from+constant_limit_0)',
+    })
+    assert.deepEqual(query('limitedValues').rowBounds, {
+      max: 1,
+      min: 1,
+      proof: 'values_2_rows+constant_limit_1',
+    })
+    assert.deepEqual(query('fetchWithTiesValues').rowBounds, {
+      max: 5,
+      min: 2,
+      proof: 'subquery_projection:values_5_rows+constant_fetch_with_ties_2',
+    })
+    assert.deepEqual(query('offsetValues').rowBounds, {
+      max: 2,
+      min: 0,
+      proof: 'values_2_rows+offset_can_drop_rows',
+    })
+    assert.deepEqual(query('dynamicLimitedValues').rowBounds, {
+      max: 2,
+      min: 0,
+      proof: 'values_2_rows+dynamic_limit_can_drop_rows',
+    })
+    assert.deepEqual(query('projectedSetOutput').rowBounds, {
+      max: 2,
+      min: 2,
+      proof: 'subquery_projection:union_all(select_without_from,select_without_from)',
+    })
+    assert.equal(nullability('projectedSetOutput')?.kind, 'nullable')
+
+    assert.deepEqual(nullability('emptyScalar'), {
+      evidence: 'scalar_sublink_empty_query',
+      kind: 'nullable',
+    })
+    assert.equal(nullability('nonNullScalar')?.kind, 'nonNull')
+    assert.equal(nullability('nullableScalar')?.kind, 'nullable')
+    assert.equal(nullability('unknownScalar')?.kind, 'unknown')
+    assert.deepEqual(nullability('unresolvedNonNullScalar'), {
+      kind: 'unknown',
+      reason: 'scalar_sublink_row_presence_unresolved',
+    })
+    assert.equal(nullability('unresolvedNullableScalar')?.kind, 'nullable')
+    assert.deepEqual(nullability('unresolvedUnknownScalar'), {
+      kind: 'unknown',
+      reason: 'scalar_sublink_row_presence_unresolved',
+    })
+    assert.equal(nullability('possibleMultipleRowsScalar')?.kind, 'nonNull')
+    assert.equal(nullability('nestedSetScalar')?.kind, 'nullable')
+  } finally {
+    await database.close()
+  }
+})
+
+test('throws on malformed and cyclic scalar EXPR subquery ownership', async () => {
+  const database = await createAnalysisDatabase({ schemaFiles: [schemaFile] })
+  try {
+    const cases: readonly {
+      readonly corrupt: (analysis: MutableEnvelopeObject) => void
+      readonly error: RegExp
+      readonly name: string
+    }[] = [
+      {
+        corrupt(analysis) {
+          const query = firstEnvelopeQuery(analysis)
+          const target = envelopeObject(envelopeArray(query.targetList)[0])
+          const subquery = envelopeObject(envelopeObject(target.expr).subquery)
+          subquery.targetList = []
+        },
+        error: /EXPR SubLink query has 0 result outputs; expected exactly 1/u,
+        name: 'missingScalarOutput',
+      },
+      {
+        corrupt(analysis) {
+          const query = firstEnvelopeQuery(analysis)
+          const target = envelopeObject(envelopeArray(query.targetList)[0])
+          envelopeObject(target.expr).subquery = query
+        },
+        error: /cyclic nested-query ownership/u,
+        name: 'cyclicScalarQuery',
+      },
+    ]
+
+    for (const fixture of cases) {
+      await assert.rejects(
+        buildTypedSqlPostgresIrFromCompiledConfigs(corruptAnalyzerEnvelope(database, fixture.corrupt), [
+          config(fixture.name, 'select (select 1) as value'),
+        ]),
+        fixture.error
+      )
+    }
+  } finally {
+    await database.close()
+  }
+})
+
+test('derives cast and domain nullability once without unsafe CHECK or JSON unwrapping', async () => {
+  const database = await createAnalysisDatabase({ schemaFiles: [schemaFile] })
+  try {
+    await database.query('create domain public.nullable_integer_domain as integer')
+    await database.query('create domain public.required_integer_domain as integer not null')
+    await database.query('create domain public.checked_required_integer_domain as integer check (value is not null)')
+    await database.query("create domain public.unknown_integer_domain as integer check (concat(value::text, '') <> '')")
+    await database.query('create domain public.nested_required_integer_domain as public.required_integer_domain')
+    await database.query("create type public.source_cast_enum as enum ('member')")
+    await database.query("create type public.target_cast_enum as enum ('member')")
+    await database.query(`create function public.source_to_target_cast(value public.source_cast_enum)
+      returns public.target_cast_enum
+      language sql immutable strict
+      as $$ select value::text::public.target_cast_enum $$`)
+    await database.query(`create cast (public.source_cast_enum as public.target_cast_enum)
+      with function public.source_to_target_cast(public.source_cast_enum)`)
+    await database.query(`create table public.coercion_probe (
+      nullable_integer integer,
+      required_integer integer not null,
+      nullable_integers integer[],
+      required_integers integer[] not null,
+      nullable_user_value public.source_cast_enum,
+      required_user_value public.source_cast_enum not null
+    )`)
+    await database.query('create table public.coercion_parent_row (parent_value integer)')
+    await database.query(
+      'create table public.coercion_child_row (child_value text) inherits (public.coercion_parent_row)'
+    )
+
+    const result = await buildTypedSqlPostgresIrFromCompiledConfigs(database, [
+      config(
+        'canonicalCoercions',
+        `select
+           required_integer::oid as required_relabel,
+           nullable_integer::oid as nullable_relabel,
+           required_integer::bigint as required_exact_function_cast,
+           nullable_integer::bigint as nullable_exact_function_cast,
+           required_integer::numeric as required_opaque_function_cast,
+           nullable_integer::numeric as nullable_opaque_function_cast,
+           required_integer::text as required_builtin_io,
+           nullable_integer::text as nullable_builtin_io,
+           nullable_integer::public.nullable_integer_domain as nullable_domain,
+           nullable_integer::public.required_integer_domain as not_null_domain,
+           nullable_integer::public.checked_required_integer_domain as rejecting_check_domain,
+           nullable_integer::public.unknown_integer_domain as unknown_domain,
+           required_integer::public.unknown_integer_domain as unknown_domain_with_required_source,
+           nullable_integer::public.nested_required_integer_domain as nested_not_null_domain,
+           required_integers::bigint[] as required_array_cast,
+           nullable_integers::bigint[] as nullable_array_cast,
+           required_user_value::public.target_cast_enum as required_user_cast,
+           nullable_user_value::public.target_cast_enum as nullable_user_cast
+         from public.coercion_probe`
+      ),
+      config(
+        'joinCoercion',
+        `select value
+         from (
+           select required_integer::bigint as value
+           from public.coercion_probe
+         ) left_source
+         inner join (
+           select required_integer::bigint as value
+           from public.coercion_probe
+         ) right_source using (value)`
+      ),
+      config(
+        'groupCoercion',
+        `select nullable_integer::numeric as value
+         from public.coercion_probe
+         group by nullable_integer::numeric`
+      ),
+      config('valuesCoercion', 'select value from (values (1::integer::bigint)) source(value)'),
+      config(
+        'rowtypeCoercion',
+        `select coercion_child_row::public.coercion_parent_row
+         from public.coercion_child_row`
+      ),
+      config('safeCheckRefinement', 'select account.role::varchar from public.accounts account'),
+      config('unsafeCheckRefinement', 'select account.role::name from public.accounts account'),
+      config(
+        'unsafeJsonCheckRefinement',
+        `select jsonb_build_object('role', account.role::name)
+         from public.accounts account`
+      ),
+      config('unsafeJsonLiteralRefinement', "select to_jsonb(('member'::text)::bytea)"),
+      config(
+        'unsafeEmptyArrayRefinement',
+        `select coalesce(
+           jsonb_agg(jsonb_build_object('id', account.id)),
+           ('[]'::text)::jsonb
+         )
+         from public.accounts account`
+      ),
+    ])
+    const queries = new Map(result.queries.map((query) => [query.name, query]))
+    const column = (name: string, index = 0) => {
+      const value = queries.get(name)?.resultColumns[index]
+      assert.ok(value, `missing result column ${index} for ${name}`)
+      return value
+    }
+
+    assert.deepEqual(
+      queries.get('canonicalCoercions')?.resultColumns.map(({ nullability }) => nullability),
+      [
+        { basis: 'not_null_column:coercion_probe.required_integer', kind: 'nonNull' },
+        { evidence: 'nullable_column:coercion_probe.nullable_integer', kind: 'nullable' },
+        { basis: 'not_null_column:coercion_probe.required_integer', kind: 'nonNull' },
+        { evidence: 'nullable_column:coercion_probe.nullable_integer', kind: 'nullable' },
+        { kind: 'unknown', reason: 'opaque_non_null_coercion:FuncExpr' },
+        { evidence: 'nullable_column:coercion_probe.nullable_integer', kind: 'nullable' },
+        { basis: 'not_null_column:coercion_probe.required_integer', kind: 'nonNull' },
+        { evidence: 'nullable_column:coercion_probe.nullable_integer', kind: 'nullable' },
+        { evidence: 'nullable_column:coercion_probe.nullable_integer', kind: 'nullable' },
+        { basis: 'domain_rejects_null', kind: 'nonNull' },
+        { basis: 'domain_rejects_null', kind: 'nonNull' },
+        { kind: 'unknown', reason: 'domain_null_admission' },
+        { basis: 'not_null_column:coercion_probe.required_integer', kind: 'nonNull' },
+        { basis: 'domain_rejects_null', kind: 'nonNull' },
+        { basis: 'not_null_column:coercion_probe.required_integers', kind: 'nonNull' },
+        { evidence: 'nullable_column:coercion_probe.nullable_integers', kind: 'nullable' },
+        { kind: 'unknown', reason: 'opaque_non_null_coercion:FuncExpr' },
+        { evidence: 'nullable_column:coercion_probe.nullable_user_value', kind: 'nullable' },
+      ]
+    )
+
+    assert.equal(column('joinCoercion').nullability.kind, 'nonNull')
+    assert.equal(column('groupCoercion').nullability.kind, 'nullable')
+    assert.equal(column('valuesCoercion').nullability.kind, 'nonNull')
+    assert.deepEqual(column('rowtypeCoercion').nullability, {
+      basis: 'whole_row',
+      kind: 'nonNull',
+    })
+
+    assert.deepEqual(column('safeCheckRefinement').checkConstraintType, {
+      kind: 'literalUnion',
+      labels: ['member', 'admin'],
+    })
+    assert.equal(column('unsafeCheckRefinement').checkConstraintType, undefined)
+    const unsafeJsonCheck = column('unsafeJsonCheckRefinement').jsonShape
+    assert.equal(unsafeJsonCheck?.kind, 'object')
+    if (unsafeJsonCheck?.kind === 'object') {
+      assert.equal(unsafeJsonCheck.fields[0]?.shape.kind, 'scalar')
+      assert.equal(
+        unsafeJsonCheck.fields[0]?.shape.kind === 'scalar'
+          ? unsafeJsonCheck.fields[0].shape.checkConstraintType
+          : undefined,
+        undefined
+      )
+    }
+    assert.notEqual(column('unsafeJsonLiteralRefinement').jsonShape?.kind, 'stringLiteral')
+    assert.equal(column('unsafeEmptyArrayRefinement').jsonShape?.kind, 'opaque')
+  } finally {
+    await database.close()
+  }
+})
+
 test('throws when a positive base Var is missing its required catalog column fact', async () => {
   const database = await createAnalysisDatabase({ schemaFiles: [schemaFile] })
   try {
@@ -330,9 +787,39 @@ test('throws on malformed owner identity, output indices, aligned expressions, a
         corrupt(analysis) {
           analysis.schemaVersion = 6
         },
-        error: /analyzer returned unsupported schema version 6; expected 7/u,
+        error: /analyzer returned unsupported schema version 6; expected 8/u,
         name: 'staleSchema',
         sql: 'select account.id from public.accounts account',
+      },
+      {
+        corrupt(analysis) {
+          const query = firstEnvelopeQuery(analysis)
+          const target = envelopeObject(envelopeArray(query.targetList)[0])
+          delete envelopeObject(target.expr).nonNullInputProducesNonNull
+        },
+        error: /RelabelType is missing canonical coercion nullability facts/u,
+        name: 'missingCoercionFact',
+        sql: 'select account.role::varchar from public.accounts account',
+      },
+      {
+        corrupt(analysis) {
+          const query = firstEnvelopeQuery(analysis)
+          const target = envelopeObject(envelopeArray(query.targetList)[0])
+          delete envelopeObject(target.expr).domainNullAdmission
+        },
+        error: /CoerceToDomain is missing canonical domain NULL admission/u,
+        name: 'missingDomainAdmission',
+        sql: 'select account.role::public.required_envelope_domain from public.accounts account',
+      },
+      {
+        corrupt(analysis) {
+          const query = firstEnvelopeQuery(analysis)
+          const target = envelopeObject(envelopeArray(query.targetList)[0])
+          delete envelopeObject(target.expr).inputFunctionOid
+        },
+        error: /CoerceViaIO is missing authoritative type I\/O function identity/u,
+        name: 'missingTypeInputIdentity',
+        sql: 'select account.id::text from public.accounts account',
       },
       {
         corrupt(analysis) {
@@ -394,6 +881,7 @@ test('throws on malformed owner identity, output indices, aligned expressions, a
       },
     ]
 
+    await database.query('create domain public.required_envelope_domain as text not null')
     for (const fixture of cases) {
       await assert.rejects(
         buildTypedSqlPostgresIrFromCompiledConfigs(corruptAnalyzerEnvelope(database, fixture.corrupt), [

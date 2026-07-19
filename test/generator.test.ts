@@ -132,6 +132,73 @@ test('generates PostgreSQL-derived types, nullability, and cardinality', async (
   assert.match(catalog, /export type Accounts__Role = "member" \| "admin"/u)
 })
 
+test('generates only immediate expressionSource runtime metadata', async () => {
+  const root = await createMinimalFixture(
+    `create table public.left_source (id integer not null, label text);
+create table public.right_source (id integer not null, label text);
+`,
+    `select
+  left_source.id as direct_id,
+  derived.id as derived_id,
+  left_source.id::text as cast_id,
+  coalesce(left_source.label, right_source.label) as merged_label
+from public.left_source
+join (select id from public.right_source) derived on derived.id = left_source.id
+join public.right_source on right_source.id = left_source.id
+`
+  )
+
+  await generateTypedSql({
+    codecProfile: 'node-postgres',
+    include: ['queries'],
+    rootDir: root,
+    schema: 'schema.sql',
+  })
+
+  const output = await readFile(join(root, 'queries/query.typed-sql.ts'), 'utf8')
+  assert.match(
+    output,
+    /expressionSource: \{"attname":"id","kind":"tableColumn","relname":"left_source","varattno":1,"varlevelsup":0,"varno":1,"varnullingrels":\[\]\}/u
+  )
+  assert.match(
+    output,
+    /expressionSource: \{"kind":"derivedVar","relname":null,"varattno":1,"varlevelsup":0,"varno":2,"varnullingrels":\[\]\}/u
+  )
+  assert.match(output, /expressionSource: \{"kind":"expression","tag":"CoerceViaIO"\}/u)
+  assert.match(output, /expressionSource: \{"kind":"expression","tag":"CoalesceExpr"\}/u)
+  assert.doesNotMatch(output, /\n {6}source:/u)
+})
+
+test('generates nullable output only when canonical coercion proof remains incomplete', async () => {
+  const root = await createMinimalFixture(
+    `create domain public.required_integer_domain as integer not null;
+create table public.coercion_outputs (
+  required_integer integer not null,
+  nullable_integer integer
+);
+`,
+    `select
+  required_integer::bigint as exact_cast,
+  required_integer::numeric as opaque_cast,
+  nullable_integer::numeric as nullable_cast,
+  nullable_integer::public.required_integer_domain as required_domain
+from public.coercion_outputs
+`
+  )
+  await generateTypedSql({
+    codecProfile: 'node-postgres',
+    include: ['queries'],
+    rootDir: root,
+    schema: 'schema.sql',
+  })
+
+  const output = await readFile(join(root, 'queries/query.typed-sql.ts'), 'utf8')
+  assert.match(output, /readonly exact_cast: PgInt8String\n/u)
+  assert.match(output, /readonly opaque_cast: PgNumericString \| null\n/u)
+  assert.match(output, /readonly nullable_cast: PgNumericString \| null\n/u)
+  assert.match(output, /readonly required_domain: number\n/u)
+})
+
 test('defaults to conservative unknown driver scalar values', async () => {
   const root = await copyFixture()
   await generateTypedSql({
@@ -2112,7 +2179,7 @@ test('maps JSON array-from and object-from derived row shapes to camel case', as
 
   const output = await readFile(join(root, 'queries/query.typed-sql.ts'), 'utf8')
   assert.match(output, /readonly accountRows: readonly \(QueryJ12_account_rowsJsonJ7_element\)\[\]/u)
-  assert.match(output, /readonly accountRow: QueryJ11_account_rowJson \| null/u)
+  assert.match(output, /readonly accountRow: QueryJ11_account_rowJson\n/u)
   assert.match(output, /readonly accountId: number/u)
   assert.match(output, /readonly displayName: 'Reader'/u)
   assert.match(output, /readonly displayName: 'Writer'/u)

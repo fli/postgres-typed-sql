@@ -57,7 +57,8 @@ function jsonFieldMappings(
   return fields
 }
 
-export type TypedSqlColumnSourceMetadata =
+/** Immediate analyzed expression metadata; this is not ultimate column lineage. */
+export type TypedSqlColumnExpressionSourceMetadata =
   | {
       readonly kind: 'derivedVar'
       readonly relname?: string | null
@@ -70,7 +71,7 @@ export type TypedSqlColumnSourceMetadata =
       readonly attname?: string
       readonly kind: 'tableColumn'
       readonly relname?: string | null
-      readonly varattno?: number
+      readonly varattno: number
       readonly varlevelsup: number
       readonly varno: number
       readonly varnullingrels: readonly number[]
@@ -81,6 +82,8 @@ export type TypedSqlColumnSourceMetadata =
     }
 
 export interface TypedSqlColumnMetadata {
+  /** The immediate analyzed expression source, not all underlying contributing columns. */
+  readonly expressionSource: TypedSqlColumnExpressionSourceMetadata
   readonly jsonMapping?: TypedSqlJsonMappingMetadata
   readonly name: string
   readonly nullable: boolean
@@ -88,7 +91,6 @@ export interface TypedSqlColumnMetadata {
   readonly pgTypeName: string
   readonly pgTypeSchema: string
   readonly propertyName: string
-  readonly source?: TypedSqlColumnSourceMetadata
 }
 
 export interface TypedSqlParameterMetadata {

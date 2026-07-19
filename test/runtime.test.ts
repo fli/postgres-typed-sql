@@ -13,18 +13,30 @@ import {
   mapTypedSqlJsonValue,
   mapTypedSqlRow,
   typedSqlRowCount,
+  type TypedSqlColumnMetadata,
   type TypedSqlQueryConfig,
   type TypedSqlStatement,
 } from '../src/runtime.js'
 
 type IsExactly<Left, Right> =
   (<Value>() => Value extends Left ? 1 : 2) extends <Value>() => Value extends Right ? 1 : 2 ? true : false
+type AssertTrue<Value extends true> = Value
+type ExpressionSourceIsRequired = AssertTrue<
+  IsExactly<
+    Pick<TypedSqlColumnMetadata, 'expressionSource'>,
+    Required<Pick<TypedSqlColumnMetadata, 'expressionSource'>>
+  >
+>
+type ObsoleteSourceIsAbsent = AssertTrue<IsExactly<Extract<keyof TypedSqlColumnMetadata, 'source'>, never>>
+
+const publicMetadataTypeAssertions: [ExpressionSourceIsRequired, ObsoleteSourceIsAbsent] = [true, true]
 
 test('runtime binds named parameters in generated order', async () => {
   const statement = createTypedSqlStatement<{ readonly email: string }, { readonly email: string }>({
     cardinality: 'optional',
     columns: [
       {
+        expressionSource: { kind: 'expression', tag: 'OpExpr' },
         name: 'email',
         nullable: false,
         pgType: 'text',
@@ -40,6 +52,8 @@ test('runtime binds named parameters in generated order', async () => {
   })
 
   assert.deepEqual(statement.values({ email: 'reader@example.test' }), ['reader@example.test'])
+  assert.deepEqual(publicMetadataTypeAssertions, [true, true])
+  assert.equal(Object.hasOwn(statement.columns[0] ?? {}, 'source'), false)
   const rawQuery = statement.query({ email: 'reader@example.test' })
   const secondRawQuery = statement.query({ email: 'reader@example.test' })
   assert.notEqual(rawQuery.values, secondRawQuery.values)
@@ -142,6 +156,7 @@ test('node-postgres adapter rejects rows that do not match the requested mapping
   const positional = createTypedSqlStatement<Record<string, never>, { readonly value: number }>({
     columns: [
       {
+        expressionSource: { kind: 'expression', tag: 'Const' },
         name: 'value',
         nullable: false,
         pgType: 'integer',
@@ -220,6 +235,7 @@ test('runtime preserves an exact __proto__ output property from array rows witho
   const statement = createTypedSqlStatement<Record<string, never>, { readonly __proto__: string }>({
     columns: [
       {
+        expressionSource: { kind: 'expression', tag: 'OpExpr' },
         name: '__proto__',
         nullable: false,
         pgType: 'text',
@@ -315,6 +331,7 @@ test('runtime public statement contract preserves legacy custom object-row mappi
     cardinality: 'many',
     columns: [
       {
+        expressionSource: { kind: 'expression', tag: 'Const' },
         name: 'camel_value',
         nullable: false,
         pgType: 'integer',
@@ -421,6 +438,7 @@ test('runtime execution applies generated nested JSON mappings to positional row
   >({
     columns: [
       {
+        expressionSource: { kind: 'expression', tag: 'SubLink' },
         jsonMapping: {
           arrayElement: {
             fields: [
