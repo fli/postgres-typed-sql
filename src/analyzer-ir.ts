@@ -18,7 +18,7 @@ import {
   type TypedSqlPostgresIrAccessEvidence,
   type TypedSqlPostgresIrCheckConstraintTypeExpression,
   type TypedSqlPostgresIrColumn,
-  type TypedSqlPostgresIrColumnSource,
+  type TypedSqlPostgresIrColumnExpressionSource,
   type TypedSqlPostgresIrCompiledConfig,
   type TypedSqlPostgresIrJsonField,
   type TypedSqlPostgresIrJsonShape,
@@ -37,7 +37,7 @@ export type {
   TypedSqlPostgresIrAccessEvidence,
   TypedSqlPostgresIrCheckConstraintTypeExpression,
   TypedSqlPostgresIrColumn,
-  TypedSqlPostgresIrColumnSource,
+  TypedSqlPostgresIrColumnExpressionSource,
   TypedSqlPostgresIrCompiledConfig,
   TypedSqlPostgresIrJsonField,
   TypedSqlPostgresIrJsonShape,
@@ -1929,7 +1929,7 @@ function expressionNullability(
   return { kind: 'unknown', reason: `unsupported_expression:${expr.tag}` }
 }
 
-function sourceForExpr(expr: PgAnalyzerExpr | null | undefined): TypedSqlPostgresIrColumnSource {
+function expressionSourceForExpr(expr: PgAnalyzerExpr | null | undefined): TypedSqlPostgresIrColumnExpressionSource {
   if (!expr || expr.tag !== 'Var' || expr.varno === undefined || expr.varattno === undefined) {
     return { kind: 'expression', tag: expr?.tag ?? 'unknown' }
   }
@@ -2291,11 +2291,11 @@ function normalizeCompiledIr(catalog: CatalogFacts, analyzed: AnalyzedCompiledCo
       : undefined
     const jsonShape = inferredJsonShape ? jsonShapeWithNullability(inferredJsonShape, nullability) : undefined
     return {
+      expressionSource: expressionSourceForExpr(expr),
       jsonShape,
       name: target.resname ?? null,
       nullability,
       ...typeFact,
-      source: sourceForExpr(expr),
       ...(checkConstraintType ? { checkConstraintType } : {}),
     }
   })

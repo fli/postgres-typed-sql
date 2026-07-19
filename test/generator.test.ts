@@ -132,6 +132,42 @@ test('generates PostgreSQL-derived types, nullability, and cardinality', async (
   assert.match(catalog, /export type Accounts__Role = "member" \| "admin"/u)
 })
 
+test('generates only immediate expressionSource runtime metadata', async () => {
+  const root = await createMinimalFixture(
+    `create table public.left_source (id integer not null, label text);
+create table public.right_source (id integer not null, label text);
+`,
+    `select
+  left_source.id as direct_id,
+  derived.id as derived_id,
+  left_source.id::text as cast_id,
+  coalesce(left_source.label, right_source.label) as merged_label
+from public.left_source
+join (select id from public.right_source) derived on derived.id = left_source.id
+join public.right_source on right_source.id = left_source.id
+`
+  )
+  await generateTypedSql({
+    codecProfile: 'node-postgres',
+    include: ['queries'],
+    rootDir: root,
+    schema: 'schema.sql',
+  })
+
+  const output = await readFile(join(root, 'queries/query.typed-sql.ts'), 'utf8')
+  assert.match(
+    output,
+    /expressionSource: \{"attname":"id","kind":"tableColumn","relname":"left_source","varlevelsup":0,"varno":1,"varnullingrels":\[\]\}/u
+  )
+  assert.match(
+    output,
+    /expressionSource: \{"kind":"derivedVar","relname":null,"varattno":1,"varlevelsup":0,"varno":2,"varnullingrels":\[\]\}/u
+  )
+  assert.match(output, /expressionSource: \{"kind":"expression","tag":"CoerceViaIO"\}/u)
+  assert.match(output, /expressionSource: \{"kind":"expression","tag":"CoalesceExpr"\}/u)
+  assert.doesNotMatch(output, /\n {6}source:/u)
+})
+
 test('defaults to conservative unknown driver scalar values', async () => {
   const root = await copyFixture()
   await generateTypedSql({

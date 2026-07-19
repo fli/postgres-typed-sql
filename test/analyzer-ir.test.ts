@@ -5,12 +5,26 @@ import test from 'node:test'
 import {
   buildTypedSqlPostgresIrFromCompiledConfigs,
   type TypedSqlPostgresIr,
+  type TypedSqlPostgresIrColumn,
   type TypedSqlPostgresIrCompiledConfig,
 } from '../src/analyzer-ir.js'
 import type { PostgresQueryable } from '../src/database.js'
 import { createAnalysisDatabase } from '../src/engine.js'
 
 const schemaFile = resolve(import.meta.dirname, 'fixtures/schema.sql')
+
+type IsExactly<Left, Right> =
+  (<Value>() => Value extends Left ? 1 : 2) extends <Value>() => Value extends Right ? 1 : 2 ? true : false
+type AssertTrue<Value extends true> = Value
+type AnalyzerExpressionSourceIsRequired = AssertTrue<
+  IsExactly<
+    Pick<TypedSqlPostgresIrColumn, 'expressionSource'>,
+    Required<Pick<TypedSqlPostgresIrColumn, 'expressionSource'>>
+  >
+>
+type AnalyzerSourceIsAbsent = AssertTrue<IsExactly<Extract<keyof TypedSqlPostgresIrColumn, 'source'>, never>>
+
+const analyzerSourceTypeAssertions: [AnalyzerExpressionSourceIsRequired, AnalyzerSourceIsAbsent] = [true, true]
 
 function config(
   name: string,
@@ -119,13 +133,94 @@ test('loads every referenced relation attribute consistently in large and focuse
 
     const [id, role, displayName, payload] = focused.queries[0]?.resultColumns ?? []
     assert.equal(id?.nullability.kind, 'nonNull')
-    assert.equal(id?.source.kind, 'tableColumn')
+    assert.equal(id?.expressionSource.kind, 'tableColumn')
     assert.deepEqual(role?.checkConstraintType, {
       kind: 'literalUnion',
       labels: ['member', 'admin'],
     })
     assert.equal(displayName?.nullability.kind, 'nonNull')
     assert.equal(payload?.jsonShape?.kind, 'object')
+  } finally {
+    await database.close()
+  }
+})
+
+test('exposes only immediate expressionSource metadata for direct, derived, and multi-source expressions', async () => {
+  const database = await createAnalysisDatabase({ schemaFiles: [schemaFile] })
+  try {
+    const result = await buildTypedSqlPostgresIrFromCompiledConfigs(database, [
+      config('direct', 'select account.id from public.accounts account'),
+      config('derived', 'select value from (select account.id as value from public.accounts account) derived'),
+      config(
+        'unioned',
+        `select value
+         from (
+           select account.id as value from public.accounts account
+           union all
+           select post.id from public.posts post
+         ) combined`
+      ),
+      config(
+        'joined',
+        `select value
+         from (select 1 as value) left_side
+         join (select 1 as value) right_side using (value)`
+      ),
+      config('casted', 'select account.id::text as value from public.accounts account'),
+      config(
+        'coalesced',
+        `select coalesce(account.display_name, post.title) as value
+         from public.accounts account
+         left join public.posts post on post.account_id = account.id`
+      ),
+      config(
+        'multiSourceOperator',
+        `select account.email || coalesce(post.title, account.display_name) as value
+         from public.accounts account
+         left join public.posts post on post.account_id = account.id`
+      ),
+    ])
+    const queries = new Map(result.queries.map((query) => [query.name, query]))
+    assert.deepEqual(analyzerSourceTypeAssertions, [true, true])
+    const column = (name: string) => {
+      const value = queries.get(name)?.resultColumns[0]
+      assert.ok(value, `missing result column for ${name}`)
+      assert.equal(Object.hasOwn(value, 'source'), false)
+      return value
+    }
+
+    assert.deepEqual(column('direct').expressionSource, {
+      attname: 'id',
+      kind: 'tableColumn',
+      relname: 'accounts',
+      varattno: 1,
+      varlevelsup: 0,
+      varno: 1,
+      varnullingrels: [],
+    })
+    for (const name of ['derived', 'unioned', 'joined']) {
+      assert.deepEqual(column(name).expressionSource, {
+        attname: undefined,
+        kind: 'derivedVar',
+        relname: null,
+        varattno: 1,
+        varlevelsup: 0,
+        varno: 1,
+        varnullingrels: [],
+      })
+    }
+    assert.deepEqual(column('casted').expressionSource, {
+      kind: 'expression',
+      tag: 'CoerceViaIO',
+    })
+    assert.deepEqual(column('coalesced').expressionSource, {
+      kind: 'expression',
+      tag: 'CoalesceExpr',
+    })
+    assert.deepEqual(column('multiSourceOperator').expressionSource, {
+      kind: 'expression',
+      tag: 'OpExpr',
+    })
   } finally {
     await database.close()
   }

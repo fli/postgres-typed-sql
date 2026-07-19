@@ -107,6 +107,8 @@ const account = await executeTypedSqlOptional(client, findAccountByEmail, { emai
 
 The node-postgres adapter requests array rows for generated statements, maps them by result-column position, enforces `one`, `optional`, and `many` result shapes, and returns the generated row type selected by the configured codec profile. Positional mapping preserves every unique PostgreSQL result name safely, including names such as `__proto__` that object-row construction cannot represent reliably. Other drivers can consume statement `text`, `values(params)`, `columns`, and `resultRowMapping` and use the core mapping functions without importing any node-postgres contract.
 
+Each generated result-column metadata entry has an `expressionSource`. This records the immediate analyzed expression source: a direct table column, a derived PostgreSQL `Var`, or an expression tag such as `CoalesceExpr`. It is syntactic metadata for the result expression at that query level, not ultimate provenance or a list of every contributing column. A union or merged join can therefore have a `derivedVar`, while a cast, `coalesce`, or other multi-input expression has its immediate expression tag; consumers must not interpret either shape as complete lineage.
+
 ## Generated property naming
 
 Postgres Typed SQL uses application-facing camel-case parameter properties by default while preserving PostgreSQL result and JSON field names by default. Configure the three boundaries independently:
