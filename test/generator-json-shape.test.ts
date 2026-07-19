@@ -55,6 +55,33 @@ left join lateral (
   assert.doesNotMatch(output, /readonly manifestObjectKey: string \| null/u)
 })
 
+test('renders VALUES JSON unions while keeping function RTE outputs explicitly nullable', async () => {
+  const root = await createMinimalFixture(
+    'select 1;\n',
+    `select source.payload, generated.value
+from (
+  values
+    (jsonb_build_object('left', 'left-value')),
+    (jsonb_build_object('right', 'right-value'))
+) source(payload)
+cross join generate_series(1, 2) generated(value)
+`
+  )
+  await generateTypedSql({
+    include: ['queries'],
+    rootDir: root,
+    codecProfile: 'node-postgres',
+    schema: 'schema.sql',
+  })
+
+  const output = await readFile(join(root, 'queries/query.typed-sql.ts'), 'utf8')
+  assert.match(output, /readonly left: 'left-value'/u)
+  assert.match(output, /readonly right: 'right-value'/u)
+  assert.match(output, /readonly payload: QueryJ7_payloadJsonJ12_alternative1 \| QueryJ7_payloadJsonJ12_alternative2/u)
+  assert.match(output, /readonly value: number \| null/u)
+  assert.match(output, /name: 'value',[\s\S]*?nullable: true/u)
+})
+
 test('keeps I/O-cast JSON shapes opaque and strict conversion results nullable', async () => {
   const root = await createMinimalFixture(
     'select 1;\n',

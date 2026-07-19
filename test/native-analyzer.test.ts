@@ -31,10 +31,25 @@ interface NativeQuery {
   readonly hasRowMarks: boolean
   readonly limitWithTies: boolean
   readonly hasVolatileFunctions: boolean
-  readonly rtable: readonly { readonly kind: string; readonly subquery?: NativeQuery }[]
+  readonly returningList: readonly NativeTarget[]
+  readonly rtable: readonly NativeRte[]
   readonly targetList: readonly NativeTarget[]
   readonly utilityKind: 'CALL' | 'EXECUTE' | 'EXPLAIN' | 'FETCH' | 'NONE' | 'OTHER' | 'SHOW'
   readonly utilityReturnsTuples: boolean
+}
+
+interface NativeRte {
+  readonly cteLevelSup?: number
+  readonly cteName?: string
+  readonly cteSelfReference?: boolean
+  readonly erefColumnNames?: readonly string[]
+  readonly groupExprs?: readonly NativeExpr[]
+  readonly joinAliasVars?: readonly (NativeExpr | null)[]
+  readonly kind: string
+  readonly lateral: boolean
+  readonly relid?: number
+  readonly subquery?: NativeQuery
+  readonly valuesLists?: readonly (readonly NativeExpr[])[]
 }
 
 interface NativeTarget {
@@ -50,6 +65,7 @@ interface NativeTarget {
 interface NativeCte {
   readonly name: string
   readonly query?: NativeQuery
+  readonly recursive?: boolean
 }
 
 interface NativeDmlParameterTarget {
@@ -78,6 +94,7 @@ interface NativeExpr {
   readonly tag: string
   readonly varattno?: number
   readonly varlevelsup?: number
+  readonly varnullingrels?: readonly number[]
   readonly varno?: number
 }
 
@@ -204,7 +221,7 @@ test('native analyzer exposes the versioned PostgreSQL query envelope', async ()
       [20]
     )
 
-    assert.equal(analysis.schemaVersion, 6)
+    assert.equal(analysis.schemaVersion, 7)
     assert.equal(analysis.postgresVersionNum, 180003)
     assert.equal(analysis.rawStatementCount, 1)
     assert.deepEqual(analysis.paramTypeOids, [20])
@@ -229,6 +246,111 @@ test('native analyzer exposes the versioned PostgreSQL query envelope', async ()
     )
     assert.equal(query.targetList[0]?.expr.tag, 'SubLink')
     assert.equal(query.targetList[0]?.expr.subLinkType, 'EXISTS')
+  })
+})
+
+test('native analyzer exposes PostgreSQL-authoritative immediate RTE outputs', async () => {
+  await withDatabase(async (database) => {
+    const relation = await analyze(
+      database,
+      'select account.id, account, account.ctid from public.accounts account',
+      []
+    )
+    const relationQuery = relation.statements[0]?.queries[0]
+    const relationRte = relationQuery?.rtable[0]
+    assert.equal(relationRte?.kind, 'RELATION')
+    assert.ok((relationRte?.relid ?? 0) > 0)
+    assert.deepEqual(
+      relationQuery?.targetList.map((target) => target.expr.varattno),
+      [1, 0, -1]
+    )
+
+    const joined = await analyze(
+      database,
+      `select value
+       from (values (1)) left_source(value)
+       full join (values (2)) right_source(value) using (value)`,
+      []
+    )
+    const joinRte = joined.statements[0]?.queries[0]?.rtable.find((rte) => rte.kind === 'JOIN')
+    assert.deepEqual(joinRte?.erefColumnNames, ['value'])
+    assert.equal(joinRte?.joinAliasVars?.length, 1)
+    assert.equal(joinRte?.joinAliasVars?.[0]?.tag, 'CoalesceExpr')
+    assert.deepEqual(
+      joinRte?.joinAliasVars?.[0]?.args?.map((argument) => argument.varnullingrels),
+      [[3], [3]]
+    )
+
+    const grouped = await analyze(
+      database,
+      'select source.value from (values (1)) source(value) group by source.value',
+      []
+    )
+    const groupRte = grouped.statements[0]?.queries[0]?.rtable.find((rte) => rte.kind === 'GROUP')
+    assert.deepEqual(groupRte?.erefColumnNames, ['value'])
+    assert.equal(groupRte?.groupExprs?.[0]?.tag, 'Var')
+
+    const valued = await analyze(database, 'select value from (values (1), (null::integer)) source(value)', [])
+    const valuesRte = valued.statements[0]?.queries[0]?.rtable[0]?.subquery?.rtable[0]
+    assert.deepEqual(valuesRte?.erefColumnNames, ['column1'])
+    assert.deepEqual(
+      valuesRte?.valuesLists?.map((row) => row.map((expression) => expression.tag)),
+      [['Const'], ['Const']]
+    )
+
+    const lateral = await analyze(
+      database,
+      `select nested.value
+       from (values (1)) source(value)
+       cross join lateral (select source.value) nested(value)`,
+      []
+    )
+    const lateralRte = lateral.statements[0]?.queries[0]?.rtable[1]
+    assert.equal(lateralRte?.kind, 'SUBQUERY')
+    assert.equal(lateralRte?.lateral, true)
+    assert.equal(lateralRte?.subquery?.targetList[0]?.expr.varlevelsup, 1)
+
+    const recursive = await analyze(
+      database,
+      `with recursive source(value) as (
+         values (1)
+         union all
+         select value + 1 from source where value < 2
+       )
+       select value from source`,
+      []
+    )
+    const recursiveCte = recursive.statements[0]?.queries[0]?.cteList[0]
+    const selfReferenceRte = recursiveCte?.query?.rtable[1]?.subquery?.rtable[0]
+    assert.equal(recursiveCte?.recursive, true)
+    assert.deepEqual(
+      {
+        cteLevelSup: selfReferenceRte?.cteLevelSup,
+        cteName: selfReferenceRte?.cteName,
+        cteSelfReference: selfReferenceRte?.cteSelfReference,
+        kind: selfReferenceRte?.kind,
+      },
+      {
+        cteLevelSup: 2,
+        cteName: 'source',
+        cteSelfReference: true,
+        kind: 'CTE',
+      }
+    )
+
+    const modifying = await analyze(
+      database,
+      `with inserted as (
+         insert into public.accounts(email) values ('native-envelope@example.com')
+         returning id
+       )
+       select id from inserted`,
+      []
+    )
+    const modifyingCte = modifying.statements[0]?.queries[0]?.cteList[0]
+    assert.equal(modifyingCte?.query?.commandType, 'INSERT')
+    assert.equal(modifyingCte?.query?.returningList[0]?.expr.tag, 'Var')
+    assert.equal(modifying.statements[0]?.queries[0]?.rtable[0]?.cteName, 'inserted')
   })
 })
 
