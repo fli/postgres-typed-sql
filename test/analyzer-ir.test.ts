@@ -572,6 +572,162 @@ test('throws on malformed and cyclic scalar EXPR subquery ownership', async () =
   }
 })
 
+test('derives cast and domain nullability once without unsafe CHECK or JSON unwrapping', async () => {
+  const database = await createAnalysisDatabase({ schemaFiles: [schemaFile] })
+  try {
+    await database.query('create domain public.nullable_integer_domain as integer')
+    await database.query('create domain public.required_integer_domain as integer not null')
+    await database.query('create domain public.checked_required_integer_domain as integer check (value is not null)')
+    await database.query("create domain public.unknown_integer_domain as integer check (concat(value::text, '') <> '')")
+    await database.query('create domain public.nested_required_integer_domain as public.required_integer_domain')
+    await database.query("create type public.source_cast_enum as enum ('member')")
+    await database.query("create type public.target_cast_enum as enum ('member')")
+    await database.query(`create function public.source_to_target_cast(value public.source_cast_enum)
+      returns public.target_cast_enum
+      language sql immutable strict
+      as $$ select value::text::public.target_cast_enum $$`)
+    await database.query(`create cast (public.source_cast_enum as public.target_cast_enum)
+      with function public.source_to_target_cast(public.source_cast_enum)`)
+    await database.query(`create table public.coercion_probe (
+      nullable_integer integer,
+      required_integer integer not null,
+      nullable_integers integer[],
+      required_integers integer[] not null,
+      nullable_user_value public.source_cast_enum,
+      required_user_value public.source_cast_enum not null
+    )`)
+    await database.query('create table public.coercion_parent_row (parent_value integer)')
+    await database.query(
+      'create table public.coercion_child_row (child_value text) inherits (public.coercion_parent_row)'
+    )
+
+    const result = await buildTypedSqlPostgresIrFromCompiledConfigs(database, [
+      config(
+        'canonicalCoercions',
+        `select
+           required_integer::oid as required_relabel,
+           nullable_integer::oid as nullable_relabel,
+           required_integer::bigint as required_exact_function_cast,
+           nullable_integer::bigint as nullable_exact_function_cast,
+           required_integer::numeric as required_opaque_function_cast,
+           nullable_integer::numeric as nullable_opaque_function_cast,
+           required_integer::text as required_builtin_io,
+           nullable_integer::text as nullable_builtin_io,
+           nullable_integer::public.nullable_integer_domain as nullable_domain,
+           nullable_integer::public.required_integer_domain as not_null_domain,
+           nullable_integer::public.checked_required_integer_domain as rejecting_check_domain,
+           nullable_integer::public.unknown_integer_domain as unknown_domain,
+           required_integer::public.unknown_integer_domain as unknown_domain_with_required_source,
+           nullable_integer::public.nested_required_integer_domain as nested_not_null_domain,
+           required_integers::bigint[] as required_array_cast,
+           nullable_integers::bigint[] as nullable_array_cast,
+           required_user_value::public.target_cast_enum as required_user_cast,
+           nullable_user_value::public.target_cast_enum as nullable_user_cast
+         from public.coercion_probe`
+      ),
+      config(
+        'joinCoercion',
+        `select value
+         from (
+           select required_integer::bigint as value
+           from public.coercion_probe
+         ) left_source
+         inner join (
+           select required_integer::bigint as value
+           from public.coercion_probe
+         ) right_source using (value)`
+      ),
+      config(
+        'groupCoercion',
+        `select nullable_integer::numeric as value
+         from public.coercion_probe
+         group by nullable_integer::numeric`
+      ),
+      config('valuesCoercion', 'select value from (values (1::integer::bigint)) source(value)'),
+      config(
+        'rowtypeCoercion',
+        `select coercion_child_row::public.coercion_parent_row
+         from public.coercion_child_row`
+      ),
+      config('safeCheckRefinement', 'select account.role::varchar from public.accounts account'),
+      config('unsafeCheckRefinement', 'select account.role::name from public.accounts account'),
+      config(
+        'unsafeJsonCheckRefinement',
+        `select jsonb_build_object('role', account.role::name)
+         from public.accounts account`
+      ),
+      config('unsafeJsonLiteralRefinement', "select to_jsonb(('member'::text)::bytea)"),
+      config(
+        'unsafeEmptyArrayRefinement',
+        `select coalesce(
+           jsonb_agg(jsonb_build_object('id', account.id)),
+           ('[]'::text)::jsonb
+         )
+         from public.accounts account`
+      ),
+    ])
+    const queries = new Map(result.queries.map((query) => [query.name, query]))
+    const column = (name: string, index = 0) => {
+      const value = queries.get(name)?.resultColumns[index]
+      assert.ok(value, `missing result column ${index} for ${name}`)
+      return value
+    }
+
+    assert.deepEqual(
+      queries.get('canonicalCoercions')?.resultColumns.map(({ nullability }) => nullability),
+      [
+        { basis: 'not_null_column:coercion_probe.required_integer', kind: 'nonNull' },
+        { evidence: 'nullable_column:coercion_probe.nullable_integer', kind: 'nullable' },
+        { basis: 'not_null_column:coercion_probe.required_integer', kind: 'nonNull' },
+        { evidence: 'nullable_column:coercion_probe.nullable_integer', kind: 'nullable' },
+        { kind: 'unknown', reason: 'opaque_non_null_coercion:FuncExpr' },
+        { evidence: 'nullable_column:coercion_probe.nullable_integer', kind: 'nullable' },
+        { basis: 'not_null_column:coercion_probe.required_integer', kind: 'nonNull' },
+        { evidence: 'nullable_column:coercion_probe.nullable_integer', kind: 'nullable' },
+        { evidence: 'nullable_column:coercion_probe.nullable_integer', kind: 'nullable' },
+        { basis: 'domain_rejects_null', kind: 'nonNull' },
+        { basis: 'domain_rejects_null', kind: 'nonNull' },
+        { kind: 'unknown', reason: 'domain_null_admission' },
+        { basis: 'not_null_column:coercion_probe.required_integer', kind: 'nonNull' },
+        { basis: 'domain_rejects_null', kind: 'nonNull' },
+        { basis: 'not_null_column:coercion_probe.required_integers', kind: 'nonNull' },
+        { evidence: 'nullable_column:coercion_probe.nullable_integers', kind: 'nullable' },
+        { kind: 'unknown', reason: 'opaque_non_null_coercion:FuncExpr' },
+        { evidence: 'nullable_column:coercion_probe.nullable_user_value', kind: 'nullable' },
+      ]
+    )
+
+    assert.equal(column('joinCoercion').nullability.kind, 'nonNull')
+    assert.equal(column('groupCoercion').nullability.kind, 'nullable')
+    assert.equal(column('valuesCoercion').nullability.kind, 'nonNull')
+    assert.deepEqual(column('rowtypeCoercion').nullability, {
+      basis: 'whole_row',
+      kind: 'nonNull',
+    })
+
+    assert.deepEqual(column('safeCheckRefinement').checkConstraintType, {
+      kind: 'literalUnion',
+      labels: ['member', 'admin'],
+    })
+    assert.equal(column('unsafeCheckRefinement').checkConstraintType, undefined)
+    const unsafeJsonCheck = column('unsafeJsonCheckRefinement').jsonShape
+    assert.equal(unsafeJsonCheck?.kind, 'object')
+    if (unsafeJsonCheck?.kind === 'object') {
+      assert.equal(unsafeJsonCheck.fields[0]?.shape.kind, 'scalar')
+      assert.equal(
+        unsafeJsonCheck.fields[0]?.shape.kind === 'scalar'
+          ? unsafeJsonCheck.fields[0].shape.checkConstraintType
+          : undefined,
+        undefined
+      )
+    }
+    assert.notEqual(column('unsafeJsonLiteralRefinement').jsonShape?.kind, 'stringLiteral')
+    assert.equal(column('unsafeEmptyArrayRefinement').jsonShape?.kind, 'opaque')
+  } finally {
+    await database.close()
+  }
+})
+
 test('throws when a positive base Var is missing its required catalog column fact', async () => {
   const database = await createAnalysisDatabase({ schemaFiles: [schemaFile] })
   try {
@@ -620,9 +776,39 @@ test('throws on malformed owner identity, output indices, aligned expressions, a
         corrupt(analysis) {
           analysis.schemaVersion = 6
         },
-        error: /analyzer returned unsupported schema version 6; expected 7/u,
+        error: /analyzer returned unsupported schema version 6; expected 8/u,
         name: 'staleSchema',
         sql: 'select account.id from public.accounts account',
+      },
+      {
+        corrupt(analysis) {
+          const query = firstEnvelopeQuery(analysis)
+          const target = envelopeObject(envelopeArray(query.targetList)[0])
+          delete envelopeObject(target.expr).nonNullInputProducesNonNull
+        },
+        error: /RelabelType is missing canonical coercion nullability facts/u,
+        name: 'missingCoercionFact',
+        sql: 'select account.role::varchar from public.accounts account',
+      },
+      {
+        corrupt(analysis) {
+          const query = firstEnvelopeQuery(analysis)
+          const target = envelopeObject(envelopeArray(query.targetList)[0])
+          delete envelopeObject(target.expr).domainNullAdmission
+        },
+        error: /CoerceToDomain is missing canonical domain NULL admission/u,
+        name: 'missingDomainAdmission',
+        sql: 'select account.role::public.required_envelope_domain from public.accounts account',
+      },
+      {
+        corrupt(analysis) {
+          const query = firstEnvelopeQuery(analysis)
+          const target = envelopeObject(envelopeArray(query.targetList)[0])
+          delete envelopeObject(target.expr).inputFunctionOid
+        },
+        error: /CoerceViaIO is missing authoritative type I\/O function identity/u,
+        name: 'missingTypeInputIdentity',
+        sql: 'select account.id::text from public.accounts account',
       },
       {
         corrupt(analysis) {
@@ -684,6 +870,7 @@ test('throws on malformed owner identity, output indices, aligned expressions, a
       },
     ]
 
+    await database.query('create domain public.required_envelope_domain as text not null')
     for (const fixture of cases) {
       await assert.rejects(
         buildTypedSqlPostgresIrFromCompiledConfigs(corruptAnalyzerEnvelope(database, fixture.corrupt), [

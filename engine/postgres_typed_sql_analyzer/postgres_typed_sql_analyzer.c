@@ -4,6 +4,7 @@
 #include "access/htup_details.h"
 #include "access/nbtree.h"
 #include "access/table.h"
+#include "access/transam.h"
 #include "catalog/pg_aggregate.h"
 #include "catalog/pg_amop.h"
 #include "catalog/pg_amproc.h"
@@ -947,8 +948,10 @@ type_null_admission(HTAB *cache, Oid type_oid)
 
   memset(&lookup_key, 0, sizeof(lookup_key));
   lookup_key.type_oid = type_oid;
-  entry = hash_search(cache, &lookup_key, HASH_FIND, &found);
-  if (found)
+  entry = cache == NULL
+            ? NULL
+            : hash_search(cache, &lookup_key, HASH_FIND, &found);
+  if (entry != NULL && found)
   {
     return entry->admission;
   }
@@ -995,8 +998,11 @@ type_null_admission(HTAB *cache, Oid type_oid)
   }
 
   ReleaseSysCache(tuple);
-  entry = hash_search(cache, &lookup_key, HASH_ENTER, &found);
-  entry->admission = admission;
+  if (cache != NULL)
+  {
+    entry = hash_search(cache, &lookup_key, HASH_ENTER, &found);
+    entry->admission = admission;
+  }
   return admission;
 }
 
@@ -3036,6 +3042,10 @@ expr_tag_name(const Node *node)
       return "CoerceViaIO";
     case T_CoerceToDomain:
       return "CoerceToDomain";
+    case T_ArrayCoerceExpr:
+      return "ArrayCoerceExpr";
+    case T_ConvertRowtypeExpr:
+      return "ConvertRowtypeExpr";
     case T_SQLValueFunction:
       return "SQLValueFunction";
     case T_ScalarArrayOpExpr:
@@ -3067,6 +3077,89 @@ bool_expr_type_name(BoolExprType boolop)
   }
 
   return "UNRECOGNIZED";
+}
+
+static const char *
+coercion_form_name(CoercionForm form)
+{
+  switch (form)
+  {
+    case COERCE_EXPLICIT_CALL:
+      return "EXPLICIT_CALL";
+    case COERCE_EXPLICIT_CAST:
+      return "EXPLICIT_CAST";
+    case COERCE_IMPLICIT_CAST:
+      return "IMPLICIT_CAST";
+    case COERCE_SQL_SYNTAX:
+      return "SQL_SYNTAX";
+  }
+
+  return "UNRECOGNIZED";
+}
+
+static bool
+function_cast_nonnull_for_nonnull_argument(const FuncExpr *function)
+{
+  Oid source_type;
+  Oid expected_source_type;
+  Oid expected_result_type;
+
+  if (function->funcretset || list_length(function->args) != 1 ||
+      (function->funcformat != COERCE_EXPLICIT_CAST &&
+       function->funcformat != COERCE_IMPLICIT_CAST))
+  {
+    return false;
+  }
+
+  /*
+   * PostgreSQL's package-owned integer cast implementations return a
+   * converted Datum or raise on overflow.  Keep this deliberately narrow
+   * and keyed by pg_proc identity plus the parsed source/result types.
+   */
+  switch (function->funcid)
+  {
+    case F_INT4_INT2:
+      expected_source_type = INT2OID;
+      expected_result_type = INT4OID;
+      break;
+    case F_INT2_INT4:
+      expected_source_type = INT4OID;
+      expected_result_type = INT2OID;
+      break;
+    case F_INT4_INT8:
+      expected_source_type = INT8OID;
+      expected_result_type = INT4OID;
+      break;
+    case F_INT8_INT4:
+      expected_source_type = INT4OID;
+      expected_result_type = INT8OID;
+      break;
+    case F_INT2_INT8:
+      expected_source_type = INT8OID;
+      expected_result_type = INT2OID;
+      break;
+    case F_INT8_INT2:
+      expected_source_type = INT2OID;
+      expected_result_type = INT8OID;
+      break;
+    default:
+      return false;
+  }
+
+  source_type = exprType((const Node *) linitial(function->args));
+  return source_type == expected_source_type &&
+         function->funcresulttype == expected_result_type;
+}
+
+static bool
+package_owned_type_io_function(Oid function_oid)
+{
+  /*
+   * ExecEvalCoerceViaIO's non-NULL path requires both type I/O calls to
+   * return non-NULL.  Trust that executor contract only for PostgreSQL-owned
+   * functions; user-defined type I/O implementations remain opaque.
+   */
+  return OidIsValid(function_oid) && function_oid < FirstNormalObjectId;
 }
 
 static const char *
@@ -3322,6 +3415,8 @@ node_has_expr_type(const Node *node)
     case T_RelabelType:
     case T_CoerceViaIO:
     case T_CoerceToDomain:
+    case T_ArrayCoerceExpr:
+    case T_ConvertRowtypeExpr:
     case T_SQLValueFunction:
     case T_ScalarArrayOpExpr:
     case T_SubLink:
@@ -3519,10 +3614,25 @@ append_expr_specific_fields(StringInfo out, const QueryScope *scope, const Node 
     case T_FuncExpr:
     {
       const FuncExpr *func = (const FuncExpr *) expr;
+      bool is_cast =
+        func->funcformat == COERCE_EXPLICIT_CAST ||
+        func->funcformat == COERCE_IMPLICIT_CAST;
+
       append_oid_field(out, "funcid", func->funcid);
       append_optional_name_field(out, "funcname", OidIsValid(func->funcid) ? get_func_name(func->funcid) : NULL);
       append_bool_field(out, "funcVariadic", func->funcvariadic);
       append_bool_field(out, "returnsSet", func->funcretset);
+      appendStringInfoString(out, ",\"coercionForm\":");
+      append_json_string(out, coercion_form_name(func->funcformat));
+      if (is_cast)
+      {
+        append_bool_field(out, "nullInputProducesNull",
+                          list_length(func->args) == 1 &&
+                          func_strict(func->funcid));
+        append_bool_field(
+          out, "nonNullInputProducesNonNull",
+          function_cast_nonnull_for_nonnull_argument(func));
+      }
       break;
     }
     case T_OpExpr:
@@ -3650,6 +3760,10 @@ append_expr_node(StringInfo out, const QueryScope *scope, const Node *expr, int 
     case T_RelabelType:
     {
       const RelabelType *relabel = (const RelabelType *) expr;
+      appendStringInfoString(out, ",\"coercionForm\":");
+      append_json_string(out, coercion_form_name(relabel->relabelformat));
+      append_bool_field(out, "nullInputProducesNull", true);
+      append_bool_field(out, "nonNullInputProducesNonNull", true);
       appendStringInfoString(out, ",\"arg\":");
       append_expr_node(out, scope, (const Node *) relabel->arg, depth - 1);
       break;
@@ -3657,6 +3771,27 @@ append_expr_node(StringInfo out, const QueryScope *scope, const Node *expr, int 
     case T_CoerceViaIO:
     {
       const CoerceViaIO *coerce = (const CoerceViaIO *) expr;
+      Oid input_function;
+      Oid output_function;
+      Oid type_io_parameter;
+      bool source_is_varlena;
+
+      getTypeInputInfo(coerce->resulttype, &input_function,
+                       &type_io_parameter);
+      getTypeOutputInfo(exprType((const Node *) coerce->arg),
+                        &output_function, &source_is_varlena);
+      appendStringInfoString(out, ",\"coercionForm\":");
+      append_json_string(out, coercion_form_name(coerce->coerceformat));
+      append_oid_field(out, "inputFunctionOid", input_function);
+      append_oid_field(out, "outputFunctionOid", output_function);
+      append_bool_field(
+        out, "nullInputProducesNull",
+        package_owned_type_io_function(input_function) ||
+        func_strict(input_function));
+      append_bool_field(
+        out, "nonNullInputProducesNonNull",
+        package_owned_type_io_function(input_function) &&
+        package_owned_type_io_function(output_function));
       appendStringInfoString(out, ",\"arg\":");
       append_expr_node(out, scope, (const Node *) coerce->arg, depth - 1);
       break;
@@ -3664,6 +3799,42 @@ append_expr_node(StringInfo out, const QueryScope *scope, const Node *expr, int 
     case T_CoerceToDomain:
     {
       const CoerceToDomain *coerce = (const CoerceToDomain *) expr;
+      TypeNullAdmission admission =
+        type_null_admission(NULL, coerce->resulttype);
+
+      appendStringInfoString(out, ",\"coercionForm\":");
+      append_json_string(out, coercion_form_name(coerce->coercionformat));
+      appendStringInfoString(out, ",\"domainNullAdmission\":");
+      append_json_string(out, null_admission_name(admission));
+      append_bool_field(out, "nullInputProducesNull",
+                        admission == TYPE_NULL_ADMITS);
+      append_bool_field(out, "nonNullInputProducesNonNull", true);
+      appendStringInfoString(out, ",\"arg\":");
+      append_expr_node(out, scope, (const Node *) coerce->arg, depth - 1);
+      break;
+    }
+    case T_ArrayCoerceExpr:
+    {
+      const ArrayCoerceExpr *coerce = (const ArrayCoerceExpr *) expr;
+      appendStringInfoString(out, ",\"coercionForm\":");
+      append_json_string(out, coercion_form_name(coerce->coerceformat));
+      append_bool_field(out, "nullInputProducesNull", true);
+      append_bool_field(out, "nonNullInputProducesNonNull", true);
+      appendStringInfoString(out, ",\"arg\":");
+      append_expr_node(out, scope, (const Node *) coerce->arg, depth - 1);
+      appendStringInfoString(out, ",\"elementExpr\":");
+      append_expr_node(out, scope, (const Node *) coerce->elemexpr,
+                       depth - 1);
+      break;
+    }
+    case T_ConvertRowtypeExpr:
+    {
+      const ConvertRowtypeExpr *coerce =
+        (const ConvertRowtypeExpr *) expr;
+      appendStringInfoString(out, ",\"coercionForm\":");
+      append_json_string(out, coercion_form_name(coerce->convertformat));
+      append_bool_field(out, "nullInputProducesNull", true);
+      append_bool_field(out, "nonNullInputProducesNonNull", true);
       appendStringInfoString(out, ",\"arg\":");
       append_expr_node(out, scope, (const Node *) coerce->arg, depth - 1);
       break;
@@ -6546,7 +6717,7 @@ postgres_typed_sql_analyze(PG_FUNCTION_ARGS)
                                       HASH_ELEM | HASH_BLOBS);
 
   initStringInfo(&out);
-  appendStringInfoString(&out, "{\"schemaVersion\":7,\"postgresVersionNum\":");
+  appendStringInfoString(&out, "{\"schemaVersion\":8,\"postgresVersionNum\":");
   appendStringInfo(&out, "%d", PG_VERSION_NUM);
   appendStringInfoString(&out, ",\"rawStatementCount\":");
   appendStringInfo(&out, "%d", list_length(raw_trees));

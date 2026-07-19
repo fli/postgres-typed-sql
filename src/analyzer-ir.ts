@@ -47,7 +47,7 @@ export type {
   TypedSqlPostgresIrRowBounds,
 } from './analyzer-ir-model.js'
 
-const ANALYZER_SCHEMA_VERSION = 7
+const ANALYZER_SCHEMA_VERSION = 8
 const ANALYZER_SQL_FUNCTION = 'pg_temp.postgres_typed_sql_analyze'
 
 interface PgAnalyzerResult {
@@ -183,18 +183,25 @@ interface PgAnalyzerExpr {
   readonly constIsNull?: boolean
   readonly constString?: string
   readonly condition?: PgAnalyzerExpr | null
+  readonly coercionForm?: 'EXPLICIT_CALL' | 'EXPLICIT_CAST' | 'IMPLICIT_CAST' | 'SQL_SYNTAX' | 'UNRECOGNIZED'
   readonly defresult?: PgAnalyzerExpr | null
+  readonly domainNullAdmission?: TypedSqlPostgresIrParamNullAdmission
+  readonly elementExpr?: PgAnalyzerExpr | null
   readonly elements?: readonly PgAnalyzerExpr[]
   readonly expr?: PgAnalyzerExpr | null
   readonly funcid?: number
   readonly funcname?: string
   readonly funcVariadic?: boolean
   readonly inputCollationOid?: number
+  readonly inputFunctionOid?: number
   readonly multidims?: boolean
   readonly nullTestType?: string
+  readonly nullInputProducesNull?: boolean
+  readonly nonNullInputProducesNonNull?: boolean
   readonly opfuncid?: number
   readonly opno?: number
   readonly opname?: string
+  readonly outputFunctionOid?: number
   readonly paramTypeOid?: number
   readonly paramId?: number
   readonly relid?: number
@@ -306,7 +313,7 @@ async function explicitCompiledParamTypeOids(
 
 function exprChildren(expr: PgAnalyzerExpr): readonly PgAnalyzerExpr[] {
   const children: PgAnalyzerExpr[] = []
-  for (const key of ['arg', 'condition', 'defresult', 'expr', 'result', 'testExpr'] as const) {
+  for (const key of ['arg', 'condition', 'defresult', 'elementExpr', 'expr', 'result', 'testExpr'] as const) {
     const child = expr[key]
     if (child) {
       children.push(child)
@@ -615,7 +622,7 @@ function foldQueryOutput<T>(scope: QueryScope, outputIndex: number, semantics: Q
 }
 
 function constNonNegativeSafeInteger(catalog: CatalogFacts, expr: PgAnalyzerExpr | null | undefined): number | null {
-  const unwrapped = unwrapCoercionExpr(expr)
+  const unwrapped = unwrapValuePreservingExpr(expr)
   if (
     unwrapped?.tag === 'FuncExpr' &&
     isBuiltinPgProcNamed(catalog, unwrapped.funcid, 'int8') &&
@@ -642,7 +649,7 @@ function limitFact(catalog: CatalogFacts, query: PgAnalyzerQuery): LimitFact {
     return { kind: 'absent' }
   }
 
-  const unwrapped = unwrapCoercionExpr(query.limitCount)
+  const unwrapped = unwrapValuePreservingExpr(query.limitCount)
   if (unwrapped?.tag === 'Const' && unwrapped.constIsNull === true) {
     return { kind: 'unbounded' }
   }
@@ -1921,12 +1928,83 @@ function expressionNullability(
         ? expressionNullability(catalog, scope, args[0], seen)
         : { kind: 'unknown', reason: 'variadic_json_build_object_arguments' }
     }
+
+    if ((expr.coercionForm === 'EXPLICIT_CAST' || expr.coercionForm === 'IMPLICIT_CAST') && expr.args?.length === 1) {
+      return coercionNullability(catalog, scope, expr, targetExprFromAggregateArg(expr.args[0]), seen)
+    }
   }
-  if (expr.tag === 'RelabelType' || expr.tag === 'CoerceViaIO' || expr.tag === 'CoerceToDomain') {
-    return expressionNullability(catalog, scope, expr.arg, seen)
+  if (
+    expr.tag === 'RelabelType' ||
+    expr.tag === 'CoerceViaIO' ||
+    expr.tag === 'CoerceToDomain' ||
+    expr.tag === 'ArrayCoerceExpr' ||
+    expr.tag === 'ConvertRowtypeExpr'
+  ) {
+    return coercionNullability(catalog, scope, expr, expr.arg, seen)
   }
 
   return { kind: 'unknown', reason: `unsupported_expression:${expr.tag}` }
+}
+
+function coercionNullability(
+  catalog: CatalogFacts,
+  scope: QueryScope,
+  coercion: PgAnalyzerExpr,
+  argument: PgAnalyzerExpr | null | undefined,
+  seen: readonly VarLocation[]
+): TypedSqlPostgresIrResultNullability {
+  if (!argument) {
+    throw new Error(`internal analyzer envelope inconsistency: ${coercion.tag} is missing its coercion argument`)
+  }
+  if (
+    coercion.coercionForm === undefined ||
+    coercion.coercionForm === 'UNRECOGNIZED' ||
+    typeof coercion.nullInputProducesNull !== 'boolean' ||
+    typeof coercion.nonNullInputProducesNonNull !== 'boolean'
+  ) {
+    throw new Error(
+      `internal analyzer envelope inconsistency: ${coercion.tag} is missing canonical coercion nullability facts`
+    )
+  }
+  if (
+    coercion.tag === 'CoerceViaIO' &&
+    (!(coercion.inputFunctionOid && coercion.inputFunctionOid > 0) ||
+      !(coercion.outputFunctionOid && coercion.outputFunctionOid > 0))
+  ) {
+    throw new Error(
+      'internal analyzer envelope inconsistency: CoerceViaIO is missing authoritative type I/O function identity'
+    )
+  }
+
+  const argumentNullability = expressionNullability(catalog, scope, argument, seen)
+  if (coercion.tag === 'CoerceToDomain') {
+    switch (coercion.domainNullAdmission) {
+      case 'rejects':
+        return { basis: 'domain_rejects_null', kind: 'nonNull' }
+      case 'accepts':
+        return argumentNullability
+      case 'unknown':
+        return argumentNullability.kind === 'nonNull'
+          ? argumentNullability
+          : { kind: 'unknown', reason: 'domain_null_admission' }
+      default:
+        throw new Error(
+          'internal analyzer envelope inconsistency: CoerceToDomain is missing canonical domain NULL admission'
+        )
+    }
+  }
+
+  if (argumentNullability.kind === 'nonNull') {
+    return coercion.nonNullInputProducesNonNull
+      ? argumentNullability
+      : { kind: 'unknown', reason: `opaque_non_null_coercion:${coercion.tag}` }
+  }
+  if (argumentNullability.kind === 'nullable') {
+    return coercion.nullInputProducesNull
+      ? argumentNullability
+      : { kind: 'unknown', reason: `opaque_null_coercion:${coercion.tag}` }
+  }
+  return argumentNullability
 }
 
 function expressionSourceForExpr(expr: PgAnalyzerExpr | null | undefined): TypedSqlPostgresIrColumnExpressionSource {
@@ -1961,16 +2039,8 @@ function unwrapValuePreservingExpr(expr: PgAnalyzerExpr | null | undefined): PgA
   return current
 }
 
-function unwrapCoercionExpr(expr: PgAnalyzerExpr | null | undefined): PgAnalyzerExpr | null | undefined {
-  let current = expr
-  while (current?.tag === 'RelabelType' || current?.tag === 'CoerceViaIO' || current?.tag === 'CoerceToDomain') {
-    current = current.arg
-  }
-  return current
-}
-
 function constStringValue(expr: PgAnalyzerExpr | null | undefined): string | null {
-  const unwrapped = unwrapCoercionExpr(expr)
+  const unwrapped = unwrapValuePreservingExpr(expr)
   if (!unwrapped || unwrapped.tag !== 'Const' || unwrapped.constIsNull === true) {
     return null
   }
@@ -1978,7 +2048,7 @@ function constStringValue(expr: PgAnalyzerExpr | null | undefined): string | nul
 }
 
 function isEmptyJsonArrayConst(expr: PgAnalyzerExpr | null | undefined): boolean {
-  const unwrapped = unwrapCoercionExpr(expr)
+  const unwrapped = unwrapValuePreservingExpr(expr)
   return unwrapped?.constEmptyJsonArray === true || constStringValue(unwrapped) === '[]'
 }
 
@@ -1993,7 +2063,7 @@ function jsonBuildObjectArguments(expr: PgAnalyzerExpr): readonly PgAnalyzerExpr
     if (objectArgs.length !== 1) {
       return null
     }
-    const array = unwrapCoercionExpr(objectArgs[0])
+    const array = unwrapValuePreservingExpr(objectArgs[0])
     if (!array || array.tag !== 'ArrayExpr' || array.multidims === true || !array.elements) {
       return null
     }
@@ -2063,7 +2133,7 @@ function jsonShapeForCaseArm(
   arm: CaseArm,
   seen: readonly VarLocation[]
 ): TypedSqlPostgresIrJsonShape | null {
-  const unwrapped = unwrapCoercionExpr(arm.result)
+  const unwrapped = unwrapValuePreservingExpr(arm.result)
   return unwrapped?.tag === 'Const' && unwrapped.constIsNull === true
     ? null
     : jsonShapeForExpr(catalog, arm.scope, arm.result, seen)
