@@ -84,9 +84,16 @@ interface NativeDmlParameterTarget {
 interface NativeExpr {
   readonly args?: readonly NativeExpr[]
   readonly attname?: string | null
+  readonly coercionForm?: string
+  readonly domainNullAdmission?: 'accepts' | 'rejects' | 'unknown'
+  readonly elementExpr?: NativeExpr
   readonly elements?: readonly NativeExpr[]
   readonly funcVariadic?: boolean
+  readonly inputFunctionOid?: number
   readonly multidims?: boolean
+  readonly nonNullInputProducesNonNull?: boolean
+  readonly nullInputProducesNull?: boolean
+  readonly outputFunctionOid?: number
   readonly relname?: string | null
   readonly rteKind?: string
   readonly subLinkType?: string
@@ -221,7 +228,7 @@ test('native analyzer exposes the versioned PostgreSQL query envelope', async ()
       [20]
     )
 
-    assert.equal(analysis.schemaVersion, 7)
+    assert.equal(analysis.schemaVersion, 8)
     assert.equal(analysis.postgresVersionNum, 180003)
     assert.equal(analysis.rawStatementCount, 1)
     assert.deepEqual(analysis.paramTypeOids, [20])
@@ -246,6 +253,137 @@ test('native analyzer exposes the versioned PostgreSQL query envelope', async ()
     )
     assert.equal(query.targetList[0]?.expr.tag, 'SubLink')
     assert.equal(query.targetList[0]?.expr.subLinkType, 'EXISTS')
+  })
+})
+
+test('native analyzer emits canonical PostgreSQL coercion nullability facts', async () => {
+  await withDatabase(async (database) => {
+    await database.query('create domain public.nullable_integer_domain as integer')
+    await database.query('create domain public.required_integer_domain as integer not null')
+    await database.query('create domain public.checked_required_integer_domain as integer check (value is not null)')
+    await database.query("create domain public.unknown_integer_domain as integer check (concat(value::text, '') <> '')")
+    await database.query('create domain public.nested_required_integer_domain as public.required_integer_domain')
+    await database.query(`create table public.coercion_envelope_probe (
+      nullable_integer integer,
+      required_integer integer not null,
+      nullable_integers integer[],
+      required_integers integer[] not null
+    )`)
+    await database.query('create table public.coercion_parent_row (parent_value integer)')
+    await database.query(
+      'create table public.coercion_child_row (child_value text) inherits (public.coercion_parent_row)'
+    )
+
+    const analysis = await analyze(
+      database,
+      `select
+         required_integer::oid,
+         nullable_integer::oid,
+         required_integer::bigint,
+         nullable_integer::bigint,
+         required_integer::numeric,
+         nullable_integer::numeric,
+         required_integer::text,
+         nullable_integer::text,
+         nullable_integer::public.nullable_integer_domain,
+         nullable_integer::public.required_integer_domain,
+         nullable_integer::public.checked_required_integer_domain,
+         nullable_integer::public.unknown_integer_domain,
+         nullable_integer::public.nested_required_integer_domain,
+         required_integers::bigint[],
+         nullable_integers::bigint[]
+       from public.coercion_envelope_probe`,
+      []
+    )
+    const expressions = analysis.statements[0]?.queries[0]?.targetList.map((target) => target.expr) ?? []
+
+    for (const expression of expressions.slice(0, 2)) {
+      assert.equal(expression.tag, 'RelabelType')
+      assert.equal(expression.coercionForm, 'EXPLICIT_CAST')
+      assert.equal(expression.nullInputProducesNull, true)
+      assert.equal(expression.nonNullInputProducesNonNull, true)
+    }
+
+    for (const expression of expressions.slice(2, 4)) {
+      assert.equal(expression.tag, 'FuncExpr')
+      assert.equal(expression.coercionForm, 'EXPLICIT_CAST')
+      assert.equal(expression.nullInputProducesNull, true)
+      assert.equal(expression.nonNullInputProducesNonNull, true)
+    }
+    for (const expression of expressions.slice(4, 6)) {
+      assert.equal(expression.tag, 'FuncExpr')
+      assert.equal(expression.coercionForm, 'EXPLICIT_CAST')
+      assert.equal(expression.nullInputProducesNull, true)
+      assert.equal(expression.nonNullInputProducesNonNull, false)
+    }
+
+    for (const expression of expressions.slice(6, 8)) {
+      assert.equal(expression.tag, 'CoerceViaIO')
+      assert.ok((expression.inputFunctionOid ?? 0) > 0)
+      assert.ok((expression.outputFunctionOid ?? 0) > 0)
+      assert.equal(expression.nullInputProducesNull, true)
+      assert.equal(expression.nonNullInputProducesNonNull, true)
+    }
+
+    assert.deepEqual(
+      expressions.slice(8, 13).map((expression) => ({
+        domainNullAdmission: expression.domainNullAdmission,
+        nonNullInputProducesNonNull: expression.nonNullInputProducesNonNull,
+        nullInputProducesNull: expression.nullInputProducesNull,
+        tag: expression.tag,
+      })),
+      [
+        {
+          domainNullAdmission: 'accepts',
+          nonNullInputProducesNonNull: true,
+          nullInputProducesNull: true,
+          tag: 'CoerceToDomain',
+        },
+        {
+          domainNullAdmission: 'rejects',
+          nonNullInputProducesNonNull: true,
+          nullInputProducesNull: false,
+          tag: 'CoerceToDomain',
+        },
+        {
+          domainNullAdmission: 'rejects',
+          nonNullInputProducesNonNull: true,
+          nullInputProducesNull: false,
+          tag: 'CoerceToDomain',
+        },
+        {
+          domainNullAdmission: 'unknown',
+          nonNullInputProducesNonNull: true,
+          nullInputProducesNull: false,
+          tag: 'CoerceToDomain',
+        },
+        {
+          domainNullAdmission: 'rejects',
+          nonNullInputProducesNonNull: true,
+          nullInputProducesNull: false,
+          tag: 'CoerceToDomain',
+        },
+      ]
+    )
+
+    for (const expression of expressions.slice(13)) {
+      assert.equal(expression.tag, 'ArrayCoerceExpr')
+      assert.equal(expression.nullInputProducesNull, true)
+      assert.equal(expression.nonNullInputProducesNonNull, true)
+      assert.equal(expression.elementExpr?.tag, 'FuncExpr')
+    }
+
+    const rowtypeAnalysis = await analyze(
+      database,
+      `select coercion_child_row::public.coercion_parent_row
+       from public.coercion_child_row`,
+      []
+    )
+    const rowtypeCoercion = rowtypeAnalysis.statements[0]?.queries[0]?.targetList[0]?.expr
+    assert.equal(rowtypeCoercion?.tag, 'ConvertRowtypeExpr')
+    assert.equal(rowtypeCoercion?.coercionForm, 'EXPLICIT_CAST')
+    assert.equal(rowtypeCoercion?.nullInputProducesNull, true)
+    assert.equal(rowtypeCoercion?.nonNullInputProducesNonNull, true)
   })
 })
 
