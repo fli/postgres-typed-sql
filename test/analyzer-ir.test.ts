@@ -200,7 +200,6 @@ test('exposes only immediate expressionSource metadata for direct, derived, and 
     })
     for (const name of ['derived', 'unioned', 'joined']) {
       assert.deepEqual(column(name).expressionSource, {
-        attname: undefined,
         kind: 'derivedVar',
         relname: null,
         varattno: 1,
@@ -396,6 +395,13 @@ test('composes canonical row bounds with scalar EXPR subquery output nullability
       config('exceptValues', 'select 1 as value except select 2'),
       config('exceptEmpty', 'select 1 as value except (select 2 limit 0)'),
       config('limitedValues', '(values (1), (2)) limit 1'),
+      config(
+        'fetchWithTiesValues',
+        `select value
+         from (values (1), (2), (3), (4), (5)) source(value)
+         order by value
+         fetch first 2 rows with ties`
+      ),
       config('offsetValues', '(values (1), (2)) offset 1'),
       config('dynamicLimitedValues', '(values (1), (2)) limit $1', ['limit']),
       config(
@@ -489,6 +495,11 @@ test('composes canonical row bounds with scalar EXPR subquery output nullability
       max: 1,
       min: 1,
       proof: 'values_2_rows+constant_limit_1',
+    })
+    assert.deepEqual(query('fetchWithTiesValues').rowBounds, {
+      max: 5,
+      min: 2,
+      proof: 'subquery_projection:values_5_rows+constant_fetch_with_ties_2',
     })
     assert.deepEqual(query('offsetValues').rowBounds, {
       max: 2,

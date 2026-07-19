@@ -71,7 +71,7 @@ export type TypedSqlColumnExpressionSourceMetadata =
       readonly attname?: string
       readonly kind: 'tableColumn'
       readonly relname?: string | null
-      readonly varattno?: number
+      readonly varattno: number
       readonly varlevelsup: number
       readonly varno: number
       readonly varnullingrels: readonly number[]

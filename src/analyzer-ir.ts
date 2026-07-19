@@ -676,7 +676,7 @@ function applyLimitBounds(
         : Math.min(base.max, limit.value)
       : base.max
   const minAfterLimit =
-    hasOffset || limit.kind === 'dynamic' || (limit.kind === 'constant' && limit.value === 0) ? 0 : base.min
+    hasOffset || limit.kind === 'dynamic' ? 0 : limit.kind === 'constant' ? Math.min(base.min, limit.value) : base.min
 
   return {
     max: maxAfterLimit,
@@ -2011,15 +2011,24 @@ function expressionSourceForExpr(expr: PgAnalyzerExpr | null | undefined): Typed
   if (!expr || expr.tag !== 'Var' || expr.varno === undefined || expr.varattno === undefined) {
     return { kind: 'expression', tag: expr?.tag ?? 'unknown' }
   }
-  return {
-    attname: expr.attname,
-    kind: expr.relname ? 'tableColumn' : 'derivedVar',
-    relname: expr.relname,
-    varattno: expr.varattno,
-    varlevelsup: expr.varlevelsup ?? 0,
-    varno: expr.varno,
-    varnullingrels: expr.varnullingrels ?? [],
-  }
+  return expr.relname
+    ? {
+        attname: expr.attname,
+        kind: 'tableColumn',
+        relname: expr.relname,
+        varattno: expr.varattno,
+        varlevelsup: expr.varlevelsup ?? 0,
+        varno: expr.varno,
+        varnullingrels: expr.varnullingrels ?? [],
+      }
+    : {
+        kind: 'derivedVar',
+        relname: expr.relname,
+        varattno: expr.varattno,
+        varlevelsup: expr.varlevelsup ?? 0,
+        varno: expr.varno,
+        varnullingrels: expr.varnullingrels ?? [],
+      }
 }
 
 function isJsonType(typeName: string | undefined): boolean {

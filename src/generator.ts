@@ -894,19 +894,7 @@ function renderGeneratedTypeDeclaration(declaration: GeneratedJsonTypeDeclaratio
 }
 
 function renderColumnExpressionSourceMetadata(expressionSource: TypedSqlPostgresIrColumnExpressionSource): string {
-  if (expressionSource.kind !== 'tableColumn') {
-    return JSON.stringify(expressionSource)
-  }
-
-  const stableExpressionSource = {
-    attname: expressionSource.attname,
-    kind: expressionSource.kind,
-    relname: expressionSource.relname,
-    varlevelsup: expressionSource.varlevelsup,
-    varno: expressionSource.varno,
-    varnullingrels: expressionSource.varnullingrels,
-  }
-  return JSON.stringify(stableExpressionSource)
+  return JSON.stringify(expressionSource)
 }
 
 function renderColumnMetadata(columns: readonly ResolvedSqlColumn[]): string {

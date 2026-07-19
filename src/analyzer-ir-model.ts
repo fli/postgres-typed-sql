@@ -125,8 +125,16 @@ export interface TypedSqlPostgresIrJsonField {
 
 export type TypedSqlPostgresIrColumnExpressionSource =
   | {
+      readonly kind: 'derivedVar'
+      readonly relname?: string | null
+      readonly varattno: number
+      readonly varlevelsup: number
+      readonly varno: number
+      readonly varnullingrels: readonly number[]
+    }
+  | {
       readonly attname?: string
-      readonly kind: 'derivedVar' | 'tableColumn'
+      readonly kind: 'tableColumn'
       readonly relname?: string | null
       readonly varattno: number
       readonly varlevelsup: number

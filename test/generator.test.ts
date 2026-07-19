@@ -158,7 +158,7 @@ join public.right_source on right_source.id = left_source.id
   const output = await readFile(join(root, 'queries/query.typed-sql.ts'), 'utf8')
   assert.match(
     output,
-    /expressionSource: \{"attname":"id","kind":"tableColumn","relname":"left_source","varlevelsup":0,"varno":1,"varnullingrels":\[\]\}/u
+    /expressionSource: \{"attname":"id","kind":"tableColumn","relname":"left_source","varattno":1,"varlevelsup":0,"varno":1,"varnullingrels":\[\]\}/u
   )
   assert.match(
     output,
@@ -2179,7 +2179,7 @@ test('maps JSON array-from and object-from derived row shapes to camel case', as
 
   const output = await readFile(join(root, 'queries/query.typed-sql.ts'), 'utf8')
   assert.match(output, /readonly accountRows: readonly \(QueryJ12_account_rowsJsonJ7_element\)\[\]/u)
-  assert.match(output, /readonly accountRow: QueryJ11_account_rowJson \| null/u)
+  assert.match(output, /readonly accountRow: QueryJ11_account_rowJson\n/u)
   assert.match(output, /readonly accountId: number/u)
   assert.match(output, /readonly displayName: 'Reader'/u)
   assert.match(output, /readonly displayName: 'Writer'/u)
