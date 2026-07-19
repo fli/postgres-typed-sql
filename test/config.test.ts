@@ -42,6 +42,7 @@ test('config defaults to conservative scalars and rejects unknown profiles', () 
   const resolved = resolveConfig({ schema: 'schema.sql' })
   assert.equal(resolved.codecProfile.name, 'conservative')
   assert.deepEqual(resolved.naming, {
+    parameterProperties: 'camelCase',
     resultColumns: 'preserve',
     structuredJsonFields: 'preserve',
   })
@@ -70,15 +71,27 @@ test('config resolves and validates generated output naming', () => {
   assert.deepEqual(
     resolveConfig({
       naming: {
+        parameterProperties: 'preserve',
         resultColumns: 'camelCase',
         structuredJsonFields: 'camelCase',
       },
       schema: 'schema.sql',
     }).naming,
     {
+      parameterProperties: 'preserve',
       resultColumns: 'camelCase',
       structuredJsonFields: 'camelCase',
     }
+  )
+  assert.throws(
+    () =>
+      resolveConfig({
+        naming: {
+          parameterProperties: 'pascalCase' as 'camelCase',
+        },
+        schema: 'schema.sql',
+      }),
+    /Unsupported parameter-property naming "pascalCase"/u
   )
   assert.throws(
     () =>

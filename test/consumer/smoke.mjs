@@ -52,7 +52,7 @@ assert.equal(conservativeResult.statementCount, 3)
 
 const conservativeInsert = await readFile('insert-widget.typed-sql.ts', 'utf8')
 assert.match(conservativeInsert, /readonly code: NonNullable<unknown>/u)
-assert.match(conservativeInsert, /readonly label: NonNullable<unknown> \| null/u)
+assert.match(conservativeInsert, /readonly widgetLabel: NonNullable<unknown> \| null/u)
 
 await generateTypedSql({
   include: ['.'],

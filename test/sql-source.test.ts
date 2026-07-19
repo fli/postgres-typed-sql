@@ -103,6 +103,11 @@ test('compiles named parameters only in PostgreSQL code contexts', () => {
       output: 'select $1, $1, $2',
       parameterNames: ['real', 'second'],
     },
+    {
+      input: 'select :platform_slug, :platform_slug, :platformSlug',
+      output: 'select $1, $1, $2',
+      parameterNames: ['platform_slug', 'platformSlug'],
+    },
   ]
 
   for (const { input, output, parameterNames } of cases) {

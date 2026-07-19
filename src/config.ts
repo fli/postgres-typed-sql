@@ -11,6 +11,8 @@ import type { SupportedExtension } from './engine.js'
 export type PostgresTypedSqlPropertyNaming = 'camelCase' | 'preserve'
 
 export interface PostgresTypedSqlNamingConfig {
+  /** Naming convention for generated parameter-object properties. Defaults to camelCase. */
+  readonly parameterProperties?: PostgresTypedSqlPropertyNaming
   /** Naming convention for top-level result-row properties. Defaults to preserve. */
   readonly resultColumns?: PostgresTypedSqlPropertyNaming
   /** Naming convention for fields in statically modeled JSON results. Defaults to preserve. */
@@ -31,7 +33,7 @@ export interface PostgresTypedSqlConfig {
   readonly include?: readonly string[]
   /** Exact module specifiers written into generated TypeScript. */
   readonly imports: PostgresTypedSqlImportsConfig
-  /** Naming conventions for generated result properties. */
+  /** Naming conventions for generated TypeScript properties. */
   readonly naming?: PostgresTypedSqlNamingConfig
   /** Project directory used to resolve every relative path. Defaults to process.cwd(). */
   readonly rootDir?: string
@@ -44,6 +46,7 @@ export interface PostgresTypedSqlConfig {
 }
 
 export interface ResolvedPostgresTypedSqlNamingConfig {
+  readonly parameterProperties: PostgresTypedSqlPropertyNaming
   readonly resultColumns: PostgresTypedSqlPropertyNaming
   readonly structuredJsonFields: PostgresTypedSqlPropertyNaming
 }
@@ -90,6 +93,10 @@ export function resolveConfig(config: PostgresTypedSqlConfig): ResolvedPostgresT
     throw new Error('The schema option must name at least one SQL file.')
   }
   const codecProfile = resolvePostgresCodecProfile(config.codecProfile ?? defaultPostgresCodecProfile)
+  const parameterProperties = config.naming?.parameterProperties ?? 'camelCase'
+  if (parameterProperties !== 'preserve' && parameterProperties !== 'camelCase') {
+    throw new Error(`Unsupported parameter-property naming ${JSON.stringify(parameterProperties)}.`)
+  }
   const resultColumns = config.naming?.resultColumns ?? 'preserve'
   if (resultColumns !== 'preserve' && resultColumns !== 'camelCase') {
     throw new Error(`Unsupported result-column naming ${JSON.stringify(resultColumns)}.`)
@@ -108,6 +115,7 @@ export function resolveConfig(config: PostgresTypedSqlConfig): ResolvedPostgresT
     },
     include: (config.include ?? ['.']).map((entry) => fromRoot(rootDir, entry)),
     naming: {
+      parameterProperties,
       resultColumns,
       structuredJsonFields,
     },

@@ -7,11 +7,15 @@ import {
 } from './check-constraint-type-facts.js'
 import {
   checkConstraintTypeKey,
+  intersectResultNullabilities,
   intersectJsonShapes,
   joinJsonShapes,
   jsonShapeWithNullability,
+  unionResultNullabilities,
   unionJsonShapes,
   type TypedSqlPostgresIr,
+  type TypedSqlPostgresIrAccessConcern,
+  type TypedSqlPostgresIrAccessEvidence,
   type TypedSqlPostgresIrCheckConstraintTypeExpression,
   type TypedSqlPostgresIrColumn,
   type TypedSqlPostgresIrColumnSource,
@@ -20,8 +24,8 @@ import {
   type TypedSqlPostgresIrJsonShape,
   type TypedSqlPostgresIrParam,
   type TypedSqlPostgresIrParamNullAdmission,
+  type TypedSqlPostgresIrResultNullability,
   type TypedSqlPostgresIrRowBounds,
-  type TypedSqlPostgresIrRowCardinality,
 } from './analyzer-ir-model.js'
 import type { PostgresQueryable } from './database.js'
 import { loadPostgresTypeFacts } from './postgres-type-facts.js'
@@ -29,6 +33,8 @@ import { postgresJsonSupportsTextualLiteralRefinement, type PostgresTypeFact } f
 
 export type {
   TypedSqlPostgresIr,
+  TypedSqlPostgresIrAccessConcern,
+  TypedSqlPostgresIrAccessEvidence,
   TypedSqlPostgresIrCheckConstraintTypeExpression,
   TypedSqlPostgresIrColumn,
   TypedSqlPostgresIrColumnSource,
@@ -37,8 +43,8 @@ export type {
   TypedSqlPostgresIrJsonShape,
   TypedSqlPostgresIrParam,
   TypedSqlPostgresIrParamNullAdmission,
+  TypedSqlPostgresIrResultNullability,
   TypedSqlPostgresIrRowBounds,
-  TypedSqlPostgresIrRowCardinality,
 } from './analyzer-ir-model.js'
 
 const ANALYZER_SCHEMA_VERSION = 6
@@ -408,19 +414,6 @@ function foldQueryOutput<T>(scope: QueryScope, outputIndex: number, semantics: Q
   return target ? semantics.target(scope, target) : semantics.unknown()
 }
 
-function rowCardinalityFromBounds(bounds: TypedSqlPostgresIrRowBounds): TypedSqlPostgresIrRowCardinality {
-  if (bounds.min === 0 && bounds.max === 0) {
-    return 'none'
-  }
-  if (bounds.min === 1 && bounds.max === 1) {
-    return 'one'
-  }
-  if (bounds.min === 0 && bounds.max === 1) {
-    return 'optional'
-  }
-  return 'many'
-}
-
 function constNonNegativeSafeInteger(catalog: CatalogFacts, expr: PgAnalyzerExpr | null | undefined): number | null {
   const unwrapped = unwrapCoercionExpr(expr)
   if (
@@ -769,7 +762,9 @@ function inferRowBounds(
   return applyLimitBounds(catalog, query, inferBaseRowBounds(catalog, query, resultColumnCount))
 }
 
-function isDataModifyingCommand(commandType: string | undefined): boolean {
+function isDataModifyingCommand(
+  commandType: string | undefined
+): commandType is 'DELETE' | 'INSERT' | 'MERGE' | 'UPDATE' {
   return commandType === 'UPDATE' || commandType === 'INSERT' || commandType === 'DELETE' || commandType === 'MERGE'
 }
 
@@ -800,28 +795,40 @@ function walkQueryTree(query: PgAnalyzerQuery, visitQuery: (query: PgAnalyzerQue
   })
 }
 
-function queryHasDataModifyingCte(query: PgAnalyzerQuery): boolean {
-  if (query.hasModifyingCTE === true) {
-    return true
+function accessEvidence(queries: readonly PgAnalyzerQuery[]): TypedSqlPostgresIrAccessEvidence {
+  const reasons: TypedSqlPostgresIrAccessConcern[] = []
+  const seen = new Set<string>()
+  const add = (reason: TypedSqlPostgresIrAccessConcern): void => {
+    const key = reason.kind === 'definiteDml' ? `${reason.kind}:${reason.command}` : reason.kind
+    if (!seen.has(key)) {
+      seen.add(key)
+      reasons.push(reason)
+    }
   }
 
-  let hasDataModifyingCte = false
-  walkQueryTree(query, (nested) => {
-    if (nested !== query && isDataModifyingCommand(nested.commandType)) {
-      hasDataModifyingCte = true
+  for (const query of queries) {
+    if (isDataModifyingCommand(query.commandType)) {
+      add({
+        command: query.commandType,
+        kind: 'definiteDml',
+      })
     }
-  })
-  return hasDataModifyingCte
-}
+    if (query.hasModifyingCTE === true) {
+      add({ kind: 'dataModifyingCte' })
+    }
+    if (query.hasRowMarks === true) {
+      add({ kind: 'rowLock' })
+    }
+    if (query.hasVolatileFunctions === true) {
+      add({ kind: 'volatileExecution' })
+    }
+    if (query.commandType === 'UTILITY' && query.utilityKind === 'CALL') {
+      add({ kind: 'procedureCall' })
+    }
+  }
 
-function queryTreeIsWrite(query: PgAnalyzerQuery): boolean {
-  return (
-    isDataModifyingCommand(query.commandType) ||
-    query.commandType === 'UTILITY' ||
-    query.hasModifyingCTE === true ||
-    query.hasRowMarks === true ||
-    query.hasVolatileFunctions === true
-  )
+  const [first, ...rest] = reasons
+  return first ? { kind: 'notProvenReadOnly', reasons: [first, ...rest] } : { kind: 'provenReadOnly' }
 }
 
 function combineParameterNullAdmission(
@@ -1356,91 +1363,125 @@ function checkedColumnParamTypes(
   return resolved
 }
 
-function queryOutputNullable(
+function queryOutputNullability(
   catalog: CatalogFacts,
   scope: QueryScope,
   outputIndex: number,
   seen: readonly VarLocation[] = []
-): boolean {
-  return foldQueryOutput<boolean>(scope, outputIndex, {
+): TypedSqlPostgresIrResultNullability {
+  return foldQueryOutput<TypedSqlPostgresIrResultNullability>(scope, outputIndex, {
     except: (left) => left,
-    intersect: (left, right) => left && right,
-    target: (targetScope, target) => expressionNullable(catalog, targetScope, target.expr, seen),
-    union: (left, right) => left || right,
-    unknown: () => true,
+    intersect: (left, right) => intersectResultNullabilities(left, right, 'query_intersection'),
+    target: (targetScope, target) => expressionNullability(catalog, targetScope, target.expr, seen),
+    union: (left, right) => unionResultNullabilities([left, right], 'query_union'),
+    unknown: () => ({ kind: 'unknown', reason: 'missing_query_output' }),
   })
 }
 
-function expressionNullable(
+function expressionNullability(
   catalog: CatalogFacts,
   scope: QueryScope,
   expr: PgAnalyzerExpr | null | undefined,
   seen: readonly VarLocation[] = []
-): boolean {
-  if (!expr || expr.truncated === true) {
-    return true
+): TypedSqlPostgresIrResultNullability {
+  if (!expr) {
+    return { kind: 'unknown', reason: 'missing_expression' }
+  }
+  if (expr.truncated === true) {
+    return { kind: 'unknown', reason: `truncated_expression:${expr.tag}` }
   }
 
   if (expr.tag === 'Var') {
     if (scopeProvesNonNull(scope, expr)) {
-      return false
+      return { basis: 'where_is_not_null', kind: 'nonNull' }
     }
     if (expr.varattno === 0) {
       return (expr.varnullingrels?.length ?? 0) > 0
+        ? { evidence: 'outer_join_whole_row', kind: 'nullable' }
+        : { basis: 'whole_row', kind: 'nonNull' }
     }
     if ((expr.varnullingrels ?? []).length > 0) {
-      return true
+      return { evidence: 'outer_join_column', kind: 'nullable' }
     }
     if (expr.relid && expr.varattno) {
       const column = catalog.columns.get(`${expr.relid}:${expr.varattno}`)
       if (column) {
-        return !column.attnotnull
+        return column.attnotnull
+          ? { basis: `not_null_column:${column.relname}.${column.attname}`, kind: 'nonNull' }
+          : { evidence: `nullable_column:${column.relname}.${column.attname}`, kind: 'nullable' }
       }
     }
 
     if (!varLocation(scope, expr)) {
-      return true
+      return { kind: 'unknown', reason: 'unresolved_variable' }
     }
     const nestedSeen = visitVar(seen, scope, expr)
     if (!nestedSeen) {
       // Recursive CTE evaluation starts from the nonrecursive term. A repeated
       // exact Var is the bottom of this monotone nullability recurrence; the
       // seed or another set-operation arm still contributes its nullable fact.
-      return false
+      return { basis: 'recursive_cte_recurrence_bottom', kind: 'nonNull' }
     }
 
     const ownerRte = varOwnerRte(scope, expr)
     const outputScope = ownerRte ? queryScopeForRteOutput(...ownerRte) : null
-    return outputScope ? queryOutputNullable(catalog, outputScope, (expr.varattno ?? 1) - 1, nestedSeen) : true
+    return outputScope
+      ? queryOutputNullability(catalog, outputScope, (expr.varattno ?? 1) - 1, nestedSeen)
+      : { kind: 'unknown', reason: 'unresolved_variable_source' }
   }
 
   if (expr.tag === 'Const') {
     return expr.constIsNull === true
+      ? { evidence: 'null_constant', kind: 'nullable' }
+      : { basis: 'non_null_constant', kind: 'nonNull' }
   }
   if (expr.tag === 'Param') {
-    return true
+    return { kind: 'unknown', reason: 'parameter' }
   }
   if (expr.tag === 'NullTest' || expr.tag === 'BooleanTest') {
-    return false
+    return { basis: expr.tag === 'NullTest' ? 'null_test' : 'boolean_test', kind: 'nonNull' }
   }
   if (expr.tag === 'SubLink') {
-    return expr.subLinkType !== 'EXISTS' && expr.subLinkType !== 'ARRAY'
+    if (expr.subLinkType === 'EXISTS' || expr.subLinkType === 'ARRAY') {
+      return { basis: `${expr.subLinkType.toLowerCase()}_sublink`, kind: 'nonNull' }
+    }
+    return {
+      evidence: `${(expr.subLinkType ?? 'unknown').toLowerCase()}_sublink_can_return_null`,
+      kind: 'nullable',
+    }
   }
   if (expr.tag === 'Aggref') {
-    return !isBuiltinPgProcNamed(catalog, expr.aggfnoid, 'count')
+    return isBuiltinPgProcNamed(catalog, expr.aggfnoid, 'count')
+      ? { basis: 'count_aggregate', kind: 'nonNull' }
+      : { kind: 'unknown', reason: `aggregate:${expr.aggname ?? expr.aggfnoid ?? 'unknown'}` }
   }
   if (expr.tag === 'CoalesceExpr') {
-    return !exprChildren(expr).some((child) => !expressionNullable(catalog, scope, child, seen))
+    const children = exprChildren(expr).map((child) => expressionNullability(catalog, scope, child, seen))
+    if (children.some((child) => child.kind === 'nonNull')) {
+      return { basis: 'coalesce_non_null_arm', kind: 'nonNull' }
+    }
+    if (children.length > 0 && children.every((child) => child.kind === 'nullable')) {
+      return { evidence: 'coalesce_all_arms_nullable', kind: 'nullable' }
+    }
+    return { kind: 'unknown', reason: 'coalesce_without_non_null_proof' }
   }
   if (expr.tag === 'CaseExpr') {
     const arms = caseArms(scope, expr)
-    return arms.length === 0 || arms.some((arm) => expressionNullable(catalog, arm.scope, arm.result, seen))
+    return arms.length === 0
+      ? { kind: 'unknown', reason: 'case_without_arms' }
+      : unionResultNullabilities(
+          arms.map((arm) => expressionNullability(catalog, arm.scope, arm.result, seen)),
+          'case'
+        )
   }
   if (expr.tag === 'BoolExpr') {
-    return exprChildren(expr).some((child) => expressionNullable(catalog, scope, child, seen))
+    return unionResultNullabilities(
+      exprChildren(expr).map((child) => expressionNullability(catalog, scope, child, seen)),
+      `boolean_${(expr.boolOp ?? 'unknown').toLowerCase()}`
+    )
   }
   if (expr.tag === 'ArrayExpr') {
-    return false
+    return { basis: 'array_constructor', kind: 'nonNull' }
   }
   if (expr.tag === 'FuncExpr') {
     if (
@@ -1449,24 +1490,31 @@ function expressionNullable(
       isBuiltinPgProcNamed(catalog, expr.funcid, 'row_to_json')
     ) {
       const args = expr.args?.map(targetExprFromAggregateArg)
-      return !args || args.length === 0 || args.some((arg) => expressionNullable(catalog, scope, arg, seen))
+      return !args || args.length === 0
+        ? { kind: 'unknown', reason: `json_conversion_arguments:${expr.funcname ?? expr.funcid ?? 'unknown'}` }
+        : unionResultNullabilities(
+            args.map((arg) => expressionNullability(catalog, scope, arg, seen)),
+            'strict_json_conversion'
+          )
     }
     if (
       isBuiltinPgProcNamed(catalog, expr.funcid, 'jsonb_build_object') ||
       isBuiltinPgProcNamed(catalog, expr.funcid, 'json_build_object')
     ) {
       if (expr.funcVariadic !== true) {
-        return false
+        return { basis: 'json_build_object', kind: 'nonNull' }
       }
       const args = expr.args?.map(targetExprFromAggregateArg)
-      return args?.length === 1 ? expressionNullable(catalog, scope, args[0], seen) : true
+      return args?.length === 1
+        ? expressionNullability(catalog, scope, args[0], seen)
+        : { kind: 'unknown', reason: 'variadic_json_build_object_arguments' }
     }
   }
   if (expr.tag === 'RelabelType' || expr.tag === 'CoerceViaIO' || expr.tag === 'CoerceToDomain') {
-    return expressionNullable(catalog, scope, expr.arg, seen)
+    return expressionNullability(catalog, scope, expr.arg, seen)
   }
 
-  return true
+  return { kind: 'unknown', reason: `unsupported_expression:${expr.tag}` }
 }
 
 function sourceForExpr(expr: PgAnalyzerExpr | null | undefined): TypedSqlPostgresIrColumnSource {
@@ -1566,19 +1614,24 @@ function jsonLeafShapeForExpr(
     constantExpr.constIsNull !== true &&
     typeof constantExpr.constString === 'string'
   ) {
-    return { ...typeFact, kind: 'stringLiteral', nullable: false, value: constantExpr.constString }
+    return {
+      ...typeFact,
+      kind: 'stringLiteral',
+      nullability: { basis: 'non_null_string_constant', kind: 'nonNull' },
+      value: constantExpr.constString,
+    }
   }
   if (isJsonType(typeFact.pgTypeName)) {
     return {
       kind: 'opaque',
-      nullable: expressionNullable(catalog, scope, expr, seen),
+      nullability: expressionNullability(catalog, scope, expr, seen),
     }
   }
 
   const checkConstraintType = literalCheckConstraintTypeForExpr(catalog, scope, expr)
   return {
     kind: 'scalar',
-    nullable: expressionNullable(catalog, scope, expr, seen),
+    nullability: expressionNullability(catalog, scope, expr, seen),
     ...typeFact,
     ...(checkConstraintType ? { checkConstraintType } : {}),
   }
@@ -1615,10 +1668,12 @@ function inferQueryOutputJsonShape(
     intersect: (left, right) => intersectJsonShapes(left, right),
     target: (targetScope, target) => {
       const targetExpr = target.expr
-      return targetExpr ? jsonShapeForExpr(catalog, targetScope, targetExpr, seen) : { kind: 'opaque', nullable: true }
+      return targetExpr
+        ? jsonShapeForExpr(catalog, targetScope, targetExpr, seen)
+        : { kind: 'opaque', nullability: { kind: 'unknown', reason: 'missing_json_target' } }
     },
     union: (left, right) => unionJsonShapes(left, right),
-    unknown: () => ({ kind: 'opaque', nullable: true }),
+    unknown: () => ({ kind: 'opaque', nullability: { kind: 'unknown', reason: 'missing_json_output' } }),
   })
 }
 
@@ -1649,12 +1704,12 @@ function inferStructuredJsonShape(
     }
 
     if (firstShape.kind === 'array' && children.length > 1 && children.slice(1).every(isEmptyJsonArrayConst)) {
-      return jsonShapeWithNullability(firstShape, false)
+      return jsonShapeWithNullability(firstShape, { basis: 'coalesce_empty_json_array', kind: 'nonNull' })
     }
 
     return {
       kind: 'opaque',
-      nullable: expressionNullable(catalog, scope, unwrapped, seen),
+      nullability: expressionNullability(catalog, scope, unwrapped, seen),
     }
   }
 
@@ -1663,13 +1718,13 @@ function inferStructuredJsonShape(
     switch (unwrapped.subLinkType) {
       case 'EXPR': {
         const shape = inferQueryOutputJsonShape(catalog, subqueryScope, 0, seen)
-        return jsonShapeWithNullability(shape, expressionNullable(catalog, scope, unwrapped, seen))
+        return jsonShapeWithNullability(shape, expressionNullability(catalog, scope, unwrapped, seen))
       }
       case 'ARRAY':
         return {
           element: inferQueryOutputJsonShape(catalog, subqueryScope, 0, seen),
           kind: 'array',
-          nullable: expressionNullable(catalog, scope, unwrapped, seen),
+          nullability: expressionNullability(catalog, scope, unwrapped, seen),
         }
       case 'ALL':
       case 'ANY':
@@ -1691,12 +1746,12 @@ function inferStructuredJsonShape(
   ) {
     const value = targetExprFromAggregateArg(unwrapped.args?.[0])
     const shape = value ? inferStructuredJsonShape(catalog, scope, value, seen) : null
-    const nullable = expressionNullable(catalog, scope, unwrapped, seen)
+    const nullability = expressionNullability(catalog, scope, unwrapped, seen)
     return shape
-      ? jsonShapeWithNullability(shape, nullable)
+      ? jsonShapeWithNullability(shape, nullability)
       : {
           kind: 'opaque',
-          nullable,
+          nullability,
         }
   }
 
@@ -1709,7 +1764,7 @@ function inferStructuredJsonShape(
     if (!args) {
       return {
         kind: 'opaque',
-        nullable: expressionNullable(catalog, scope, unwrapped, seen),
+        nullability: expressionNullability(catalog, scope, unwrapped, seen),
       }
     }
     const fields = new Map<string, TypedSqlPostgresIrJsonField>()
@@ -1721,7 +1776,7 @@ function inferStructuredJsonShape(
       if (key === null || !value) {
         return {
           kind: 'opaque',
-          nullable: expressionNullable(catalog, scope, unwrapped, seen),
+          nullability: expressionNullability(catalog, scope, unwrapped, seen),
         }
       }
 
@@ -1734,7 +1789,7 @@ function inferStructuredJsonShape(
     return {
       fields: [...fields.values()],
       kind: 'object',
-      nullable: expressionNullable(catalog, scope, unwrapped, seen),
+      nullability: expressionNullability(catalog, scope, unwrapped, seen),
     }
   }
 
@@ -1751,7 +1806,7 @@ function inferStructuredJsonShape(
     return {
       element: jsonShapeForExpr(catalog, scope, valueExpr, seen),
       kind: 'array',
-      nullable: expressionNullable(catalog, scope, unwrapped, seen),
+      nullability: expressionNullability(catalog, scope, unwrapped, seen),
     }
   }
 
@@ -1774,19 +1829,19 @@ function inferStructuredJsonShape(
           }
         }),
         kind: 'object',
-        nullable: expressionNullable(catalog, scope, unwrapped, seen),
+        nullability: expressionNullability(catalog, scope, unwrapped, seen),
       }
     }
     const shape = outputScope
       ? inferQueryOutputJsonShape(catalog, outputScope, (unwrapped.varattno ?? 1) - 1, nestedSeen)
       : null
-    return shape ? jsonShapeWithNullability(shape, expressionNullable(catalog, scope, unwrapped, seen)) : null
+    return shape ? jsonShapeWithNullability(shape, expressionNullability(catalog, scope, unwrapped, seen)) : null
   }
 
   if (isJsonType(unwrapped.typeName)) {
     return {
       kind: 'opaque',
-      nullable: expressionNullable(catalog, scope, unwrapped, seen),
+      nullability: expressionNullability(catalog, scope, unwrapped, seen),
     }
   }
 
@@ -1801,15 +1856,15 @@ function normalizeCompiledIr(catalog: CatalogFacts, analyzed: AnalyzedCompiledCo
     const expr = target.expr
     const typeFact = typeFactForOid(catalog, expr?.typeOid, expr?.typeName)
     const checkConstraintType = checkConstraintTypeForQueryOutput(catalog, rootScope, outputIndex, [])
-    const nullable = queryOutputNullable(catalog, rootScope, outputIndex)
+    const nullability = queryOutputNullability(catalog, rootScope, outputIndex)
     const inferredJsonShape = isJsonType(typeFact.pgTypeName)
       ? inferQueryOutputJsonShape(catalog, rootScope, outputIndex, [])
       : undefined
-    const jsonShape = inferredJsonShape ? jsonShapeWithNullability(inferredJsonShape, nullable) : undefined
+    const jsonShape = inferredJsonShape ? jsonShapeWithNullability(inferredJsonShape, nullability) : undefined
     return {
       jsonShape,
       name: target.resname ?? null,
-      nullable,
+      nullability,
       ...typeFact,
       source: sourceForExpr(expr),
       ...(checkConstraintType ? { checkConstraintType } : {}),
@@ -1830,25 +1885,21 @@ function normalizeCompiledIr(catalog: CatalogFacts, analyzed: AnalyzedCompiledCo
     return {
       name,
       nullAdmission,
-      nullable: nullAdmission === 'accepts',
       ...typeFact,
-      propertyName: name,
       ...(checkConstraintType ? { checkConstraintType } : {}),
     }
   })
   const rowBounds = inferRowBounds(catalog, query, resultColumns.length)
 
   return {
+    accessEvidence: accessEvidence(rewrittenQueries),
     analyzerSchemaVersion: analysis.schemaVersion,
     command: query.commandType,
-    hasDataModifyingCte: rewrittenQueries.some(queryHasDataModifyingCte),
-    isWrite: rewrittenQueries.some(queryTreeIsWrite),
     name: config.name,
     params,
     postgresVersionNum: analysis.postgresVersionNum,
     resultColumns,
     rowBounds,
-    rowCardinality: rowCardinalityFromBounds(rowBounds),
     sourceFile: config.sourceFile,
   }
 }

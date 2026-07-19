@@ -623,7 +623,7 @@ test('native analyzer follows only execution-reachable SELECT CTEs', async () =>
   })
 })
 
-test('native analyzer treats volatile aggregate support functions as writes', async () => {
+test('native analyzer detects reachable volatile aggregate support functions', async () => {
   await withDatabase(async (database) => {
     await database.query('create table public.aggregate_side_effects (value integer)')
     await database.query(`create function public.volatile_sum_transition(state integer, value integer)

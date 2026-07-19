@@ -6,12 +6,14 @@ import { basename, dirname, join, relative } from 'node:path'
 import { buildTypedSqlPostgresIrFromCompiledConfigs } from './analyzer-ir.js'
 import {
   flattenJsonShapeAlternatives,
+  resultNullabilityAllowsNull,
+  type TypedSqlPostgresIrAccessConcern,
+  type TypedSqlPostgresIrAccessEvidence,
   type TypedSqlPostgresIrCheckConstraintTypeExpression,
   type TypedSqlPostgresIrColumnSource,
   type TypedSqlPostgresIrJsonField,
   type TypedSqlPostgresIrJsonShape,
   type TypedSqlPostgresIrRowBounds,
-  type TypedSqlPostgresIrRowCardinality,
 } from './analyzer-ir-model.js'
 import { buildCatalogTypes } from './catalog-generator.js'
 import type { PostgresTypedSqlPropertyNaming, ResolvedPostgresTypedSqlConfig } from './config.js'
@@ -30,10 +32,11 @@ import {
 } from './postgres-codecs.js'
 import { postgresJsonValueMayBeStructured } from './postgres-types.js'
 import { compileNamedParameters, parseTypedSqlSource } from './sql-source.js'
+import type { TypedSqlCardinality } from './runtime.js'
 import {
   assertTypeScriptBindingIdentifier,
   assertUniqueTypeScriptBindings,
-  camelCaseOutputProperty,
+  camelCasePropertyName,
   pascalCaseIdentifier,
   quotePropertyName,
   renderTypeScriptLineCommentValue,
@@ -60,10 +63,13 @@ const ignoredDiscoveryDirectories = new Set([
   'test-results',
 ])
 
-interface SqlParameter {
+interface SqlParameterDeclaration {
   readonly name: string
   readonly nullable?: boolean
   readonly pgType?: string
+}
+
+interface SqlParameter extends SqlParameterDeclaration {
   readonly propertyName: string
 }
 
@@ -71,7 +77,6 @@ interface SqlColumn {
   readonly name: string
   readonly nullable?: boolean
   readonly pgType?: string
-  readonly propertyName: string
 }
 
 interface TypedSqlConfig {
@@ -79,7 +84,7 @@ interface TypedSqlConfig {
   readonly columns: readonly SqlColumn[]
   readonly name: string
   readonly outputPath: string
-  readonly parameters: readonly SqlParameter[]
+  readonly parameters: readonly SqlParameterDeclaration[]
   readonly sourceFile: string
   readonly sourcePath: string
   readonly sql: string
@@ -91,8 +96,6 @@ interface CompiledTypedSql {
   readonly name: string
   readonly outputPath: string
   readonly parameters: readonly SqlParameter[]
-  readonly parameterNames: readonly string[]
-  readonly parameterTypes: readonly (string | undefined)[]
   readonly sourceFile: string
   readonly sourcePath: string
   readonly sql: string
@@ -127,15 +130,13 @@ type TypedSqlAccess = 'read' | 'write'
 
 interface ResolvedTypedSql {
   readonly access: TypedSqlAccess
-  readonly cardinality: TypedSqlPostgresIrRowCardinality
+  readonly cardinality: TypedSqlCardinality
   readonly columns: readonly ResolvedSqlColumn[]
   readonly command: TypedSqlCommand
   readonly generatedTypeDeclarations: readonly string[]
   readonly name: string
   readonly outputPath: string
   readonly parameters: readonly ResolvedSqlParameter[]
-  readonly parameterNames: readonly string[]
-  readonly parameterTypes: readonly string[]
   readonly rowBounds: TypedSqlPostgresIrRowBounds
   readonly scalarTypeImports: readonly string[]
   readonly sourceFile: string
@@ -235,8 +236,36 @@ function typedSqlCommandFromPostgres(command: string): TypedSqlCommand {
   }
 }
 
-function typedSqlAccessForCommand(command: TypedSqlCommand): TypedSqlAccess {
-  return command === 'select' ? 'read' : 'write'
+function typedSqlCardinalityFromRowBounds(bounds: TypedSqlPostgresIrRowBounds): TypedSqlCardinality {
+  if (bounds.min === 0 && bounds.max === 0) {
+    return 'none'
+  }
+  if (bounds.min === 1 && bounds.max === 1) {
+    return 'one'
+  }
+  if (bounds.min === 0 && bounds.max === 1) {
+    return 'optional'
+  }
+  return 'many'
+}
+
+function typedSqlAccessFromEvidence(evidence: TypedSqlPostgresIrAccessEvidence): TypedSqlAccess {
+  return evidence.kind === 'provenReadOnly' ? 'read' : 'write'
+}
+
+function accessConcernDescription(concern: TypedSqlPostgresIrAccessConcern): string {
+  switch (concern.kind) {
+    case 'definiteDml':
+      return `direct ${concern.command} DML`
+    case 'dataModifyingCte':
+      return 'a data-modifying CTE'
+    case 'rowLock':
+      return 'a row lock that is incompatible with read-only execution'
+    case 'volatileExecution':
+      return 'an execution-reachable volatile path that prevents a read-only proof'
+    case 'procedureCall':
+      return 'an opaque procedure call whose read-only behavior cannot be proved'
+  }
 }
 
 function parseDirectivePgType(pgType: string | undefined): {
@@ -315,7 +344,7 @@ async function readTypedSqlConfigs(generatorConfig: ResolvedPostgresTypedSqlConf
     const defaultName = lowerCamelCaseFromPathBase(basename(sourceFile, typedSqlSourceSuffix))
     let access: TypedSqlAccess | undefined
     let name = defaultName
-    const parameters: SqlParameter[] = []
+    const parameters: SqlParameterDeclaration[] = []
     const columns: SqlColumn[] = []
     let firstAccessLocation: string | undefined
     let firstNameLocation: string | undefined
@@ -381,7 +410,6 @@ async function readTypedSqlConfigs(generatorConfig: ResolvedPostgresTypedSqlConf
         name: identifier,
         nullable: parsedPgType.nullable,
         pgType,
-        propertyName: identifier,
       }
 
       if (kind === 'param') {
@@ -417,23 +445,21 @@ function assertUniqueTypedSqlNames(configs: readonly TypedSqlConfig[]): void {
   }
 }
 
-function compileTypedSql(config: TypedSqlConfig): CompiledTypedSql {
+function compileTypedSql(config: TypedSqlConfig, parameterNaming: PostgresTypedSqlPropertyNaming): CompiledTypedSql {
   const parametersByName = new Map(config.parameters.map((parameter) => [parameter.name, parameter]))
   const compiled = compileNamedParameters(config.sql, config.sourceFile)
-  const parameterTypes: (string | undefined)[] = []
-  const parameters: SqlParameter[] = []
-  const parameterNames = compiled.parameterNames.map((name) => {
-    const parameter =
-      parametersByName.get(name) ??
-      ({
-        name,
-        propertyName: name,
-      } satisfies SqlParameter)
-
-    parameters.push(parameter)
-    parameterTypes.push(parameter.pgType)
-    return parameter.propertyName
+  const parameters = compiled.parameterNames.map((name): SqlParameter => {
+    const declaration = parametersByName.get(name) ?? { name }
+    return {
+      ...declaration,
+      propertyName: propertyNameForNaming(name, parameterNaming),
+    }
   })
+  assertUniquePublicNames(
+    parameters.map((parameter) => parameter.propertyName),
+    'parameter property',
+    config.sourceFile
+  )
 
   const unusedParameters = config.parameters.filter(
     (parameter) => !parameters.some((used) => used.name === parameter.name)
@@ -450,8 +476,6 @@ function compileTypedSql(config: TypedSqlConfig): CompiledTypedSql {
     name: config.name,
     outputPath: config.outputPath,
     parameters,
-    parameterNames,
-    parameterTypes,
     sourceFile: config.sourceFile,
     sourcePath: config.sourcePath,
     sql: compiled.sql,
@@ -467,6 +491,13 @@ interface GeneratedJsonTypeDeclaration {
   readonly name: string
 }
 
+type ResolvedJsonLeafShape<Kind extends 'opaque' | 'scalar' | 'stringLiteral'> = Omit<
+  Extract<TypedSqlPostgresIrJsonShape, { readonly kind: Kind }>,
+  'nullability'
+> & {
+  readonly nullable: boolean
+}
+
 type ResolvedJsonShape =
   | {
       readonly element: ResolvedJsonShape
@@ -478,7 +509,9 @@ type ResolvedJsonShape =
       readonly kind: 'object'
       readonly nullable: boolean
     }
-  | Extract<TypedSqlPostgresIrJsonShape, { readonly kind: 'opaque' | 'scalar' | 'stringLiteral' }>
+  | ResolvedJsonLeafShape<'opaque'>
+  | ResolvedJsonLeafShape<'scalar'>
+  | ResolvedJsonLeafShape<'stringLiteral'>
   | {
       readonly alternatives: readonly ResolvedJsonShape[]
       readonly kind: 'union'
@@ -502,8 +535,8 @@ interface GeneratedJsonMapping {
   readonly fields?: readonly GeneratedJsonFieldMapping[]
 }
 
-function outputPropertyName(name: string, naming: PostgresTypedSqlPropertyNaming): string {
-  return naming === 'camelCase' ? camelCaseOutputProperty(name) : name
+function propertyNameForNaming(name: string, naming: PostgresTypedSqlPropertyNaming): string {
+  return naming === 'camelCase' ? camelCasePropertyName(name) : name
 }
 
 function resolveJsonShapeNames(
@@ -517,12 +550,12 @@ function resolveJsonShapeNames(
       return {
         element: resolveJsonShapeNames(shape.element, naming, sourceFile, `${context}[]`),
         kind: 'array',
-        nullable: shape.nullable,
+        nullable: resultNullabilityAllowsNull(shape.nullability),
       }
     case 'object': {
       const fields = shape.fields.map((field) => ({
         name: field.name,
-        propertyName: outputPropertyName(field.name, naming),
+        propertyName: propertyNameForNaming(field.name, naming),
         shape: resolveJsonShapeNames(field.shape, naming, sourceFile, `${context}.${field.name}`),
       }))
       assertUniquePublicNames(
@@ -533,20 +566,25 @@ function resolveJsonShapeNames(
       return {
         fields,
         kind: 'object',
-        nullable: shape.nullable,
+        nullable: resultNullabilityAllowsNull(shape.nullability),
       }
     }
     case 'opaque':
     case 'scalar':
-    case 'stringLiteral':
-      return shape
+    case 'stringLiteral': {
+      const { nullability, ...value } = shape
+      return {
+        ...value,
+        nullable: resultNullabilityAllowsNull(nullability),
+      }
+    }
     case 'union':
       return {
         alternatives: shape.alternatives.map((alternative, index) =>
           resolveJsonShapeNames(alternative, naming, sourceFile, `${context}<alternative ${index + 1}>`)
         ),
         kind: 'union',
-        nullable: shape.nullable,
+        nullable: resultNullabilityAllowsNull(shape.nullability),
       }
   }
 }
@@ -563,7 +601,7 @@ function applyOpaqueJsonBarriersToAlternatives(
   }
   const alternatives = shapes.flatMap(flattenJsonShapeAlternatives)
   if (alternatives.some(isJsonTraversalBarrier)) {
-    return shapes.map((shape) => ({ kind: 'opaque', nullable: shape.nullable }))
+    return shapes.map((shape) => ({ kind: 'opaque', nullability: shape.nullability }))
   }
 
   const arrayElements = alternatives.flatMap((alternative) =>
@@ -722,7 +760,7 @@ function encodedTypeNameSegment(value: string): string {
 }
 
 function scalarTsTypeForJsonShape(
-  shape: Extract<TypedSqlPostgresIrJsonShape, { readonly kind: 'scalar' }>,
+  shape: Extract<ResolvedJsonShape, { readonly kind: 'scalar' }>,
   dependencies: TypeScriptDependencies,
   codecProfile: ResolvedPostgresCodecProfile
 ): string {
@@ -918,7 +956,7 @@ ${parameters
 function renderStatement(config: ResolvedTypedSql): string {
   const paramsName = `${pascalCaseIdentifier(config.name)}Params`
   const rowName = `${pascalCaseIdentifier(config.name)}Row`
-  const parameterNames = config.parameterNames.map(quoteString).join(', ')
+  const parameterNames = config.parameters.map((parameter) => quoteString(parameter.propertyName)).join(', ')
   const generatedTypeDeclarations =
     config.generatedTypeDeclarations.length > 0 ? `${config.generatedTypeDeclarations.join('\n\n')}\n\n` : ''
 
@@ -1016,8 +1054,8 @@ async function resolveTypedSqlWithAnalyzer(
     client,
     configs.map((config) => ({
       name: config.name,
-      parameterNames: config.parameterNames,
-      parameterTypes: config.parameterTypes,
+      parameterNames: config.parameters.map((parameter) => parameter.name),
+      parameterTypes: config.parameters.map((parameter) => parameter.pgType),
       sourceFile: config.sourceFile,
       sql: config.sql,
     }))
@@ -1043,7 +1081,7 @@ async function resolveTypedSqlWithAnalyzer(
     const usedGeneratedTypeNames = new Map(statementTypeBindings.map((binding) => [binding.name, binding.source]))
     const columns = ir.resultColumns.map((column, columnIndex): ResolvedSqlColumn => {
       const name = column.name ?? `column_${columnIndex + 1}`
-      const propertyName = outputPropertyName(name, generatorConfig.naming.resultColumns)
+      const propertyName = propertyNameForNaming(name, generatorConfig.naming.resultColumns)
       const suggestedJsonTypeName = `${pascalCaseIdentifier(config.name)}${encodedTypeNameSegment(name)}Json`
       const safeJsonShape = column.jsonShape ? applyOpaqueJsonBarriers(column.jsonShape) : undefined
       const resolvedJsonShape = safeJsonShape
@@ -1088,7 +1126,7 @@ async function resolveTypedSqlWithAnalyzer(
         ...(jsonShape ? { jsonShape } : {}),
         ...(jsonMapping ? { jsonMapping } : {}),
         name,
-        nullable: column.nullable,
+        nullable: resultNullabilityAllowsNull(column.nullability),
         pgType: column.pgType,
         pgTypeName: column.pgTypeName,
         pgTypeOid: column.pgTypeOid,
@@ -1135,11 +1173,6 @@ async function resolveTypedSqlWithAnalyzer(
         tsType: resolution.type,
       }
     })
-    assertUniquePublicNames(
-      parameters.map((parameter) => parameter.propertyName),
-      'parameter',
-      config.sourceFile
-    )
     const usesRecordUtilityType =
       parameters.length === 0 || columns.length === 0 || generatedDeclarations.some(({ fields }) => fields.length === 0)
     const ambientBindings = new Set(typeDependencies.ambient)
@@ -1160,22 +1193,26 @@ async function resolveTypedSqlWithAnalyzer(
       config.sourceFile
     )
 
-    const inferredAccess = ir.isWrite ? 'write' : typedSqlAccessForCommand(typedSqlCommandFromPostgres(ir.command))
+    const inferredAccess = typedSqlAccessFromEvidence(ir.accessEvidence)
     if (config.access === 'read' && inferredAccess === 'write') {
-      throw new Error(`${config.sourceFile}: @access read conflicts with PostgreSQL's write classification.`)
+      const reasons =
+        ir.accessEvidence.kind === 'notProvenReadOnly'
+          ? ir.accessEvidence.reasons.map(accessConcernDescription).join('; ')
+          : 'an unknown analyzer result'
+      throw new Error(
+        `${config.sourceFile}: @access read requires analyzer-proved read-only execution; PostgreSQL analysis found ${reasons}.`
+      )
     }
 
     resolvedQueries.push({
       columns,
       access: config.access ?? inferredAccess,
-      cardinality: ir.rowCardinality,
+      cardinality: typedSqlCardinalityFromRowBounds(ir.rowBounds),
       command: typedSqlCommandFromPostgres(ir.command),
       generatedTypeDeclarations: generatedDeclarations.map(renderGeneratedTypeDeclaration),
       name: config.name,
       outputPath: config.outputPath,
       parameters,
-      parameterNames: config.parameterNames,
-      parameterTypes: parameters.map((parameter) => parameter.pgType),
       rowBounds: ir.rowBounds,
       scalarTypeImports: [...typeDependencies.scalar].toSorted(),
       sourceFile: config.sourceFile,
@@ -1498,7 +1535,7 @@ export async function generateTypedSql(config: PostgresTypedSqlConfig): Promise<
     const catalogContents = await buildCatalogTypes(database, resolvedConfig)
     const rawConfigs = await readTypedSqlConfigs(resolvedConfig)
     assertUniqueTypedSqlNames(rawConfigs)
-    const configs = rawConfigs.map(compileTypedSql)
+    const configs = rawConfigs.map((config) => compileTypedSql(config, resolvedConfig.naming.parameterProperties))
     const resolvedConfigs = await resolveTypedSqlWithAnalyzer(configs, database, resolvedConfig)
 
     const staleFiles = await findStaleGeneratedFiles(resolvedConfigs, resolvedConfig)

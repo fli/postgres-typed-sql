@@ -6,6 +6,7 @@ export type TypedSqlCommandKind = 'delete' | 'insert' | 'merge' | 'select' | 'un
 export type TypedSqlAccessKind = 'read' | 'write'
 
 export interface TypedSqlRowBounds {
+  /** A finite upper bound proved by analysis, or null when no finite upper bound was proved. */
   readonly max: number | null
   readonly min: number
   readonly proof: string

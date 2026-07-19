@@ -67,7 +67,7 @@ test('infers structured JSON from scalar subqueries and derived whole rows', asy
     const arrayShape = result.queries.find((query) => query.name === 'jsonArrayFrom')?.resultColumns[0]?.jsonShape
     assert.equal(arrayShape?.kind, 'array')
     if (arrayShape?.kind === 'array') {
-      assert.equal(arrayShape.nullable, false)
+      assert.equal(arrayShape.nullability.kind, 'nonNull')
       assert.equal(arrayShape.element.kind, 'object')
       if (arrayShape.element.kind === 'object') {
         assert.deepEqual(
@@ -88,7 +88,7 @@ test('infers structured JSON from scalar subqueries and derived whole rows', asy
     const directObjectShape = result.queries.find((query) => query.name === 'directJsonObject')?.resultColumns[0]
       ?.jsonShape
     assert.equal(directObjectShape?.kind, 'object')
-    assert.equal(directObjectShape?.nullable, false)
+    assert.equal(directObjectShape?.nullability.kind, 'nonNull')
   } finally {
     await database.close()
   }
@@ -151,7 +151,7 @@ test('models exposed whole-row names, set operations, and each JSON sublink resu
 
     const arrayShape = shape('arraySublink')
     assert.equal(arrayShape?.kind, 'array')
-    assert.equal(arrayShape?.nullable, false)
+    assert.equal(arrayShape?.nullability.kind, 'nonNull')
     if (arrayShape?.kind === 'array') {
       assert.equal(arrayShape.element.kind, 'object')
       if (arrayShape.element.kind === 'object') {
@@ -174,7 +174,7 @@ test('models exposed whole-row names, set operations, and each JSON sublink resu
   }
 })
 
-test('rejects unmodeled PostgreSQL utilities while preserving no-result CALL as a write', async () => {
+test('rejects unmodeled PostgreSQL utilities while write-routing an opaque no-result CALL', async () => {
   const database = await createAnalysisDatabase({ schemaFiles: [schemaFile] })
   try {
     await database.query(`create procedure public.ir_no_result(value integer)
@@ -192,10 +192,12 @@ test('rejects unmodeled PostgreSQL utilities while preserving no-result CALL as 
     ])
     const call = result.queries[0]
     assert.equal(call?.command, 'UTILITY')
-    assert.equal(call?.isWrite, true)
+    assert.deepEqual(call?.accessEvidence, {
+      kind: 'notProvenReadOnly',
+      reasons: [{ kind: 'procedureCall' }],
+    })
     assert.deepEqual(call?.resultColumns, [])
     assert.deepEqual(call?.rowBounds, { max: 0, min: 0, proof: 'no_result_columns' })
-    assert.equal(call?.rowCardinality, 'none')
     await database.query('call public.ir_no_result($1)', [1])
 
     for (const [name, sql, error] of [
@@ -419,19 +421,19 @@ test('normalizes PostgreSQL statement, nullability, DML, and cardinality facts c
       return value
     }
 
-    assert.equal(query('directRefinement').resultColumns[0]?.nullable, false)
-    assert.equal(query('andRefinement').resultColumns[0]?.nullable, false)
-    assert.equal(query('orRefinement').resultColumns[0]?.nullable, true)
-    assert.equal(query('orIntersectionRefinement').resultColumns[0]?.nullable, false)
-    assert.equal(query('notRefinement').resultColumns[0]?.nullable, true)
+    assert.equal(query('directRefinement').resultColumns[0]?.nullability.kind, 'nonNull')
+    assert.equal(query('andRefinement').resultColumns[0]?.nullability.kind, 'nonNull')
+    assert.equal(query('orRefinement').resultColumns[0]?.nullability.kind, 'nullable')
+    assert.equal(query('orIntersectionRefinement').resultColumns[0]?.nullability.kind, 'nonNull')
+    assert.equal(query('notRefinement').resultColumns[0]?.nullability.kind, 'nullable')
 
-    assert.equal(query('scalarSublink').resultColumns[0]?.nullable, true)
-    assert.equal(query('existsSublink').resultColumns[0]?.nullable, false)
-    assert.equal(query('arraySublink').resultColumns[0]?.nullable, false)
-    assert.equal(query('unionNullability').resultColumns[0]?.nullable, true)
-    assert.equal(query('intersectNullability').resultColumns[0]?.nullable, false)
-    assert.equal(query('exceptNullability').resultColumns[0]?.nullable, false)
-    assert.equal(query('nestedSetNullability').resultColumns[0]?.nullable, true)
+    assert.equal(query('scalarSublink').resultColumns[0]?.nullability.kind, 'nullable')
+    assert.equal(query('existsSublink').resultColumns[0]?.nullability.kind, 'nonNull')
+    assert.equal(query('arraySublink').resultColumns[0]?.nullability.kind, 'nonNull')
+    assert.equal(query('unionNullability').resultColumns[0]?.nullability.kind, 'nullable')
+    assert.equal(query('intersectNullability').resultColumns[0]?.nullability.kind, 'nonNull')
+    assert.equal(query('exceptNullability').resultColumns[0]?.nullability.kind, 'nonNull')
+    assert.equal(query('nestedSetNullability').resultColumns[0]?.nullability.kind, 'nullable')
 
     const divergentJsonShape = query('divergentJsonUnion').resultColumns[0]?.jsonShape
     assert.equal(divergentJsonShape?.kind, 'union')
@@ -449,60 +451,70 @@ test('normalizes PostgreSQL statement, nullability, DML, and cardinality facts c
       min: 0,
       proof: 'select_without_from+dynamic_limit_can_drop_rows',
     })
-    assert.equal(query('dynamicLimit').rowCardinality, 'optional')
     assert.equal(query('dynamicLimit').params[0]?.nullAdmission, 'accepts')
-    assert.equal(query('dynamicLimit').params[0]?.nullable, true)
     assert.equal(query('rejectingWindowFrame').params[0]?.nullAdmission, 'rejects')
-    assert.equal(query('rejectingWindowFrame').params[0]?.nullable, false)
     assert.equal(query('acceptingWindowFrame').params[0]?.nullAdmission, 'unknown')
     assert.equal(query('rejectingTableSample').params[0]?.nullAdmission, 'rejects')
-    assert.equal(query('rejectingTableSample').params[0]?.nullable, false)
     assert.equal(query('acceptingTableSample').params[0]?.nullAdmission, 'unknown')
     assert.equal(query('opaqueCall').params[0]?.nullAdmission, 'unknown')
-    assert.equal(query('opaqueCall').params[0]?.nullable, false)
-    assert.equal(query('nullLimit').rowCardinality, 'one')
-    assert.equal(query('allLimit').rowCardinality, 'one')
-    assert.equal(query('zeroLimit').rowCardinality, 'none')
-    assert.equal(query('noFromSelect').rowCardinality, 'one')
-    assert.equal(query('noFromHaving').rowCardinality, 'optional')
+    assert.deepEqual(query('nullLimit').rowBounds, { max: 1, min: 1, proof: 'select_without_from' })
+    assert.deepEqual(query('allLimit').rowBounds, { max: 1, min: 1, proof: 'select_without_from' })
+    assert.deepEqual(query('zeroLimit').rowBounds, {
+      max: 0,
+      min: 0,
+      proof: 'select_without_from+constant_limit_0',
+    })
+    assert.deepEqual(query('noFromSelect').rowBounds, { max: 1, min: 1, proof: 'select_without_from' })
+    assert.deepEqual(query('noFromHaving').rowBounds, {
+      max: 1,
+      min: 0,
+      proof: 'select_without_from_with_qual',
+    })
     assert.deepEqual(query('noFromGroupingSets').rowBounds, {
       max: null,
       min: 0,
       proof: 'select_without_from_with_grouping',
     })
-    assert.equal(query('zeroColumnNoFromSelect').rowCardinality, 'one')
-    assert.equal(query('zeroColumnNoFromHaving').rowCardinality, 'optional')
+    assert.deepEqual(query('zeroColumnNoFromSelect').rowBounds, {
+      max: 1,
+      min: 1,
+      proof: 'select_without_from',
+    })
+    assert.deepEqual(query('zeroColumnNoFromHaving').rowBounds, {
+      max: 1,
+      min: 0,
+      proof: 'select_without_from_with_qual',
+    })
     assert.deepEqual(query('zeroColumnNoFromGroupingSets').rowBounds, {
       max: null,
       min: 0,
       proof: 'select_without_from_with_grouping',
     })
     assert.equal(query('nullableSelectParameter').params[0]?.nullAdmission, 'accepts')
-    assert.equal(query('nullableSelectParameter').params[0]?.nullable, true)
 
-    assert.equal(query('uniqueLookup').rowCardinality, 'optional')
+    assert.deepEqual(query('uniqueLookup').rowBounds, {
+      max: 1,
+      min: 0,
+      proof: 'primary_key_equality:accounts_pkey',
+    })
     assert.deepEqual(query('multipliedUniqueLookup').rowBounds, {
       max: null,
       min: 0,
       proof: 'unbounded',
     })
-    assert.equal(query('multipliedUniqueLookup').rowCardinality, 'many')
 
     assert.deepEqual(
-      query('multiRowInsert').params.map(({ name, nullAdmission, nullable }) => ({
+      query('multiRowInsert').params.map(({ name, nullAdmission }) => ({
         name,
         nullAdmission,
-        nullable,
       })),
       [
-        { name: 'email', nullAdmission: 'rejects', nullable: false },
-        { name: 'display_name', nullAdmission: 'accepts', nullable: true },
-        { name: 'second_email', nullAdmission: 'rejects', nullable: false },
+        { name: 'email', nullAdmission: 'rejects' },
+        { name: 'display_name', nullAdmission: 'accepts' },
+        { name: 'second_email', nullAdmission: 'rejects' },
       ]
     )
-    assert.equal(query('mixedTargetInsert').params[0]?.nullable, false)
     assert.equal(query('mixedTargetInsert').params[0]?.nullAdmission, 'rejects')
-    assert.equal(query('opaqueNullableTargetInsert').params[0]?.nullable, false)
     assert.equal(query('opaqueNullableTargetInsert').params[0]?.nullAdmission, 'unknown')
     assert.deepEqual(query('checkedRoleInsert').params[1]?.checkConstraintType, {
       kind: 'literalUnion',
@@ -554,31 +566,35 @@ test('normalizes PostgreSQL statement, nullability, DML, and cardinality facts c
       }
     }
     assert.equal(query('modifyingCte').command, 'SELECT')
-    assert.equal(query('modifyingCte').hasDataModifyingCte, true)
-    assert.equal(query('modifyingCte').isWrite, true)
+    assert.deepEqual(query('modifyingCte').accessEvidence, {
+      kind: 'notProvenReadOnly',
+      reasons: [{ kind: 'dataModifyingCte' }, { kind: 'volatileExecution' }],
+    })
     assert.deepEqual(
-      query('modifyingCte').params.map(({ name, nullable }) => ({ name, nullable })),
+      query('modifyingCte').params.map(({ name, nullAdmission }) => ({ name, nullAdmission })),
       [
-        { name: 'email', nullable: false },
-        { name: 'display_name', nullable: true },
+        { name: 'email', nullAdmission: 'rejects' },
+        { name: 'display_name', nullAdmission: 'accepts' },
       ]
     )
 
     assert.equal(query('rewrittenInsert').command, 'INSERT')
     assert.equal(query('rewrittenInsert').resultColumns[0]?.name, 'value')
-    assert.equal(query('rewrittenInsert').isWrite, true)
-    assert.equal(query('rewrittenInsert').params[0]?.nullable, false)
+    assert.deepEqual(query('rewrittenInsert').accessEvidence, {
+      kind: 'notProvenReadOnly',
+      reasons: [{ command: 'INSERT', kind: 'definiteDml' }],
+    })
     assert.equal(query('rewrittenInsert').params[0]?.nullAdmission, 'rejects')
     assert.equal(query('rewrittenInsert').params[0]?.checkConstraintType, undefined)
 
     assert.equal(query('domainTypedSource').params[0]?.nullAdmission, 'rejects')
-    assert.equal(query('domainTypedSource').params[0]?.nullable, false)
     assert.equal(query('rejectingReturningUse').params[0]?.nullAdmission, 'rejects')
-    assert.equal(query('rejectingReturningUse').params[0]?.nullable, false)
     assert.equal(query('nullExtendedInsert').params[0]?.nullAdmission, 'accepts')
-    assert.equal(query('nullExtendedInsert').params[0]?.nullable, true)
     assert.equal(query('nullExtendedInsert').params[0]?.checkConstraintType, undefined)
-    assert.equal(query('nestedRowLock').isWrite, true)
+    assert.deepEqual(query('nestedRowLock').accessEvidence, {
+      kind: 'notProvenReadOnly',
+      reasons: [{ kind: 'rowLock' }],
+    })
     assert.equal((await database.query('select 1 as value')).rows.length, 1)
     assert.equal((await database.query('select 1 as value having false')).rows.length, 0)
     assert.equal((await database.query('select 1 as value group by grouping sets ((), ())')).rows.length, 2)
@@ -719,7 +735,7 @@ test('preserves correlated CHECK metadata and folds CHECK result types through s
     const left = { kind: 'literalUnion', labels: ['left_only', 'shared'] } as const
     const right = { kind: 'literalUnion', labels: ['right_only', 'shared'] } as const
 
-    assert.equal(queries.get('correlatedLateral')?.resultColumns[0]?.nullable, true)
+    assert.equal(queries.get('correlatedLateral')?.resultColumns[0]?.nullability.kind, 'nullable')
     assert.deepEqual(refinement('correlatedLateral'), {
       kind: 'literalUnion',
       labels: ['outer_only'],
@@ -837,7 +853,7 @@ test('resolves correlated derived provenance from the Var owner query scope', as
       kind: 'literalUnion',
       labels: ['inner'],
     })
-    assert.equal(outerDerived?.resultColumns[1]?.nullable, true)
+    assert.equal(outerDerived?.resultColumns[1]?.nullability.kind, 'nullable')
 
     const jsonShape = outerDerived?.resultColumns[2]?.jsonShape
     assert.equal(jsonShape?.kind, 'union')
@@ -931,23 +947,27 @@ test('uses exact PostgreSQL proof objects for uniqueness, inheritance, checks, a
       return value
     }
 
-    assert.equal(query('customEquality').rowCardinality, 'many')
-    assert.equal(query('ordinaryEquality').rowCardinality, 'optional')
-    assert.equal(query('includeKey').rowCardinality, 'optional')
-    assert.equal(query('includePayload').rowCardinality, 'many')
-    assert.equal(query('deferredEquality').rowCardinality, 'many')
-    assert.equal(query('inheritedParent').rowCardinality, 'many')
-    assert.equal(query('onlyParent').rowCardinality, 'optional')
+    assert.equal(query('customEquality').rowBounds.max, null)
+    assert.deepEqual(query('ordinaryEquality').rowBounds, {
+      max: 1,
+      min: 0,
+      proof: 'primary_key_equality:operator_unique_pkey',
+    })
+    assert.equal(query('includeKey').rowBounds.max, 1)
+    assert.equal(query('includePayload').rowBounds.max, null)
+    assert.equal(query('deferredEquality').rowBounds.max, null)
+    assert.equal(query('inheritedParent').rowBounds.max, null)
+    assert.equal(query('onlyParent').rowBounds.max, 1)
     assert.equal(query('noInheritCheck').resultColumns[0]?.checkConstraintType, undefined)
     assert.deepEqual(query('inheritedCheck').resultColumns[0]?.checkConstraintType, {
       kind: 'literalUnion',
       labels: ['shared'],
     })
     assert.equal(query('emptyRows').resultColumns.length, 0)
-    assert.equal(query('emptyRows').rowCardinality, 'many')
-    assert.equal(query('withTies').rowCardinality, 'many')
-    assert.equal(query('withoutTies').rowCardinality, 'optional')
-    assert.equal(query('truncatedNull').resultColumns[0]?.nullable, true)
+    assert.equal(query('emptyRows').rowBounds.max, null)
+    assert.equal(query('withTies').rowBounds.max, null)
+    assert.equal(query('withoutTies').rowBounds.max, 1)
+    assert.equal(query('truncatedNull').resultColumns[0]?.nullability.kind, 'unknown')
 
     const customRows = await database.query('select id from public.operator_unique where id operator(public.=) $1', [1])
     assert.equal(customRows.rows.length, 2)
