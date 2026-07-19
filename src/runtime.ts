@@ -93,7 +93,7 @@ export interface TypedSqlColumnMetadata {
 
 export interface TypedSqlParameterMetadata {
   readonly name: string
-  readonly nullable?: boolean
+  readonly nullable: boolean
   readonly pgType: string
   readonly pgTypeName: string
   readonly pgTypeSchema: string

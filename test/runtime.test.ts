@@ -102,6 +102,11 @@ test('runtime looks up public parameter properties independently of raw SQL meta
   })
 
   assert.deepEqual(statement.values({ platformSlug: 'web' }), ['web'])
+  assert.deepEqual(
+    statement.values({ platformSlug: null } as unknown as { readonly platformSlug: string }),
+    [null],
+    'the runtime binder does not duplicate the generated TypeScript null contract'
+  )
   assert.throws(
     () => statement.values({ platform_slug: 'web' } as unknown as { readonly platformSlug: string }),
     /expected an own parameter property "platformSlug"/u

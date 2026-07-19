@@ -29,7 +29,7 @@ test('camel-cases only conventional generated property names', () => {
 test('camel-cases parameter properties by default while preserving raw SQL metadata', async () => {
   const root = await createMinimalFixture(
     'select 1;\n',
-    `-- @param platform_slug text?
+    `-- @param platform_slug text
 select
   :platform_slug::text is not distinct from :platform_slug::text
   and :alreadyCamel::text is not null
@@ -49,7 +49,7 @@ select
   })
 
   const output = await readFile(join(root, 'queries/query.typed-sql.ts'), 'utf8')
-  assert.match(output, /readonly platformSlug: string \| null/u)
+  assert.match(output, /readonly platformSlug: string\n/u)
   assert.match(output, /readonly alreadyCamel: string/u)
   assert.match(output, /readonly URL: string/u)
   assert.match(output, /readonly __proto__: string/u)
@@ -77,7 +77,8 @@ test('supports explicit parameter-property preservation', async () => {
   })
 
   const output = await readFile(join(root, 'queries/query.typed-sql.ts'), 'utf8')
-  assert.match(output, /readonly platform_slug: string \| null/u)
+  assert.match(output, /readonly platform_slug: string\n/u)
+  assert.match(output, /name: 'platform_slug',[\s\S]*?nullable: false/u)
   assert.match(output, /parameterNames: \['platform_slug'\]/u)
   assert.match(output, /name: 'platform_slug',[\s\S]*?propertyName: 'platform_slug'/u)
 })
@@ -235,17 +236,35 @@ test('deduplicates Record when generated empty objects and codec types use the s
   assert.match(output, /readonly value: Record<string, unknown>/u)
 })
 
-test('generates nullable parameters when a direct SELECT use proves NULL is accepted', async () => {
+test('requires explicit caller null permission even when PostgreSQL proves NULL is accepted', async () => {
   const root = await createMinimalFixture('select 1;\n', 'select :value::text as value\n')
-  await generateTypedSql({
+  const config = {
     include: ['queries'],
     rootDir: root,
-    codecProfile: 'node-postgres',
+    codecProfile: 'node-postgres' as const,
     schema: 'schema.sql',
-  })
+  }
+  const queryFile = join(root, 'queries/query.typed.sql')
+  const outputFile = join(root, 'queries/query.typed-sql.ts')
 
-  const output = await readFile(join(root, 'queries/query.typed-sql.ts'), 'utf8')
+  await generateTypedSql(config)
+  let output = await readFile(outputFile, 'utf8')
+  assert.match(output, /export interface QueryParams \{[\s\S]*readonly value: string\n/u)
+  assert.match(output, /name: 'value',[\s\S]*?nullable: false/u)
+
+  await writeFile(queryFile, '-- @param value ?\nselect :value::text as value\n')
+  await generateTypedSql(config)
+  output = await readFile(outputFile, 'utf8')
   assert.match(output, /export interface QueryParams \{[\s\S]*readonly value: string \| null/u)
+  assert.match(output, /name: 'value',[\s\S]*?nullable: true/u)
+  assert.match(output, /pgType: 'text'/u)
+
+  await writeFile(queryFile, '-- @param value text?\nselect :value as value\n')
+  await generateTypedSql(config)
+  output = await readFile(outputFile, 'utf8')
+  assert.match(output, /export interface QueryParams \{[\s\S]*readonly value: string \| null/u)
+  assert.match(output, /name: 'value',[\s\S]*?nullable: true/u)
+  assert.match(output, /pgType: 'text'/u)
 })
 
 test('preserves PostgreSQL array slices through named-parameter compilation and analysis', async () => {
@@ -340,6 +359,42 @@ test('imports every scalar dependency used by bytea array parameters', async () 
     /export interface QueryParams \{[\s\S]*readonly payloads: PgArrayParameter<PgByteaHexString> \| string/u
   )
   assert.match(output, /export interface QueryRow \{[\s\S]*readonly payloads: PgArray<Uint8Array> \| null/u)
+})
+
+test('keeps array elements and JSON contents independent from explicit top-level SQL NULL permission', async () => {
+  const root = await createMinimalFixture('select 1;\n', 'select :values::integer[] as values\n')
+  const config = {
+    include: ['queries'],
+    rootDir: root,
+    codecProfile: 'node-postgres' as const,
+    schema: 'schema.sql',
+  }
+  const queryFile = join(root, 'queries/query.typed.sql')
+  const outputFile = join(root, 'queries/query.typed-sql.ts')
+
+  await generateTypedSql(config)
+  let output = await readFile(outputFile, 'utf8')
+  assert.match(output, /readonly values: PgArrayParameter<bigint \| number \| string> \| string\n/u)
+  assert.match(output, /name: 'values',[\s\S]*?nullable: false/u)
+
+  await writeFile(queryFile, '-- @param values ?\nselect :values::integer[] as values\n')
+  await generateTypedSql(config)
+  output = await readFile(outputFile, 'utf8')
+  assert.match(output, /readonly values: PgArrayParameter<bigint \| number \| string> \| string \| null/u)
+  assert.match(output, /name: 'values',[\s\S]*?nullable: true/u)
+
+  await writeFile(queryFile, 'select :payload::jsonb as payload\n')
+  await generateTypedSql(config)
+  output = await readFile(outputFile, 'utf8')
+  assert.match(output, /readonly payload: DbJsonParameter\n/u)
+  assert.match(output, /name: 'payload',[\s\S]*?nullable: false/u)
+
+  await writeFile(queryFile, '-- @param payload jsonb?\nselect :payload as payload\n')
+  await generateTypedSql(config)
+  output = await readFile(outputFile, 'utf8')
+  assert.match(output, /readonly payload: DbJsonParameter \| null/u)
+  assert.match(output, /name: 'payload',[\s\S]*?nullable: true/u)
+  assert.doesNotMatch(output, /nullAdmission/u)
 })
 
 test('surfaces native PostgreSQL diagnostics for invalid SQL', async () => {
@@ -812,7 +867,7 @@ select :value
 
   const nativeFacts = await readFile(join(root, 'queries/native-dml-facts.typed-sql.ts'), 'utf8')
   assert.match(nativeFacts, /readonly email: string\n/u)
-  assert.match(nativeFacts, /readonly displayName: string \| null/u)
+  assert.match(nativeFacts, /readonly displayName: string\n/u)
   assert.match(nativeFacts, /readonly secondEmail: string\n/u)
 
   const mixedTarget = await readFile(join(root, 'queries/mixed-dml-target.typed-sql.ts'), 'utf8')
@@ -822,11 +877,11 @@ select :value
   const modifyingCte = await readFile(join(root, 'queries/modifying-cte.typed-sql.ts'), 'utf8')
   assert.match(modifyingCte, /access: 'write'/u)
   assert.match(modifyingCte, /readonly email: string\n/u)
-  assert.match(modifyingCte, /readonly displayName: string \| null/u)
+  assert.match(modifyingCte, /readonly displayName: string\n/u)
 
   const domainNullability = await readFile(join(root, 'queries/domain-nullability.typed-sql.ts'), 'utf8')
-  assert.match(domainNullability, /readonly maybeValue: string \| null/u)
-  assert.match(domainNullability, /readonly checkedValue: string \| null/u)
+  assert.match(domainNullability, /readonly maybeValue: string\n/u)
+  assert.match(domainNullability, /readonly checkedValue: string\n/u)
   assert.match(domainNullability, /readonly requiredValue: string\n/u)
   assert.match(domainNullability, /readonly nestedRequiredValue: string\n/u)
 
@@ -839,7 +894,7 @@ select :value
   assert.doesNotMatch(rejectingReturningUse, /readonly value: string \| null/u)
 
   const nullExtendedInput = await readFile(join(root, 'queries/null-extended-input.typed-sql.ts'), 'utf8')
-  assert.match(nullExtendedInput, /readonly value: string \| null/u)
+  assert.match(nullExtendedInput, /readonly value: string\n/u)
   assert.doesNotMatch(nullExtendedInput, /OuterJoinInputs__Value/u)
 
   const unsafeInsertSelect = await readFile(join(root, 'queries/unsafe-insert-select.typed-sql.ts'), 'utf8')
@@ -1354,15 +1409,56 @@ insert into public.required_values(value) values (:value)
   )
 })
 
-test('enforces required-nonnull contexts while keeping opaque and transformed uses overridable', async () => {
+test('proof-gates nullable domain and DML parameters through final analyzer admission', async () => {
+  const root = await createMinimalFixture(
+    `create domain public.optional_text as text;
+create domain public.required_text as text not null;
+create table public.nullable_targets (value text);
+create table public.required_targets (value text not null);
+`,
+    '-- @param value ?\nselect :value::public.optional_text as value\n'
+  )
+  const config = {
+    include: ['queries'],
+    rootDir: root,
+    codecProfile: 'node-postgres' as const,
+    schema: 'schema.sql',
+  }
+  const queryFile = join(root, 'queries/query.typed.sql')
+  const outputFile = join(root, 'queries/query.typed-sql.ts')
+
+  await generateTypedSql(config)
+  let output = await readFile(outputFile, 'utf8')
+  assert.match(output, /readonly value: string \| null/u)
+  assert.match(output, /name: 'value',[\s\S]*?nullable: true/u)
+
+  await writeFile(queryFile, '-- @param value public.required_text?\nselect :value::public.required_text as value\n')
+  await assert.rejects(
+    generateTypedSql(config),
+    /@param value cannot be nullable because PostgreSQL proves that one of its uses rejects NULL/u
+  )
+
+  await writeFile(queryFile, '-- @param value ?\ninsert into public.nullable_targets(value) values (:value)\n')
+  await generateTypedSql(config)
+  output = await readFile(outputFile, 'utf8')
+  assert.match(output, /readonly value: string \| null/u)
+  assert.match(output, /name: 'value',[\s\S]*?nullable: true/u)
+
+  await writeFile(queryFile, '-- @param value text?\ninsert into public.required_targets(value) values (:value)\n')
+  await assert.rejects(
+    generateTypedSql(config),
+    /@param value cannot be nullable because PostgreSQL proves that one of its uses rejects NULL/u
+  )
+})
+
+test('proof-gates both nullable parameter syntaxes through final PostgreSQL admission', async () => {
   const root = await createMinimalFixture(
     `create table public.null_admission_sample (value integer);
 create procedure public.accept_null(value integer)
 language plpgsql
 as $$ begin null; end $$;
 `,
-    `-- @param offset bigint?
-select sum(value) over (rows between :offset preceding and current row) as total
+    `select sum(value) over (rows between :offset preceding and current row) as total
 from (values (1), (2)) input(value)
 `
   )
@@ -1375,68 +1471,69 @@ from (values (1), (2)) input(value)
   const queryFile = join(root, 'queries/query.typed.sql')
   const outputFile = join(root, 'queries/query.typed-sql.ts')
 
-  await assert.rejects(
-    generateTypedSql(config),
-    /@param offset cannot be nullable because PostgreSQL proves that one of its uses rejects NULL/u
-  )
+  await generateTypedSql(config)
+  let output = await readFile(outputFile, 'utf8')
+  assert.match(output, /readonly offset: bigint \| number \| string\n/u)
+  assert.match(output, /name: 'offset',[\s\S]*?nullable: false/u)
+
+  for (const directive of ['-- @param offset ?', '-- @param offset bigint?']) {
+    await writeFile(
+      queryFile,
+      `${directive}
+select sum(value) over (rows between :offset preceding and current row) as total
+from (values (1), (2)) input(value)
+`
+    )
+    await assert.rejects(
+      generateTypedSql(config),
+      /@param offset cannot be nullable because PostgreSQL proves that one of its uses rejects NULL/u
+    )
+  }
 
   await writeFile(
     queryFile,
-    `-- @param offset bigint?
-select sum(value) over (rows between coalesce(:offset, 0) preceding and current row) as total
+    `select sum(value) over (rows between coalesce(:offset, 0) preceding and current row) as total
 from (values (1), (2)) input(value)
 `
   )
   await generateTypedSql(config)
-  let output = await readFile(outputFile, 'utf8')
-  assert.match(output, /readonly offset: [^\n]+ \| null/u)
-  assert.match(output, /name: 'offset',[\s\S]*?nullable: true/u)
+  output = await readFile(outputFile, 'utf8')
+  assert.match(output, /readonly offset: bigint \| number \| string\n/u)
+  assert.match(output, /name: 'offset',[\s\S]*?nullable: false/u)
 
-  await writeFile(
-    queryFile,
-    `-- @param percentage real?
-select value from public.null_admission_sample tablesample system (:percentage)
+  for (const directive of ['-- @param offset ?', '-- @param offset bigint?']) {
+    await writeFile(
+      queryFile,
+      `${directive}
+select sum(value) over (rows between coalesce(:offset, 0) preceding and current row) as total
+from (values (1), (2)) input(value)
 `
-  )
-  await assert.rejects(
-    generateTypedSql(config),
-    /@param percentage cannot be nullable because PostgreSQL proves that one of its uses rejects NULL/u
-  )
+    )
+    await assert.rejects(
+      generateTypedSql(config),
+      /@param offset cannot be nullable because PostgreSQL could not prove that every use accepts NULL/u
+    )
+  }
 
-  await writeFile(
-    queryFile,
-    `-- @param percentage real?
-select value
-from public.null_admission_sample tablesample system (coalesce(:percentage, 100))
-`
-  )
+  await writeFile(queryFile, '-- @param value integer\ncall public.accept_null(:value)\n')
   await generateTypedSql(config)
   output = await readFile(outputFile, 'utf8')
-  assert.match(output, /readonly percentage: bigint \| number \| string \| null/u)
-  assert.match(output, /name: 'percentage',[\s\S]*?nullable: true/u)
-
-  await writeFile(
-    queryFile,
-    `-- @param value integer
-call public.accept_null(:value)
-`
-  )
-  await generateTypedSql(config)
-  output = await readFile(outputFile, 'utf8')
-  assert.match(output, /readonly value: bigint \| number \| string/u)
-  assert.doesNotMatch(output, /readonly value: bigint \| number \| string \| null/u)
+  assert.match(output, /readonly value: bigint \| number \| string\n/u)
   assert.match(output, /name: 'value',[\s\S]*?nullable: false/u)
 
   await writeFile(
     queryFile,
-    `-- @param value integer?
-call public.accept_null(:value)
+    `-- @param offset bigint?
+select :offset::bigint,
+  sum(value) over (rows between :offset preceding and current row) as total
+from (values (1), (2)) input(value)
+group by value
 `
   )
-  await generateTypedSql(config)
-  output = await readFile(outputFile, 'utf8')
-  assert.match(output, /readonly value: bigint \| number \| string \| null/u)
-  assert.match(output, /name: 'value',[\s\S]*?nullable: true/u)
+  await assert.rejects(
+    generateTypedSql(config),
+    /@param offset cannot be nullable because PostgreSQL proves that one of its uses rejects NULL/u
+  )
 })
 
 test('narrows CHECK parameters only for direct value-preserving assignments', async () => {
@@ -1458,13 +1555,13 @@ test('narrows CHECK parameters only for direct value-preserving assignments', as
 
   await writeFile(
     join(root, 'queries/query.typed.sql'),
-    `-- @param value text?
+    `-- @param value text
 insert into public.checked_values(value) values (coalesce(:value, 'A'))
 `
   )
   await generateTypedSql(config)
   output = await readFile(join(root, 'queries/query.typed-sql.ts'), 'utf8')
-  assert.match(output, /readonly value: string \| null/u)
+  assert.match(output, /readonly value: string\n/u)
   assert.doesNotMatch(output, /readonly value: CheckedValues__Value/u)
 })
 

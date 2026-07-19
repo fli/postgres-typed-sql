@@ -13,10 +13,17 @@ void values
 void client.query(query)
 
 echoBytes.query({ payloads: [] })
+echoBytes.query({ payloads: [null] })
+
+// @ts-expect-error Top-level SQL NULL requires explicit caller permission.
+echoBytes.query({ payloads: null })
 
 findWidget.query({ code: 'widget-code', metrics: [] })
 findWidget.query({ code: 'widget-code', metrics: [1, '2', 3n, null] })
 findWidget.query({ code: 'widget-code', metrics: '{{1,2},{3,4}}' })
+
+// @ts-expect-error Array element NULL does not make the top-level SQL parameter nullable.
+findWidget.query({ code: 'widget-code', metrics: null })
 
 const flatParameter: PgArrayParameter<number> = [1, null, 2]
 const recursiveResult: PgArray<number> = [

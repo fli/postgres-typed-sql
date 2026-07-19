@@ -64,8 +64,8 @@ const ignoredDiscoveryDirectories = new Set([
 ])
 
 interface SqlParameterDeclaration {
+  readonly allowsNull: boolean
   readonly name: string
-  readonly nullable?: boolean
   readonly pgType?: string
 }
 
@@ -75,7 +75,6 @@ interface SqlParameter extends SqlParameterDeclaration {
 
 interface SqlColumn {
   readonly name: string
-  readonly nullable?: boolean
   readonly pgType?: string
 }
 
@@ -269,23 +268,23 @@ function accessConcernDescription(concern: TypedSqlPostgresIrAccessConcern): str
 }
 
 function parseDirectivePgType(pgType: string | undefined): {
-  readonly nullable: boolean
+  readonly allowsNull: boolean
   readonly pgType?: string
 } {
   if (!pgType) {
-    return { nullable: false }
+    return { allowsNull: false }
   }
 
   if (pgType === '?') {
-    return { nullable: true }
+    return { allowsNull: true }
   }
 
   if (pgType.endsWith('?')) {
     const typeWithoutSuffix = pgType.slice(0, -1).trimEnd()
-    return { nullable: true, ...(typeWithoutSuffix ? { pgType: typeWithoutSuffix } : {}) }
+    return { allowsNull: true, ...(typeWithoutSuffix ? { pgType: typeWithoutSuffix } : {}) }
   }
 
-  return { nullable: false, pgType }
+  return { allowsNull: false, pgType }
 }
 
 async function walkTypedSqlFiles(directory: string, output: string[]): Promise<void> {
@@ -395,7 +394,7 @@ async function readTypedSqlConfigs(generatorConfig: ResolvedPostgresTypedSqlConf
       if (kind === 'param' && !/^[A-Za-z_][A-Za-z0-9_]*$/u.test(identifier)) {
         throw new Error(`${location}: @param requires a named-parameter identifier.`)
       }
-      if (kind === 'column' && parsedPgType.nullable) {
+      if (kind === 'column' && parsedPgType.allowsNull) {
         throw new Error(`${location}: @column does not support ?; PostgreSQL determines result nullability.`)
       }
 
@@ -406,16 +405,17 @@ async function readTypedSqlConfigs(generatorConfig: ResolvedPostgresTypedSqlConf
       }
       firstDirectiveByName.set(identifier, location)
 
-      const entry = {
-        name: identifier,
-        nullable: parsedPgType.nullable,
-        pgType,
-      }
-
       if (kind === 'param') {
-        parameters.push(entry)
+        parameters.push({
+          allowsNull: parsedPgType.allowsNull,
+          name: identifier,
+          pgType,
+        })
       } else {
-        columns.push(entry)
+        columns.push({
+          name: identifier,
+          pgType,
+        })
       }
     }
 
@@ -449,7 +449,7 @@ function compileTypedSql(config: TypedSqlConfig, parameterNaming: PostgresTypedS
   const parametersByName = new Map(config.parameters.map((parameter) => [parameter.name, parameter]))
   const compiled = compileNamedParameters(config.sql, config.sourceFile)
   const parameters = compiled.parameterNames.map((name): SqlParameter => {
-    const declaration = parametersByName.get(name) ?? { name }
+    const declaration = parametersByName.get(name) ?? { allowsNull: false, name }
     return {
       ...declaration,
       propertyName: propertyNameForNaming(name, parameterNaming),
@@ -1158,14 +1158,16 @@ async function resolveTypedSqlWithAnalyzer(
             }
           : resolveTypeScriptParameterTypeForPostgresType(analyzed, generatorConfig.codecProfile)
       collectTypeResolutionDependencies(typeDependencies, resolution)
-      if (parameter.nullable === true && analyzed.nullAdmission === 'rejects') {
-        throw new Error(
-          `${config.sourceFile}: @param ${parameter.name} cannot be nullable because PostgreSQL proves that one of its uses rejects NULL.`
-        )
+      if (parameter.allowsNull && analyzed.nullAdmission !== 'accepts') {
+        const reason =
+          analyzed.nullAdmission === 'rejects'
+            ? 'PostgreSQL proves that one of its uses rejects NULL'
+            : 'PostgreSQL could not prove that every use accepts NULL'
+        throw new Error(`${config.sourceFile}: @param ${parameter.name} cannot be nullable because ${reason}.`)
       }
       return {
         name: parameter.name,
-        nullable: analyzed.nullAdmission === 'accepts' || parameter.nullable === true,
+        nullable: parameter.allowsNull,
         pgType: analyzed.pgType,
         pgTypeName: analyzed.pgTypeName,
         pgTypeSchema: analyzed.pgTypeSchema,
