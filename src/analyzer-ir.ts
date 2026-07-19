@@ -877,16 +877,11 @@ function walkQuery(query: PgAnalyzerQuery, visitExpr: (expr: PgAnalyzerExpr) => 
 
 function collectOids(analysis: PgAnalyzerResult): {
   readonly procOids: ReadonlySet<number>
-  readonly relationColumns: readonly {
-    readonly attnum: number
-    readonly relid: number
-  }[]
   readonly relationRelids: ReadonlySet<number>
   readonly typeOids: ReadonlySet<number>
 } {
   const typeOids = new Set<number>(analysis.paramTypeOids)
   const procOids = new Set<number>()
-  const relationColumns = new Map<string, { readonly attnum: number; readonly relid: number }>()
   const relationRelids = new Set<number>()
 
   for (const statement of analysis.statements) {
@@ -906,19 +901,12 @@ function collectOids(analysis: PgAnalyzerResult): {
             procOids.add(oid)
           }
         }
-        if (expr.relid && expr.varattno && expr.varattno > 0) {
-          relationColumns.set(`${expr.relid}:${expr.varattno}`, {
-            attnum: expr.varattno,
-            relid: expr.relid,
-          })
-        }
       })
     }
   }
 
   return {
     procOids,
-    relationColumns: [...relationColumns.values()],
     relationRelids,
     typeOids,
   }
@@ -937,7 +925,6 @@ function walkQueryRelations(query: PgAnalyzerQuery, visitRelid: (relid: number) 
 async function loadCatalog(client: PostgresQueryable, analyses: readonly PgAnalyzerResult[]): Promise<CatalogFacts> {
   const typeOids = new Set<number>()
   const procOids = new Set<number>()
-  const relationColumnKeys = new Map<string, { readonly attnum: number; readonly relid: number }>()
   const relationRelids = new Set<number>()
   for (const analysis of analyses) {
     const collected = collectOids(analysis)
@@ -946,9 +933,6 @@ async function loadCatalog(client: PostgresQueryable, analyses: readonly PgAnaly
     }
     for (const oid of collected.procOids) {
       procOids.add(oid)
-    }
-    for (const column of collected.relationColumns) {
-      relationColumnKeys.set(`${column.relid}:${column.attnum}`, column)
     }
     for (const relid of collected.relationRelids) {
       relationRelids.add(relid)
@@ -978,8 +962,7 @@ async function loadCatalog(client: PostgresQueryable, analyses: readonly PgAnaly
   }
 
   const columns = new Map<string, ColumnCatalogRow>()
-  const relationColumns = [...relationColumnKeys.values()]
-  if (relationColumns.length > 0) {
+  if (relationRelids.size > 0) {
     const result = await client.query<ColumnCatalogRow>(
       `
         select
@@ -991,10 +974,11 @@ async function loadCatalog(client: PostgresQueryable, analyses: readonly PgAnaly
         from pg_class c
         join pg_attribute a
           on a.attrelid = c.oid
-        where (c.oid::int, a.attnum) in (${relationColumns.map((_, index) => `($${index * 2 + 1}::int, $${index * 2 + 2}::int)`).join(', ')})
+        where c.oid = any($1::oid[])
+          and a.attnum > 0
           and not a.attisdropped
       `,
-      relationColumns.flatMap((column) => [column.relid, column.attnum])
+      [[...relationRelids]]
     )
     for (const row of result.rows) {
       columns.set(`${row.relid}:${row.attnum}`, row)
@@ -1392,6 +1376,22 @@ function expressionNullability(
   }
 
   if (expr.tag === 'Var') {
+    const ownerRte = varOwnerRte(scope, expr)
+    const ownerRelation = ownerRte?.[1].kind === 'RELATION' ? ownerRte[1] : null
+    let baseColumn: ColumnCatalogRow | undefined
+    if (typeof expr.varattno === 'number' && expr.varattno > 0 && ownerRelation) {
+      if (typeof ownerRelation.relid !== 'number' || ownerRelation.relid <= 0) {
+        return { kind: 'unknown', reason: 'malformed_relation_variable' }
+      }
+      baseColumn = catalog.columns.get(`${ownerRelation.relid}:${expr.varattno}`)
+      if (!baseColumn) {
+        const commandType = ownerRte?.[0].query.commandType ?? 'unknown'
+        throw new Error(
+          `internal analyzer catalog inconsistency: missing positive base-column fact for relation OID ${ownerRelation.relid}, attribute number ${expr.varattno} in ${commandType} query`
+        )
+      }
+    }
+
     if (scopeProvesNonNull(scope, expr)) {
       return { basis: 'where_is_not_null', kind: 'nonNull' }
     }
@@ -1403,13 +1403,13 @@ function expressionNullability(
     if ((expr.varnullingrels ?? []).length > 0) {
       return { evidence: 'outer_join_column', kind: 'nullable' }
     }
-    if (expr.relid && expr.varattno) {
-      const column = catalog.columns.get(`${expr.relid}:${expr.varattno}`)
-      if (column) {
-        return column.attnotnull
-          ? { basis: `not_null_column:${column.relname}.${column.attname}`, kind: 'nonNull' }
-          : { evidence: `nullable_column:${column.relname}.${column.attname}`, kind: 'nullable' }
-      }
+    if (baseColumn) {
+      return baseColumn.attnotnull
+        ? { basis: `not_null_column:${baseColumn.relname}.${baseColumn.attname}`, kind: 'nonNull' }
+        : { evidence: `nullable_column:${baseColumn.relname}.${baseColumn.attname}`, kind: 'nullable' }
+    }
+    if (typeof expr.varattno === 'number' && expr.varattno < 0 && ownerRelation) {
+      return { kind: 'unknown', reason: `system_attribute:${expr.varattno}` }
     }
 
     if (!varLocation(scope, expr)) {
@@ -1423,7 +1423,6 @@ function expressionNullability(
       return { basis: 'recursive_cte_recurrence_bottom', kind: 'nonNull' }
     }
 
-    const ownerRte = varOwnerRte(scope, expr)
     const outputScope = ownerRte ? queryScopeForRteOutput(...ownerRte) : null
     return outputScope
       ? queryOutputNullability(catalog, outputScope, (expr.varattno ?? 1) - 1, nestedSeen)
@@ -2002,6 +2001,16 @@ export async function buildTypedSqlPostgresIrFromCompiledConfigs(
       types: catalog.types.size,
       uniqueIndexes: [...catalog.uniqueIndexesByRelid.values()].reduce((count, entries) => count + entries.length, 0),
     },
-    queries: analyses.map((analyzed) => normalizeCompiledIr(catalog, analyzed)),
+    queries: analyses.map((analyzed) => {
+      try {
+        return normalizeCompiledIr(catalog, analyzed)
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        throw new Error(
+          `${analyzed.config.sourceFile}: failed to build typed SQL IR ${analyzed.config.name}: ${message}`,
+          { cause: error }
+        )
+      }
+    }),
   }
 }
