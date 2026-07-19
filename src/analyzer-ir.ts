@@ -47,7 +47,7 @@ export type {
   TypedSqlPostgresIrRowBounds,
 } from './analyzer-ir-model.js'
 
-const ANALYZER_SCHEMA_VERSION = 6
+const ANALYZER_SCHEMA_VERSION = 7
 const ANALYZER_SQL_FUNCTION = 'pg_temp.postgres_typed_sql_analyze'
 
 interface PgAnalyzerResult {
@@ -143,14 +143,32 @@ interface PgAnalyzerCte {
   readonly recursive?: boolean
 }
 
+type PgAnalyzerRteKind =
+  | 'CTE'
+  | 'FUNCTION'
+  | 'GROUP'
+  | 'JOIN'
+  | 'NAMEDTUPLESTORE'
+  | 'RELATION'
+  | 'RESULT'
+  | 'SUBQUERY'
+  | 'TABLEFUNC'
+  | 'UNRECOGNIZED'
+  | 'VALUES'
+
 interface PgAnalyzerRte {
   readonly cteName?: string
   readonly cteLevelSup?: number
+  readonly cteSelfReference?: boolean
   readonly erefColumnNames?: readonly string[]
+  readonly groupExprs?: readonly PgAnalyzerExpr[]
   readonly inh?: boolean
-  readonly kind: string
+  readonly joinAliasVars?: readonly (PgAnalyzerExpr | null)[]
+  readonly kind: PgAnalyzerRteKind
+  readonly lateral?: boolean
   readonly relid?: number | null
   readonly subquery?: PgAnalyzerQuery
+  readonly valuesLists?: readonly (readonly PgAnalyzerExpr[])[]
 }
 
 interface PgAnalyzerExpr {
@@ -355,27 +373,200 @@ function queryScopeAtLevel(scope: QueryScope, levelsUp: number): QueryScope | nu
   return owner
 }
 
-function queryScopeForRteOutput(ownerScope: QueryScope, rte: PgAnalyzerRte): QueryScope | null {
-  if (rte.kind === 'SUBQUERY' && rte.subquery) {
-    return queryScope(rte.subquery, ownerScope)
-  }
-  if (rte.kind !== 'CTE') {
-    return null
-  }
+type ImmediateVarSource =
+  | {
+      readonly attnum: number
+      readonly kind: 'relationColumn'
+      readonly relid: number
+    }
+  | {
+      readonly kind: 'queryOutput'
+      readonly outputIndex: number
+      readonly scope: QueryScope
+    }
+  | {
+      readonly expressions: readonly PgAnalyzerExpr[]
+      readonly kind: 'expressions'
+      readonly scope: QueryScope
+    }
+  | {
+      readonly kind: 'opaque'
+      readonly rteKind: PgAnalyzerRteKind
+    }
+  | {
+      readonly kind: 'wholeRow'
+      readonly output: {
+        readonly columnNames: readonly string[]
+        readonly scope: QueryScope
+      } | null
+    }
+  | {
+      readonly attnum: number
+      readonly kind: 'specialAttribute'
+    }
 
-  const cteOwnerScope = queryScopeAtLevel(ownerScope, rte.cteLevelSup ?? 0)
-  const cteQuery = cteOwnerScope ? cteByName(cteOwnerScope.query, rte.cteName)?.query : undefined
-  return cteQuery && cteOwnerScope ? queryScope(cteQuery, cteOwnerScope) : null
-}
-
-function varOwnerRte(scope: QueryScope, expr: PgAnalyzerExpr): readonly [QueryScope, PgAnalyzerRte] | null {
-  if (expr.tag !== 'Var' || !expr.varno) {
-    return null
+function resolveImmediateVarSource(scope: QueryScope, expr: PgAnalyzerExpr): ImmediateVarSource {
+  if (
+    expr.tag !== 'Var' ||
+    !Number.isInteger(expr.varno) ||
+    (expr.varno as number) <= 0 ||
+    !Number.isInteger(expr.varattno) ||
+    !Number.isInteger(expr.varlevelsup ?? 0) ||
+    (expr.varlevelsup ?? 0) < 0
+  ) {
+    throw new Error('internal analyzer envelope inconsistency: malformed Var identity')
   }
 
   const ownerScope = queryScopeAtLevel(scope, expr.varlevelsup ?? 0)
-  const rte = ownerScope?.query.rtable?.[expr.varno - 1]
-  return ownerScope && rte ? [ownerScope, rte] : null
+  if (!ownerScope) {
+    throw new Error(
+      `internal analyzer envelope inconsistency: Var level ${expr.varlevelsup ?? 0} has no owning query scope`
+    )
+  }
+  const rte = ownerScope.query.rtable?.[(expr.varno as number) - 1]
+  if (!rte) {
+    throw new Error(
+      `internal analyzer envelope inconsistency: Var owner RTE ${expr.varno as number} is absent from ${ownerScope.query.commandType} query`
+    )
+  }
+
+  const outputColumnNames = (): readonly string[] => {
+    if (!rte.erefColumnNames) {
+      throw new Error(
+        `internal analyzer envelope inconsistency: ${rte.kind} RTE ${expr.varno as number} is missing output column identity`
+      )
+    }
+    return rte.erefColumnNames
+  }
+  const requireOutputIndex = (attnum: number): number => {
+    const outputIndex = attnum - 1
+    const columnCount = outputColumnNames().length
+    if (outputIndex < 0 || outputIndex >= columnCount) {
+      throw new Error(
+        `internal analyzer envelope inconsistency: ${rte.kind} RTE ${expr.varno as number} has no positive output attribute ${attnum}; expected 1..${columnCount}`
+      )
+    }
+    return outputIndex
+  }
+  const queryOutputScope = (): QueryScope => {
+    if (rte.kind === 'SUBQUERY') {
+      if (!rte.subquery) {
+        throw new Error(
+          `internal analyzer envelope inconsistency: SUBQUERY RTE ${expr.varno as number} is missing its query`
+        )
+      }
+      return queryScope(rte.subquery, ownerScope)
+    }
+    if (rte.kind !== 'CTE') {
+      throw new Error(`internal analyzer envelope inconsistency: ${rte.kind} RTE has no query output`)
+    }
+    if (typeof rte.cteName !== 'string' || !Number.isInteger(rte.cteLevelSup) || (rte.cteLevelSup as number) < 0) {
+      throw new Error(
+        `internal analyzer envelope inconsistency: CTE RTE ${expr.varno as number} has malformed owner identity`
+      )
+    }
+    const cteOwnerScope = queryScopeAtLevel(ownerScope, rte.cteLevelSup as number)
+    if (!cteOwnerScope) {
+      throw new Error(
+        `internal analyzer envelope inconsistency: CTE ${JSON.stringify(rte.cteName)} owner level ${rte.cteLevelSup as number} has no query scope`
+      )
+    }
+    const cte = cteByName(cteOwnerScope.query, rte.cteName)
+    if (!cte?.query) {
+      throw new Error(
+        `internal analyzer envelope inconsistency: CTE ${JSON.stringify(rte.cteName)} is absent from its exact owner query`
+      )
+    }
+    if (rte.cteSelfReference === true && cte.recursive !== true) {
+      throw new Error(
+        `internal analyzer envelope inconsistency: nonrecursive CTE ${JSON.stringify(rte.cteName)} is marked as a self-reference`
+      )
+    }
+    return queryScope(cte.query, cteOwnerScope)
+  }
+
+  const attnum = expr.varattno as number
+  if (attnum === 0) {
+    let output: Extract<ImmediateVarSource, { readonly kind: 'wholeRow' }>['output'] = null
+    if (rte.kind === 'SUBQUERY' || rte.kind === 'CTE') {
+      const columnNames = outputColumnNames()
+      const outputScope = queryOutputScope()
+      if (columnNames.length !== resultTargets(outputScope.query).length) {
+        throw new Error(
+          `internal analyzer envelope inconsistency: ${rte.kind} RTE ${expr.varno as number} has misaligned whole-row output identity`
+        )
+      }
+      output = { columnNames, scope: outputScope }
+    }
+    return { kind: 'wholeRow', output }
+  }
+  if (attnum < 0) {
+    return { attnum, kind: 'specialAttribute' }
+  }
+
+  switch (rte.kind) {
+    case 'RELATION': {
+      if (typeof rte.relid !== 'number' || rte.relid <= 0) {
+        throw new Error(
+          `internal analyzer envelope inconsistency: RELATION RTE ${expr.varno as number} is missing its authoritative relation OID`
+        )
+      }
+      if (typeof expr.relid === 'number' && expr.relid > 0 && expr.relid !== rte.relid) {
+        throw new Error(
+          `internal analyzer envelope inconsistency: Var relation OID ${expr.relid} contradicts owner RTE relation OID ${rte.relid}`
+        )
+      }
+      return { attnum, kind: 'relationColumn', relid: rte.relid }
+    }
+    case 'SUBQUERY':
+    case 'CTE':
+      return { kind: 'queryOutput', outputIndex: requireOutputIndex(attnum), scope: queryOutputScope() }
+    case 'JOIN': {
+      const outputIndex = requireOutputIndex(attnum)
+      const expression = rte.joinAliasVars?.[outputIndex]
+      if (!expression || rte.joinAliasVars?.length !== outputColumnNames().length) {
+        throw new Error(
+          `internal analyzer envelope inconsistency: JOIN RTE ${expr.varno as number} has misaligned alias output expressions`
+        )
+      }
+      return { expressions: [expression], kind: 'expressions', scope: ownerScope }
+    }
+    case 'GROUP': {
+      const outputIndex = requireOutputIndex(attnum)
+      const expression = rte.groupExprs?.[outputIndex]
+      if (!expression || rte.groupExprs?.length !== outputColumnNames().length) {
+        throw new Error(
+          `internal analyzer envelope inconsistency: GROUP RTE ${expr.varno as number} has misaligned output expressions`
+        )
+      }
+      return { expressions: [expression], kind: 'expressions', scope: ownerScope }
+    }
+    case 'VALUES': {
+      const outputIndex = requireOutputIndex(attnum)
+      if (!rte.valuesLists || rte.valuesLists.length === 0) {
+        throw new Error(
+          `internal analyzer envelope inconsistency: VALUES RTE ${expr.varno as number} is missing row expressions`
+        )
+      }
+      const expressions = rte.valuesLists.map((row) => row[outputIndex])
+      if (
+        expressions.some((expression) => !expression) ||
+        rte.valuesLists.some((row) => row.length !== outputColumnNames().length)
+      ) {
+        throw new Error(
+          `internal analyzer envelope inconsistency: VALUES RTE ${expr.varno as number} has misaligned row expressions`
+        )
+      }
+      return { expressions: expressions as readonly PgAnalyzerExpr[], kind: 'expressions', scope: ownerScope }
+    }
+    case 'FUNCTION':
+    case 'NAMEDTUPLESTORE':
+    case 'RESULT':
+    case 'TABLEFUNC':
+    case 'UNRECOGNIZED':
+      requireOutputIndex(attnum)
+      return { kind: 'opaque', rteKind: rte.kind }
+  }
 }
 
 interface QueryOutputSemantics<T> {
@@ -771,6 +962,16 @@ function isDataModifyingCommand(
 function walkDirectQueryExpressions(query: PgAnalyzerQuery, visitExpr: (expr: PgAnalyzerExpr) => void): void {
   for (const target of [...(query.targetList ?? []), ...(query.returningList ?? [])]) {
     walkExpr(target.expr, visitExpr)
+  }
+  for (const rte of query.rtable ?? []) {
+    for (const expression of [...(rte.joinAliasVars ?? []), ...(rte.groupExprs ?? [])]) {
+      walkExpr(expression, visitExpr)
+    }
+    for (const row of rte.valuesLists ?? []) {
+      for (const expression of row) {
+        walkExpr(expression, visitExpr)
+      }
+    }
   }
   walkExpr(query.whereQual, visitExpr)
   walkExpr(query.limitCount, visitExpr)
@@ -1272,23 +1473,35 @@ function checkConstraintTypeForExpr(
     return null
   }
 
-  if (unwrapped.relid && unwrapped.varattno) {
-    const fact = catalog.checkConstraintTypesByColumn.get(
-      checkConstraintLiteralUnionColumnKey({
-        attnum: unwrapped.varattno,
-        relid: unwrapped.relid,
-      })
-    )
-    if (fact) {
-      return { kind: 'literalUnion', labels: fact.labels }
+  const source = resolveImmediateVarSource(scope, unwrapped)
+  switch (source.kind) {
+    case 'relationColumn': {
+      const fact = catalog.checkConstraintTypesByColumn.get(
+        checkConstraintLiteralUnionColumnKey({
+          attnum: source.attnum,
+          relid: source.relid,
+        })
+      )
+      return fact ? { kind: 'literalUnion', labels: fact.labels } : null
     }
+    case 'queryOutput':
+      return checkConstraintTypeForQueryOutput(catalog, source.scope, source.outputIndex, nestedSeen)
+    case 'expressions': {
+      const types = source.expressions.map((expression) =>
+        checkConstraintTypeForExpr(catalog, source.scope, expression, nestedSeen)
+      )
+      if (types.some((type) => !type)) {
+        return null
+      }
+      return (types as readonly TypedSqlPostgresIrCheckConstraintTypeExpression[]).reduce((left, right) =>
+        combineCheckConstraintTypes('union', left, right)
+      )
+    }
+    case 'opaque':
+    case 'specialAttribute':
+    case 'wholeRow':
+      return null
   }
-
-  const ownerRte = varOwnerRte(scope, unwrapped)
-  const outputScope = ownerRte ? queryScopeForRteOutput(...ownerRte) : null
-  return outputScope
-    ? checkConstraintTypeForQueryOutput(catalog, outputScope, (unwrapped.varattno ?? 1) - 1, nestedSeen)
-    : null
 }
 
 function literalCheckConstraintTypeForExpr(
@@ -1376,44 +1589,32 @@ function expressionNullability(
   }
 
   if (expr.tag === 'Var') {
-    const ownerRte = varOwnerRte(scope, expr)
-    const ownerRelation = ownerRte?.[1].kind === 'RELATION' ? ownerRte[1] : null
-    let baseColumn: ColumnCatalogRow | undefined
-    if (typeof expr.varattno === 'number' && expr.varattno > 0 && ownerRelation) {
-      if (typeof ownerRelation.relid !== 'number' || ownerRelation.relid <= 0) {
-        return { kind: 'unknown', reason: 'malformed_relation_variable' }
-      }
-      baseColumn = catalog.columns.get(`${ownerRelation.relid}:${expr.varattno}`)
-      if (!baseColumn) {
-        const commandType = ownerRte?.[0].query.commandType ?? 'unknown'
-        throw new Error(
-          `internal analyzer catalog inconsistency: missing positive base-column fact for relation OID ${ownerRelation.relid}, attribute number ${expr.varattno} in ${commandType} query`
-        )
-      }
-    }
-
-    if (scopeProvesNonNull(scope, expr)) {
-      return { basis: 'where_is_not_null', kind: 'nonNull' }
-    }
     if (expr.varattno === 0) {
+      if (scopeProvesNonNull(scope, expr)) {
+        return { basis: 'where_is_not_null', kind: 'nonNull' }
+      }
       return (expr.varnullingrels?.length ?? 0) > 0
         ? { evidence: 'outer_join_whole_row', kind: 'nullable' }
         : { basis: 'whole_row', kind: 'nonNull' }
     }
-    if ((expr.varnullingrels ?? []).length > 0) {
-      return { evidence: 'outer_join_column', kind: 'nullable' }
-    }
-    if (baseColumn) {
-      return baseColumn.attnotnull
+    const source = resolveImmediateVarSource(scope, expr)
+    let relationNullability: TypedSqlPostgresIrResultNullability | undefined
+    if (source.kind === 'relationColumn') {
+      const baseColumn = catalog.columns.get(`${source.relid}:${source.attnum}`)
+      if (!baseColumn) {
+        throw new Error(
+          `internal analyzer catalog inconsistency: missing positive base-column fact for relation OID ${source.relid}, attribute number ${source.attnum} in ${scope.query.commandType} query`
+        )
+      }
+      relationNullability = baseColumn.attnotnull
         ? { basis: `not_null_column:${baseColumn.relname}.${baseColumn.attname}`, kind: 'nonNull' }
         : { evidence: `nullable_column:${baseColumn.relname}.${baseColumn.attname}`, kind: 'nullable' }
     }
-    if (typeof expr.varattno === 'number' && expr.varattno < 0 && ownerRelation) {
-      return { kind: 'unknown', reason: `system_attribute:${expr.varattno}` }
+    if (scopeProvesNonNull(scope, expr)) {
+      return { basis: 'where_is_not_null', kind: 'nonNull' }
     }
-
-    if (!varLocation(scope, expr)) {
-      return { kind: 'unknown', reason: 'unresolved_variable' }
+    if ((expr.varnullingrels ?? []).length > 0) {
+      return { evidence: 'outer_join_column', kind: 'nullable' }
     }
     const nestedSeen = visitVar(seen, scope, expr)
     if (!nestedSeen) {
@@ -1423,10 +1624,29 @@ function expressionNullability(
       return { basis: 'recursive_cte_recurrence_bottom', kind: 'nonNull' }
     }
 
-    const outputScope = ownerRte ? queryScopeForRteOutput(...ownerRte) : null
-    return outputScope
-      ? queryOutputNullability(catalog, outputScope, (expr.varattno ?? 1) - 1, nestedSeen)
-      : { kind: 'unknown', reason: 'unresolved_variable_source' }
+    switch (source.kind) {
+      case 'relationColumn':
+        if (!relationNullability) {
+          throw new Error('internal analyzer catalog inconsistency: relation nullability was not established')
+        }
+        return relationNullability
+      case 'queryOutput':
+        return queryOutputNullability(catalog, source.scope, source.outputIndex, nestedSeen)
+      case 'expressions': {
+        const nullabilities = source.expressions.map((expression) =>
+          expressionNullability(catalog, source.scope, expression, nestedSeen)
+        )
+        return nullabilities.length === 1
+          ? (nullabilities[0] as TypedSqlPostgresIrResultNullability)
+          : unionResultNullabilities(nullabilities, 'rte_expression_union')
+      }
+      case 'opaque':
+        return { kind: 'unknown', reason: `opaque_rte:${source.rteKind.toLowerCase()}` }
+      case 'wholeRow':
+        return { basis: 'whole_row', kind: 'nonNull' }
+      case 'specialAttribute':
+        return { kind: 'unknown', reason: `system_attribute:${source.attnum}` }
+    }
   }
 
   if (expr.tag === 'Const') {
@@ -1815,25 +2035,43 @@ function inferStructuredJsonShape(
       return null
     }
 
-    const ownerRte = varOwnerRte(scope, unwrapped)
-    const outputScope = ownerRte ? queryScopeForRteOutput(...ownerRte) : null
-    if (ownerRte && outputScope && unwrapped.varattno === 0) {
-      const [, rte] = ownerRte
-      return {
-        fields: resultTargets(outputScope.query).map((target, targetIndex) => {
-          const name = rte.erefColumnNames?.[targetIndex] ?? target.resname ?? `column_${targetIndex + 1}`
-          return {
-            name,
-            shape: inferQueryOutputJsonShape(catalog, outputScope, targetIndex, nestedSeen),
-          }
-        }),
-        kind: 'object',
-        nullability: expressionNullability(catalog, scope, unwrapped, seen),
+    const source = resolveImmediateVarSource(scope, unwrapped)
+    let shape: TypedSqlPostgresIrJsonShape | null
+    switch (source.kind) {
+      case 'queryOutput':
+        shape = inferQueryOutputJsonShape(catalog, source.scope, source.outputIndex, nestedSeen)
+        break
+      case 'expressions': {
+        const shapes = source.expressions.map((expression) =>
+          jsonShapeForExpr(catalog, source.scope, expression, nestedSeen)
+        )
+        const [firstShape, ...remainingShapes] = shapes
+        if (!firstShape) {
+          throw new Error('internal analyzer envelope inconsistency: immediate expression source is empty')
+        }
+        shape = remainingShapes.reduce((left, right) => unionJsonShapes(left, right), firstShape)
+        break
       }
+      case 'wholeRow': {
+        const output = source.output
+        shape = output
+          ? {
+              fields: output.columnNames.map((name, outputIndex) => ({
+                name,
+                shape: inferQueryOutputJsonShape(catalog, output.scope, outputIndex, nestedSeen),
+              })),
+              kind: 'object',
+              nullability: expressionNullability(catalog, scope, unwrapped, seen),
+            }
+          : null
+        break
+      }
+      case 'opaque':
+      case 'relationColumn':
+      case 'specialAttribute':
+        shape = null
+        break
     }
-    const shape = outputScope
-      ? inferQueryOutputJsonShape(catalog, outputScope, (unwrapped.varattno ?? 1) - 1, nestedSeen)
-      : null
     return shape ? jsonShapeWithNullability(shape, expressionNullability(catalog, scope, unwrapped, seen)) : null
   }
 
@@ -1913,7 +2151,9 @@ async function analyzeCompiledConfig(
   )
   const analysis = result.rows[0]?.analysis
   if (!analysis || analysis.schemaVersion !== ANALYZER_SCHEMA_VERSION) {
-    throw new Error('analyzer returned unsupported schema.')
+    throw new Error(
+      `analyzer returned unsupported schema version ${analysis?.schemaVersion ?? 'missing'}; expected ${ANALYZER_SCHEMA_VERSION}.`
+    )
   }
   if (analysis.rawStatementCount !== 1) {
     throw new Error(`typed SQL must contain exactly one PostgreSQL statement; received ${analysis.rawStatementCount}.`)

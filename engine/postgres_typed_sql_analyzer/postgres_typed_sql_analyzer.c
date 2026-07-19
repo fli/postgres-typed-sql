@@ -3376,6 +3376,39 @@ append_expr_list(StringInfo out, const QueryScope *scope, const char *name, cons
 }
 
 static void
+append_expr_rows(StringInfo out, const QueryScope *scope, const char *name, const List *rows, int depth)
+{
+  ListCell *row_cell;
+  bool first_row = true;
+
+  appendStringInfo(out, ",\"%s\":[", name);
+  foreach(row_cell, rows)
+  {
+    const List *row = (const List *) lfirst(row_cell);
+    ListCell *expr_cell;
+    bool first_expr = true;
+
+    if (!first_row)
+    {
+      appendStringInfoChar(out, ',');
+    }
+    first_row = false;
+    appendStringInfoChar(out, '[');
+    foreach(expr_cell, row)
+    {
+      if (!first_expr)
+      {
+        appendStringInfoChar(out, ',');
+      }
+      first_expr = false;
+      append_expr_node(out, scope, (const Node *) lfirst(expr_cell), depth - 1);
+    }
+    appendStringInfoChar(out, ']');
+  }
+  appendStringInfoChar(out, ']');
+}
+
+static void
 append_target_expr_list(StringInfo out, const QueryScope *scope, const char *name, const List *targets, int depth)
 {
   ListCell *cell;
@@ -3871,6 +3904,7 @@ append_rtable(StringInfo out, const QueryScope *scope, int depth)
     appendStringInfo(out, "{\"index\":%d,\"kind\":", index);
     append_json_string(out, rte_kind_name(rte->rtekind));
     append_bool_field(out, "inh", rte->inh);
+    append_bool_field(out, "lateral", rte->lateral);
     if (rte->eref != NULL)
     {
       append_optional_name_field(out, "erefAlias", rte->eref->aliasname);
@@ -3881,12 +3915,22 @@ append_rtable(StringInfo out, const QueryScope *scope, int depth)
       appendStringInfoString(out, ",\"joinType\":");
       append_json_string(out, rte_join_type_name(rte->jointype));
       appendStringInfo(out, ",\"joinMergedCols\":%d", rte->joinmergedcols);
+      append_expr_list(out, scope, "joinAliasVars", rte->joinaliasvars, depth);
+    }
+    if (rte->rtekind == RTE_VALUES)
+    {
+      append_expr_rows(out, scope, "valuesLists", rte->values_lists, depth);
     }
     if (rte->rtekind == RTE_CTE)
     {
       append_optional_name_field(out, "cteName", rte->ctename);
       appendStringInfo(out, ",\"cteLevelSup\":%u", rte->ctelevelsup);
+      append_bool_field(out, "cteSelfReference", rte->self_reference);
       append_oid_list_field(out, "cteColumnTypeOids", rte->coltypes);
+    }
+    if (rte->rtekind == RTE_GROUP)
+    {
+      append_expr_list(out, scope, "groupExprs", rte->groupexprs, depth);
     }
     append_oid_field(out, "relid", rte->relid);
     append_optional_name_field(out, "relname", OidIsValid(rte->relid) ? get_rel_name(rte->relid) : NULL);
@@ -6502,7 +6546,7 @@ postgres_typed_sql_analyze(PG_FUNCTION_ARGS)
                                       HASH_ELEM | HASH_BLOBS);
 
   initStringInfo(&out);
-  appendStringInfoString(&out, "{\"schemaVersion\":6,\"postgresVersionNum\":");
+  appendStringInfoString(&out, "{\"schemaVersion\":7,\"postgresVersionNum\":");
   appendStringInfo(&out, "%d", PG_VERSION_NUM);
   appendStringInfoString(&out, ",\"rawStatementCount\":");
   appendStringInfo(&out, "%d", list_length(raw_trees));

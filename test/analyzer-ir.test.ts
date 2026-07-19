@@ -27,6 +27,42 @@ function config(
   }
 }
 
+type MutableEnvelopeObject = Record<string, unknown>
+
+function envelopeObject(value: unknown): MutableEnvelopeObject {
+  assert.ok(value && typeof value === 'object' && !Array.isArray(value))
+  return value as MutableEnvelopeObject
+}
+
+function envelopeArray(value: unknown): unknown[] {
+  assert.ok(Array.isArray(value))
+  return value
+}
+
+function corruptAnalyzerEnvelope(
+  database: PostgresQueryable,
+  mutate: (analysis: MutableEnvelopeObject) => void
+): PostgresQueryable {
+  return {
+    async query<Row>(text: string, params?: readonly unknown[]) {
+      const result = await database.query<Row>(text, params)
+      if (!text.includes('postgres_typed_sql_analyze')) {
+        return result
+      }
+      const rows = structuredClone(result.rows) as unknown[]
+      const firstRow = envelopeObject(rows[0])
+      const analysis = envelopeObject(firstRow.analysis)
+      mutate(analysis)
+      return { rows: rows as Row[] }
+    },
+  }
+}
+
+function firstEnvelopeQuery(analysis: MutableEnvelopeObject): MutableEnvelopeObject {
+  const statement = envelopeObject(envelopeArray(analysis.statements)[0])
+  return envelopeObject(envelopeArray(statement.queries)[0])
+}
+
 test('loads every referenced relation attribute consistently in large and focused batches', async () => {
   const database = await createAnalysisDatabase({ schemaFiles: [schemaFile] })
   try {
@@ -130,6 +166,122 @@ test('preserves base alias, outer-join, whole-row, and system-attribute distinct
   }
 })
 
+test('resolves immediate JOIN, GROUP, VALUES, CTE, and opaque RTE sources once for every consumer', async () => {
+  const database = await createAnalysisDatabase({ schemaFiles: [schemaFile] })
+  try {
+    await database.query("create table public.immediate_left (value text not null check (value in ('left')))")
+    await database.query("create table public.immediate_right (value text not null check (value in ('right')))")
+
+    const result = await buildTypedSqlPostgresIrFromCompiledConfigs(database, [
+      config('innerUsing', 'select value from public.immediate_left inner join public.immediate_right using (value)'),
+      config('leftUsing', 'select value from public.immediate_left left join public.immediate_right using (value)'),
+      config('rightUsing', 'select value from public.immediate_left right join public.immediate_right using (value)'),
+      config('fullUsing', 'select value from public.immediate_left full join public.immediate_right using (value)'),
+      config('groupOutput', 'select source.value from public.immediate_left source group by source.value'),
+      config('oneRowValues', 'select value from (values (1)) source(value)'),
+      config('multiRowValues', 'select value from (values (1), (2)) source(value)'),
+      config('mixedValues', 'select value from (values (1), (null::integer)) source(value)'),
+      config('ordinaryCte', 'with source as (select value from public.immediate_left) select value from source'),
+      config(
+        'modifyingCte',
+        `with inserted as (
+           insert into public.accounts(email) values ('immediate-source@example.com')
+           returning id
+         )
+         select id from inserted`
+      ),
+      config(
+        'recursiveCte',
+        `with recursive source(value) as (
+           values (1)
+           union all
+           select value from source where false
+         )
+         select value from source`
+      ),
+      config('functionOutput', 'select value from generate_series(1, 2) source(value)'),
+      config(
+        'jsonJoinOutput',
+        `select payload
+         from (values (jsonb_build_object('joined', 'value'))) left_source(payload)
+         inner join (values (jsonb_build_object('joined', 'value'))) right_source(payload)
+           using (payload)`
+      ),
+      config(
+        'jsonGroupOutput',
+        `select source.payload
+         from (values (jsonb_build_object('grouped', 'value'))) source(payload)
+         group by source.payload`
+      ),
+      config(
+        'jsonValuesOutput',
+        `select payload
+         from (
+           values
+             (jsonb_build_object('left', 'value')),
+             (jsonb_build_object('right', 'value'))
+         ) source(payload)`
+      ),
+    ])
+    const queries = new Map(result.queries.map((query) => [query.name, query]))
+    const column = (name: string) => {
+      const value = queries.get(name)?.resultColumns[0]
+      assert.ok(value, `missing result column for ${name}`)
+      return value
+    }
+
+    const leftCheck = { kind: 'literalUnion', labels: ['left'] } as const
+    const rightCheck = { kind: 'literalUnion', labels: ['right'] } as const
+    for (const name of ['innerUsing', 'leftUsing'] as const) {
+      assert.equal(column(name).nullability.kind, 'nonNull')
+      assert.deepEqual(column(name).checkConstraintType, leftCheck)
+    }
+    assert.equal(column('rightUsing').nullability.kind, 'nonNull')
+    assert.deepEqual(column('rightUsing').checkConstraintType, rightCheck)
+    assert.deepEqual(column('fullUsing').nullability, {
+      evidence: 'coalesce_all_arms_nullable',
+      kind: 'nullable',
+    })
+    assert.equal(column('fullUsing').checkConstraintType, undefined)
+
+    assert.equal(column('groupOutput').nullability.kind, 'nonNull')
+    assert.deepEqual(column('groupOutput').checkConstraintType, leftCheck)
+    assert.equal(column('oneRowValues').nullability.kind, 'nonNull')
+    assert.equal(column('multiRowValues').nullability.kind, 'nonNull')
+    assert.deepEqual(column('mixedValues').nullability, {
+      evidence: 'rte_expression_union:null_constant',
+      kind: 'nullable',
+    })
+
+    assert.equal(column('ordinaryCte').nullability.kind, 'nonNull')
+    assert.deepEqual(column('ordinaryCte').checkConstraintType, leftCheck)
+    assert.equal(column('modifyingCte').nullability.kind, 'nonNull')
+    assert.deepEqual(column('recursiveCte').nullability, {
+      basis: 'query_union',
+      kind: 'nonNull',
+    })
+    assert.deepEqual(column('functionOutput').nullability, {
+      kind: 'unknown',
+      reason: 'opaque_rte:function',
+    })
+
+    const fieldNames = (name: string): readonly (readonly string[])[] => {
+      const shape = column(name).jsonShape
+      assert.ok(shape)
+      const alternatives = shape.kind === 'union' ? shape.alternatives : [shape]
+      return alternatives.map((alternative) => {
+        assert.equal(alternative.kind, 'object')
+        return alternative.kind === 'object' ? alternative.fields.map((field) => field.name) : []
+      })
+    }
+    assert.deepEqual(fieldNames('jsonJoinOutput'), [['joined']])
+    assert.deepEqual(fieldNames('jsonGroupOutput'), [['grouped']])
+    assert.deepEqual(fieldNames('jsonValuesOutput'), [['left'], ['right']])
+  } finally {
+    await database.close()
+  }
+})
+
 test('throws when a positive base Var is missing its required catalog column fact', async () => {
   const database = await createAnalysisDatabase({ schemaFiles: [schemaFile] })
   try {
@@ -160,6 +312,96 @@ test('throws when a positive base Var is missing its required catalog column fac
       ]),
       /queries\/missingOuterJoinedColumnFact\.typed\.sql: failed to build typed SQL IR missingOuterJoinedColumnFact: internal analyzer catalog inconsistency: missing positive base-column fact for relation OID \d+, attribute number 1 in SELECT query/u
     )
+  } finally {
+    await database.close()
+  }
+})
+
+test('throws on malformed owner identity, output indices, aligned expressions, and schema versions', async () => {
+  const database = await createAnalysisDatabase({ schemaFiles: [schemaFile] })
+  try {
+    const cases: readonly {
+      readonly corrupt: (analysis: MutableEnvelopeObject) => void
+      readonly error: RegExp
+      readonly name: string
+      readonly sql: string
+    }[] = [
+      {
+        corrupt(analysis) {
+          analysis.schemaVersion = 6
+        },
+        error: /analyzer returned unsupported schema version 6; expected 7/u,
+        name: 'staleSchema',
+        sql: 'select account.id from public.accounts account',
+      },
+      {
+        corrupt(analysis) {
+          const query = firstEnvelopeQuery(analysis)
+          const relation = envelopeObject(envelopeArray(query.rtable)[0])
+          relation.relid = null
+        },
+        error: /RELATION RTE 1 is missing its authoritative relation OID/u,
+        name: 'missingRelationIdentity',
+        sql: 'select account.id from public.accounts account',
+      },
+      {
+        corrupt(analysis) {
+          const query = firstEnvelopeQuery(analysis)
+          const target = envelopeObject(envelopeArray(query.targetList)[0])
+          envelopeObject(target.expr).varattno = 2
+        },
+        error: /SUBQUERY RTE 1 has no positive output attribute 2; expected 1\.\.1/u,
+        name: 'invalidOutputIndex',
+        sql: 'select value from (values (1)) source(value)',
+      },
+      {
+        corrupt(analysis) {
+          const query = firstEnvelopeQuery(analysis)
+          const join = envelopeArray(query.rtable)
+            .map(envelopeObject)
+            .find((rte) => rte.kind === 'JOIN')
+          assert.ok(join)
+          delete join.joinAliasVars
+        },
+        error: /JOIN RTE 3 has misaligned alias output expressions/u,
+        name: 'missingJoinAliasExpression',
+        sql: 'select value from (values (1)) left_source(value) full join (values (1)) right_source(value) using (value)',
+      },
+      {
+        corrupt(analysis) {
+          const query = firstEnvelopeQuery(analysis)
+          const group = envelopeArray(query.rtable)
+            .map(envelopeObject)
+            .find((rte) => rte.kind === 'GROUP')
+          assert.ok(group)
+          delete group.groupExprs
+        },
+        error: /GROUP RTE 2 has misaligned output expressions/u,
+        name: 'missingGroupExpression',
+        sql: 'select source.value from (values (1)) source(value) group by source.value',
+      },
+      {
+        corrupt(analysis) {
+          const query = firstEnvelopeQuery(analysis)
+          const outerRte = envelopeObject(envelopeArray(query.rtable)[0])
+          const nestedQuery = envelopeObject(outerRte.subquery)
+          const valuesRte = envelopeObject(envelopeArray(nestedQuery.rtable)[0])
+          valuesRte.valuesLists = [[envelopeObject(envelopeArray(envelopeArray(valuesRte.valuesLists)[0])[0])], []]
+        },
+        error: /VALUES RTE 1 has misaligned row expressions/u,
+        name: 'misalignedValuesRows',
+        sql: 'select value from (values (1), (2)) source(value)',
+      },
+    ]
+
+    for (const fixture of cases) {
+      await assert.rejects(
+        buildTypedSqlPostgresIrFromCompiledConfigs(corruptAnalyzerEnvelope(database, fixture.corrupt), [
+          config(fixture.name, fixture.sql),
+        ]),
+        fixture.error
+      )
+    }
   } finally {
     await database.close()
   }
