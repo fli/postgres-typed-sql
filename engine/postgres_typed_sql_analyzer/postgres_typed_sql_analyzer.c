@@ -64,6 +64,7 @@ static void append_rtable(StringInfo out, const QueryScope *scope, int depth);
 static void append_set_operation(StringInfo out, const Node *node);
 static const char *command_type_name(CmdType command_type);
 static const char *utility_kind_name(const Node *utility_stmt);
+static const char *var_returning_type_name(VarReturningType returning_type);
 static bool utility_returns_tuples_stably(const Node *utility_stmt);
 static void append_json_string(StringInfo out, const char *value);
 static void append_bool_field(StringInfo out, const char *name, bool value);
@@ -2999,6 +3000,22 @@ rte_kind_name(RTEKind rte_kind)
 }
 
 static const char *
+var_returning_type_name(VarReturningType returning_type)
+{
+  switch (returning_type)
+  {
+    case VAR_RETURNING_DEFAULT:
+      return "DEFAULT";
+    case VAR_RETURNING_OLD:
+      return "OLD";
+    case VAR_RETURNING_NEW:
+      return "NEW";
+  }
+
+  return "UNRECOGNIZED";
+}
+
+static const char *
 expr_tag_name(const Node *node)
 {
   if (node == NULL)
@@ -3543,6 +3560,8 @@ append_expr_specific_fields(StringInfo out, const QueryScope *scope, const Node 
       appendStringInfo(out, ",\"varno\":%u,\"varattno\":%d,\"varlevelsup\":%u",
                        var->varno, var->varattno, var->varlevelsup);
       append_bitmapset_field(out, "varnullingrels", var->varnullingrels);
+      appendStringInfoString(out, ",\"varreturningtype\":");
+      append_json_string(out, var_returning_type_name(var->varreturningtype));
 
       if (owner_scope != NULL && var->varno > 0 &&
           var->varno <= list_length(owner_scope->query->rtable))
@@ -6717,7 +6736,7 @@ postgres_typed_sql_analyze(PG_FUNCTION_ARGS)
                                       HASH_ELEM | HASH_BLOBS);
 
   initStringInfo(&out);
-  appendStringInfoString(&out, "{\"schemaVersion\":8,\"postgresVersionNum\":");
+  appendStringInfoString(&out, "{\"schemaVersion\":9,\"postgresVersionNum\":");
   appendStringInfo(&out, "%d", PG_VERSION_NUM);
   appendStringInfoString(&out, ",\"rawStatementCount\":");
   appendStringInfo(&out, "%d", list_length(raw_trees));

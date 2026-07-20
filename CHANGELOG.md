@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.0-beta.8
+
+- Added predicate-aware nullability for finite, nonempty PostgreSQL range and multirange endpoints, including structured JSON fields, scoped boolean branches, derived queries, and set operations.
+- Kept predicate proofs sound across outer-join null extension and PostgreSQL 18 `OLD`/`NEW` `RETURNING` row images. The schema-9 native envelope now preserves row-image identity, distinguishes pre-update and post-assignment values, and treats unavailable row images as nullable before applying catalog constraints.
+- Added zero-or-one cardinality inference through conservative primary-key and unique-index join closures, including exact operator-family, collation, inheritance, and join-form checks.
+- Split predicate facts, PostgreSQL analyzer models, and unique-join closure logic into focused modules with adversarial native, analyzer, generator, and packed-consumer coverage.
+
 ## 0.1.0-beta.7
 
 - Breaking: public analyzer IR and generated runtime result-column metadata now expose the required `expressionSource` field instead of the ambiguous `source`. It describes only the immediate analyzed expression—a direct table column, derived `Var`, or expression tag—and does not claim ultimate lineage.

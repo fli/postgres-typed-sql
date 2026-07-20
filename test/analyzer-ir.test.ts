@@ -787,7 +787,7 @@ test('throws on malformed owner identity, output indices, aligned expressions, a
         corrupt(analysis) {
           analysis.schemaVersion = 6
         },
-        error: /analyzer returned unsupported schema version 6; expected 8/u,
+        error: /analyzer returned unsupported schema version 6; expected 9/u,
         name: 'staleSchema',
         sql: 'select account.id from public.accounts account',
       },

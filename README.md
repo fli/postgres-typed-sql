@@ -139,6 +139,8 @@ The generated row type describes mapped execution through the node-postgres adap
 
 Structured JSON field naming requires a codec profile with `structuredJson: true` when a query needs a nested mapping, because the runtime must know that `json` and `jsonb` values are decoded into JavaScript objects and arrays. The built-in `node-postgres` profile provides this capability.
 
+Structured JSON fields use the same predicate-aware nullability analysis as top-level result expressions. For PostgreSQL ranges, `lower(value)` is non-null only when the active predicate proves that the range is nonempty and has a finite lower bound; `upper(value)` uses the corresponding upper-bound proof. `not isempty(value)` alone is insufficient because a nonempty range may still be unbounded.
+
 ## Codec profiles
 
 Drivers choose how PostgreSQL values become JavaScript values, and applications can replace those parsers. Postgres Typed SQL therefore does not claim one universal decoded scalar type.
@@ -225,7 +227,7 @@ Caller permission and PostgreSQL admission are deliberately different facts. An 
 
 Top-level SQL `NULL` is also distinct from values nested inside a parameter. `PgArrayParameter<T>` continues to permit NULL array elements without making the outer array nullable. JSON objects may contain JSON null, and serialized JSON text such as `'null'` remains a non-null SQL parameter value; only an accepted nullable directive adds top-level SQL `null` to the generated property.
 
-Generated cardinality is derived from the analyzer's row bounds. A `rowBounds.max` value of `null` means that analysis did not prove a finite upper bound, not that execution is known to produce multiple rows; the public contract remains conservatively `many`.
+Generated cardinality is derived from the analyzer's row bounds. At-most-one proofs include direct primary/unique-key lookups and supported inner-join chains in which every relation is determined through primary or unique keys. A `rowBounds.max` value of `null` means that analysis did not prove a finite upper bound, not that execution is known to produce multiple rows; the public contract remains conservatively `many`.
 
 ## Schema input
 
