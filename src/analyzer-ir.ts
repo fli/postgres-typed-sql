@@ -6,6 +6,21 @@ import {
   type CheckConstraintLiteralUnionFact,
 } from './check-constraint-type-facts.js'
 import {
+  intersectPredicateFacts,
+  mergePredicateFacts,
+  nonNullVarFactKey,
+  noPredicateFacts,
+  singletonPredicateFact,
+  unaryFunctionFalseFactKey,
+  unaryFunctionNonNullFactKey,
+  type PredicateFacts,
+} from './analyzer-predicate-facts.js'
+import {
+  collectUniqueJoinProofInput,
+  inferUniqueJoinClosure,
+  type UniqueJoinRelation as UniqueJoinClosureRelation,
+} from './analyzer-unique-joins.js'
+import {
   checkConstraintTypeKey,
   intersectResultNullabilities,
   intersectJsonShapes,
@@ -29,6 +44,18 @@ import {
 } from './analyzer-ir-model.js'
 import type { PostgresQueryable } from './database.js'
 import { loadPostgresTypeFacts } from './postgres-type-facts.js'
+import {
+  analyzerExprChildren as exprChildren,
+  targetExprFromAggregateArg,
+  type PgAnalyzerCte,
+  type PgAnalyzerExpr,
+  type PgAnalyzerQuery,
+  type PgAnalyzerResult,
+  type PgAnalyzerRteKind,
+  type PgAnalyzerSetOperation,
+  type PgAnalyzerTarget,
+  unwrapValuePreservingExpr,
+} from './postgres-analyzer-model.js'
 import { postgresJsonSupportsTextualLiteralRefinement, type PostgresTypeFact } from './postgres-types.js'
 
 export type {
@@ -47,18 +74,8 @@ export type {
   TypedSqlPostgresIrRowBounds,
 } from './analyzer-ir-model.js'
 
-const ANALYZER_SCHEMA_VERSION = 8
+const ANALYZER_SCHEMA_VERSION = 9
 const ANALYZER_SQL_FUNCTION = 'pg_temp.postgres_typed_sql_analyze'
-
-interface PgAnalyzerResult {
-  readonly paramTypeOids: readonly number[]
-  readonly paramTypeNullAdmissions: readonly TypedSqlPostgresIrParamNullAdmission[]
-  readonly paramUsageNullAdmissions: readonly TypedSqlPostgresIrParamNullAdmission[]
-  readonly postgresVersionNum: number
-  readonly rawStatementCount: number
-  readonly schemaVersion: number
-  readonly statements: readonly PgAnalyzerStatement[]
-}
 
 export async function bindTypedSqlPostgresAnalyzer(client: PostgresQueryable): Promise<void> {
   await client.query(`
@@ -66,159 +83,6 @@ export async function bindTypedSqlPostgresAnalyzer(client: PostgresQueryable): P
     as '$libdir/postgres_typed_sql_analyzer', 'postgres_typed_sql_analyze'
     language c strict
   `)
-}
-
-interface PgAnalyzerStatement {
-  readonly queries: readonly PgAnalyzerQuery[]
-  readonly rewrittenQueryCount: number
-}
-
-interface PgAnalyzerQuery {
-  readonly canSetTag: boolean
-  readonly commandType: string
-  readonly cteList?: readonly PgAnalyzerCte[]
-  readonly dmlParameterTargets: readonly PgAnalyzerDmlParameterTarget[]
-  readonly distinctClauseCount?: number
-  readonly groupClauseCount?: number
-  readonly groupingSetsCount?: number
-  readonly hasAggs?: boolean
-  readonly hasHavingQual?: boolean
-  readonly hasLimitOffset?: boolean
-  readonly hasLimitCount?: boolean
-  readonly hasModifyingCTE?: boolean
-  readonly hasRowMarks?: boolean
-  readonly hasSetOperations?: boolean
-  readonly hasTargetSRFs?: boolean
-  readonly hasVolatileFunctions?: boolean
-  readonly hasWindowFuncs?: boolean
-  readonly limitCount?: PgAnalyzerExpr | null
-  readonly limitWithTies?: boolean
-  readonly returningList?: readonly PgAnalyzerTarget[]
-  readonly resultRelation?: number
-  readonly rtable?: readonly PgAnalyzerRte[]
-  readonly setOperation?: PgAnalyzerSetOperation | null
-  readonly targetList?: readonly PgAnalyzerTarget[]
-  readonly utilityKind?: 'CALL' | 'EXECUTE' | 'EXPLAIN' | 'FETCH' | 'NONE' | 'OTHER' | 'SHOW'
-  readonly utilityReturnsTuples?: boolean
-  readonly whereQual?: PgAnalyzerExpr | null
-}
-
-type PgAnalyzerSetOperation =
-  | {
-      readonly kind: 'leaf'
-      readonly rtindex: number
-    }
-  | {
-      readonly all: boolean
-      readonly kind: 'operation'
-      readonly left: PgAnalyzerSetOperation
-      readonly operation: 'EXCEPT' | 'INTERSECT' | 'UNION'
-      readonly right: PgAnalyzerSetOperation
-    }
-
-interface PgAnalyzerDmlParameterTarget {
-  readonly directAssignment: boolean
-  readonly paramId: number
-  readonly source: 'INSERT' | 'MERGE_INSERT' | 'MERGE_UPDATE' | 'ON_CONFLICT_UPDATE' | 'UPDATE'
-  readonly targetAttname: string
-  readonly targetAttnum: number
-  readonly targetNullAdmission: TypedSqlPostgresIrParamNullAdmission
-  readonly targetNullable: boolean
-  readonly targetRelid: number
-  readonly targetTypeName: string | null
-  readonly targetTypeOid: number
-}
-
-interface PgAnalyzerTarget {
-  readonly expr?: PgAnalyzerExpr | null
-  readonly resno?: number
-  readonly resjunk?: boolean
-  readonly resname?: string | null
-}
-
-interface PgAnalyzerCte {
-  readonly commandType?: string
-  readonly name: string
-  readonly query?: PgAnalyzerQuery
-  readonly recursive?: boolean
-}
-
-type PgAnalyzerRteKind =
-  | 'CTE'
-  | 'FUNCTION'
-  | 'GROUP'
-  | 'JOIN'
-  | 'NAMEDTUPLESTORE'
-  | 'RELATION'
-  | 'RESULT'
-  | 'SUBQUERY'
-  | 'TABLEFUNC'
-  | 'UNRECOGNIZED'
-  | 'VALUES'
-
-interface PgAnalyzerRte {
-  readonly cteName?: string
-  readonly cteLevelSup?: number
-  readonly cteSelfReference?: boolean
-  readonly erefColumnNames?: readonly string[]
-  readonly groupExprs?: readonly PgAnalyzerExpr[]
-  readonly inh?: boolean
-  readonly joinAliasVars?: readonly (PgAnalyzerExpr | null)[]
-  readonly kind: PgAnalyzerRteKind
-  readonly lateral?: boolean
-  readonly relid?: number | null
-  readonly subquery?: PgAnalyzerQuery
-  readonly valuesLists?: readonly (readonly PgAnalyzerExpr[])[]
-}
-
-interface PgAnalyzerExpr {
-  readonly aggfnoid?: number
-  readonly aggname?: string
-  readonly arg?: PgAnalyzerExpr | null
-  readonly args?: readonly (PgAnalyzerExpr | { readonly expr?: PgAnalyzerExpr | null })[]
-  readonly attname?: string
-  readonly boolOp?: string
-  readonly constInteger?: string
-  readonly constEmptyJsonArray?: boolean
-  readonly constIsNull?: boolean
-  readonly constString?: string
-  readonly condition?: PgAnalyzerExpr | null
-  readonly coercionForm?: 'EXPLICIT_CALL' | 'EXPLICIT_CAST' | 'IMPLICIT_CAST' | 'SQL_SYNTAX' | 'UNRECOGNIZED'
-  readonly defresult?: PgAnalyzerExpr | null
-  readonly domainNullAdmission?: TypedSqlPostgresIrParamNullAdmission
-  readonly elementExpr?: PgAnalyzerExpr | null
-  readonly elements?: readonly PgAnalyzerExpr[]
-  readonly expr?: PgAnalyzerExpr | null
-  readonly funcid?: number
-  readonly funcname?: string
-  readonly funcVariadic?: boolean
-  readonly inputCollationOid?: number
-  readonly inputFunctionOid?: number
-  readonly multidims?: boolean
-  readonly nullTestType?: string
-  readonly nullInputProducesNull?: boolean
-  readonly nonNullInputProducesNonNull?: boolean
-  readonly opfuncid?: number
-  readonly opno?: number
-  readonly opname?: string
-  readonly outputFunctionOid?: number
-  readonly paramTypeOid?: number
-  readonly paramId?: number
-  readonly relid?: number
-  readonly relname?: string | null
-  readonly result?: PgAnalyzerExpr | null
-  readonly subLinkType?: string
-  readonly subquery?: PgAnalyzerQuery | null
-  readonly tag: string
-  readonly testExpr?: PgAnalyzerExpr | null
-  readonly truncated?: boolean
-  readonly typeName?: string
-  readonly typeOid?: number
-  readonly varattno?: number
-  readonly varlevelsup?: number
-  readonly varno?: number
-  readonly varnullingrels?: readonly number[]
-  readonly whenClauses?: readonly PgAnalyzerExpr[]
 }
 
 interface AnalyzedCompiledConfig {
@@ -311,28 +175,6 @@ async function explicitCompiledParamTypeOids(
   return typeOids
 }
 
-function exprChildren(expr: PgAnalyzerExpr): readonly PgAnalyzerExpr[] {
-  const children: PgAnalyzerExpr[] = []
-  for (const key of ['arg', 'condition', 'defresult', 'elementExpr', 'expr', 'result', 'testExpr'] as const) {
-    const child = expr[key]
-    if (child) {
-      children.push(child)
-    }
-  }
-  children.push(...(expr.elements ?? []))
-  for (const whenClause of expr.whenClauses ?? []) {
-    children.push(whenClause)
-  }
-  for (const arg of expr.args ?? []) {
-    if ('tag' in arg) {
-      children.push(arg)
-    } else if (arg.expr) {
-      children.push(arg.expr)
-    }
-  }
-  return children
-}
-
 function walkExpr(expr: PgAnalyzerExpr | null | undefined, visit: (expr: PgAnalyzerExpr) => void): void {
   if (!expr) {
     return
@@ -353,23 +195,34 @@ function resultTargets(query: PgAnalyzerQuery): readonly PgAnalyzerTarget[] {
 }
 
 type VarKey = string
-type NonNullFacts = ReadonlyMap<PgAnalyzerQuery, ReadonlySet<VarKey>>
 
 interface VarLocation {
   readonly key: VarKey
   readonly query: PgAnalyzerQuery
 }
 
-const noNonNullFacts: NonNullFacts = new Map()
+// Qualifiers observe a query's input tuple. Result expressions observe the
+// qualified tuple after command-specific transformations such as UPDATE SET.
+type QueryEvaluationPhase = 'input' | 'result'
 
 interface QueryScope {
-  readonly nonNullVars: NonNullFacts
+  readonly evaluationPhase: QueryEvaluationPhase
+  readonly predicateFacts: PredicateFacts
   readonly parent: QueryScope | null
   readonly query: PgAnalyzerQuery
 }
 
 function queryScope(query: PgAnalyzerQuery, parent: QueryScope | null = null): QueryScope {
-  return scopeWithQual({ nonNullVars: parent?.nonNullVars ?? noNonNullFacts, parent, query }, query.whereQual)
+  const inputScope: QueryScope = {
+    evaluationPhase: 'input',
+    predicateFacts: parent?.predicateFacts ?? noPredicateFacts,
+    parent,
+    query,
+  }
+  // Record WHERE facts against input identities before advancing result
+  // expression analysis to its own evaluation phase.
+  const qualifiedInputScope = scopeWithQual(inputScope, query.whereQual)
+  return { ...qualifiedInputScope, evaluationPhase: 'result' }
 }
 
 function queryScopeAtLevel(scope: QueryScope, levelsUp: number): QueryScope | null {
@@ -870,6 +723,39 @@ function uniqueIndexRowBounds(catalog: CatalogFacts, query: PgAnalyzerQuery): Ty
   }
 }
 
+function uniqueJoinRowBounds(catalog: CatalogFacts, query: PgAnalyzerQuery): TypedSqlPostgresIrRowBounds | null {
+  if (
+    query.commandType !== 'SELECT' ||
+    query.hasAggs === true ||
+    query.hasSetOperations === true ||
+    query.hasTargetSRFs === true ||
+    query.hasWindowFuncs === true ||
+    (query.groupClauseCount ?? 0) > 0 ||
+    (query.groupingSetsCount ?? 0) > 0
+  ) {
+    return null
+  }
+  const input = collectUniqueJoinProofInput(query)
+  if (!input) {
+    return null
+  }
+
+  const relations: UniqueJoinClosureRelation[] = input.sources.map((relation) => ({
+    indexes: (catalog.uniqueIndexesByRelid.get(relation.relid) ?? [])
+      .filter((index) => !(relation.inh && index.has_inheritors && index.relkind !== 'p'))
+      .map((index) => ({
+        attnums: index.attnums,
+        collationOids: index.collation_oids,
+        opfamilyOids: index.opfamily_oids,
+        proof: `${index.indisprimary ? 'primary_key' : 'unique_index'}:${index.index_name}`,
+      })),
+    varno: relation.varno,
+  }))
+  const proofs = inferUniqueJoinClosure(relations, input.constraints, catalog.uniqueEqualityOperators)
+
+  return proofs ? { max: 1, min: 0, proof: `unique_join_closure(${proofs.join(',')})` } : null
+}
+
 function projectionSourceRowBounds(
   catalog: CatalogFacts,
   query: PgAnalyzerQuery,
@@ -1072,6 +958,10 @@ function inferBaseRowBounds(
   const uniqueBounds = uniqueIndexRowBounds(catalog, query)
   if (uniqueBounds) {
     return uniqueBounds
+  }
+  const uniqueJoinBounds = uniqueJoinRowBounds(catalog, query)
+  if (uniqueJoinBounds) {
+    return uniqueJoinBounds
   }
   const projectionBounds = projectionSourceRowBounds(catalog, query, seen)
   if (projectionBounds) {
@@ -1491,12 +1381,120 @@ function typeFactForOid(
   }
 }
 
+type ReturningRowImage = 'actionDefault' | 'new' | 'old' | 'possiblyUnavailable' | 'unavailable' | 'unknown'
+
+function isDmlTargetVar(scope: QueryScope, expr: PgAnalyzerExpr): boolean {
+  return (
+    ['DELETE', 'INSERT', 'MERGE', 'UPDATE'].includes(scope.query.commandType) &&
+    expr.varno === scope.query.resultRelation
+  )
+}
+
+function returningRowImage(scope: QueryScope, expr: PgAnalyzerExpr): ReturningRowImage | null {
+  if (scope.evaluationPhase !== 'result' || !isDmlTargetVar(scope, expr)) {
+    return null
+  }
+
+  switch (scope.query.commandType) {
+    case 'DELETE':
+      switch (expr.varreturningtype) {
+        case 'DEFAULT':
+        case 'OLD':
+          return 'old'
+        case 'NEW':
+          return 'unavailable'
+        case 'UNRECOGNIZED':
+        case undefined:
+          return 'unknown'
+      }
+      break
+    case 'INSERT':
+      switch (expr.varreturningtype) {
+        case 'DEFAULT':
+        case 'NEW':
+          return 'new'
+        case 'OLD':
+          return 'unavailable'
+        case 'UNRECOGNIZED':
+        case undefined:
+          return 'unknown'
+      }
+      break
+    case 'UPDATE':
+      switch (expr.varreturningtype) {
+        case 'DEFAULT':
+        case 'NEW':
+          return 'new'
+        case 'OLD':
+          return 'old'
+        case 'UNRECOGNIZED':
+        case undefined:
+          return 'unknown'
+      }
+      break
+    case 'MERGE':
+      switch (expr.varreturningtype) {
+        case 'DEFAULT':
+          return 'actionDefault'
+        case 'NEW':
+        case 'OLD':
+          return 'possiblyUnavailable'
+        case 'UNRECOGNIZED':
+        case undefined:
+          return 'unknown'
+      }
+      break
+  }
+
+  return 'unknown'
+}
+
+function updateAssignsAttribute(scope: QueryScope, expr: PgAnalyzerExpr): boolean {
+  return (
+    scope.query.commandType === 'UPDATE' &&
+    scope.query.targetList?.some((target) => target.resjunk !== true && target.resno === expr.varattno) === true
+  )
+}
+
+function varValueVersion(scope: QueryScope, expr: PgAnalyzerExpr): string {
+  if (!isDmlTargetVar(scope, expr)) {
+    return ''
+  }
+  if (scope.evaluationPhase === 'input') {
+    return ':old'
+  }
+
+  const rowImage = returningRowImage(scope, expr)
+  switch (rowImage) {
+    case 'old':
+      return ':old'
+    case 'new':
+      // An unchanged UPDATE attribute is the same value in OLD and NEW, so
+      // input facts remain applicable without conflating assigned attributes.
+      return scope.query.commandType === 'UPDATE' && !updateAssignsAttribute(scope, expr) ? ':old' : ':new'
+    case 'actionDefault':
+      return ':merge_action_default'
+    case 'possiblyUnavailable':
+      return `:merge_${expr.varreturningtype?.toLowerCase() ?? 'unknown'}`
+    case 'unavailable':
+      return `:unavailable_${expr.varreturningtype?.toLowerCase() ?? 'unknown'}`
+    case 'unknown':
+    case null:
+      return ':unknown_returning'
+  }
+}
+
 function varLocation(scope: QueryScope, expr: PgAnalyzerExpr | null | undefined): VarLocation | null {
   if (!expr || expr.tag !== 'Var' || expr.varno === undefined || expr.varattno === undefined) {
     return null
   }
   const ownerScope = queryScopeAtLevel(scope, expr.varlevelsup ?? 0)
-  return ownerScope ? { key: `${expr.varno}:${expr.varattno}`, query: ownerScope.query } : null
+  if (!ownerScope) {
+    return null
+  }
+
+  const version = varValueVersion(ownerScope, expr)
+  return { key: `${expr.varno}:${expr.varattno}${version}`, query: ownerScope.query }
 }
 
 function visitVar(
@@ -1516,62 +1514,61 @@ interface CaseArm {
   readonly scope: QueryScope
 }
 
-function mergeNonNullFacts(left: NonNullFacts, right: NonNullFacts): NonNullFacts {
-  if (right.size === 0) {
-    return left
-  }
-  const merged = new Map(left)
-  for (const [query, rightKeys] of right) {
-    merged.set(query, new Set([...(merged.get(query) ?? []), ...rightKeys]))
-  }
-  return merged
-}
-
-function intersectNonNullFacts(facts: readonly NonNullFacts[]): NonNullFacts {
-  const [first, ...rest] = facts
-  if (!first) {
-    return noNonNullFacts
-  }
-  const intersection = new Map<PgAnalyzerQuery, ReadonlySet<VarKey>>()
-  for (const [query, keys] of first) {
-    const shared = new Set([...keys].filter((key) => rest.every((candidate) => candidate.get(query)?.has(key))))
-    if (shared.size > 0) {
-      intersection.set(query, shared)
-    }
-  }
-  return intersection
-}
-
-function collectNonNullVarFacts(scope: QueryScope, expr: PgAnalyzerExpr | null | undefined): NonNullFacts {
+function collectPredicateFacts(scope: QueryScope, expr: PgAnalyzerExpr | null | undefined): PredicateFacts {
   if (expr?.tag === 'NullTest' && expr.nullTestType === 'IS_NOT_NULL') {
-    const location = varLocation(scope, unwrapValuePreservingExpr(expr.arg))
-    return location ? new Map([[location.query, new Set([location.key])]]) : noNonNullFacts
+    const tested = unwrapValuePreservingExpr(expr.arg)
+    const location = varLocation(scope, tested)
+    if (location) {
+      return singletonPredicateFact(location.query, nonNullVarFactKey(location.key))
+    }
+    if (tested?.tag === 'FuncExpr' && tested.funcid && tested.args?.length === 1) {
+      const argumentLocation = varLocation(scope, unwrapValuePreservingExpr(targetExprFromAggregateArg(tested.args[0])))
+      if (argumentLocation) {
+        return singletonPredicateFact(
+          argumentLocation.query,
+          unaryFunctionNonNullFactKey(tested.funcid, argumentLocation.key)
+        )
+      }
+    }
+    return noPredicateFacts
   }
 
-  if (expr?.tag !== 'BoolExpr' || expr.boolOp === 'NOT') {
-    return noNonNullFacts
+  if (expr?.tag !== 'BoolExpr') {
+    return noPredicateFacts
   }
 
-  const branches = exprChildren(expr).map((child) => collectNonNullVarFacts(scope, child))
+  const children = exprChildren(expr)
+  if (expr.boolOp === 'NOT') {
+    const child = children.length === 1 ? unwrapValuePreservingExpr(children[0]) : undefined
+    if (child?.tag === 'FuncExpr' && child.funcid && child.args?.length === 1) {
+      const location = varLocation(scope, unwrapValuePreservingExpr(targetExprFromAggregateArg(child.args[0])))
+      if (location) {
+        return singletonPredicateFact(location.query, unaryFunctionFalseFactKey(child.funcid, location.key))
+      }
+    }
+    return noPredicateFacts
+  }
+
+  const branches = children.map((child) => collectPredicateFacts(scope, child))
   if (expr.boolOp === 'AND') {
-    return branches.reduce(mergeNonNullFacts, noNonNullFacts)
+    return branches.reduce(mergePredicateFacts, noPredicateFacts)
   }
 
   if (expr.boolOp === 'OR' && branches.length > 0) {
-    return intersectNonNullFacts(branches)
+    return intersectPredicateFacts(branches)
   }
 
-  return noNonNullFacts
+  return noPredicateFacts
 }
 
 function scopeWithQual(scope: QueryScope, qual: PgAnalyzerExpr | null | undefined): QueryScope {
-  const nonNullVars = mergeNonNullFacts(scope.nonNullVars, collectNonNullVarFacts(scope, qual))
-  return nonNullVars === scope.nonNullVars ? scope : { ...scope, nonNullVars }
+  const predicateFacts = mergePredicateFacts(scope.predicateFacts, collectPredicateFacts(scope, qual))
+  return predicateFacts === scope.predicateFacts ? scope : { ...scope, predicateFacts }
 }
 
 function scopeProvesNonNull(scope: QueryScope, expr: PgAnalyzerExpr): boolean {
   const location = varLocation(scope, expr)
-  return Boolean(location && scope.nonNullVars.get(location.query)?.has(location.key))
+  return Boolean(location && scope.predicateFacts.get(location.query)?.has(nonNullVarFactKey(location.key)))
 }
 
 function caseArms(scope: QueryScope, expr: PgAnalyzerExpr): readonly CaseArm[] {
@@ -1786,6 +1783,16 @@ function expressionNullability(
   }
 
   if (expr.tag === 'Var') {
+    const rowImage = returningRowImage(scope, expr)
+    if (rowImage === 'unavailable' || rowImage === 'possiblyUnavailable' || rowImage === 'unknown') {
+      return {
+        evidence:
+          rowImage === 'unavailable'
+            ? `returning_${expr.varreturningtype?.toLowerCase() ?? 'unknown'}_row_unavailable`
+            : 'returning_row_availability_unresolved',
+        kind: 'nullable',
+      }
+    }
     if (expr.varattno === 0) {
       if (scopeProvesNonNull(scope, expr)) {
         return { basis: 'where_is_not_null', kind: 'nonNull' }
@@ -1903,6 +1910,28 @@ function expressionNullability(
     return { basis: 'array_constructor', kind: 'nonNull' }
   }
   if (expr.tag === 'FuncExpr') {
+    if (
+      (isBuiltinPgProcNamed(catalog, expr.funcid, 'lower') || isBuiltinPgProcNamed(catalog, expr.funcid, 'upper')) &&
+      expr.funcid &&
+      expr.args?.length === 1
+    ) {
+      const argument = targetExprFromAggregateArg(expr.args[0])
+      const argumentType = argument ? typeFactForOid(catalog, argument.typeOid, argument.typeName) : undefined
+      if (argument && (argumentType?.pgTypeKind === 'range' || argumentType?.pgTypeKind === 'multirange')) {
+        const endpoint = isBuiltinPgProcNamed(catalog, expr.funcid, 'lower') ? 'lower' : 'upper'
+        if (scopeProvesUnaryFunctionResultNonNull(scope, expr.funcid, argument)) {
+          return { basis: 'where_function_is_not_null', kind: 'nonNull' }
+        }
+        if (
+          scopeProvesBuiltinUnaryFunctionFalse(catalog, scope, 'isempty', argument) &&
+          scopeProvesBuiltinUnaryFunctionFalse(catalog, scope, `${endpoint}_inf`, argument)
+        ) {
+          return { basis: `finite_nonempty_range_${endpoint}`, kind: 'nonNull' }
+        }
+        return { evidence: `range_${endpoint}_endpoint_can_be_absent`, kind: 'nullable' }
+      }
+    }
+
     if (
       isBuiltinPgProcNamed(catalog, expr.funcid, 'to_json') ||
       isBuiltinPgProcNamed(catalog, expr.funcid, 'to_jsonb') ||
@@ -2040,12 +2069,64 @@ function isBuiltinPgProcNamed(catalog: CatalogFacts, oid: number | undefined, na
   return proc?.is_builtin === true && proc.proname === name
 }
 
-function unwrapValuePreservingExpr(expr: PgAnalyzerExpr | null | undefined): PgAnalyzerExpr | null | undefined {
-  let current = expr
-  while (current?.tag === 'RelabelType' || current?.tag === 'CoerceToDomain') {
-    current = current.arg
+function scopeProvesUnaryFunctionResultNonNull(scope: QueryScope, funcid: number, argument: PgAnalyzerExpr): boolean {
+  const location = varLocation(scope, unwrapValuePreservingExpr(argument))
+  return Boolean(
+    location && scope.predicateFacts.get(location.query)?.has(unaryFunctionNonNullFactKey(funcid, location.key))
+  )
+}
+
+function scopeProvesBuiltinUnaryFunctionFalse(
+  catalog: CatalogFacts,
+  scope: QueryScope,
+  functionName: string,
+  argument: PgAnalyzerExpr,
+  seen: readonly VarLocation[] = []
+): boolean {
+  const unwrapped = unwrapValuePreservingExpr(argument)
+  const location = varLocation(scope, unwrapped)
+  if (!location) {
+    return false
   }
-  return current
+  const facts = scope.predicateFacts.get(location.query)
+  for (const [oid, proc] of catalog.procs) {
+    if (proc.is_builtin && proc.proname === functionName && facts?.has(unaryFunctionFalseFactKey(oid, location.key))) {
+      return true
+    }
+  }
+
+  if (!unwrapped || unwrapped.tag !== 'Var') {
+    return false
+  }
+  if ((unwrapped.varnullingrels?.length ?? 0) > 0) {
+    return false
+  }
+  const nestedSeen = visitVar(seen, scope, unwrapped)
+  if (!nestedSeen) {
+    return false
+  }
+  const source = resolveImmediateVarSource(scope, unwrapped)
+  if (source.kind === 'queryOutput') {
+    return foldQueryOutput<boolean>(source.scope, source.outputIndex, {
+      except: (left) => left,
+      intersect: (left, right) => left || right,
+      target: (targetScope, target) =>
+        Boolean(
+          target.expr &&
+            scopeProvesBuiltinUnaryFunctionFalse(catalog, targetScope, functionName, target.expr, nestedSeen)
+        ),
+      union: (left, right) => left && right,
+    })
+  }
+  if (source.kind === 'expressions') {
+    return (
+      source.expressions.length > 0 &&
+      source.expressions.every((sourceExpr) =>
+        scopeProvesBuiltinUnaryFunctionFalse(catalog, source.scope, functionName, sourceExpr, nestedSeen)
+      )
+    )
+  }
+  return false
 }
 
 function constStringValue(expr: PgAnalyzerExpr | null | undefined): string | null {
@@ -2080,15 +2161,6 @@ function jsonBuildObjectArguments(expr: PgAnalyzerExpr): readonly PgAnalyzerExpr
   }
 
   return objectArgs.length % 2 === 0 ? objectArgs : null
-}
-
-function targetExprFromAggregateArg(
-  arg: PgAnalyzerExpr | { readonly expr?: PgAnalyzerExpr | null } | undefined
-): PgAnalyzerExpr | null | undefined {
-  if (!arg) {
-    return null
-  }
-  return 'tag' in arg ? arg : arg.expr
 }
 
 function jsonLeafShapeForExpr(

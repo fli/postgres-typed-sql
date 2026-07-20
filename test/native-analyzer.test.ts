@@ -26,6 +26,7 @@ interface NativeQuery {
   readonly commandType: string
   readonly cteList: readonly NativeCte[]
   readonly dmlParameterTargets: readonly NativeDmlParameterTarget[]
+  readonly fromTree: NativeFromNode
   readonly hasModifyingCTE: boolean
   readonly hasLimitCount: boolean
   readonly hasRowMarks: boolean
@@ -36,6 +37,17 @@ interface NativeQuery {
   readonly targetList: readonly NativeTarget[]
   readonly utilityKind: 'CALL' | 'EXECUTE' | 'EXPLAIN' | 'FETCH' | 'NONE' | 'OTHER' | 'SHOW'
   readonly utilityReturnsTuples: boolean
+}
+
+interface NativeFromNode {
+  readonly fromlist?: readonly NativeFromNode[]
+  readonly joinType?: string
+  readonly left?: NativeFromNode
+  readonly quals?: NativeExpr | null
+  readonly right?: NativeFromNode
+  readonly rtindex?: number
+  readonly tag: string
+  readonly truncated?: boolean
 }
 
 interface NativeRte {
@@ -103,6 +115,7 @@ interface NativeExpr {
   readonly varlevelsup?: number
   readonly varnullingrels?: readonly number[]
   readonly varno?: number
+  readonly varreturningtype?: 'DEFAULT' | 'NEW' | 'OLD' | 'UNRECOGNIZED'
 }
 
 async function analyze(
@@ -228,7 +241,7 @@ test('native analyzer exposes the versioned PostgreSQL query envelope', async ()
       [20]
     )
 
-    assert.equal(analysis.schemaVersion, 8)
+    assert.equal(analysis.schemaVersion, 9)
     assert.equal(analysis.postgresVersionNum, 180003)
     assert.equal(analysis.rawStatementCount, 1)
     assert.deepEqual(analysis.paramTypeOids, [20])
@@ -251,6 +264,9 @@ test('native analyzer exposes the versioned PostgreSQL query envelope', async ()
       query.rtable[1]?.subquery?.rtable.map((entry) => entry.kind),
       ['VALUES']
     )
+    assert.equal(query.fromTree.tag, 'FromExpr')
+    assert.equal(query.fromTree.fromlist?.[0]?.tag, 'JoinExpr')
+    assert.equal(query.fromTree.fromlist?.[0]?.joinType, 'INNER')
     assert.equal(query.targetList[0]?.expr.tag, 'SubLink')
     assert.equal(query.targetList[0]?.expr.subLinkType, 'EXISTS')
   })
@@ -488,7 +504,27 @@ test('native analyzer exposes PostgreSQL-authoritative immediate RTE outputs', a
     const modifyingCte = modifying.statements[0]?.queries[0]?.cteList[0]
     assert.equal(modifyingCte?.query?.commandType, 'INSERT')
     assert.equal(modifyingCte?.query?.returningList[0]?.expr.tag, 'Var')
+    assert.equal(modifyingCte?.query?.returningList[0]?.expr.varreturningtype, 'DEFAULT')
     assert.equal(modifying.statements[0]?.queries[0]?.rtable[0]?.cteName, 'inserted')
+  })
+})
+
+test('native analyzer preserves PostgreSQL RETURNING row-image identity', async () => {
+  await withDatabase(async (database) => {
+    await database.query(
+      'create table public.returning_identity_native (id integer primary key, value int4range not null)'
+    )
+    const analysis = await analyze(
+      database,
+      `delete from public.returning_identity_native
+       returning OLD.id as old_id, NEW.id as new_id`,
+      []
+    )
+    const outputs = analysis.statements[0]?.queries[0]?.returningList
+    assert.deepEqual(
+      outputs?.map((target) => target.expr.varreturningtype),
+      ['OLD', 'NEW']
+    )
   })
 })
 
