@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.0-beta.7.1
+
+- Added default export-map fallbacks for every public entry point so source loaders that resolve TypeScript through CommonJS hooks, including `tsx`, can load the ESM runtime and node-postgres adapter.
+
 ## 0.1.0-beta.7
 
 - Breaking: public analyzer IR and generated runtime result-column metadata now expose the required `expressionSource` field instead of the ambiguous `source`. It describes only the immediate analyzed expression—a direct table column, derived `Var`, or expression tag—and does not claim ultimate lineage.
