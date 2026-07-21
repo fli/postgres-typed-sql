@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.0-beta.9
+
+- Added default export-map fallbacks for every public entry point so source loaders that resolve TypeScript through CommonJS hooks, including `tsx`, can load the ESM runtime and node-postgres adapter.
+
 ## 0.1.0-beta.8
 
 - Added predicate-aware nullability for finite, nonempty PostgreSQL range and multirange endpoints, including structured JSON fields, scoped boolean branches, derived queries, and set operations.
