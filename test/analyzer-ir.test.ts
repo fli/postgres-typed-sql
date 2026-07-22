@@ -787,9 +787,83 @@ test('throws on malformed owner identity, output indices, aligned expressions, a
         corrupt(analysis) {
           analysis.schemaVersion = 6
         },
-        error: /analyzer returned unsupported schema version 6; expected 9/u,
+        error: /analyzer returned unsupported schema version 6; expected 10/u,
         name: 'staleSchema',
         sql: 'select account.id from public.accounts account',
+      },
+      {
+        corrupt(analysis) {
+          delete firstEnvelopeQuery(analysis).dmlDirectAssignments
+        },
+        error: /analyzer returned a query without required DML direct-assignment facts/u,
+        name: 'missingDmlDirectAssignments',
+        sql: 'select account.id from public.accounts account',
+      },
+      {
+        corrupt(analysis) {
+          delete firstEnvelopeQuery(analysis).dmlParameterNullAdmissions
+        },
+        error: /analyzer returned a query without required DML parameter NULL-admission facts/u,
+        name: 'missingDmlParameterNullAdmissions',
+        sql: 'select account.id from public.accounts account',
+      },
+      {
+        corrupt(analysis) {
+          const query = firstEnvelopeQuery(analysis)
+          query.dmlDirectAssignments = [{ paramId: 0, targetAttnum: 0, targetRelid: 0, targetTypeOid: 0 }]
+        },
+        error: /analyzer returned an inconsistent DML direct-assignment fact/u,
+        name: 'invalidDmlDirectAssignment',
+        sql: 'select account.id from public.accounts account',
+      },
+      {
+        corrupt(analysis) {
+          const query = firstEnvelopeQuery(analysis)
+          query.dmlDirectAssignments = [
+            { directAssignment: true, paramId: 1, targetAttnum: 1, targetRelid: 1, targetTypeOid: 25 },
+          ]
+        },
+        error: /analyzer returned an inconsistent DML direct-assignment fact/u,
+        name: 'legacyDmlDirectAssignment',
+        sql: 'select $1::text',
+      },
+      {
+        corrupt(analysis) {
+          const query = firstEnvelopeQuery(analysis)
+          query.dmlParameterNullAdmissions = [{ admission: 'accepts', basis: 'unsupported_basis', paramId: 0 }]
+        },
+        error: /analyzer returned an inconsistent DML parameter NULL-admission fact/u,
+        name: 'invalidDmlParameterNullAdmission',
+        sql: 'select account.id from public.accounts account',
+      },
+      ...(
+        [
+          ['rejects', 'action_unreachable_when_null'],
+          ['unknown', 'action_unreachable_when_null'],
+          ['rejects', 'row_values_preserved_when_null'],
+          ['unknown', 'row_values_preserved_when_null'],
+          ['unknown', 'direct_target_null_admission'],
+          ['accepts', 'unresolved'],
+          ['rejects', 'unresolved'],
+        ] as const
+      ).map(([admission, basis]) => ({
+        corrupt(analysis: MutableEnvelopeObject) {
+          firstEnvelopeQuery(analysis).dmlParameterNullAdmissions = [{ admission, basis, paramId: 1 }]
+        },
+        error: /analyzer returned an inconsistent DML parameter NULL-admission fact/u,
+        name: `invalidDmlParameterNullAdmission_${admission}_${basis}`,
+        sql: 'select $1::text',
+      })),
+      {
+        corrupt(analysis) {
+          const query = firstEnvelopeQuery(analysis)
+          query.dmlParameterNullAdmissions = [
+            { admission: 'accepts', basis: 'direct_target_null_admission', paramId: 1, targetNullable: true },
+          ]
+        },
+        error: /analyzer returned an inconsistent DML parameter NULL-admission fact/u,
+        name: 'legacyDmlParameterNullAdmission',
+        sql: 'select $1::text',
       },
       {
         corrupt(analysis) {
@@ -885,7 +959,7 @@ test('throws on malformed owner identity, output indices, aligned expressions, a
     for (const fixture of cases) {
       await assert.rejects(
         buildTypedSqlPostgresIrFromCompiledConfigs(corruptAnalyzerEnvelope(database, fixture.corrupt), [
-          config(fixture.name, fixture.sql),
+          config(fixture.name, fixture.sql, fixture.sql.includes('$1') ? ['value'] : []),
         ]),
         fixture.error
       )
@@ -1095,6 +1169,10 @@ test('normalizes PostgreSQL statement, nullability, DML, and cardinality facts c
     await database.query('create table public.source_domain_probe (value text)')
     await database.query("create table public.outer_join_probe (value text check (value in ('allowed')))")
     await database.query('create table public.null_admission_sample (value integer)')
+    await database.query(`create table public.null_admission_place (
+      id integer primary key,
+      required_location point not null
+    )`)
     await database.query(`create procedure public.accept_null(value integer)
       language plpgsql
       as $$ begin null; end $$`)
@@ -1198,6 +1276,25 @@ test('normalizes PostgreSQL statement, nullability, DML, and cardinality facts c
       config('zeroColumnNoFromHaving', 'select having false'),
       config('zeroColumnNoFromGroupingSets', 'select group by grouping sets ((), ())'),
       config('nullableSelectParameter', 'select $1::text as value', ['value']),
+      config(
+        'rowPreservingPointUpdate',
+        `update public.null_admission_place
+         set required_location = coalesce(point($1, $2), required_location)
+         where id = 1`,
+        ['latitude', 'longitude'],
+        ['double precision', 'double precision']
+      ),
+      config(
+        'rowPreservingPointCaseUpdate',
+        `update public.null_admission_place
+         set required_location = coalesce(
+           case when $1 is not null and $2 is not null then point($1, $2) end,
+           required_location
+         )
+         where id = 1`,
+        ['latitude', 'longitude'],
+        ['double precision', 'double precision']
+      ),
       config('uniqueLookup', 'select account.id from public.accounts account where account.id = $1', ['id']),
       config(
         'multipliedUniqueLookup',
@@ -1360,6 +1457,20 @@ test('normalizes PostgreSQL statement, nullability, DML, and cardinality facts c
       proof: 'select_without_from_with_grouping',
     })
     assert.equal(query('nullableSelectParameter').params[0]?.nullAdmission, 'accepts')
+    assert.deepEqual(
+      query('rowPreservingPointUpdate').params.map(({ name, nullAdmission }) => ({ name, nullAdmission })),
+      [
+        { name: 'latitude', nullAdmission: 'accepts' },
+        { name: 'longitude', nullAdmission: 'accepts' },
+      ]
+    )
+    assert.deepEqual(
+      query('rowPreservingPointCaseUpdate').params.map(({ name, nullAdmission }) => ({ name, nullAdmission })),
+      [
+        { name: 'latitude', nullAdmission: 'accepts' },
+        { name: 'longitude', nullAdmission: 'accepts' },
+      ]
+    )
 
     assert.deepEqual(query('uniqueLookup').rowBounds, {
       max: 1,

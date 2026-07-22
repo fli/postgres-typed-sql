@@ -19,7 +19,8 @@ export interface PgAnalyzerQuery {
   readonly canSetTag: boolean
   readonly commandType: string
   readonly cteList?: readonly PgAnalyzerCte[]
-  readonly dmlParameterTargets: readonly PgAnalyzerDmlParameterTarget[]
+  readonly dmlDirectAssignments: readonly PgAnalyzerDmlDirectAssignment[]
+  readonly dmlParameterNullAdmissions: readonly PgAnalyzerDmlParameterNullAdmission[]
   readonly distinctClauseCount?: number
   readonly fromTree: PgAnalyzerFromNode | null
   readonly groupClauseCount?: number
@@ -59,18 +60,29 @@ export type PgAnalyzerSetOperation =
       readonly right: PgAnalyzerSetOperation
     }
 
-export interface PgAnalyzerDmlParameterTarget {
-  readonly directAssignment: boolean
+export interface PgAnalyzerDmlDirectAssignment {
   readonly paramId: number
-  readonly source: 'INSERT' | 'MERGE_INSERT' | 'MERGE_UPDATE' | 'ON_CONFLICT_UPDATE' | 'UPDATE'
-  readonly targetAttname: string
   readonly targetAttnum: number
-  readonly targetNullAdmission: TypedSqlPostgresIrParamNullAdmission
-  readonly targetNullable: boolean
   readonly targetRelid: number
-  readonly targetTypeName: string | null
   readonly targetTypeOid: number
 }
+
+export type PgAnalyzerDmlParameterNullAdmission =
+  | {
+      readonly admission: 'accepts'
+      readonly basis: 'action_unreachable_when_null' | 'row_values_preserved_when_null'
+      readonly paramId: number
+    }
+  | {
+      readonly admission: Exclude<TypedSqlPostgresIrParamNullAdmission, 'unknown'>
+      readonly basis: 'direct_target_null_admission'
+      readonly paramId: number
+    }
+  | {
+      readonly admission: 'unknown'
+      readonly basis: 'unresolved'
+      readonly paramId: number
+    }
 
 export interface PgAnalyzerTarget {
   readonly expr?: PgAnalyzerExpr | null

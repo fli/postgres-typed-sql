@@ -1518,6 +1518,195 @@ create table public.required_targets (value text not null);
   )
 })
 
+test('accepts nullable coordinates when a DML assignment preserves the old point under NULL', async () => {
+  const root = await createMinimalFixture(
+    `create table public.places (
+  id integer primary key,
+  required_location point not null,
+  fallback_location point
+);
+`,
+    'select 1\n'
+  )
+  const config = {
+    include: ['queries'],
+    rootDir: root,
+    codecProfile: 'node-postgres' as const,
+    schema: 'schema.sql',
+  }
+  const queryFile = join(root, 'queries/query.typed.sql')
+  const outputFile = join(root, 'queries/query.typed-sql.ts')
+  const expressions = [
+    'coalesce(point(:latitude, :longitude), required_location)',
+    `coalesce(
+  case when :latitude::float8 is not null and :longitude::float8 is not null
+    then point(:latitude, :longitude)
+  end,
+  required_location
+)`,
+  ] as const
+  const directiveSets = [
+    '-- @param latitude ?\n-- @param longitude ?',
+    '-- @param latitude float8?\n-- @param longitude float8?',
+  ] as const
+
+  for (const expression of expressions) {
+    for (const directives of directiveSets) {
+      await writeFile(
+        queryFile,
+        `${directives}
+update public.places
+set required_location = ${expression}
+where id = 1
+`
+      )
+      await generateTypedSql(config)
+      const output = await readFile(outputFile, 'utf8')
+      assert.match(output, /readonly latitude: bigint \| number \| string \| null/u)
+      assert.match(output, /readonly longitude: bigint \| number \| string \| null/u)
+      assert.match(output, /name: 'latitude',[\s\S]*?nullable: true/u)
+      assert.match(output, /name: 'longitude',[\s\S]*?nullable: true/u)
+    }
+  }
+
+  await writeFile(
+    queryFile,
+    `-- @param latitude float8?
+-- @param longitude float8?
+update public.places
+set fallback_location = coalesce(point(:latitude, :longitude), fallback_location)
+where id = 1
+`
+  )
+  await generateTypedSql(config)
+  const output = await readFile(outputFile, 'utf8')
+  assert.match(output, /readonly latitude: bigint \| number \| string \| null/u)
+  assert.match(output, /readonly longitude: bigint \| number \| string \| null/u)
+
+  for (const expression of [
+    'point(:latitude, :longitude)',
+    'coalesce(point(:latitude, :longitude), point(0, 0))',
+    'coalesce(point(:latitude, :longitude), fallback_location)',
+  ]) {
+    await writeFile(
+      queryFile,
+      `-- @param latitude float8?
+-- @param longitude float8?
+update public.places
+set required_location = ${expression}
+where id = 1
+`
+    )
+    await assert.rejects(
+      generateTypedSql(config),
+      /@param latitude cannot be nullable because PostgreSQL could not prove that every use accepts NULL/u
+    )
+  }
+
+  for (const nullableCoordinate of ['latitude', 'longitude'] as const) {
+    await writeFile(
+      queryFile,
+      `-- @param latitude float8${nullableCoordinate === 'latitude' ? '?' : ''}
+-- @param longitude float8${nullableCoordinate === 'longitude' ? '?' : ''}
+update public.places
+set required_location = point(:latitude, :longitude)
+where id = 1
+`
+    )
+    await assert.rejects(
+      generateTypedSql(config),
+      new RegExp(
+        `@param ${nullableCoordinate} cannot be nullable because PostgreSQL could not prove that every use accepts NULL`,
+        'u'
+      )
+    )
+  }
+})
+
+test('correlates nullable OLD tails and rejects unstable row-preservation boundaries', async () => {
+  const root = await createMinimalFixture(
+    `create table public.old_value_contract (
+  value integer check (value <> 0),
+  divisor integer not null
+);
+insert into public.old_value_contract(value, divisor) values (null, 0);
+
+create table public.unvalidated_contract (value integer);
+insert into public.unvalidated_contract(value) values (0);
+alter table public.unvalidated_contract
+  add constraint unvalidated_contract_positive check (value > 0) not valid;
+
+create table public.unvalidated_not_null_contract (value integer);
+insert into public.unvalidated_not_null_contract(value) values (null);
+alter table public.unvalidated_not_null_contract
+  add constraint unvalidated_not_null_contract_value not null value not valid;
+
+create table public.nulls_not_distinct_contract (
+  id integer primary key,
+  value integer unique nulls not distinct
+);
+insert into public.nulls_not_distinct_contract(id, value) values (1, null), (2, 1);
+
+create sequence public.mutable_contract_sequence start 1;
+create function public.mutable_contract_check(value integer)
+returns boolean language sql volatile
+as $$ select nextval('public.mutable_contract_sequence') % 2 = 1 $$;
+create table public.mutable_contract (
+  value integer check (public.mutable_contract_check(value))
+);
+insert into public.mutable_contract(value) values (1);
+`,
+    `-- @param value integer?
+update public.old_value_contract
+set value = coalesce(value, :value)
+`
+  )
+  const config = {
+    include: ['queries'],
+    rootDir: root,
+    codecProfile: 'node-postgres' as const,
+    schema: 'schema.sql',
+  }
+  const queryFile = join(root, 'queries/query.typed.sql')
+  const outputFile = join(root, 'queries/query.typed-sql.ts')
+
+  await generateTypedSql(config)
+  const output = await readFile(outputFile, 'utf8')
+  assert.match(output, /readonly value: bigint \| number \| string \| null/u)
+  assert.match(output, /name: 'value',[\s\S]*?nullable: true/u)
+
+  const rejectedSql = [
+    `update public.old_value_contract as old_target
+set value = coalesce(old_target.value, :value, 0)`,
+    `update public.old_value_contract as old_target
+set value = coalesce(:value::integer + (1 / old_target.divisor), old_target.value)`,
+    `update public.old_value_contract as old_target
+set value = case
+  when :value::integer is null and old_target.value is null then 0
+  else old_target.value
+end`,
+    `update public.unvalidated_contract as old_target
+set value = coalesce(:value, old_target.value)`,
+    `update public.unvalidated_not_null_contract as old_target
+set value = coalesce(:value, old_target.value)`,
+    `insert into public.nulls_not_distinct_contract(id, value)
+values (3, :value)`,
+    `update public.nulls_not_distinct_contract
+set value = :value where id = 2`,
+    `update public.mutable_contract as old_target
+set value = coalesce(:value, old_target.value)`,
+  ] as const
+
+  for (const sql of rejectedSql) {
+    await writeFile(queryFile, `-- @param value integer?\n${sql}\n`)
+    await assert.rejects(
+      generateTypedSql(config),
+      /@param value cannot be nullable because PostgreSQL could not prove that every use accepts NULL/u,
+      sql
+    )
+  }
+})
+
 test('proof-gates both nullable parameter syntaxes through final PostgreSQL admission', async () => {
   const root = await createMinimalFixture(
     `create table public.null_admission_sample (value integer);
@@ -1629,6 +1818,18 @@ insert into public.checked_values(value) values (coalesce(:value, 'A'))
   await generateTypedSql(config)
   output = await readFile(join(root, 'queries/query.typed-sql.ts'), 'utf8')
   assert.match(output, /readonly value: string\n/u)
+  assert.doesNotMatch(output, /readonly value: CheckedValues__Value/u)
+
+  await writeFile(
+    join(root, 'queries/query.typed.sql'),
+    `-- @param value text?
+update public.checked_values
+set value = coalesce(:value, value)
+`
+  )
+  await generateTypedSql(config)
+  output = await readFile(join(root, 'queries/query.typed-sql.ts'), 'utf8')
+  assert.match(output, /readonly value: string \| null/u)
   assert.doesNotMatch(output, /readonly value: CheckedValues__Value/u)
 })
 

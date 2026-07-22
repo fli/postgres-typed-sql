@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.0-beta.10
+
+- Added sound nullable-parameter admission for guarded DML assignments, including correlated `CASE` and `COALESCE` tails that preserve nullable old values as a group.
+- Separated structural assignment identity, action-unreachable proofs, old-row-preservation proofs, and target-constraint completeness so definite acceptance and rejection survive unrelated PostgreSQL enforcement uncertainty.
+- Hardened DML admission across triggers, RLS, partitions, generated columns, unvalidated constraints, foreign keys, expression and partial indexes, exclusion constraints, and `NULLS NOT DISTINCT` uniqueness.
+- Split native NULL evaluation, substitution, admission, DML lineage, query scope, and array-shape analysis into focused modules with exact build-cache discovery and adversarial PostgreSQL regressions.
+- Breaking: native analyzer schema 10 replaces `dmlParameterTargets` with discriminated `dmlDirectAssignments` and `dmlParameterNullAdmissions` facts; regenerate checked-in typed SQL outputs after upgrading.
+
 ## 0.1.0-beta.9
 
 - Added default export-map fallbacks for every public entry point so source loaders that resolve TypeScript through CommonJS hooks, including `tsx`, can load the ESM runtime and node-postgres adapter.

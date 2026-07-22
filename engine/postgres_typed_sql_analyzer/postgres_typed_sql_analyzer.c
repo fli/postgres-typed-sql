@@ -46,21 +46,25 @@
 #include "utils/syscache.h"
 #include "utils/typcache.h"
 
+#include "array_shape.h"
+#include "dml_analysis.h"
+#include "null_admission.h"
+#include "null_evaluation.h"
+#include "null_substitution.h"
+#include "parameter_null_admission.h"
+#include "query_scope.h"
+
 PG_MODULE_MAGIC;
 
 PG_FUNCTION_INFO_V1(postgres_typed_sql_analyze);
 
-typedef struct QueryScope QueryScope;
-typedef bool (*ExecutionReachableQueryVisitor)(const QueryScope *scope,
-                                               void *context);
-
-static void append_expr_node(StringInfo out, const QueryScope *scope, const Node *expr, int depth);
+static void append_expr_node(StringInfo out, const PtsQueryScope *scope, const Node *expr, int depth);
 static void append_query_summary(StringInfo out, const Query *query,
-                                 const QueryScope *parent_scope, int depth,
+                                 const PtsQueryScope *parent_scope, int depth,
                                  bool protocol_output,
                                  bool bind_io_invokes_volatile);
-static void append_from_node(StringInfo out, const QueryScope *scope, const Node *node, int depth);
-static void append_rtable(StringInfo out, const QueryScope *scope, int depth);
+static void append_from_node(StringInfo out, const PtsQueryScope *scope, const Node *node, int depth);
+static void append_rtable(StringInfo out, const PtsQueryScope *scope, int depth);
 static void append_set_operation(StringInfo out, const Node *node);
 static const char *command_type_name(CmdType command_type);
 static const char *utility_kind_name(const Node *utility_stmt);
@@ -70,18 +74,12 @@ static void append_json_string(StringInfo out, const char *value);
 static void append_bool_field(StringInfo out, const char *name, bool value);
 static void append_oid_field(StringInfo out, const char *name, Oid value);
 static void append_optional_name_field(StringInfo out, const char *name, const char *value);
-static const CommonTableExpr *cte_by_name(const Query *query, const char *name);
-static const QueryScope *query_scope_at_level(const QueryScope *scope,
-                                              Index levels_up);
-static bool execution_reachable_query_walker(
-  const Query *query, ExecutionReachableQueryVisitor visitor, void *context);
 static bool query_contains_volatile_functions(const Query *query);
 static bool volatile_function_walker(Node *node, void *context);
 static bool query_contains_row_marks(const Query *query);
 static bool executor_support_dependency_invokes_volatile(
   Oid function_oid, const List *args, bool target_entries,
   Oid result_type, int32 result_typmod);
-
 static bool
 json_text_is_empty_array(const char *value)
 {
@@ -110,2756 +108,10 @@ json_text_is_empty_array(const char *value)
   return *cursor == '\0';
 }
 
-struct QueryScope
-{
-  const Query *query;
-  const struct QueryScope *parent;
-};
-
 typedef struct VolatileFunctionContext
 {
-  const QueryScope *scope;
+  const PtsQueryScope *scope;
 } VolatileFunctionContext;
-
-typedef enum NullProof
-{
-  NULL_PROOF_NULL,
-  NULL_PROOF_TRUE,
-  NULL_PROOF_FALSE,
-  NULL_PROOF_NONNULL,
-  NULL_PROOF_UNKNOWN
-} NullProof;
-
-typedef struct NullEvaluation
-{
-  NullProof proof;
-  bool evaluation_safe;
-  bool depends_on_subject;
-} NullEvaluation;
-
-typedef enum TypeNullAdmission
-{
-  TYPE_NULL_ADMITS,
-  TYPE_NULL_REJECTS,
-  TYPE_NULL_UNKNOWN
-} TypeNullAdmission;
-
-typedef enum ArrayShapeProof
-{
-  ARRAY_SHAPE_VALID,
-  ARRAY_SHAPE_INVALID,
-  ARRAY_SHAPE_UNKNOWN
-} ArrayShapeProof;
-
-typedef struct ArrayShape
-{
-  ArrayShapeProof proof;
-  bool is_null;
-  int ndims;
-  int dims[MAXDIM];
-  int lbs[MAXDIM];
-  int nitems;
-} ArrayShape;
-
-typedef enum ArrayCardinalityProof
-{
-  ARRAY_CARDINALITY_EMPTY,
-  ARRAY_CARDINALITY_NONEMPTY,
-  ARRAY_CARDINALITY_UNKNOWN
-} ArrayCardinalityProof;
-
-static ArrayShape
-unknown_array_shape(void)
-{
-  ArrayShape shape = {0};
-
-  shape.proof = ARRAY_SHAPE_UNKNOWN;
-  return shape;
-}
-
-static ArrayShape
-invalid_array_shape(void)
-{
-  ArrayShape shape = {0};
-
-  shape.proof = ARRAY_SHAPE_INVALID;
-  return shape;
-}
-
-static ArrayShape
-array_shape_proof(const Node *node)
-{
-  ArrayShape shape = {0};
-
-  if (node == NULL)
-  {
-    return unknown_array_shape();
-  }
-  if (IsA(node, Const))
-  {
-    const Const *constant = (const Const *) node;
-    ArrayType *value;
-
-    shape.proof = ARRAY_SHAPE_VALID;
-    if (constant->constisnull)
-    {
-      shape.is_null = true;
-      return shape;
-    }
-
-    value = DatumGetArrayTypeP(constant->constvalue);
-    shape.ndims = ARR_NDIM(value);
-    if (shape.ndims < 0 || shape.ndims > MAXDIM)
-    {
-      return invalid_array_shape();
-    }
-    if (shape.ndims > 0)
-    {
-      memcpy(shape.dims, ARR_DIMS(value), shape.ndims * sizeof(int));
-      memcpy(shape.lbs, ARR_LBOUND(value), shape.ndims * sizeof(int));
-    }
-    shape.nitems = ArrayGetNItems(shape.ndims, shape.dims);
-    return shape;
-  }
-  if (IsA(node, ArrayExpr))
-  {
-    const ArrayExpr *array = (const ArrayExpr *) node;
-    int element_count = list_length(array->elements);
-
-    shape.proof = ARRAY_SHAPE_VALID;
-    if (!array->multidims)
-    {
-      shape.ndims = 1;
-      shape.dims[0] = element_count;
-      shape.lbs[0] = 1;
-      shape.nitems = element_count;
-      return shape;
-    }
-
-    {
-      ArrayShape first_nonempty = {0};
-      ListCell *cell;
-      bool saw_empty = false;
-      bool saw_nonempty = false;
-      bool saw_unknown = false;
-
-      foreach(cell, array->elements)
-      {
-        ArrayShape child = array_shape_proof((const Node *) lfirst(cell));
-
-        if (child.proof == ARRAY_SHAPE_INVALID)
-        {
-          return invalid_array_shape();
-        }
-        if (child.proof == ARRAY_SHAPE_UNKNOWN)
-        {
-          saw_unknown = true;
-          continue;
-        }
-        if (child.is_null || child.nitems == 0 || child.ndims <= 0)
-        {
-          saw_empty = true;
-          continue;
-        }
-        if (!saw_nonempty)
-        {
-          first_nonempty = child;
-          saw_nonempty = true;
-        }
-        else if (child.ndims != first_nonempty.ndims ||
-                 memcmp(child.dims, first_nonempty.dims,
-                        child.ndims * sizeof(int)) != 0 ||
-                 memcmp(child.lbs, first_nonempty.lbs,
-                        child.ndims * sizeof(int)) != 0)
-        {
-          return invalid_array_shape();
-        }
-      }
-
-      if (saw_unknown)
-      {
-        return unknown_array_shape();
-      }
-      if (!saw_nonempty)
-      {
-        return shape;
-      }
-      if (saw_empty || first_nonempty.ndims >= MAXDIM)
-      {
-        return invalid_array_shape();
-      }
-
-      shape.ndims = first_nonempty.ndims + 1;
-      shape.dims[0] = element_count;
-      shape.lbs[0] = 1;
-      memcpy(&shape.dims[1], first_nonempty.dims,
-             first_nonempty.ndims * sizeof(int));
-      memcpy(&shape.lbs[1], first_nonempty.lbs,
-             first_nonempty.ndims * sizeof(int));
-      if (first_nonempty.nitems > 0 &&
-          (Size) element_count > MaxArraySize / (Size) first_nonempty.nitems)
-      {
-        return unknown_array_shape();
-      }
-      shape.nitems = element_count * first_nonempty.nitems;
-      return shape;
-    }
-  }
-  return unknown_array_shape();
-}
-
-static ArrayCardinalityProof
-array_cardinality_proof(const Node *node)
-{
-  ArrayShape shape = array_shape_proof(node);
-
-  if (shape.proof != ARRAY_SHAPE_VALID || shape.is_null)
-  {
-    return ARRAY_CARDINALITY_UNKNOWN;
-  }
-  return shape.nitems == 0
-           ? ARRAY_CARDINALITY_EMPTY
-           : ARRAY_CARDINALITY_NONEMPTY;
-}
-
-typedef struct DmlParameterTargetKey
-{
-  int param_id;
-  Oid target_relid;
-  AttrNumber target_attnum;
-  const char *source;
-  TypeNullAdmission target_null_admission;
-  bool direct_assignment;
-} DmlParameterTargetKey;
-
-typedef struct TypeNullAdmissionEntry
-{
-  Oid type_oid;
-  TypeNullAdmission admission;
-} TypeNullAdmissionEntry;
-
-typedef struct ColumnNullAdmissionKey
-{
-  Oid relid;
-  AttrNumber attnum;
-} ColumnNullAdmissionKey;
-
-typedef struct ColumnNullAdmissionEntry
-{
-  ColumnNullAdmissionKey key;
-  TypeNullAdmission admission;
-} ColumnNullAdmissionEntry;
-
-typedef enum LineageWorkKind
-{
-  LINEAGE_WORK_EXPR,
-  LINEAGE_WORK_QUERY_OUTPUT,
-  LINEAGE_WORK_SET_OPERATION
-} LineageWorkKind;
-
-typedef struct LineageVisitKey
-{
-  LineageWorkKind kind;
-  const Query *query;
-  const Node *node;
-  AttrNumber output_attnum;
-  TypeNullAdmission null_admission;
-  bool value_preserving;
-  bool null_propagating;
-  bool unconditional;
-} LineageVisitKey;
-
-typedef struct LineageWorkItem
-{
-  LineageWorkKind kind;
-  const QueryScope *scope;
-  const Node *node;
-  AttrNumber output_attnum;
-  TypeNullAdmission null_admission;
-  bool value_preserving;
-  bool null_propagating;
-  bool unconditional;
-  struct LineageWorkItem *next;
-} LineageWorkItem;
-
-typedef struct LineageWorkQueue
-{
-  LineageWorkItem *head;
-  LineageWorkItem *tail;
-} LineageWorkQueue;
-
-typedef struct DmlLineageContext
-{
-  StringInfo out;
-  Oid target_relid;
-  AttrNumber target_attnum;
-  const char *source;
-  bool *first;
-  HTAB *facts;
-  HTAB *type_admissions;
-  HTAB *column_admissions;
-  HTAB *visited;
-  const List *target_list;
-  const List *match_full_foreign_keys;
-  bool has_additional_constraints;
-  bool has_opaque_enforcement;
-} DmlLineageContext;
-
-typedef struct RelationWriteEnforcement
-{
-  bool has_generated_columns;
-  bool opaque;
-  List *match_full_foreign_keys;
-} RelationWriteEnforcement;
-
-typedef struct NullProofSubject
-{
-  AttrNumber target_attnum;
-  int param_id;
-  HTAB *node_analysis;
-} NullProofSubject;
-
-typedef struct ParameterNodeKey
-{
-  const Node *node;
-  int param_id;
-} ParameterNodeKey;
-
-typedef struct ParameterNodeAnalysisEntry
-{
-  ParameterNodeKey key;
-  NullEvaluation null_evaluation;
-  bool proof_known;
-  bool mentions_parameter;
-  bool mention_known;
-} ParameterNodeAnalysisEntry;
-
-typedef struct ParameterMentionContext
-{
-  int param_id;
-  HTAB *node_analysis;
-} ParameterMentionContext;
-
-typedef struct ParameterUsageEvidence
-{
-  bool seen;
-  TypeNullAdmission admission;
-} ParameterUsageEvidence;
-
-typedef struct ParameterUsageContext
-{
-  int param_id;
-  ParameterUsageEvidence evidence;
-  HTAB *type_admissions;
-  HTAB *node_analysis;
-} ParameterUsageContext;
-
-static NullEvaluation
-make_null_evaluation(NullProof proof, bool evaluation_safe,
-                     bool depends_on_subject)
-{
-  NullEvaluation evaluation = {proof, evaluation_safe, depends_on_subject};
-
-  return evaluation;
-}
-
-static NullEvaluation
-invert_null_evaluation(NullEvaluation evaluation)
-{
-  if (evaluation.proof == NULL_PROOF_TRUE)
-  {
-    evaluation.proof = NULL_PROOF_FALSE;
-  }
-  else if (evaluation.proof == NULL_PROOF_FALSE)
-  {
-    evaluation.proof = NULL_PROOF_TRUE;
-  }
-  return evaluation;
-}
-
-static NullEvaluation
-check_null_evaluation_for_subject_uncached(const Node *expr,
-                                           const NullProofSubject *subject);
-
-static NullEvaluation
-check_null_evaluation_for_subject(const Node *expr,
-                                  const NullProofSubject *subject)
-{
-  ParameterNodeKey key;
-  ParameterNodeAnalysisEntry *entry;
-  NullEvaluation evaluation;
-  bool found;
-
-  if (expr == NULL || subject->node_analysis == NULL || subject->param_id <= 0)
-  {
-    return check_null_evaluation_for_subject_uncached(expr, subject);
-  }
-
-  memset(&key, 0, sizeof(key));
-  key.node = expr;
-  key.param_id = subject->param_id;
-  entry = hash_search(subject->node_analysis, &key, HASH_FIND, &found);
-  if (found && entry->proof_known)
-  {
-    return entry->null_evaluation;
-  }
-
-  evaluation = check_null_evaluation_for_subject_uncached(expr, subject);
-  entry = hash_search(subject->node_analysis, &key, HASH_ENTER, &found);
-  if (!found)
-  {
-    entry->mention_known = false;
-  }
-  entry->null_evaluation = evaluation;
-  entry->proof_known = true;
-  return evaluation;
-}
-
-static NullEvaluation
-check_null_evaluation_for_subject_uncached(const Node *expr,
-                                           const NullProofSubject *subject)
-{
-  if (expr == NULL)
-  {
-    return make_null_evaluation(NULL_PROOF_UNKNOWN, false, true);
-  }
-
-  switch (nodeTag(expr))
-  {
-    case T_CoerceToDomainValue:
-      return make_null_evaluation(NULL_PROOF_NULL, true, true);
-    case T_Param:
-    {
-      const Param *parameter = (const Param *) expr;
-
-      return make_null_evaluation(
-        subject->param_id > 0 && parameter->paramkind == PARAM_EXTERN &&
-            parameter->paramid == subject->param_id
-          ? NULL_PROOF_NULL
-          : NULL_PROOF_UNKNOWN,
-        true,
-        subject->param_id > 0 && parameter->paramkind == PARAM_EXTERN &&
-          parameter->paramid == subject->param_id);
-    }
-    case T_Var:
-    {
-      const Var *variable = (const Var *) expr;
-
-      if (subject->target_attnum > 0 && variable->varlevelsup == 0 && variable->varno == 1 &&
-          variable->varattno == subject->target_attnum)
-      {
-        return make_null_evaluation(NULL_PROOF_NULL, true, true);
-      }
-      return make_null_evaluation(NULL_PROOF_UNKNOWN, true, false);
-    }
-    case T_Const:
-    {
-      const Const *constant = (const Const *) expr;
-
-      if (constant->constisnull)
-      {
-        return make_null_evaluation(NULL_PROOF_NULL, true, false);
-      }
-      if (constant->consttype == BOOLOID)
-      {
-        return make_null_evaluation(
-          DatumGetBool(constant->constvalue) ? NULL_PROOF_TRUE : NULL_PROOF_FALSE,
-          true, false);
-      }
-      return make_null_evaluation(NULL_PROOF_NONNULL, true, false);
-    }
-    case T_RelabelType:
-      return check_null_evaluation_for_subject(
-        (const Node *) ((const RelabelType *) expr)->arg, subject);
-    case T_CollateExpr:
-      return check_null_evaluation_for_subject(
-        (const Node *) ((const CollateExpr *) expr)->arg, subject);
-    case T_CoerceViaIO:
-    {
-      NullEvaluation argument = check_null_evaluation_for_subject(
-        (const Node *) ((const CoerceViaIO *) expr)->arg, subject);
-
-      return make_null_evaluation(argument.proof,
-                                  argument.evaluation_safe &&
-                                    argument.proof == NULL_PROOF_NULL,
-                                  argument.depends_on_subject);
-    }
-    case T_ArrayCoerceExpr:
-    {
-      NullEvaluation argument = check_null_evaluation_for_subject(
-        (const Node *) ((const ArrayCoerceExpr *) expr)->arg, subject);
-
-      return make_null_evaluation(argument.proof,
-                                  argument.evaluation_safe &&
-                                    argument.proof == NULL_PROOF_NULL,
-                                  argument.depends_on_subject);
-    }
-    case T_ConvertRowtypeExpr:
-    {
-      NullEvaluation argument = check_null_evaluation_for_subject(
-        (const Node *) ((const ConvertRowtypeExpr *) expr)->arg, subject);
-
-      return make_null_evaluation(argument.proof,
-                                  argument.evaluation_safe &&
-                                    argument.proof == NULL_PROOF_NULL,
-                                  argument.depends_on_subject);
-    }
-    case T_NullTest:
-    {
-      const NullTest *test = (const NullTest *) expr;
-      NullEvaluation argument = check_null_evaluation_for_subject(
-        (const Node *) test->arg, subject);
-
-      if (test->argisrow || argument.proof == NULL_PROOF_UNKNOWN)
-      {
-        return make_null_evaluation(NULL_PROOF_UNKNOWN,
-                                    argument.evaluation_safe,
-                                    argument.depends_on_subject);
-      }
-      if (argument.proof == NULL_PROOF_NULL)
-      {
-        return make_null_evaluation(
-          test->nulltesttype == IS_NULL ? NULL_PROOF_TRUE : NULL_PROOF_FALSE,
-          argument.evaluation_safe, argument.depends_on_subject);
-      }
-      return make_null_evaluation(
-        test->nulltesttype == IS_NULL ? NULL_PROOF_FALSE : NULL_PROOF_TRUE,
-        argument.evaluation_safe, argument.depends_on_subject);
-    }
-    case T_BooleanTest:
-    {
-      const BooleanTest *test = (const BooleanTest *) expr;
-      NullEvaluation argument = check_null_evaluation_for_subject(
-        (const Node *) test->arg, subject);
-      NullProof proof;
-
-      if (argument.proof == NULL_PROOF_UNKNOWN ||
-          argument.proof == NULL_PROOF_NONNULL)
-      {
-        return make_null_evaluation(NULL_PROOF_UNKNOWN,
-                                    argument.evaluation_safe,
-                                    argument.depends_on_subject);
-      }
-      switch (test->booltesttype)
-      {
-        case IS_TRUE:
-          proof = argument.proof == NULL_PROOF_TRUE ? NULL_PROOF_TRUE : NULL_PROOF_FALSE;
-          break;
-        case IS_NOT_TRUE:
-          proof = argument.proof == NULL_PROOF_TRUE ? NULL_PROOF_FALSE : NULL_PROOF_TRUE;
-          break;
-        case IS_FALSE:
-          proof = argument.proof == NULL_PROOF_FALSE ? NULL_PROOF_TRUE : NULL_PROOF_FALSE;
-          break;
-        case IS_NOT_FALSE:
-          proof = argument.proof == NULL_PROOF_FALSE ? NULL_PROOF_FALSE : NULL_PROOF_TRUE;
-          break;
-        case IS_UNKNOWN:
-          proof = argument.proof == NULL_PROOF_NULL ? NULL_PROOF_TRUE : NULL_PROOF_FALSE;
-          break;
-        case IS_NOT_UNKNOWN:
-          proof = argument.proof == NULL_PROOF_NULL ? NULL_PROOF_FALSE : NULL_PROOF_TRUE;
-          break;
-        default:
-          proof = NULL_PROOF_UNKNOWN;
-          break;
-      }
-      return make_null_evaluation(proof, argument.evaluation_safe,
-                                  argument.depends_on_subject);
-    }
-    case T_BoolExpr:
-    {
-      const BoolExpr *boolean = (const BoolExpr *) expr;
-      ListCell *cell;
-      bool saw_null = false;
-      bool saw_unknown = false;
-      bool saw_decisive = false;
-      bool evaluation_safe = true;
-      bool depends_on_subject = false;
-
-      if (boolean->boolop == NOT_EXPR && list_length(boolean->args) == 1)
-      {
-        return invert_null_evaluation(check_null_evaluation_for_subject(
-          (const Node *) linitial(boolean->args), subject));
-      }
-
-      foreach(cell, boolean->args)
-      {
-        NullEvaluation argument = check_null_evaluation_for_subject(
-          (const Node *) lfirst(cell), subject);
-
-        evaluation_safe = evaluation_safe && argument.evaluation_safe;
-        depends_on_subject = depends_on_subject ||
-                             argument.depends_on_subject;
-        if ((boolean->boolop == AND_EXPR && argument.proof == NULL_PROOF_FALSE) ||
-            (boolean->boolop == OR_EXPR && argument.proof == NULL_PROOF_TRUE))
-        {
-          saw_decisive = true;
-        }
-        else if (argument.proof == NULL_PROOF_NULL)
-        {
-          saw_null = true;
-        }
-        else if (argument.proof == NULL_PROOF_UNKNOWN ||
-                 argument.proof == NULL_PROOF_NONNULL)
-        {
-          saw_unknown = true;
-        }
-      }
-
-      if (saw_decisive)
-      {
-        return make_null_evaluation(
-          boolean->boolop == AND_EXPR ? NULL_PROOF_FALSE : NULL_PROOF_TRUE,
-          evaluation_safe, depends_on_subject);
-      }
-      if (saw_unknown)
-      {
-        return make_null_evaluation(NULL_PROOF_UNKNOWN, evaluation_safe,
-                                    depends_on_subject);
-      }
-      if (saw_null)
-      {
-        return make_null_evaluation(NULL_PROOF_NULL, evaluation_safe,
-                                    depends_on_subject);
-      }
-      return make_null_evaluation(
-        boolean->boolop == AND_EXPR ? NULL_PROOF_TRUE : NULL_PROOF_FALSE,
-        evaluation_safe, depends_on_subject);
-    }
-    case T_CoalesceExpr:
-    {
-      const CoalesceExpr *coalesce = (const CoalesceExpr *) expr;
-      ListCell *cell;
-      bool saw_unknown = false;
-      bool evaluation_safe = true;
-      bool depends_on_subject = false;
-
-      foreach(cell, coalesce->args)
-      {
-        NullEvaluation argument = check_null_evaluation_for_subject(
-          (const Node *) lfirst(cell), subject);
-
-        evaluation_safe = evaluation_safe && argument.evaluation_safe;
-        depends_on_subject = depends_on_subject ||
-                             argument.depends_on_subject;
-        if (saw_unknown)
-        {
-          continue;
-        }
-        if (argument.proof == NULL_PROOF_NULL)
-        {
-          continue;
-        }
-        if (argument.proof == NULL_PROOF_UNKNOWN)
-        {
-          saw_unknown = true;
-          continue;
-        }
-        return make_null_evaluation(argument.proof, evaluation_safe,
-                                    depends_on_subject);
-      }
-      return make_null_evaluation(
-        saw_unknown ? NULL_PROOF_UNKNOWN : NULL_PROOF_NULL,
-        evaluation_safe, depends_on_subject);
-    }
-    case T_FuncExpr:
-    {
-      const FuncExpr *function = (const FuncExpr *) expr;
-      ListCell *cell;
-      bool all_arguments_safe = true;
-      bool saw_safely_null_argument = false;
-      bool depends_on_subject = false;
-
-      foreach(cell, function->args)
-      {
-        NullEvaluation argument = check_null_evaluation_for_subject(
-          (const Node *) lfirst(cell), subject);
-
-        all_arguments_safe = all_arguments_safe && argument.evaluation_safe;
-        depends_on_subject = depends_on_subject ||
-                             argument.depends_on_subject;
-        saw_safely_null_argument = saw_safely_null_argument ||
-                                   (argument.evaluation_safe &&
-                                    argument.proof == NULL_PROOF_NULL);
-      }
-      if (!func_strict(function->funcid))
-      {
-        return make_null_evaluation(NULL_PROOF_UNKNOWN,
-                                    all_arguments_safe &&
-                                      !depends_on_subject,
-                                    depends_on_subject);
-      }
-      return all_arguments_safe && saw_safely_null_argument
-               ? make_null_evaluation(NULL_PROOF_NULL, true,
-                                      depends_on_subject)
-               : make_null_evaluation(NULL_PROOF_UNKNOWN,
-                                      all_arguments_safe &&
-                                        !depends_on_subject,
-                                      depends_on_subject);
-    }
-    case T_OpExpr:
-    {
-      const OpExpr *operation = (const OpExpr *) expr;
-      ListCell *cell;
-      bool all_arguments_safe = true;
-      bool saw_safely_null_argument = false;
-      bool depends_on_subject = false;
-
-      foreach(cell, operation->args)
-      {
-        NullEvaluation argument = check_null_evaluation_for_subject(
-          (const Node *) lfirst(cell), subject);
-
-        all_arguments_safe = all_arguments_safe && argument.evaluation_safe;
-        depends_on_subject = depends_on_subject ||
-                             argument.depends_on_subject;
-        saw_safely_null_argument = saw_safely_null_argument ||
-                                   (argument.evaluation_safe &&
-                                    argument.proof == NULL_PROOF_NULL);
-      }
-      if (!op_strict(operation->opno))
-      {
-        return make_null_evaluation(NULL_PROOF_UNKNOWN,
-                                    all_arguments_safe &&
-                                      !depends_on_subject,
-                                    depends_on_subject);
-      }
-      return all_arguments_safe && saw_safely_null_argument
-               ? make_null_evaluation(NULL_PROOF_NULL, true,
-                                      depends_on_subject)
-               : make_null_evaluation(NULL_PROOF_UNKNOWN,
-                                      all_arguments_safe &&
-                                        !depends_on_subject,
-                                      depends_on_subject);
-    }
-    case T_ArrayExpr:
-    {
-      const ArrayExpr *array = (const ArrayExpr *) expr;
-      ListCell *cell;
-      bool evaluation_safe = true;
-      bool depends_on_subject = false;
-
-      foreach(cell, array->elements)
-      {
-        NullEvaluation element = check_null_evaluation_for_subject(
-          (const Node *) lfirst(cell), subject);
-
-        evaluation_safe = evaluation_safe && element.evaluation_safe;
-        depends_on_subject = depends_on_subject ||
-                             element.depends_on_subject;
-      }
-      if (array->multidims)
-      {
-        ArrayShape shape = array_shape_proof(expr);
-
-        evaluation_safe = evaluation_safe &&
-                          shape.proof == ARRAY_SHAPE_VALID;
-      }
-      return make_null_evaluation(NULL_PROOF_NONNULL, evaluation_safe,
-                                  depends_on_subject);
-    }
-    case T_ScalarArrayOpExpr:
-    {
-      const ScalarArrayOpExpr *operation = (const ScalarArrayOpExpr *) expr;
-      const Node *scalar;
-      const Node *array;
-      ArrayCardinalityProof cardinality;
-      NullEvaluation scalar_evaluation;
-      NullEvaluation array_evaluation;
-      bool evaluation_safe;
-      bool depends_on_subject;
-
-      if (!op_strict(operation->opno) || list_length(operation->args) != 2)
-      {
-        return make_null_evaluation(NULL_PROOF_UNKNOWN, false, true);
-      }
-      scalar = (const Node *) linitial(operation->args);
-      array = (const Node *) lsecond(operation->args);
-      scalar_evaluation = check_null_evaluation_for_subject(scalar, subject);
-      array_evaluation = check_null_evaluation_for_subject(array, subject);
-      evaluation_safe = scalar_evaluation.evaluation_safe &&
-                        array_evaluation.evaluation_safe;
-      depends_on_subject = scalar_evaluation.depends_on_subject ||
-                           array_evaluation.depends_on_subject;
-      cardinality = array_cardinality_proof(array);
-      if (cardinality == ARRAY_CARDINALITY_EMPTY)
-      {
-        return make_null_evaluation(
-          operation->useOr ? NULL_PROOF_FALSE : NULL_PROOF_TRUE,
-          evaluation_safe, depends_on_subject);
-      }
-      if (cardinality == ARRAY_CARDINALITY_NONEMPTY &&
-          scalar_evaluation.proof == NULL_PROOF_NULL)
-      {
-        return make_null_evaluation(NULL_PROOF_NULL, evaluation_safe,
-                                    depends_on_subject);
-      }
-      return make_null_evaluation(NULL_PROOF_UNKNOWN,
-                                  evaluation_safe && !depends_on_subject,
-                                  depends_on_subject);
-    }
-    default:
-      return make_null_evaluation(NULL_PROOF_UNKNOWN, false, true);
-  }
-}
-
-static NullEvaluation
-check_null_evaluation(const Node *expr, AttrNumber target_attnum)
-{
-  const NullProofSubject subject = {target_attnum, 0, NULL};
-
-  return check_null_evaluation_for_subject(expr, &subject);
-}
-
-static NullEvaluation
-check_parameter_null_evaluation(const Node *expr, int param_id,
-                                HTAB *node_analysis)
-{
-  const NullProofSubject subject = {0, param_id, node_analysis};
-
-  return check_null_evaluation_for_subject(expr, &subject);
-}
-
-static TypeNullAdmission
-null_evaluation_admission(NullEvaluation evaluation)
-{
-  if (evaluation.proof == NULL_PROOF_FALSE)
-  {
-    return TYPE_NULL_REJECTS;
-  }
-  if (evaluation.evaluation_safe &&
-      (evaluation.proof == NULL_PROOF_TRUE ||
-       evaluation.proof == NULL_PROOF_NULL))
-  {
-    return TYPE_NULL_ADMITS;
-  }
-  return TYPE_NULL_UNKNOWN;
-}
-
-static TypeNullAdmission
-type_null_admission(HTAB *cache, Oid type_oid)
-{
-  TypeNullAdmissionEntry lookup_key;
-  TypeNullAdmissionEntry *entry;
-  HeapTuple tuple;
-  Form_pg_type type;
-  bool found;
-  TypeNullAdmission admission = TYPE_NULL_ADMITS;
-
-  memset(&lookup_key, 0, sizeof(lookup_key));
-  lookup_key.type_oid = type_oid;
-  entry = cache == NULL
-            ? NULL
-            : hash_search(cache, &lookup_key, HASH_FIND, &found);
-  if (entry != NULL && found)
-  {
-    return entry->admission;
-  }
-
-  tuple = SearchSysCache1(TYPEOID, ObjectIdGetDatum(type_oid));
-  if (!HeapTupleIsValid(tuple))
-  {
-    elog(ERROR, "cache lookup failed for type %u", type_oid);
-  }
-  type = (Form_pg_type) GETSTRUCT(tuple);
-
-  if (type->typtype == TYPTYPE_DOMAIN)
-  {
-    DomainConstraintRef *constraints;
-    ListCell *cell;
-
-    constraints = palloc(sizeof(DomainConstraintRef));
-    InitDomainConstraintRef(type_oid, constraints, CurrentMemoryContext, false);
-    foreach(cell, constraints->constraints)
-    {
-      const DomainConstraintState *constraint = lfirst_node(DomainConstraintState, cell);
-
-      if (constraint->constrainttype == DOM_CONSTRAINT_NOTNULL)
-      {
-        admission = TYPE_NULL_REJECTS;
-        break;
-      }
-      if (constraint->constrainttype == DOM_CONSTRAINT_CHECK)
-      {
-        TypeNullAdmission check_admission = null_evaluation_admission(
-          check_null_evaluation((const Node *) constraint->check_expr, 0));
-
-        if (check_admission == TYPE_NULL_REJECTS)
-        {
-          admission = TYPE_NULL_REJECTS;
-          break;
-        }
-        if (check_admission == TYPE_NULL_UNKNOWN)
-        {
-          admission = TYPE_NULL_UNKNOWN;
-        }
-      }
-    }
-  }
-
-  ReleaseSysCache(tuple);
-  if (cache != NULL)
-  {
-    entry = hash_search(cache, &lookup_key, HASH_ENTER, &found);
-    entry->admission = admission;
-  }
-  return admission;
-}
-
-typedef struct ColumnMentionsContext
-{
-  Bitmapset *attnums;
-  bool whole_row;
-} ColumnMentionsContext;
-
-static bool
-collect_column_mentions_walker(Node *node, void *walker_context)
-{
-  ColumnMentionsContext *context = (ColumnMentionsContext *) walker_context;
-
-  if (node == NULL)
-  {
-    return false;
-  }
-  if (IsA(node, Var))
-  {
-    const Var *variable = (const Var *) node;
-
-    if (variable->varlevelsup == 0 && variable->varno == 1)
-    {
-      if (variable->varattno > 0)
-      {
-        context->attnums = bms_add_member(context->attnums, variable->varattno);
-      }
-      else if (variable->varattno == InvalidAttrNumber)
-      {
-        context->whole_row = true;
-      }
-    }
-  }
-  return expression_tree_walker(node, collect_column_mentions_walker, walker_context);
-}
-
-static void
-update_column_null_admission(HTAB *cache, Oid relid, AttrNumber attnum,
-                             NullEvaluation evaluation)
-{
-  ColumnNullAdmissionKey key;
-  ColumnNullAdmissionEntry *entry;
-  bool found;
-
-  memset(&key, 0, sizeof(key));
-  key.relid = relid;
-  key.attnum = attnum;
-  entry = hash_search(cache, &key, HASH_FIND, &found);
-  if (!found || entry->admission == TYPE_NULL_REJECTS)
-  {
-    return;
-  }
-  if (null_evaluation_admission(evaluation) == TYPE_NULL_REJECTS)
-  {
-    entry->admission = TYPE_NULL_REJECTS;
-  }
-  else if (null_evaluation_admission(evaluation) == TYPE_NULL_UNKNOWN)
-  {
-    entry->admission = TYPE_NULL_UNKNOWN;
-  }
-}
-
-static TypeNullAdmission
-combine_null_admission(TypeNullAdmission left, TypeNullAdmission right)
-{
-  if (left == TYPE_NULL_REJECTS || right == TYPE_NULL_REJECTS)
-  {
-    return TYPE_NULL_REJECTS;
-  }
-  if (left == TYPE_NULL_UNKNOWN || right == TYPE_NULL_UNKNOWN)
-  {
-    return TYPE_NULL_UNKNOWN;
-  }
-  return TYPE_NULL_ADMITS;
-}
-
-static bool
-node_mentions_external_parameter(const Node *node,
-                                 ParameterMentionContext *context);
-
-static bool
-node_mentions_external_parameter_walker(Node *node, void *walker_context)
-{
-  ParameterMentionContext *context = (ParameterMentionContext *) walker_context;
-
-  return node_mentions_external_parameter(node, context);
-}
-
-static bool
-node_mentions_external_parameter(const Node *node,
-                                 ParameterMentionContext *context)
-{
-  ParameterNodeKey key;
-  ParameterNodeAnalysisEntry *entry;
-  bool found;
-  bool mentions_parameter;
-
-  if (node == NULL)
-  {
-    return false;
-  }
-
-  memset(&key, 0, sizeof(key));
-  key.node = node;
-  key.param_id = context->param_id;
-  entry = hash_search(context->node_analysis, &key, HASH_FIND, &found);
-  if (found && entry->mention_known)
-  {
-    return entry->mentions_parameter;
-  }
-
-  if (IsA(node, Param))
-  {
-    const Param *param = (const Param *) node;
-
-    mentions_parameter = param->paramkind == PARAM_EXTERN &&
-                         param->paramid == context->param_id;
-  }
-  else if (IsA(node, Query))
-  {
-    mentions_parameter = query_tree_walker(
-      (Query *) node, node_mentions_external_parameter_walker, context,
-      QTW_EXAMINE_SORTGROUP);
-  }
-  else
-  {
-    mentions_parameter = expression_tree_walker(
-      (Node *) node, node_mentions_external_parameter_walker, context);
-  }
-
-  entry = hash_search(context->node_analysis, &key, HASH_ENTER, &found);
-  if (!found)
-  {
-    entry->proof_known = false;
-  }
-  entry->mentions_parameter = mentions_parameter;
-  entry->mention_known = true;
-  return mentions_parameter;
-}
-
-static void
-mark_parameter_usage(ParameterUsageContext *context,
-                     TypeNullAdmission admission)
-{
-  if (!context->evidence.seen)
-  {
-    context->evidence.seen = true;
-    context->evidence.admission = admission;
-    return;
-  }
-  context->evidence.admission = combine_null_admission(
-    context->evidence.admission, admission);
-}
-
-static void
-merge_parameter_usage_evidence(ParameterUsageEvidence *target,
-                               const ParameterUsageEvidence *source)
-{
-  if (!source->seen)
-  {
-    return;
-  }
-  if (!target->seen)
-  {
-    *target = *source;
-    return;
-  }
-  target->admission = combine_null_admission(target->admission,
-                                             source->admission);
-}
-
-static void
-mark_required_nonnull_parameter_usage(ParameterUsageContext *context,
-                                      const Node *expr)
-{
-  ParameterMentionContext mention_context = {
-    context->param_id,
-    context->node_analysis
-  };
-  NullEvaluation evaluation;
-
-  if (!node_mentions_external_parameter(expr, &mention_context))
-  {
-    return;
-  }
-
-  evaluation = check_parameter_null_evaluation(expr, context->param_id,
-                                               context->node_analysis);
-  if (evaluation.proof == NULL_PROOF_NULL && evaluation.evaluation_safe)
-  {
-    mark_parameter_usage(context, TYPE_NULL_REJECTS);
-  }
-  else if (evaluation.proof == NULL_PROOF_UNKNOWN ||
-           !evaluation.evaluation_safe)
-  {
-    mark_parameter_usage(context, TYPE_NULL_UNKNOWN);
-  }
-}
-
-static bool
-parameter_usage_null_admission_walker(Node *node, void *walker_context)
-{
-  ParameterUsageContext *context = (ParameterUsageContext *) walker_context;
-  ParameterMentionContext mention_context = {
-    context->param_id,
-    context->node_analysis
-  };
-  bool mentions_parameter;
-
-  if (node == NULL)
-  {
-    return false;
-  }
-  if (context->evidence.seen &&
-      context->evidence.admission == TYPE_NULL_REJECTS)
-  {
-    return true;
-  }
-  if (IsA(node, Query))
-  {
-    return false;
-  }
-
-  mentions_parameter = node_mentions_external_parameter(node,
-                                                         &mention_context);
-  if (!mentions_parameter)
-  {
-    return false;
-  }
-
-  switch (nodeTag(node))
-  {
-    case T_Param:
-      mark_parameter_usage(context, TYPE_NULL_ADMITS);
-      break;
-    case T_CoerceToDomain:
-    {
-      const CoerceToDomain *coerce = (const CoerceToDomain *) node;
-      NullEvaluation argument = check_parameter_null_evaluation(
-        (const Node *) coerce->arg, context->param_id,
-        context->node_analysis);
-
-      mark_parameter_usage(
-        context,
-        argument.evaluation_safe && argument.proof == NULL_PROOF_NULL
-          ? type_null_admission(context->type_admissions,
-                                coerce->resulttype)
-          : TYPE_NULL_UNKNOWN);
-      break;
-    }
-    case T_FuncExpr:
-    {
-      const FuncExpr *function = (const FuncExpr *) node;
-      NullEvaluation evaluation = check_parameter_null_evaluation(
-        node, context->param_id, context->node_analysis);
-
-      if (!func_strict(function->funcid) ||
-          evaluation.proof != NULL_PROOF_NULL ||
-          !evaluation.evaluation_safe)
-      {
-        mark_parameter_usage(context, TYPE_NULL_UNKNOWN);
-      }
-      break;
-    }
-    case T_OpExpr:
-    {
-      const OpExpr *operation = (const OpExpr *) node;
-      NullEvaluation evaluation = check_parameter_null_evaluation(
-        node, context->param_id, context->node_analysis);
-
-      if (!op_strict(operation->opno) ||
-          evaluation.proof != NULL_PROOF_NULL ||
-          !evaluation.evaluation_safe)
-      {
-        mark_parameter_usage(context, TYPE_NULL_UNKNOWN);
-      }
-      break;
-    }
-    case T_ScalarArrayOpExpr:
-    {
-      const ScalarArrayOpExpr *operation = (const ScalarArrayOpExpr *) node;
-      NullEvaluation evaluation = check_parameter_null_evaluation(
-        node, context->param_id, context->node_analysis);
-
-      if (!op_strict(operation->opno) ||
-          !evaluation.evaluation_safe ||
-          (evaluation.proof != NULL_PROOF_NULL &&
-           evaluation.proof != NULL_PROOF_TRUE &&
-           evaluation.proof != NULL_PROOF_FALSE))
-      {
-        mark_parameter_usage(context, TYPE_NULL_UNKNOWN);
-      }
-      break;
-    }
-    case T_CoerceViaIO:
-    {
-      const CoerceViaIO *coerce = (const CoerceViaIO *) node;
-      NullEvaluation argument = check_parameter_null_evaluation(
-        (const Node *) coerce->arg, context->param_id,
-        context->node_analysis);
-
-      if (argument.proof != NULL_PROOF_NULL ||
-          !argument.evaluation_safe)
-      {
-        mark_parameter_usage(context, TYPE_NULL_UNKNOWN);
-      }
-      break;
-    }
-    case T_ArrayCoerceExpr:
-    {
-      const ArrayCoerceExpr *coerce = (const ArrayCoerceExpr *) node;
-      NullEvaluation argument = check_parameter_null_evaluation(
-        (const Node *) coerce->arg, context->param_id,
-        context->node_analysis);
-
-      if (argument.proof != NULL_PROOF_NULL ||
-          !argument.evaluation_safe)
-      {
-        mark_parameter_usage(context, TYPE_NULL_UNKNOWN);
-      }
-      break;
-    }
-    case T_ConvertRowtypeExpr:
-    {
-      const ConvertRowtypeExpr *coerce = (const ConvertRowtypeExpr *) node;
-      NullEvaluation argument = check_parameter_null_evaluation(
-        (const Node *) coerce->arg, context->param_id,
-        context->node_analysis);
-
-      if (argument.proof != NULL_PROOF_NULL ||
-          !argument.evaluation_safe)
-      {
-        mark_parameter_usage(context, TYPE_NULL_UNKNOWN);
-      }
-      break;
-    }
-    case T_DistinctExpr:
-    {
-      const DistinctExpr *distinct = (const DistinctExpr *) node;
-      ListCell *cell;
-      bool null_short_circuit = false;
-      bool arguments_safe = true;
-
-      foreach(cell, distinct->args)
-      {
-        const Node *argument = (const Node *) lfirst(cell);
-        NullEvaluation evaluation = check_parameter_null_evaluation(
-          argument, context->param_id, context->node_analysis);
-
-        arguments_safe = arguments_safe && evaluation.evaluation_safe;
-        if (node_mentions_external_parameter(argument, &mention_context) &&
-            evaluation.proof == NULL_PROOF_NULL &&
-            evaluation.evaluation_safe)
-        {
-          null_short_circuit = true;
-        }
-      }
-      if (!null_short_circuit || !arguments_safe)
-      {
-        mark_parameter_usage(context, TYPE_NULL_UNKNOWN);
-      }
-      break;
-    }
-    case T_WindowClause:
-    {
-      const WindowClause *window = (const WindowClause *) node;
-
-      mark_required_nonnull_parameter_usage(context, window->startOffset);
-      mark_required_nonnull_parameter_usage(context, window->endOffset);
-      break;
-    }
-    case T_TableSampleClause:
-    {
-      const TableSampleClause *sample = (const TableSampleClause *) node;
-      ListCell *cell;
-
-      foreach(cell, sample->args)
-      {
-        mark_required_nonnull_parameter_usage(
-          context, (const Node *) lfirst(cell));
-      }
-      mark_required_nonnull_parameter_usage(
-        context, (const Node *) sample->repeatable);
-      break;
-    }
-    case T_BoolExpr:
-    {
-      NullEvaluation evaluation = check_parameter_null_evaluation(
-        node, context->param_id, context->node_analysis);
-
-      if (!evaluation.evaluation_safe)
-      {
-        mark_parameter_usage(context, TYPE_NULL_UNKNOWN);
-      }
-      break;
-    }
-    case T_Query:
-    case T_List:
-    case T_TargetEntry:
-    case T_NamedArgExpr:
-    case T_SubLink:
-    case T_FieldSelect:
-    case T_RelabelType:
-    case T_CollateExpr:
-    case T_CaseExpr:
-    case T_ArrayExpr:
-    case T_RowExpr:
-    case T_CoalesceExpr:
-    case T_NullTest:
-    case T_BooleanTest:
-    case T_CommonTableExpr:
-    case T_FromExpr:
-    case T_OnConflictExpr:
-    case T_MergeAction:
-    case T_JoinExpr:
-    case T_SetOperationStmt:
-    case T_PlaceHolderVar:
-    case T_InferenceElem:
-    case T_ReturningExpr:
-    case T_RangeTblFunction:
-      break;
-    default:
-      /* Unmodeled parameter-bearing semantics cannot prove acceptance. */
-      mark_parameter_usage(context, TYPE_NULL_UNKNOWN);
-      break;
-  }
-
-  if (context->evidence.seen &&
-      context->evidence.admission == TYPE_NULL_REJECTS)
-  {
-    return true;
-  }
-  return expression_tree_walker(node,
-                                parameter_usage_null_admission_walker,
-                                walker_context);
-}
-
-static bool
-parameter_usage_null_admission_query(const QueryScope *scope,
-                                     void *walker_context)
-{
-  ParameterUsageContext *context =
-    (ParameterUsageContext *) walker_context;
-
-  /* PostgreSQL's query_tree_walker deliberately does not visit utilityStmt. */
-  if (scope->query->utilityStmt != NULL)
-  {
-    mark_parameter_usage(context, TYPE_NULL_UNKNOWN);
-  }
-  return query_tree_walker(
-    (Query *) scope->query, parameter_usage_null_admission_walker,
-    walker_context, QTW_EXAMINE_SORTGROUP | QTW_IGNORE_CTE_SUBQUERIES);
-}
-
-static void
-update_parameter_usage_null_admissions(const Query *query,
-                                       ParameterUsageEvidence *evidence,
-                                       int param_count,
-                                       HTAB *type_admissions)
-{
-  HASHCTL control;
-  HTAB *node_analysis;
-  int index;
-
-  memset(&control, 0, sizeof(control));
-  control.keysize = sizeof(ParameterNodeKey);
-  control.entrysize = sizeof(ParameterNodeAnalysisEntry);
-  node_analysis = hash_create("typed SQL parameter node analysis", 128,
-                              &control, HASH_ELEM | HASH_BLOBS);
-
-  for (index = 0; index < param_count; index++)
-  {
-    ParameterUsageContext context = {
-      index + 1,
-      {false, TYPE_NULL_UNKNOWN},
-      type_admissions,
-      node_analysis
-    };
-
-    execution_reachable_query_walker(
-      query, parameter_usage_null_admission_query, &context);
-    merge_parameter_usage_evidence(&evidence[index], &context.evidence);
-  }
-
-  hash_destroy(node_analysis);
-}
-
-static void
-populate_column_null_admissions(HTAB *cache, Oid relid)
-{
-  Relation relation;
-  TupleDesc descriptor;
-  TupleConstr *constraints;
-  int index;
-
-  relation = table_open(relid, AccessShareLock);
-  descriptor = RelationGetDescr(relation);
-  constraints = descriptor->constr;
-  for (index = 0; index < descriptor->natts; index++)
-  {
-    Form_pg_attribute attribute = TupleDescAttr(descriptor, index);
-    ColumnNullAdmissionKey key;
-    ColumnNullAdmissionEntry *entry;
-    bool found;
-
-    if (attribute->attisdropped)
-    {
-      continue;
-    }
-    memset(&key, 0, sizeof(key));
-    key.relid = relid;
-    key.attnum = attribute->attnum;
-    entry = hash_search(cache, &key, HASH_ENTER, &found);
-    entry->admission = TYPE_NULL_ADMITS;
-  }
-  if (constraints != NULL)
-  {
-    for (index = 0; index < constraints->num_check; index++)
-    {
-      const ConstrCheck *constraint = &constraints->check[index];
-      Node *check;
-      ColumnMentionsContext mentions = {NULL, false};
-      int attnum = -1;
-
-      if (!constraint->ccenforced)
-      {
-        continue;
-      }
-      check = stringToNode(constraint->ccbin);
-      collect_column_mentions_walker(check, &mentions);
-      if (mentions.whole_row)
-      {
-        for (attnum = 1; attnum <= descriptor->natts; attnum++)
-        {
-          update_column_null_admission(cache, relid, attnum,
-                                       check_null_evaluation(check, attnum));
-        }
-      }
-      else
-      {
-        while ((attnum = bms_next_member(mentions.attnums, attnum)) >= 0)
-        {
-          update_column_null_admission(cache, relid, (AttrNumber) attnum,
-                                       check_null_evaluation(check, (AttrNumber) attnum));
-        }
-      }
-      bms_free(mentions.attnums);
-    }
-  }
-  table_close(relation, AccessShareLock);
-}
-
-static TypeNullAdmission
-column_check_null_admission(HTAB *cache, Oid relid, AttrNumber target_attnum)
-{
-  ColumnNullAdmissionKey key;
-  ColumnNullAdmissionEntry *entry;
-  bool found;
-
-  memset(&key, 0, sizeof(key));
-  key.relid = relid;
-  key.attnum = target_attnum;
-  entry = hash_search(cache, &key, HASH_FIND, &found);
-  if (!found)
-  {
-    populate_column_null_admissions(cache, relid);
-    entry = hash_search(cache, &key, HASH_FIND, &found);
-  }
-  return found ? entry->admission : TYPE_NULL_UNKNOWN;
-}
-
-static const char *
-null_admission_name(TypeNullAdmission admission)
-{
-  switch (admission)
-  {
-    case TYPE_NULL_ADMITS:
-      return "accepts";
-    case TYPE_NULL_REJECTS:
-      return "rejects";
-    case TYPE_NULL_UNKNOWN:
-      return "unknown";
-  }
-  return "unknown";
-}
-
-static const TargetEntry *
-target_entry_by_resno(const List *target_list, AttrNumber resno)
-{
-  ListCell *cell;
-
-  foreach(cell, target_list)
-  {
-    const TargetEntry *target = lfirst_node(TargetEntry, cell);
-
-    if (!target->resjunk && target->resno == resno)
-    {
-      return target;
-    }
-  }
-
-  return NULL;
-}
-
-static TypeNullAdmission
-match_full_null_admission(const List *foreign_keys, const List *target_list,
-                          int param_id, AttrNumber target_attnum)
-{
-  TypeNullAdmission admission = TYPE_NULL_ADMITS;
-  ListCell *foreign_key_cell;
-
-  foreach(foreign_key_cell, foreign_keys)
-  {
-    const ForeignKeyCacheInfo *foreign_key =
-      lfirst_node(ForeignKeyCacheInfo, foreign_key_cell);
-    bool applies_to_target = false;
-    bool saw_null = false;
-    bool saw_nonnull = false;
-    bool saw_unknown = false;
-    int key_index;
-
-    for (key_index = 0; key_index < foreign_key->nkeys; key_index++)
-    {
-      if (foreign_key->conkey[key_index] == target_attnum)
-      {
-        applies_to_target = true;
-        break;
-      }
-    }
-    if (!applies_to_target)
-    {
-      continue;
-    }
-
-    for (key_index = 0; key_index < foreign_key->nkeys; key_index++)
-    {
-      AttrNumber key_attnum = foreign_key->conkey[key_index];
-      const TargetEntry *target = target_entry_by_resno(target_list, key_attnum);
-      NullEvaluation evaluation = key_attnum == target_attnum
-                                    ? make_null_evaluation(NULL_PROOF_NULL, true, true)
-                                    : target == NULL
-                                        ? make_null_evaluation(NULL_PROOF_UNKNOWN, false, true)
-                                        : check_parameter_null_evaluation(
-                                            (const Node *) target->expr,
-                                            param_id, NULL);
-
-      if (!evaluation.evaluation_safe)
-      {
-        saw_unknown = true;
-      }
-      else if (evaluation.proof == NULL_PROOF_NULL)
-      {
-        saw_null = true;
-      }
-      else if (evaluation.proof == NULL_PROOF_UNKNOWN)
-      {
-        saw_unknown = true;
-      }
-      else
-      {
-        saw_nonnull = true;
-      }
-    }
-
-    if (saw_null && saw_nonnull)
-    {
-      admission = combine_null_admission(admission, TYPE_NULL_REJECTS);
-    }
-    else if (saw_unknown)
-    {
-      admission = combine_null_admission(admission, TYPE_NULL_UNKNOWN);
-    }
-  }
-
-  return admission;
-}
-
-static const CommonTableExpr *
-cte_by_name(const Query *query, const char *name)
-{
-  ListCell *cell;
-
-  if (name == NULL)
-  {
-    return NULL;
-  }
-
-  foreach(cell, query->cteList)
-  {
-    const CommonTableExpr *cte = lfirst_node(CommonTableExpr, cell);
-
-    if (strcmp(cte->ctename, name) == 0 && cte->ctequery != NULL && IsA(cte->ctequery, Query))
-    {
-      return cte;
-    }
-  }
-
-  return NULL;
-}
-
-static const Node *
-unwrap_direct_assignment_expr(DmlLineageContext *context, const Node *expr,
-                              TypeNullAdmission *null_admission,
-                              bool *direct_assignment)
-{
-  const Node *current = expr;
-
-  while (current != NULL)
-  {
-    switch (nodeTag(current))
-    {
-      case T_RelabelType:
-        current = (const Node *) ((const RelabelType *) current)->arg;
-        break;
-      case T_CoerceViaIO:
-        *direct_assignment = false;
-        current = (const Node *) ((const CoerceViaIO *) current)->arg;
-        break;
-      case T_CollateExpr:
-        current = (const Node *) ((const CollateExpr *) current)->arg;
-        break;
-      case T_ArrayCoerceExpr:
-        *direct_assignment = false;
-        current = (const Node *) ((const ArrayCoerceExpr *) current)->arg;
-        break;
-      case T_ConvertRowtypeExpr:
-        *direct_assignment = false;
-        current = (const Node *) ((const ConvertRowtypeExpr *) current)->arg;
-        break;
-      case T_CoerceToDomain:
-      {
-        const CoerceToDomain *coerce = (const CoerceToDomain *) current;
-
-        *null_admission = combine_null_admission(
-          *null_admission,
-          type_null_admission(context->type_admissions, coerce->resulttype));
-        current = (const Node *) coerce->arg;
-        break;
-      }
-      case T_FuncExpr:
-      {
-        const FuncExpr *function = (const FuncExpr *) current;
-
-        if (function->funcretset ||
-            (function->funcformat != COERCE_EXPLICIT_CAST &&
-             function->funcformat != COERCE_IMPLICIT_CAST) ||
-            list_length(function->args) != 1 || !func_strict(function->funcid))
-        {
-          return current;
-        }
-        *direct_assignment = false;
-        current = (const Node *) linitial(function->args);
-        break;
-      }
-      default:
-        return current;
-    }
-  }
-
-  return NULL;
-}
-
-static void
-append_dml_parameter_target(DmlLineageContext *context, int param_id,
-                            TypeNullAdmission path_admission,
-                            bool value_preserving, bool null_propagating,
-                            bool unconditional)
-{
-  HeapTuple tuple;
-  Form_pg_attribute attribute;
-  DmlParameterTargetKey lookup_key;
-  Oid type_oid;
-  char *type_name;
-  TypeNullAdmission target_admission;
-  bool direct_assignment;
-  bool found;
-
-  if (!OidIsValid(context->target_relid) || context->target_attnum <= 0 || param_id <= 0)
-  {
-    return;
-  }
-
-  tuple = SearchSysCache2(ATTNUM, ObjectIdGetDatum(context->target_relid),
-                          Int16GetDatum(context->target_attnum));
-  if (!HeapTupleIsValid(tuple))
-  {
-    return;
-  }
-
-  attribute = (Form_pg_attribute) GETSTRUCT(tuple);
-  if (attribute->attisdropped)
-  {
-    ReleaseSysCache(tuple);
-    return;
-  }
-
-  type_oid = attribute->atttypid;
-  target_admission = null_propagating ? path_admission : TYPE_NULL_UNKNOWN;
-  if (null_propagating && attribute->attnotnull)
-  {
-    target_admission = TYPE_NULL_REJECTS;
-  }
-  if (null_propagating)
-  {
-    target_admission = combine_null_admission(
-      target_admission, type_null_admission(context->type_admissions, type_oid));
-    target_admission = combine_null_admission(
-      target_admission,
-      column_check_null_admission(context->column_admissions,
-                                  context->target_relid, context->target_attnum));
-    target_admission = combine_null_admission(
-      target_admission,
-      match_full_null_admission(context->match_full_foreign_keys,
-                                context->target_list, param_id,
-                                context->target_attnum));
-    if (context->has_additional_constraints)
-    {
-      target_admission = combine_null_admission(target_admission,
-                                                TYPE_NULL_UNKNOWN);
-    }
-  }
-  if (context->has_opaque_enforcement)
-  {
-    target_admission = TYPE_NULL_UNKNOWN;
-  }
-  if (!unconditional && target_admission == TYPE_NULL_REJECTS)
-  {
-    target_admission = TYPE_NULL_UNKNOWN;
-  }
-  direct_assignment = value_preserving && unconditional &&
-                      !context->has_opaque_enforcement;
-
-  memset(&lookup_key, 0, sizeof(lookup_key));
-  lookup_key.param_id = param_id;
-  lookup_key.target_relid = context->target_relid;
-  lookup_key.target_attnum = context->target_attnum;
-  lookup_key.source = context->source;
-  lookup_key.target_null_admission = target_admission;
-  lookup_key.direct_assignment = direct_assignment;
-  hash_search(context->facts, &lookup_key, HASH_ENTER, &found);
-  if (found)
-  {
-    ReleaseSysCache(tuple);
-    return;
-  }
-
-  type_name = OidIsValid(type_oid)
-                ? format_type_extended(type_oid, attribute->atttypmod, FORMAT_TYPE_TYPEMOD_GIVEN)
-                : NULL;
-
-  if (!*context->first)
-  {
-    appendStringInfoChar(context->out, ',');
-  }
-  *context->first = false;
-
-  appendStringInfo(context->out,
-                   "{\"paramId\":%d,\"targetRelid\":%u,\"targetAttnum\":%d,\"targetAttname\":",
-                   param_id, context->target_relid, context->target_attnum);
-  append_json_string(context->out, NameStr(attribute->attname));
-  append_bool_field(context->out, "directAssignment", direct_assignment);
-  append_bool_field(context->out, "targetNullable", target_admission == TYPE_NULL_ADMITS);
-  appendStringInfoString(context->out, ",\"targetNullAdmission\":");
-  append_json_string(context->out, null_admission_name(target_admission));
-  append_oid_field(context->out, "targetTypeOid", type_oid);
-  append_optional_name_field(context->out, "targetTypeName", type_name);
-  appendStringInfoString(context->out, ",\"source\":");
-  append_json_string(context->out, context->source);
-  appendStringInfoChar(context->out, '}');
-
-  ReleaseSysCache(tuple);
-}
-
-static const QueryScope *
-query_scope_at_level(const QueryScope *scope, Index levels_up)
-{
-  const QueryScope *current = scope;
-
-  while (current != NULL && levels_up > 0)
-  {
-    current = current->parent;
-    levels_up--;
-  }
-
-  return current;
-}
-
-typedef struct ExecutionReachableQueryKey
-{
-  const Query *query;
-} ExecutionReachableQueryKey;
-
-typedef struct ExecutionReachableQueryContext
-{
-  const QueryScope *scope;
-  ExecutionReachableQueryVisitor visitor;
-  void *visitor_context;
-  HTAB *visited;
-} ExecutionReachableQueryContext;
-
-static bool execution_reachable_query_walker_internal(
-  const Query *query, const QueryScope *parent_scope,
-  ExecutionReachableQueryVisitor visitor, void *visitor_context,
-  HTAB *visited);
-
-static bool
-query_is_data_modifying(const Query *query)
-{
-  return query->commandType == CMD_INSERT ||
-         query->commandType == CMD_UPDATE ||
-         query->commandType == CMD_DELETE ||
-         query->commandType == CMD_MERGE;
-}
-
-static bool
-execution_reachable_query_discovery_walker(Node *node,
-                                           void *walker_context)
-{
-  ExecutionReachableQueryContext *context =
-    (ExecutionReachableQueryContext *) walker_context;
-
-  if (node == NULL)
-  {
-    return false;
-  }
-  if (IsA(node, Query))
-  {
-    return execution_reachable_query_walker_internal(
-      (const Query *) node, context->scope, context->visitor,
-      context->visitor_context, context->visited);
-  }
-  if (IsA(node, RangeTblEntry))
-  {
-    const RangeTblEntry *rte = (const RangeTblEntry *) node;
-
-    if (rte->rtekind == RTE_CTE)
-    {
-      const QueryScope *owner_scope = query_scope_at_level(
-        context->scope, rte->ctelevelsup);
-      const CommonTableExpr *cte = owner_scope == NULL
-                                     ? NULL
-                                     : cte_by_name(owner_scope->query,
-                                                   rte->ctename);
-
-      if (cte != NULL && cte->ctequery != NULL &&
-          IsA(cte->ctequery, Query) &&
-          execution_reachable_query_walker_internal(
-            (const Query *) cte->ctequery, owner_scope, context->visitor,
-            context->visitor_context, context->visited))
-      {
-        return true;
-      }
-    }
-    return false;
-  }
-  return expression_tree_walker(
-    node, execution_reachable_query_discovery_walker, walker_context);
-}
-
-static bool
-execution_reachable_query_walker_internal(
-  const Query *query, const QueryScope *parent_scope,
-  ExecutionReachableQueryVisitor visitor, void *visitor_context,
-  HTAB *visited)
-{
-  ExecutionReachableQueryKey key;
-  QueryScope scope = {query, parent_scope};
-  ExecutionReachableQueryContext context = {
-    &scope,
-    visitor,
-    visitor_context,
-    visited
-  };
-  ListCell *cell;
-  bool found;
-
-  memset(&key, 0, sizeof(key));
-  key.query = query;
-  hash_search(visited, &key, HASH_ENTER, &found);
-  if (found)
-  {
-    return false;
-  }
-  if (visitor(&scope, visitor_context))
-  {
-    return true;
-  }
-
-  /*
-   * PostgreSQL executes data-modifying CTEs to completion when their owning
-   * query executes, even if no RTE_CTE references their result.
-   */
-  foreach(cell, query->cteList)
-  {
-    const CommonTableExpr *cte = lfirst_node(CommonTableExpr, cell);
-
-    if (cte->ctequery != NULL && IsA(cte->ctequery, Query) &&
-        query_is_data_modifying((const Query *) cte->ctequery) &&
-        execution_reachable_query_walker_internal(
-          (const Query *) cte->ctequery, &scope, visitor, visitor_context,
-          visited))
-    {
-      return true;
-    }
-  }
-
-  /*
-   * Ordinary CTE bodies are reached only through RTE_CTE references.  RTE
-   * subqueries and SubLinks remain ordinary reachable child queries.
-   */
-  return query_tree_walker(
-    (Query *) query, execution_reachable_query_discovery_walker, &context,
-    QTW_IGNORE_CTE_SUBQUERIES | QTW_EXAMINE_RTES_BEFORE);
-}
-
-static bool
-execution_reachable_query_walker(
-  const Query *query, ExecutionReachableQueryVisitor visitor, void *context)
-{
-  HASHCTL control;
-  HTAB *visited;
-  bool result;
-
-  memset(&control, 0, sizeof(control));
-  control.keysize = sizeof(ExecutionReachableQueryKey);
-  control.entrysize = sizeof(ExecutionReachableQueryKey);
-  visited = hash_create("typed SQL reachable query visits", 32,
-                        &control, HASH_ELEM | HASH_BLOBS);
-  result = execution_reachable_query_walker_internal(
-    query, NULL, visitor, context, visited);
-  hash_destroy(visited);
-  return result;
-}
-
-static void
-enqueue_lineage_work(DmlLineageContext *context, LineageWorkQueue *work,
-                     LineageWorkKind kind, const QueryScope *scope,
-                     const Node *node, AttrNumber output_attnum,
-                     TypeNullAdmission null_admission,
-                     bool value_preserving, bool null_propagating,
-                     bool unconditional)
-{
-  LineageVisitKey key;
-  LineageWorkItem *item;
-  bool found;
-
-  if (scope == NULL || node == NULL)
-  {
-    return;
-  }
-
-  memset(&key, 0, sizeof(key));
-  key.kind = kind;
-  key.query = scope->query;
-  key.node = node;
-  key.output_attnum = output_attnum;
-  key.null_admission = null_admission;
-  key.value_preserving = value_preserving;
-  key.null_propagating = null_propagating;
-  key.unconditional = unconditional;
-  hash_search(context->visited, &key, HASH_ENTER, &found);
-  if (found)
-  {
-    return;
-  }
-
-  item = palloc(sizeof(LineageWorkItem));
-  item->kind = kind;
-  item->scope = scope;
-  item->node = node;
-  item->output_attnum = output_attnum;
-  item->null_admission = null_admission;
-  item->value_preserving = value_preserving;
-  item->null_propagating = null_propagating;
-  item->unconditional = unconditional;
-  item->next = NULL;
-  if (work->tail == NULL)
-  {
-    work->head = item;
-  }
-  else
-  {
-    work->tail->next = item;
-  }
-  work->tail = item;
-}
-
-static QueryScope *
-make_query_scope(const Query *query, const QueryScope *parent)
-{
-  QueryScope *scope = palloc(sizeof(QueryScope));
-
-  scope->query = query;
-  scope->parent = parent;
-  return scope;
-}
-
-static bool query_output_is_unconditional_at_depth(const Query *query, int depth);
-
-static bool
-from_node_is_unconditional(const Query *query, const Node *node, int depth)
-{
-  if (node == NULL || depth <= 0)
-  {
-    return false;
-  }
-  if (IsA(node, RangeTblRef))
-  {
-    const RangeTblRef *reference = (const RangeTblRef *) node;
-    const RangeTblEntry *rte;
-
-    if (reference->rtindex <= 0 ||
-        reference->rtindex > list_length(query->rtable))
-    {
-      return false;
-    }
-    rte = rt_fetch(reference->rtindex, query->rtable);
-    switch (rte->rtekind)
-    {
-      case RTE_RESULT:
-        return true;
-      case RTE_VALUES:
-        return rte->values_lists != NIL;
-      case RTE_SUBQUERY:
-        return rte->subquery != NULL &&
-               query_output_is_unconditional_at_depth(rte->subquery, depth - 1);
-      case RTE_CTE:
-      {
-        const CommonTableExpr *cte = rte->ctelevelsup == 0
-                                       ? cte_by_name(query, rte->ctename)
-                                       : NULL;
-
-        return cte != NULL && !cte->cterecursive && cte->ctequery != NULL &&
-               IsA(cte->ctequery, Query) &&
-               query_output_is_unconditional_at_depth((const Query *) cte->ctequery,
-                                                        depth - 1);
-      }
-      default:
-        return false;
-    }
-  }
-  if (IsA(node, JoinExpr))
-  {
-    const JoinExpr *join = (const JoinExpr *) node;
-    bool left = from_node_is_unconditional(query, join->larg, depth - 1);
-    bool right = from_node_is_unconditional(query, join->rarg, depth - 1);
-
-    switch (join->jointype)
-    {
-      case JOIN_INNER:
-        return join->quals == NULL && left && right;
-      case JOIN_LEFT:
-        return left;
-      case JOIN_RIGHT:
-        return right;
-      case JOIN_FULL:
-        return left || right;
-      default:
-        return false;
-    }
-  }
-  return false;
-}
-
-static bool
-query_output_is_unconditional_at_depth(const Query *query, int depth)
-{
-  ListCell *from_cell;
-
-  if (depth <= 0 || (query->commandType != CMD_SELECT &&
-                     query->commandType != CMD_INSERT) ||
-      query->hasTargetSRFs ||
-      query->havingQual != NULL || query->limitOffset != NULL ||
-      query->limitCount != NULL)
-  {
-    return false;
-  }
-  if (query->hasAggs && query->groupClause == NIL &&
-      query->groupingSets == NIL)
-  {
-    return true;
-  }
-  if (query->jointree == NULL || query->jointree->quals != NULL)
-  {
-    return false;
-  }
-  foreach(from_cell, query->jointree->fromlist)
-  {
-    if (!from_node_is_unconditional(query, (const Node *) lfirst(from_cell),
-                                    depth - 1))
-    {
-      return false;
-    }
-  }
-  return true;
-}
-
-static bool
-query_output_is_unconditional(const Query *query)
-{
-  return query_output_is_unconditional_at_depth(query, 16);
-}
-
-typedef struct UnknownLineageWalkerContext
-{
-  DmlLineageContext *lineage;
-  LineageWorkQueue *work;
-  const QueryScope *scope;
-} UnknownLineageWalkerContext;
-
-static bool
-enqueue_unknown_lineage_walker(Node *node, void *walker_context)
-{
-  UnknownLineageWalkerContext *context = (UnknownLineageWalkerContext *) walker_context;
-
-  if (node == NULL)
-  {
-    return false;
-  }
-  if (IsA(node, Param))
-  {
-    const Param *param = (const Param *) node;
-
-    if (param->paramkind == PARAM_EXTERN)
-    {
-      append_dml_parameter_target(context->lineage, param->paramid,
-                                  TYPE_NULL_UNKNOWN, false, false, false);
-    }
-    return false;
-  }
-  if (IsA(node, Var))
-  {
-    enqueue_lineage_work(context->lineage, context->work, LINEAGE_WORK_EXPR,
-                         context->scope, node, 0, TYPE_NULL_UNKNOWN,
-                         false, false, false);
-    return false;
-  }
-  if (IsA(node, Query))
-  {
-    QueryScope *query_scope = make_query_scope((const Query *) node, context->scope);
-    UnknownLineageWalkerContext query_context = {
-      context->lineage,
-      context->work,
-      query_scope
-    };
-
-    return query_tree_walker((Query *) node, enqueue_unknown_lineage_walker,
-                             &query_context, 0);
-  }
-  return expression_tree_walker(node, enqueue_unknown_lineage_walker,
-                                walker_context);
-}
-
-static void
-append_direct_parameter_targets(DmlLineageContext *context, const QueryScope *scope,
-                                const Node *expr, TypeNullAdmission null_admission,
-                                bool unconditional)
-{
-  LineageWorkQueue work = {NULL, NULL};
-
-  enqueue_lineage_work(context, &work, LINEAGE_WORK_EXPR, scope, expr, 0,
-                       null_admission, true, true, unconditional);
-
-  while (work.head != NULL)
-  {
-    LineageWorkItem *item = work.head;
-
-    work.head = item->next;
-    if (work.head == NULL)
-    {
-      work.tail = NULL;
-    }
-
-    if (item->kind == LINEAGE_WORK_QUERY_OUTPUT)
-    {
-      const TargetEntry *target;
-      bool unconditional = item->unconditional &&
-                           query_output_is_unconditional(item->scope->query);
-
-      if (item->scope->query->setOperations != NULL)
-      {
-        enqueue_lineage_work(context, &work, LINEAGE_WORK_SET_OPERATION,
-                             item->scope, item->scope->query->setOperations,
-                             item->output_attnum, item->null_admission,
-                             item->value_preserving, item->null_propagating,
-                             unconditional);
-      }
-      else
-      {
-        target = target_entry_by_resno(item->scope->query->targetList,
-                                       item->output_attnum);
-        if (target != NULL)
-        {
-          enqueue_lineage_work(context, &work, LINEAGE_WORK_EXPR, item->scope,
-                               (const Node *) target->expr, 0, item->null_admission,
-                               item->value_preserving, item->null_propagating,
-                               unconditional);
-        }
-      }
-      pfree(item);
-      continue;
-    }
-
-    if (item->kind == LINEAGE_WORK_SET_OPERATION)
-    {
-      if (IsA(item->node, SetOperationStmt))
-      {
-        const SetOperationStmt *set = (const SetOperationStmt *) item->node;
-
-        switch (set->op)
-        {
-          case SETOP_UNION:
-            enqueue_lineage_work(context, &work, LINEAGE_WORK_SET_OPERATION,
-                                 item->scope, set->larg, item->output_attnum,
-                                 item->null_admission, item->value_preserving,
-                                 item->null_propagating, item->unconditional);
-            enqueue_lineage_work(context, &work, LINEAGE_WORK_SET_OPERATION,
-                                 item->scope, set->rarg, item->output_attnum,
-                                 item->null_admission, item->value_preserving,
-                                 item->null_propagating, item->unconditional);
-            break;
-          case SETOP_INTERSECT:
-            enqueue_lineage_work(context, &work, LINEAGE_WORK_SET_OPERATION,
-                                 item->scope, set->larg, item->output_attnum,
-                                 item->null_admission, item->value_preserving,
-                                 item->null_propagating, false);
-            enqueue_lineage_work(context, &work, LINEAGE_WORK_SET_OPERATION,
-                                 item->scope, set->rarg, item->output_attnum,
-                                 item->null_admission, item->value_preserving,
-                                 item->null_propagating, false);
-            break;
-          case SETOP_EXCEPT:
-            enqueue_lineage_work(context, &work, LINEAGE_WORK_SET_OPERATION,
-                                 item->scope, set->larg, item->output_attnum,
-                                 item->null_admission, item->value_preserving,
-                                 item->null_propagating, false);
-            break;
-          case SETOP_NONE:
-            enqueue_lineage_work(context, &work, LINEAGE_WORK_SET_OPERATION,
-                                 item->scope, set->larg, item->output_attnum,
-                                 item->null_admission, item->value_preserving,
-                                 item->null_propagating, false);
-            enqueue_lineage_work(context, &work, LINEAGE_WORK_SET_OPERATION,
-                                 item->scope, set->rarg, item->output_attnum,
-                                 item->null_admission, item->value_preserving,
-                                 item->null_propagating, false);
-            break;
-        }
-      }
-      else if (IsA(item->node, RangeTblRef))
-      {
-        const RangeTblRef *reference = (const RangeTblRef *) item->node;
-
-        if (reference->rtindex > 0 &&
-            reference->rtindex <= list_length(item->scope->query->rtable))
-        {
-          const RangeTblEntry *rte = rt_fetch(reference->rtindex,
-                                              item->scope->query->rtable);
-
-          if (rte->rtekind == RTE_SUBQUERY && rte->subquery != NULL)
-          {
-            QueryScope *child_scope = make_query_scope(rte->subquery, item->scope);
-
-            enqueue_lineage_work(context, &work, LINEAGE_WORK_QUERY_OUTPUT,
-                                 child_scope, (const Node *) rte->subquery,
-                                 item->output_attnum, item->null_admission,
-                                 item->value_preserving, item->null_propagating,
-                                 item->unconditional);
-          }
-        }
-      }
-      pfree(item);
-      continue;
-    }
-
-    if (item->kind == LINEAGE_WORK_EXPR)
-    {
-      TypeNullAdmission item_admission = item->null_admission;
-      bool value_preserving = item->value_preserving;
-      const Node *unwrapped = unwrap_direct_assignment_expr(context, item->node,
-                                                            &item_admission,
-                                                            &value_preserving);
-
-      if (unwrapped != NULL && IsA(unwrapped, Param))
-      {
-        const Param *param = (const Param *) unwrapped;
-
-        if (param->paramkind == PARAM_EXTERN)
-        {
-          append_dml_parameter_target(context, param->paramid, item_admission,
-                                      value_preserving, item->null_propagating,
-                                      item->unconditional);
-        }
-      }
-      else if (unwrapped != NULL && IsA(unwrapped, Var))
-      {
-        const Var *var = (const Var *) unwrapped;
-        const QueryScope *variable_scope = query_scope_at_level(item->scope,
-                                                                var->varlevelsup);
-
-        if (var->varnullingrels != NULL)
-        {
-          value_preserving = false;
-        }
-
-        if (variable_scope != NULL && var->varno > 0 &&
-            var->varno <= list_length(variable_scope->query->rtable))
-        {
-          const RangeTblEntry *rte = rt_fetch(var->varno, variable_scope->query->rtable);
-
-          if (variable_scope->query->onConflict != NULL &&
-              var->varno == variable_scope->query->onConflict->exclRelIndex)
-          {
-            if (var->varattno > 0)
-            {
-              const TargetEntry *insert_target = target_entry_by_resno(
-                variable_scope->query->targetList, var->varattno);
-
-              if (insert_target != NULL)
-              {
-                enqueue_lineage_work(context, &work, LINEAGE_WORK_EXPR,
-                                     variable_scope,
-                                     (const Node *) insert_target->expr,
-                                     0, item_admission, false,
-                                     item->null_propagating, false);
-              }
-            }
-            else if (var->varattno == InvalidAttrNumber)
-            {
-              ListCell *target_cell;
-
-              foreach(target_cell, variable_scope->query->targetList)
-              {
-                const TargetEntry *insert_target =
-                  lfirst_node(TargetEntry, target_cell);
-                UnknownLineageWalkerContext walker_context = {
-                  context,
-                  &work,
-                  variable_scope
-                };
-
-                if (!insert_target->resjunk)
-                {
-                  enqueue_unknown_lineage_walker(
-                    (Node *) insert_target->expr, &walker_context);
-                }
-              }
-            }
-          }
-          else if (var->varattno > 0 && rte->rtekind == RTE_VALUES)
-          {
-            ListCell *row_cell;
-
-            foreach(row_cell, rte->values_lists)
-            {
-              const List *row = (const List *) lfirst(row_cell);
-
-              if (var->varattno <= list_length(row))
-              {
-                enqueue_lineage_work(context, &work, LINEAGE_WORK_EXPR,
-                                     variable_scope,
-                                     (const Node *) list_nth(row, var->varattno - 1),
-                                     0, item_admission, value_preserving,
-                                     item->null_propagating, item->unconditional);
-              }
-            }
-          }
-          else if (var->varattno > 0 && rte->rtekind == RTE_SUBQUERY &&
-                   rte->subquery != NULL)
-          {
-            QueryScope *child_scope = make_query_scope(rte->subquery, variable_scope);
-
-            enqueue_lineage_work(context, &work, LINEAGE_WORK_QUERY_OUTPUT,
-                                 child_scope, (const Node *) rte->subquery,
-                                 var->varattno, item_admission,
-                                 value_preserving, item->null_propagating,
-                                 item->unconditional);
-          }
-          else if (var->varattno > 0 && rte->rtekind == RTE_CTE)
-          {
-            const QueryScope *owner_scope = query_scope_at_level(variable_scope,
-                                                                 rte->ctelevelsup);
-            const CommonTableExpr *cte = owner_scope == NULL
-                                           ? NULL
-                                           : cte_by_name(owner_scope->query, rte->ctename);
-            const Query *cte_query = cte == NULL ? NULL : (const Query *) cte->ctequery;
-
-            if (cte_query != NULL)
-            {
-              QueryScope *cte_scope = make_query_scope(cte_query, owner_scope);
-
-              enqueue_lineage_work(context, &work, LINEAGE_WORK_QUERY_OUTPUT,
-                                   cte_scope, (const Node *) cte_query,
-                                   var->varattno, item_admission,
-                                   value_preserving, item->null_propagating,
-                                   item->unconditional);
-            }
-          }
-          else if (var->varattno > 0 && rte->rtekind == RTE_JOIN &&
-                   var->varattno <= list_length(rte->joinaliasvars))
-          {
-            enqueue_lineage_work(context, &work, LINEAGE_WORK_EXPR,
-                                 variable_scope,
-                                 (const Node *) list_nth(rte->joinaliasvars,
-                                                        var->varattno - 1),
-                                 0, item_admission, value_preserving,
-                                 item->null_propagating, item->unconditional);
-          }
-          else if (var->varattno > 0 && rte->rtekind == RTE_GROUP &&
-                   var->varattno <= list_length(rte->groupexprs))
-          {
-            enqueue_lineage_work(context, &work, LINEAGE_WORK_EXPR,
-                                 variable_scope,
-                                 (const Node *) list_nth(rte->groupexprs,
-                                                        var->varattno - 1),
-                                 0, item_admission, value_preserving,
-                                 item->null_propagating, item->unconditional);
-          }
-          else if (var->varattno == InvalidAttrNumber &&
-                   (rte->rtekind == RTE_VALUES ||
-                    rte->rtekind == RTE_JOIN ||
-                    rte->rtekind == RTE_GROUP))
-          {
-            const Node *payload = rte->rtekind == RTE_VALUES
-                                    ? (const Node *) rte->values_lists
-                                    : rte->rtekind == RTE_JOIN
-                                        ? (const Node *) rte->joinaliasvars
-                                        : (const Node *) rte->groupexprs;
-            UnknownLineageWalkerContext walker_context = {
-              context,
-              &work,
-              variable_scope
-            };
-
-            enqueue_unknown_lineage_walker((Node *) payload,
-                                            &walker_context);
-          }
-          else if (var->varattno == InvalidAttrNumber &&
-                   rte->rtekind == RTE_SUBQUERY && rte->subquery != NULL)
-          {
-            UnknownLineageWalkerContext walker_context = {
-              context,
-              &work,
-              variable_scope
-            };
-
-            enqueue_unknown_lineage_walker(
-              (Node *) rte->subquery, &walker_context);
-          }
-          else if (var->varattno == InvalidAttrNumber &&
-                   rte->rtekind == RTE_CTE)
-          {
-            const QueryScope *owner_scope = query_scope_at_level(
-              variable_scope, rte->ctelevelsup);
-            const CommonTableExpr *cte = owner_scope == NULL
-                                           ? NULL
-                                           : cte_by_name(owner_scope->query,
-                                                         rte->ctename);
-
-            if (cte != NULL && cte->ctequery != NULL &&
-                IsA(cte->ctequery, Query))
-            {
-              UnknownLineageWalkerContext walker_context = {
-                context,
-                &work,
-                owner_scope
-              };
-
-              enqueue_unknown_lineage_walker(cte->ctequery,
-                                              &walker_context);
-            }
-          }
-          else if (rte->rtekind == RTE_FUNCTION)
-          {
-            ListCell *function_cell;
-
-            foreach(function_cell, rte->functions)
-            {
-              const RangeTblFunction *function =
-                lfirst_node(RangeTblFunction, function_cell);
-              UnknownLineageWalkerContext walker_context = {
-                context,
-                &work,
-                variable_scope
-              };
-
-              enqueue_unknown_lineage_walker(function->funcexpr,
-                                              &walker_context);
-            }
-          }
-          else if (rte->rtekind == RTE_TABLEFUNC && rte->tablefunc != NULL)
-          {
-            UnknownLineageWalkerContext walker_context = {
-              context,
-              &work,
-              variable_scope
-            };
-
-            enqueue_unknown_lineage_walker((Node *) rte->tablefunc,
-                                            &walker_context);
-          }
-        }
-      }
-      else if (unwrapped != NULL)
-      {
-        UnknownLineageWalkerContext walker_context = {
-          context,
-          &work,
-          item->scope
-        };
-
-        enqueue_unknown_lineage_walker((Node *) unwrapped, &walker_context);
-      }
-    }
-    pfree(item);
-  }
-}
-
-static RelationWriteEnforcement
-relation_write_enforcement(Oid relid, const RangeTblEntry *target_rte,
-                           CmdType command)
-{
-  Relation relation;
-  Form_pg_class relation_form;
-  TupleDesc descriptor;
-  TriggerDesc *trigger_desc;
-  RelationWriteEnforcement result = {false, false, NIL};
-  List *foreign_keys;
-  ListCell *foreign_key_cell;
-  int attribute_index;
-  int trigger_index;
-
-  if (!OidIsValid(relid))
-  {
-    return result;
-  }
-
-  relation = table_open(relid, AccessShareLock);
-  relation_form = RelationGetForm(relation);
-  /* Descendants can add stricter constraints and triggers than the parent. */
-  result.opaque = (target_rte != NULL && target_rte->inh &&
-                   has_subclass(relid)) ||
-                  relation_form->relkind == RELKIND_PARTITIONED_TABLE ||
-                  relation_form->relkind == RELKIND_FOREIGN_TABLE ||
-                  relation_form->relrowsecurity || relation_form->relforcerowsecurity;
-  descriptor = RelationGetDescr(relation);
-  for (attribute_index = 0;
-       !result.has_generated_columns && attribute_index < descriptor->natts;
-       attribute_index++)
-  {
-    Form_pg_attribute attribute = TupleDescAttr(descriptor, attribute_index);
-
-    result.has_generated_columns = !attribute->attisdropped &&
-                                   attribute->attgenerated != '\0';
-  }
-  trigger_desc = relation->trigdesc;
-  foreign_keys = copyObject(RelationGetFKeyList(relation));
-
-  foreach(foreign_key_cell, foreign_keys)
-  {
-    const ForeignKeyCacheInfo *foreign_key =
-      lfirst_node(ForeignKeyCacheInfo, foreign_key_cell);
-    HeapTuple tuple = SearchSysCache1(CONSTROID,
-                                      ObjectIdGetDatum(foreign_key->conoid));
-
-    if (!HeapTupleIsValid(tuple))
-    {
-      result.opaque = true;
-      continue;
-    }
-    if (((Form_pg_constraint) GETSTRUCT(tuple))->conenforced &&
-        ((Form_pg_constraint) GETSTRUCT(tuple))->confmatchtype == FKCONSTR_MATCH_FULL)
-    {
-      result.match_full_foreign_keys =
-        lappend(result.match_full_foreign_keys, copyObject(foreign_key));
-    }
-    ReleaseSysCache(tuple);
-  }
-  list_free_deep(foreign_keys);
-
-  for (trigger_index = 0;
-       !result.opaque && trigger_desc != NULL && trigger_index < trigger_desc->numtriggers;
-       trigger_index++)
-  {
-    const Trigger *trigger = &trigger_desc->triggers[trigger_index];
-    bool relevant_event =
-      (command == CMD_INSERT && (trigger->tgtype & TRIGGER_TYPE_INSERT) != 0) ||
-      (command == CMD_UPDATE && (trigger->tgtype & TRIGGER_TYPE_UPDATE) != 0);
-
-    if (relevant_event && trigger->tgenabled != TRIGGER_DISABLED &&
-        (!trigger->tgisinternal || trigger->tgisclone))
-    {
-      result.opaque = true;
-    }
-  }
-
-  table_close(relation, AccessShareLock);
-  return result;
-}
-
-static void
-append_targets_from_list(StringInfo out, const QueryScope *scope, const List *target_list,
-                         Oid target_relid, const char *source, bool unconditional,
-                         bool has_additional_constraints,
-                         const RelationWriteEnforcement *enforcement,
-                         bool *first,
-                         HTAB *facts, HTAB *type_admissions, HTAB *column_admissions)
-{
-  ListCell *cell;
-
-  foreach(cell, target_list)
-  {
-    const TargetEntry *target = lfirst_node(TargetEntry, cell);
-
-    if (!target->resjunk && target->resno > 0)
-    {
-      HASHCTL visited_control;
-      DmlLineageContext context;
-
-      memset(&visited_control, 0, sizeof(visited_control));
-      visited_control.keysize = sizeof(LineageVisitKey);
-      visited_control.entrysize = sizeof(LineageVisitKey);
-      context.out = out;
-      context.target_relid = target_relid;
-      context.target_attnum = target->resno;
-      context.source = source;
-      context.first = first;
-      context.facts = facts;
-      context.type_admissions = type_admissions;
-      context.column_admissions = column_admissions;
-      context.target_list = target_list;
-      context.match_full_foreign_keys = enforcement->match_full_foreign_keys;
-      context.has_additional_constraints = has_additional_constraints;
-      context.has_opaque_enforcement = enforcement->opaque;
-      context.visited = hash_create("typed SQL DML lineage visits", 32,
-                                    &visited_control, HASH_ELEM | HASH_BLOBS);
-      append_direct_parameter_targets(&context, scope, (const Node *) target->expr,
-                                      TYPE_NULL_ADMITS, unconditional);
-      hash_destroy(context.visited);
-    }
-  }
-}
-
-static void
-append_dml_parameter_targets(StringInfo out, const Query *query)
-{
-  const RangeTblEntry *target_rte = NULL;
-  Oid target_relid = InvalidOid;
-  bool first = true;
-  HASHCTL fact_control;
-  HASHCTL type_control;
-  HASHCTL column_control;
-  HTAB *facts;
-  HTAB *type_admissions;
-  HTAB *column_admissions;
-  QueryScope scope = {query, NULL};
-
-  memset(&fact_control, 0, sizeof(fact_control));
-  fact_control.keysize = sizeof(DmlParameterTargetKey);
-  fact_control.entrysize = sizeof(DmlParameterTargetKey);
-  facts = hash_create("typed SQL DML parameter target facts", 32,
-                      &fact_control, HASH_ELEM | HASH_BLOBS);
-  memset(&type_control, 0, sizeof(type_control));
-  type_control.keysize = sizeof(Oid);
-  type_control.entrysize = sizeof(TypeNullAdmissionEntry);
-  type_admissions = hash_create("typed SQL type NULL admissions", 16,
-                                &type_control, HASH_ELEM | HASH_BLOBS);
-  memset(&column_control, 0, sizeof(column_control));
-  column_control.keysize = sizeof(ColumnNullAdmissionKey);
-  column_control.entrysize = sizeof(ColumnNullAdmissionEntry);
-  column_admissions = hash_create("typed SQL column NULL admissions", 16,
-                                  &column_control, HASH_ELEM | HASH_BLOBS);
-
-  appendStringInfoString(out, ",\"dmlParameterTargets\":[");
-
-  if (query->resultRelation > 0 && query->resultRelation <= list_length(query->rtable))
-  {
-    target_rte = rt_fetch(query->resultRelation, query->rtable);
-    target_relid = target_rte->relid;
-  }
-
-  if (OidIsValid(target_relid) &&
-      (query->commandType == CMD_INSERT || query->commandType == CMD_UPDATE))
-  {
-    RelationWriteEnforcement enforcement =
-      relation_write_enforcement(target_relid, target_rte,
-                                 query->commandType);
-
-    append_targets_from_list(out, &scope, query->targetList, target_relid,
-                             command_type_name(query->commandType),
-                             query->commandType == CMD_INSERT &&
-                             query_output_is_unconditional(query),
-                             query->withCheckOptions != NIL ||
-                             enforcement.has_generated_columns,
-                             &enforcement,
-                             &first,
-                             facts, type_admissions, column_admissions);
-    list_free_deep(enforcement.match_full_foreign_keys);
-  }
-
-  if (OidIsValid(target_relid) && query->onConflict != NULL &&
-      query->onConflict->action == ONCONFLICT_UPDATE)
-  {
-    RelationWriteEnforcement enforcement =
-      relation_write_enforcement(target_relid, target_rte, CMD_UPDATE);
-
-    append_targets_from_list(out, &scope, query->onConflict->onConflictSet,
-                             target_relid, "ON_CONFLICT_UPDATE", false,
-                             query->withCheckOptions != NIL ||
-                             enforcement.has_generated_columns,
-                             &enforcement, &first,
-                             facts, type_admissions, column_admissions);
-    list_free_deep(enforcement.match_full_foreign_keys);
-  }
-
-  if (OidIsValid(target_relid) && query->commandType == CMD_MERGE)
-  {
-    ListCell *cell;
-    RelationWriteEnforcement insert_enforcement =
-      relation_write_enforcement(target_relid, target_rte, CMD_INSERT);
-    RelationWriteEnforcement update_enforcement =
-      relation_write_enforcement(target_relid, target_rte, CMD_UPDATE);
-
-    foreach(cell, query->mergeActionList)
-    {
-      const MergeAction *action = lfirst_node(MergeAction, cell);
-
-      if (action->commandType == CMD_INSERT)
-      {
-        append_targets_from_list(out, &scope, action->targetList,
-                                 target_relid, "MERGE_INSERT", false,
-                                 query->withCheckOptions != NIL ||
-                                 insert_enforcement.has_generated_columns,
-                                 &insert_enforcement, &first,
-                                 facts, type_admissions, column_admissions);
-      }
-      else if (action->commandType == CMD_UPDATE)
-      {
-        append_targets_from_list(out, &scope, action->targetList,
-                                 target_relid, "MERGE_UPDATE", false,
-                                 query->withCheckOptions != NIL ||
-                                 update_enforcement.has_generated_columns,
-                                 &update_enforcement, &first,
-                                 facts, type_admissions, column_admissions);
-      }
-    }
-    list_free_deep(insert_enforcement.match_full_foreign_keys);
-    list_free_deep(update_enforcement.match_full_foreign_keys);
-  }
-
-  appendStringInfoChar(out, ']');
-  hash_destroy(column_admissions);
-  hash_destroy(type_admissions);
-  hash_destroy(facts);
-}
 
 static const char *
 command_type_name(CmdType command_type)
@@ -3469,7 +721,7 @@ append_expr_type_fields(StringInfo out, const Node *expr)
 }
 
 static void
-append_expr_list(StringInfo out, const QueryScope *scope, const char *name, const List *exprs, int depth)
+append_expr_list(StringInfo out, const PtsQueryScope *scope, const char *name, const List *exprs, int depth)
 {
   ListCell *cell;
   bool first = true;
@@ -3488,7 +740,7 @@ append_expr_list(StringInfo out, const QueryScope *scope, const char *name, cons
 }
 
 static void
-append_expr_rows(StringInfo out, const QueryScope *scope, const char *name, const List *rows, int depth)
+append_expr_rows(StringInfo out, const PtsQueryScope *scope, const char *name, const List *rows, int depth)
 {
   ListCell *row_cell;
   bool first_row = true;
@@ -3521,7 +773,7 @@ append_expr_rows(StringInfo out, const QueryScope *scope, const char *name, cons
 }
 
 static void
-append_target_expr_list(StringInfo out, const QueryScope *scope, const char *name, const List *targets, int depth)
+append_target_expr_list(StringInfo out, const PtsQueryScope *scope, const char *name, const List *targets, int depth)
 {
   ListCell *cell;
   bool first = true;
@@ -3544,7 +796,7 @@ append_target_expr_list(StringInfo out, const QueryScope *scope, const char *nam
 }
 
 static void
-append_expr_specific_fields(StringInfo out, const QueryScope *scope, const Node *expr)
+append_expr_specific_fields(StringInfo out, const PtsQueryScope *scope, const Node *expr)
 {
   if (expr == NULL)
   {
@@ -3556,7 +808,7 @@ append_expr_specific_fields(StringInfo out, const QueryScope *scope, const Node 
     case T_Var:
     {
       const Var *var = (const Var *) expr;
-      const QueryScope *owner_scope = query_scope_at_level(scope, var->varlevelsup);
+      const PtsQueryScope *owner_scope = pts_query_scope_at_level(scope, var->varlevelsup);
       appendStringInfo(out, ",\"varno\":%u,\"varattno\":%d,\"varlevelsup\":%u",
                        var->varno, var->varattno, var->varlevelsup);
       append_bitmapset_field(out, "varnullingrels", var->varnullingrels);
@@ -3678,7 +930,7 @@ append_expr_specific_fields(StringInfo out, const QueryScope *scope, const Node 
 }
 
 static void
-append_expr_node(StringInfo out, const QueryScope *scope, const Node *expr, int depth)
+append_expr_node(StringInfo out, const PtsQueryScope *scope, const Node *expr, int depth)
 {
   if (expr == NULL)
   {
@@ -3818,15 +1070,15 @@ append_expr_node(StringInfo out, const QueryScope *scope, const Node *expr, int 
     case T_CoerceToDomain:
     {
       const CoerceToDomain *coerce = (const CoerceToDomain *) expr;
-      TypeNullAdmission admission =
-        type_null_admission(NULL, coerce->resulttype);
+      PtsNullAdmission admission =
+        pts_type_null_admission(NULL, coerce->resulttype);
 
       appendStringInfoString(out, ",\"coercionForm\":");
       append_json_string(out, coercion_form_name(coerce->coercionformat));
       appendStringInfoString(out, ",\"domainNullAdmission\":");
-      append_json_string(out, null_admission_name(admission));
+      append_json_string(out, pts_null_admission_name(admission));
       append_bool_field(out, "nullInputProducesNull",
-                        admission == TYPE_NULL_ADMITS);
+                        admission == PTS_NULL_ADMITS);
       append_bool_field(out, "nonNullInputProducesNonNull", true);
       appendStringInfoString(out, ",\"arg\":");
       append_expr_node(out, scope, (const Node *) coerce->arg, depth - 1);
@@ -3914,7 +1166,7 @@ append_expr_node(StringInfo out, const QueryScope *scope, const Node *expr, int 
 }
 
 static void
-append_cte_list(StringInfo out, const QueryScope *scope, int depth)
+append_cte_list(StringInfo out, const PtsQueryScope *scope, int depth)
 {
   const Query *query = scope->query;
   ListCell *cell;
@@ -3951,7 +1203,7 @@ append_cte_list(StringInfo out, const QueryScope *scope, int depth)
 }
 
 static void
-append_target_list(StringInfo out, const QueryScope *scope)
+append_target_list(StringInfo out, const PtsQueryScope *scope)
 {
   const Query *query = scope->query;
   ListCell *cell;
@@ -4044,7 +1296,7 @@ append_set_operation(StringInfo out, const Node *node)
 }
 
 static void
-append_returning_list(StringInfo out, const QueryScope *scope)
+append_returning_list(StringInfo out, const PtsQueryScope *scope)
 {
   const Query *query = scope->query;
   ListCell *cell;
@@ -4073,7 +1325,7 @@ append_returning_list(StringInfo out, const QueryScope *scope)
 }
 
 static void
-append_rtable(StringInfo out, const QueryScope *scope, int depth)
+append_rtable(StringInfo out, const PtsQueryScope *scope, int depth)
 {
   const Query *query = scope->query;
   ListCell *cell;
@@ -4136,7 +1388,7 @@ append_rtable(StringInfo out, const QueryScope *scope, int depth)
 }
 
 static void
-append_from_list(StringInfo out, const QueryScope *scope, const char *name, const List *nodes, int depth)
+append_from_list(StringInfo out, const PtsQueryScope *scope, const char *name, const List *nodes, int depth)
 {
   ListCell *cell;
   bool first = true;
@@ -4155,7 +1407,7 @@ append_from_list(StringInfo out, const QueryScope *scope, const char *name, cons
 }
 
 static void
-append_from_node(StringInfo out, const QueryScope *scope, const Node *node, int depth)
+append_from_node(StringInfo out, const PtsQueryScope *scope, const Node *node, int depth)
 {
   const Query *query = scope->query;
   if (node == NULL)
@@ -4305,7 +1557,7 @@ aggregate_invokes_volatile_function(Oid aggregate_oid, const List *args,
 
 static const WindowClause *
 window_clause_for_function(const WindowFunc *function,
-                           const QueryScope *scope)
+                           const PtsQueryScope *scope)
 {
   ListCell *cell;
 
@@ -4342,7 +1594,7 @@ window_function_arguments_contain_subplans(const WindowFunc *function)
 
 static AggregateExecutionProfile
 window_aggregate_execution_profile(const WindowFunc *function,
-                                   const QueryScope *scope)
+                                   const PtsQueryScope *scope)
 {
   HeapTuple tuple;
   Form_pg_aggregate aggregate;
@@ -5129,7 +2381,7 @@ scalar_array_hash_support_invokes_volatile(const ScalarArrayOpExpr *expression)
   RuntimeTypeSupportContext context = {0};
   const Node *left_argument;
   const Node *array_argument;
-  ArrayShape array_shape;
+  PtsArrayShape array_shape;
 
   if (list_length(expression->args) != 2)
   {
@@ -5137,9 +2389,9 @@ scalar_array_hash_support_invokes_volatile(const ScalarArrayOpExpr *expression)
   }
 
   array_argument = (const Node *) lsecond(expression->args);
-  array_shape = array_shape_proof(array_argument);
+  array_shape = pts_array_shape_proof(array_argument);
   /* Keep this cutoff synchronized with convert_saop_to_hashed_saop(). */
-  if (array_shape.proof == ARRAY_SHAPE_VALID &&
+  if (array_shape.proof == PTS_ARRAY_SHAPE_VALID &&
       (array_shape.is_null ||
        array_shape.nitems < MIN_ARRAY_SIZE_FOR_HASHED_SAOP))
   {
@@ -6234,7 +3486,7 @@ xml_expression_invokes_volatile(const XmlExpr *expression)
 static bool
 operator_operand_is_execution_relevant_walker(Node *node, void *context)
 {
-  const QueryScope *scope = (const QueryScope *) context;
+  const PtsQueryScope *scope = (const PtsQueryScope *) context;
 
   if (node == NULL)
   {
@@ -6247,7 +3499,7 @@ operator_operand_is_execution_relevant_walker(Node *node, void *context)
   if (IsA(node, Var))
   {
     const Var *variable = (const Var *) node;
-    const QueryScope *owner_scope = query_scope_at_level(
+    const PtsQueryScope *owner_scope = pts_query_scope_at_level(
       scope, variable->varlevelsup);
 
     if (owner_scope != NULL && variable->varno > 0 &&
@@ -6270,7 +3522,7 @@ operator_operand_is_execution_relevant_walker(Node *node, void *context)
 
 static bool
 operator_expr_has_execution_relevant_operand(Node *node,
-                                             const QueryScope *scope)
+                                             const PtsQueryScope *scope)
 {
   return operator_operand_is_execution_relevant_walker(node, (void *) scope);
 }
@@ -6345,7 +3597,7 @@ operator_family_support_invokes_volatile_function(Oid operator_oid)
 }
 
 static bool
-node_invokes_volatile_function(Node *node, const QueryScope *scope)
+node_invokes_volatile_function(Node *node, const PtsQueryScope *scope)
 {
   switch (nodeTag(node))
   {
@@ -6417,9 +3669,9 @@ node_invokes_volatile_function(Node *node, const QueryScope *scope)
       const Node *array_argument = list_length(expr->args) == 2
                                      ? (const Node *) lsecond(expr->args)
                                      : NULL;
-      ArrayShape array_shape = array_shape_proof(array_argument);
+      PtsArrayShape array_shape = pts_array_shape_proof(array_argument);
 
-      if (array_shape.proof == ARRAY_SHAPE_VALID &&
+      if (array_shape.proof == PTS_ARRAY_SHAPE_VALID &&
           (array_shape.is_null || array_shape.nitems == 0))
       {
         return false;
@@ -6526,7 +3778,7 @@ volatile_function_walker(Node *node, void *context)
 }
 
 static bool
-query_contains_volatile_functions_visitor(const QueryScope *scope,
+query_contains_volatile_functions_visitor(const PtsQueryScope *scope,
                                           void *context)
 {
   VolatileFunctionContext volatile_context = {scope};
@@ -6541,12 +3793,12 @@ query_contains_volatile_functions_visitor(const QueryScope *scope,
 static bool
 query_contains_volatile_functions(const Query *query)
 {
-  return execution_reachable_query_walker(
+  return pts_execution_reachable_query_walker(
     query, query_contains_volatile_functions_visitor, NULL);
 }
 
 static bool
-query_contains_row_marks_visitor(const QueryScope *scope, void *context)
+query_contains_row_marks_visitor(const PtsQueryScope *scope, void *context)
 {
   (void) context;
   return scope->query->rowMarks != NIL;
@@ -6555,17 +3807,17 @@ query_contains_row_marks_visitor(const QueryScope *scope, void *context)
 static bool
 query_contains_row_marks(const Query *query)
 {
-  return execution_reachable_query_walker(
+  return pts_execution_reachable_query_walker(
     query, query_contains_row_marks_visitor, NULL);
 }
 
 static void
 append_query_summary(StringInfo out, const Query *query,
-                     const QueryScope *parent_scope, int depth,
+                     const PtsQueryScope *parent_scope, int depth,
                      bool protocol_output,
                      bool bind_io_invokes_volatile)
 {
-  QueryScope *scope = make_query_scope(query, parent_scope);
+  PtsQueryScope *scope = pts_make_query_scope(query, parent_scope);
   bool has_volatile_functions = bind_io_invokes_volatile ||
                                 query_contains_volatile_functions(query) ||
                                 (protocol_output &&
@@ -6604,7 +3856,7 @@ append_query_summary(StringInfo out, const Query *query,
   appendStringInfoChar(out, ',');
   append_target_list(out, scope);
   append_returning_list(out, scope);
-  append_dml_parameter_targets(out, query);
+  pts_append_dml_analysis(out, query);
   append_cte_list(out, scope, depth);
   append_rtable(out, scope, depth);
   appendStringInfoString(out, ",\"fromTree\":");
@@ -6662,15 +3914,10 @@ static void
 append_param_type_null_admissions(StringInfo out, const Oid *param_types,
                                   int param_count)
 {
-  HASHCTL control;
-  HTAB *cache;
+  PtsNullAdmissionAnalysis *analysis;
   int index;
 
-  memset(&control, 0, sizeof(control));
-  control.keysize = sizeof(Oid);
-  control.entrysize = sizeof(TypeNullAdmissionEntry);
-  cache = hash_create("typed SQL parameter type NULL admissions", 16,
-                      &control, HASH_ELEM | HASH_BLOBS);
+  analysis = pts_create_null_admission_analysis();
 
   appendStringInfoString(out, ",\"paramTypeNullAdmissions\":[");
   for (index = 0; index < param_count; index++)
@@ -6679,18 +3926,18 @@ append_param_type_null_admissions(StringInfo out, const Oid *param_types,
     {
       appendStringInfoChar(out, ',');
     }
-    append_json_string(out, null_admission_name(
+    append_json_string(out, pts_null_admission_name(
       OidIsValid(param_types[index])
-        ? type_null_admission(cache, param_types[index])
-        : TYPE_NULL_UNKNOWN));
+        ? pts_type_null_admission(analysis, param_types[index])
+        : PTS_NULL_UNKNOWN));
   }
   appendStringInfoChar(out, ']');
-  hash_destroy(cache);
+  pts_destroy_null_admission_analysis(analysis);
 }
 
 static void
 append_param_usage_null_admissions(StringInfo out,
-                                   const ParameterUsageEvidence *evidence,
+                                   const PtsParameterUsageEvidence *evidence,
                                    int param_count)
 {
   int index;
@@ -6704,9 +3951,9 @@ append_param_usage_null_admissions(StringInfo out,
     }
     append_json_string(
       out,
-      null_admission_name(evidence[index].seen
+      pts_null_admission_name(evidence[index].seen
                             ? evidence[index].admission
-                            : TYPE_NULL_UNKNOWN));
+                            : PTS_NULL_UNKNOWN));
   }
   appendStringInfoChar(out, ']');
 }
@@ -6720,23 +3967,17 @@ postgres_typed_sql_analyze(PG_FUNCTION_ARGS)
   int param_count = 0;
   Oid *param_types = read_param_type_oids(param_type_array, &param_count);
   List *raw_trees = pg_parse_query(sql);
-  ParameterUsageEvidence *param_usage_evidence = NULL;
+  PtsParameterUsageEvidence *param_usage_evidence = NULL;
   int param_usage_count = 0;
-  HASHCTL usage_type_control;
-  HTAB *usage_type_admissions;
+  PtsNullAdmissionAnalysis *usage_null_admission_analysis;
   StringInfoData out;
   ListCell *raw_cell;
   bool first_raw = true;
 
-  memset(&usage_type_control, 0, sizeof(usage_type_control));
-  usage_type_control.keysize = sizeof(Oid);
-  usage_type_control.entrysize = sizeof(TypeNullAdmissionEntry);
-  usage_type_admissions = hash_create("typed SQL parameter usage type NULL admissions",
-                                      16, &usage_type_control,
-                                      HASH_ELEM | HASH_BLOBS);
+  usage_null_admission_analysis = pts_create_null_admission_analysis();
 
   initStringInfo(&out);
-  appendStringInfoString(&out, "{\"schemaVersion\":9,\"postgresVersionNum\":");
+  appendStringInfoString(&out, "{\"schemaVersion\":10,\"postgresVersionNum\":");
   appendStringInfo(&out, "%d", PG_VERSION_NUM);
   appendStringInfoString(&out, ",\"rawStatementCount\":");
   appendStringInfo(&out, "%d", list_length(raw_trees));
@@ -6758,13 +3999,13 @@ postgres_typed_sql_analyze(PG_FUNCTION_ARGS)
       int index;
 
       param_usage_evidence = param_usage_evidence == NULL
-                               ? palloc(sizeof(ParameterUsageEvidence) * param_count)
+                               ? palloc(sizeof(PtsParameterUsageEvidence) * param_count)
                                : repalloc(param_usage_evidence,
-                                          sizeof(ParameterUsageEvidence) * param_count);
+                                          sizeof(PtsParameterUsageEvidence) * param_count);
       for (index = param_usage_count; index < param_count; index++)
       {
         param_usage_evidence[index].seen = false;
-        param_usage_evidence[index].admission = TYPE_NULL_UNKNOWN;
+        param_usage_evidence[index].admission = PTS_NULL_UNKNOWN;
       }
       param_usage_count = param_count;
     }
@@ -6783,9 +4024,9 @@ postgres_typed_sql_analyze(PG_FUNCTION_ARGS)
     {
       Query *query = lfirst_node(Query, query_cell);
 
-      update_parameter_usage_null_admissions(query, param_usage_evidence,
-                                             param_count,
-                                             usage_type_admissions);
+      pts_update_parameter_usage_null_admissions(query, param_usage_evidence,
+                                                 param_count,
+                                                 usage_null_admission_analysis);
 
       if (!first_query)
       {
@@ -6815,7 +4056,7 @@ postgres_typed_sql_analyze(PG_FUNCTION_ARGS)
                                      param_count);
   appendStringInfoChar(&out, '}');
 
-  hash_destroy(usage_type_admissions);
+  pts_destroy_null_admission_analysis(usage_null_admission_analysis);
   if (param_usage_evidence != NULL)
   {
     pfree(param_usage_evidence);

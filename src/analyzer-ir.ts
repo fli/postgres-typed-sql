@@ -74,7 +74,7 @@ export type {
   TypedSqlPostgresIrRowBounds,
 } from './analyzer-ir-model.js'
 
-const ANALYZER_SCHEMA_VERSION = 9
+const ANALYZER_SCHEMA_VERSION = 10
 const ANALYZER_SQL_FUNCTION = 'pg_temp.postgres_typed_sql_analyze'
 
 export async function bindTypedSqlPostgresAnalyzer(client: PostgresQueryable): Promise<void> {
@@ -1119,10 +1119,10 @@ function dmlParameterNullAdmissions(
   }
   for (const query of queries) {
     walkQueryTree(query, (nested) => {
-      for (const target of nested.dmlParameterTargets) {
+      for (const fact of nested.dmlParameterNullAdmissions) {
         admissionByParamId.set(
-          target.paramId,
-          combineParameterNullAdmission(admissionByParamId.get(target.paramId), target.targetNullAdmission)
+          fact.paramId,
+          combineParameterNullAdmission(admissionByParamId.get(fact.paramId), fact.admission)
         )
       }
     })
@@ -1687,10 +1687,7 @@ function checkedColumnParamTypes(
   const candidates = new Map<number, Map<string, TypedSqlPostgresIrCheckConstraintTypeExpression>>()
   for (const query of queries) {
     walkQueryTree(query, (nested) => {
-      for (const target of nested.dmlParameterTargets) {
-        if (!target.directAssignment) {
-          continue
-        }
+      for (const target of nested.dmlDirectAssignments) {
         if (paramTypeOids[target.paramId - 1] !== target.targetTypeOid) {
           continue
         }
@@ -2484,6 +2481,61 @@ function normalizeCompiledIr(catalog: CatalogFacts, analyzed: AnalyzedCompiledCo
   }
 }
 
+function isPositiveInteger(value: unknown): value is number {
+  return typeof value === 'number' && Number.isInteger(value) && value > 0
+}
+
+function hasExactlyKeys(value: object, expected: readonly string[]): boolean {
+  const actual = Object.keys(value).sort()
+  return actual.length === expected.length && actual.every((key, index) => key === expected[index])
+}
+
+function validateDmlQueryEnvelope(query: PgAnalyzerQuery, parameterCount: number): void {
+  walkQueryTree(query, (nested) => {
+    if (!Array.isArray(nested.dmlDirectAssignments)) {
+      throw new Error('analyzer returned a query without required DML direct-assignment facts.')
+    }
+    if (!Array.isArray(nested.dmlParameterNullAdmissions)) {
+      throw new Error('analyzer returned a query without required DML parameter NULL-admission facts.')
+    }
+
+    for (const assignment of nested.dmlDirectAssignments) {
+      if (
+        typeof assignment !== 'object' ||
+        assignment === null ||
+        !hasExactlyKeys(assignment, ['paramId', 'targetAttnum', 'targetRelid', 'targetTypeOid']) ||
+        !isPositiveInteger(assignment.paramId) ||
+        assignment.paramId > parameterCount ||
+        !isPositiveInteger(assignment.targetRelid) ||
+        !isPositiveInteger(assignment.targetAttnum) ||
+        !isPositiveInteger(assignment.targetTypeOid)
+      ) {
+        throw new Error('analyzer returned an inconsistent DML direct-assignment fact.')
+      }
+    }
+
+    for (const fact of nested.dmlParameterNullAdmissions) {
+      if (
+        typeof fact !== 'object' ||
+        fact === null ||
+        !hasExactlyKeys(fact, ['admission', 'basis', 'paramId']) ||
+        !isPositiveInteger(fact.paramId) ||
+        fact.paramId > parameterCount ||
+        !(
+          (fact.admission === 'accepts' &&
+            (fact.basis === 'action_unreachable_when_null' ||
+              fact.basis === 'row_values_preserved_when_null' ||
+              fact.basis === 'direct_target_null_admission')) ||
+          (fact.admission === 'rejects' && fact.basis === 'direct_target_null_admission') ||
+          (fact.admission === 'unknown' && fact.basis === 'unresolved')
+        )
+      ) {
+        throw new Error('analyzer returned an inconsistent DML parameter NULL-admission fact.')
+      }
+    }
+  })
+}
+
 async function analyzeCompiledConfig(
   client: PostgresQueryable,
   config: TypedSqlPostgresIrCompiledConfig
@@ -2523,6 +2575,9 @@ async function analyzeCompiledConfig(
   const statement = analysis.statements[0]
   if (!statement || statement.rewrittenQueryCount !== statement.queries.length) {
     throw new Error('analyzer returned an inconsistent rewritten-query envelope.')
+  }
+  for (const query of statement.queries) {
+    validateDmlQueryEnvelope(query, config.parameterNames.length)
   }
   const tagSettingQueries = statement.queries.filter((query) => query.canSetTag)
   if (tagSettingQueries.length !== 1) {
