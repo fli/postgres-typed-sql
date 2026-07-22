@@ -7,8 +7,19 @@ source_dir=${PGLITE_SOURCE_DIR:-"$default_source_dir"}
 pglite_repository=${PGLITE_SOURCE_REPOSITORY:-https://github.com/electric-sql/pglite.git}
 pglite_revision=25d0a55e1f1e4c59f26d9e125150dda88a33fd00
 postgres_revision=7b4ee5086055dc5e54ae1e13e487888249438e68
-cache_format=1
+cache_format=4
 managed_source=false
+native_source_manifest=$(
+  for native_source_path in \
+    "$project_root/engine/postgres_typed_sql_analyzer/Makefile" \
+    "$project_root/engine/postgres_typed_sql_analyzer/"*.c \
+    "$project_root/engine/postgres_typed_sql_analyzer/"*.h
+  do
+    if [ -f "$native_source_path" ]; then
+      basename "$native_source_path"
+    fi
+  done | LC_ALL=C sort
+)
 
 if [ "$source_dir" = "$default_source_dir" ]; then
   managed_source=true
@@ -18,6 +29,14 @@ hash_file() {
   git hash-object "$1"
 }
 
+native_source_identity() {
+  for native_source in $native_source_manifest; do
+    native_path="engine/postgres_typed_sql_analyzer/$native_source"
+    native_hash=$(hash_file "$project_root/$native_path")
+    printf 'native-source:%s=%s\n' "$native_path" "$native_hash"
+  done
+}
+
 identity_manifest() {
   cat <<EOF
 cache-format=$cache_format
@@ -25,8 +44,7 @@ pglite-repository=$pglite_repository
 pglite-revision=$pglite_revision
 postgres-pglite-revision=$postgres_revision
 postgres-pglite-patch=$(hash_file "$project_root/patches/postgres-pglite-analyzer.patch")
-analyzer-c=$(hash_file "$project_root/engine/postgres_typed_sql_analyzer/postgres_typed_sql_analyzer.c")
-analyzer-makefile=$(hash_file "$project_root/engine/postgres_typed_sql_analyzer/Makefile")
+$(native_source_identity)
 platform=$(uname -s)
 architecture=$(uname -m)
 node-abi=$(node -p 'process.versions.modules')
@@ -104,13 +122,13 @@ prepare_source_tree() {
     return 1
   fi
 
+  rm -rf "$tree_analyzer"
   mkdir -p "$tree_analyzer"
-  copy_if_changed \
-    "$project_root/engine/postgres_typed_sql_analyzer/postgres_typed_sql_analyzer.c" \
-    "$tree_analyzer/postgres_typed_sql_analyzer.c"
-  copy_if_changed \
-    "$project_root/engine/postgres_typed_sql_analyzer/Makefile" \
-    "$tree_analyzer/Makefile"
+  for native_source in $native_source_manifest; do
+    copy_if_changed \
+      "$project_root/engine/postgres_typed_sql_analyzer/$native_source" \
+      "$tree_analyzer/$native_source"
+  done
 }
 
 clone_cold_source() {
@@ -355,8 +373,23 @@ esac
 
 if [ ! -d "$source_dir/.git" ]; then
   if [ "$managed_source" = true ]; then
+    if [ -e "$source_dir" ] || [ -L "$source_dir" ]; then
+      invalid_source="$project_root/source/.pglite.invalid.$$"
+      echo "Quarantining invalid managed engine source at $invalid_source." >&2
+      mv "$source_dir" "$invalid_source"
+    else
+      invalid_source=
+    fi
     seed_managed_source
+    if [ -n "$invalid_source" ]; then
+      rm -rf "$invalid_source"
+    fi
   else
+    if [ -e "$source_dir" ] || [ -L "$source_dir" ]; then
+      echo "Refusing to initialize the non-Git PGLITE_SOURCE_DIR: $source_dir" >&2
+      echo "Move or remove that path, or point PGLITE_SOURCE_DIR at a valid PGlite checkout." >&2
+      exit 1
+    fi
     mkdir -p "$(dirname "$source_dir")"
     clone_cold_source "$source_dir"
   fi

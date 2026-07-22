@@ -25,7 +25,8 @@ interface NativeQuery {
   readonly canSetTag: boolean
   readonly commandType: string
   readonly cteList: readonly NativeCte[]
-  readonly dmlParameterTargets: readonly NativeDmlParameterTarget[]
+  readonly dmlDirectAssignments: readonly NativeDmlDirectAssignment[]
+  readonly dmlParameterNullAdmissions: readonly NativeDmlParameterNullAdmission[]
   readonly fromTree: NativeFromNode
   readonly hasModifyingCTE: boolean
   readonly hasLimitCount: boolean
@@ -80,18 +81,25 @@ interface NativeCte {
   readonly recursive?: boolean
 }
 
-interface NativeDmlParameterTarget {
-  readonly directAssignment: boolean
+interface NativeDmlDirectAssignment {
   readonly paramId: number
-  readonly source: string
-  readonly targetAttname: string
   readonly targetAttnum: number
-  readonly targetNullAdmission: 'accepts' | 'rejects' | 'unknown'
-  readonly targetNullable: boolean
   readonly targetRelid: number
-  readonly targetTypeName: string
   readonly targetTypeOid: number
 }
+
+type NativeDmlParameterNullAdmission =
+  | {
+      readonly admission: 'accepts'
+      readonly basis: 'action_unreachable_when_null' | 'row_values_preserved_when_null'
+      readonly paramId: number
+    }
+  | {
+      readonly admission: 'accepts' | 'rejects'
+      readonly basis: 'direct_target_null_admission'
+      readonly paramId: number
+    }
+  | { readonly admission: 'unknown'; readonly basis: 'unresolved'; readonly paramId: number }
 
 interface NativeExpr {
   readonly args?: readonly NativeExpr[]
@@ -241,7 +249,7 @@ test('native analyzer exposes the versioned PostgreSQL query envelope', async ()
       [20]
     )
 
-    assert.equal(analysis.schemaVersion, 9)
+    assert.equal(analysis.schemaVersion, 10)
     assert.equal(analysis.postgresVersionNum, 180003)
     assert.equal(analysis.rawStatementCount, 1)
     assert.deepEqual(analysis.paramTypeOids, [20])
@@ -770,7 +778,7 @@ test('native analyzer requires CHECK expressions to be safe when proving NULL ad
     for (const unsafeCase of unsafeCases) {
       const analysis = await analyze(database, unsafeCase.sql, [])
       assert.equal(
-        analysis.statements[0]?.queries[0]?.dmlParameterTargets[0]?.targetNullAdmission,
+        analysis.statements[0]?.queries[0]?.dmlParameterNullAdmissions[0]?.admission,
         'unknown',
         unsafeCase.sql
       )
@@ -786,8 +794,8 @@ test('native analyzer requires CHECK expressions to be safe when proving NULL ad
       select $1, $2, $3`
     const safeAnalysis = await analyze(database, safeSql, [])
     assert.ok(
-      safeAnalysis.statements[0]?.queries[0]?.dmlParameterTargets.every(
-        ({ targetNullAdmission }) => targetNullAdmission === 'accepts'
+      safeAnalysis.statements[0]?.queries[0]?.dmlParameterNullAdmissions.every(
+        ({ admission }) => admission === 'accepts'
       )
     )
     await database.query(safeSql, [null, null, null])
@@ -1225,38 +1233,25 @@ test('native analyzer follows grouped and excluded DML lineage and keeps inherit
 
     const inheritedSql = 'update public.inherited_target set value = $1'
     const inherited = await analyze(database, inheritedSql, [23])
-    assert.deepEqual(
-      inherited.statements[0]?.queries[0]?.dmlParameterTargets.map(({ directAssignment, targetNullAdmission }) => ({
-        directAssignment,
-        targetNullAdmission,
-      })),
-      [{ directAssignment: false, targetNullAdmission: 'unknown' }]
-    )
+    assert.deepEqual(inherited.statements[0]?.queries[0]?.dmlParameterNullAdmissions, [
+      { admission: 'unknown', basis: 'unresolved', paramId: 1 },
+    ])
     await assert.rejects(database.query(inheritedSql, [null]), /not-null constraint/u)
 
     const onlySql = 'update only public.inherited_target set value = $1'
     const only = await analyze(database, onlySql, [23])
-    assert.deepEqual(
-      only.statements[0]?.queries[0]?.dmlParameterTargets.map(({ directAssignment, targetNullAdmission }) => ({
-        directAssignment,
-        targetNullAdmission,
-      })),
-      [{ directAssignment: false, targetNullAdmission: 'accepts' }]
-    )
+    assert.deepEqual(only.statements[0]?.queries[0]?.dmlParameterNullAdmissions, [
+      { admission: 'accepts', basis: 'direct_target_null_admission', paramId: 1 },
+    ])
     await database.query(onlySql, [null])
 
     await database.query('create table public.grouped_sink (value integer not null)')
     const groupedSql = `insert into public.grouped_sink(value)
       select $1::integer group by $1`
     const grouped = await analyze(database, groupedSql, [23])
-    assert.deepEqual(
-      grouped.statements[0]?.queries[0]?.dmlParameterTargets.map(({ paramId, targetAttname, targetNullAdmission }) => ({
-        paramId,
-        targetAttname,
-        targetNullAdmission,
-      })),
-      [{ paramId: 1, targetAttname: 'value', targetNullAdmission: 'rejects' }]
-    )
+    assert.deepEqual(grouped.statements[0]?.queries[0]?.dmlParameterNullAdmissions, [
+      { admission: 'rejects', basis: 'direct_target_null_admission', paramId: 1 },
+    ])
     await assert.rejects(database.query(groupedSql, [null]), /not-null constraint/u)
 
     await database.query(`create table public.excluded_target (
@@ -1270,30 +1265,10 @@ test('native analyzer follows grouped and excluded DML lineage and keeps inherit
       on conflict (key) do update
       set required_value = excluded.source_value`
     const excluded = await analyze(database, excludedSql, [23])
-    assert.deepEqual(
-      excluded.statements[0]?.queries[0]?.dmlParameterTargets.map(
-        ({ paramId, source, targetAttname, targetNullAdmission }) => ({
-          paramId,
-          source,
-          targetAttname,
-          targetNullAdmission,
-        })
-      ),
-      [
-        {
-          paramId: 1,
-          source: 'INSERT',
-          targetAttname: 'source_value',
-          targetNullAdmission: 'accepts',
-        },
-        {
-          paramId: 1,
-          source: 'ON_CONFLICT_UPDATE',
-          targetAttname: 'required_value',
-          targetNullAdmission: 'unknown',
-        },
-      ]
-    )
+    assert.deepEqual(excluded.statements[0]?.queries[0]?.dmlParameterNullAdmissions, [
+      { admission: 'accepts', basis: 'direct_target_null_admission', paramId: 1 },
+      { admission: 'unknown', basis: 'unresolved', paramId: 1 },
+    ])
     await assert.rejects(database.query(excludedSql, [null]), /not-null constraint/u)
 
     await database.query(`create function public.excluded_source_value(
@@ -1306,12 +1281,8 @@ test('native analyzer follows grouped and excluded DML lineage and keeps inherit
       set required_value = public.excluded_source_value(excluded)`
     const excludedWholeRow = await analyze(database, excludedWholeRowSql, [23])
     assert.ok(
-      excludedWholeRow.statements[0]?.queries[0]?.dmlParameterTargets.some(
-        ({ paramId, source, targetAttname, targetNullAdmission }) =>
-          paramId === 1 &&
-          source === 'ON_CONFLICT_UPDATE' &&
-          targetAttname === 'required_value' &&
-          targetNullAdmission === 'unknown'
+      excludedWholeRow.statements[0]?.queries[0]?.dmlParameterNullAdmissions.some(
+        ({ paramId, basis, admission }) => paramId === 1 && basis === 'unresolved' && admission === 'unknown'
       )
     )
     await assert.rejects(database.query(excludedWholeRowSql, [null]), /not-null constraint/u)
@@ -1320,17 +1291,285 @@ test('native analyzer follows grouped and excluded DML lineage and keeps inherit
     const functionSql = `insert into public.function_sink(value)
       select value from generate_series($1::integer, $1::integer) source(value)`
     const functionLineage = await analyze(database, functionSql, [23])
-    assert.deepEqual(
-      functionLineage.statements[0]?.queries[0]?.dmlParameterTargets.map(
-        ({ paramId, targetAttname, targetNullAdmission }) => ({
-          paramId,
-          targetAttname,
-          targetNullAdmission,
-        })
-      ),
-      [{ paramId: 1, targetAttname: 'value', targetNullAdmission: 'unknown' }]
-    )
+    assert.deepEqual(functionLineage.statements[0]?.queries[0]?.dmlParameterNullAdmissions, [
+      { admission: 'unknown', basis: 'unresolved', paramId: 1 },
+    ])
     assert.deepEqual((await database.query(functionSql, [null])).rows, [])
+  })
+})
+
+test('native analyzer proves all-or-nothing point UPDATE parameters only when the old row is preserved', async () => {
+  await withDatabase(async (database) => {
+    await database.query(`create table public.point_update_probe (
+      id integer primary key,
+      location point not null,
+      other_location point,
+      revision integer not null default 0
+    )`)
+    await database.query(`insert into public.point_update_probe(id, location, other_location)
+      values (1, point(10, 20), point(30, 40))`)
+
+    const provenUpdates = [
+      `update public.point_update_probe as old_target
+       set location = coalesce(point($1, $2), old_target.location),
+           revision = case when point($1, $2) is null then revision else revision + 1 end
+       where id = 1
+       returning revision`,
+      `update public.point_update_probe as old_target
+       set location = case
+         when $1::double precision is null or $2::double precision is null then old_target.location
+         else point($1, $2)
+       end,
+       revision = case
+         when $1::double precision is null or $2::double precision is null then revision
+         else revision + 1
+       end
+       where id = 1
+       returning revision`,
+    ] as const
+
+    for (const sql of provenUpdates) {
+      const analysis = await analyze(database, sql, [])
+      const query = analysis.statements[0]?.queries[0]
+      assert.deepEqual(query?.dmlDirectAssignments, [])
+      assert.deepEqual(query?.dmlParameterNullAdmissions, [
+        { admission: 'accepts', basis: 'row_values_preserved_when_null', paramId: 1 },
+        { admission: 'accepts', basis: 'row_values_preserved_when_null', paramId: 2 },
+      ])
+
+      await database.query('update public.point_update_probe set location = point(10, 20), revision = 0 where id = 1')
+      for (const [x, y, expectedX, expectedY] of [
+        [null, null, 10, 20],
+        [null, 2, 10, 20],
+        [1, null, 10, 20],
+        [1, 2, 1, 2],
+      ] as const) {
+        const update = await database.query<{ revision: number }>(sql, [x, y])
+        assert.equal(update.rows.length, 1, 'UPDATE must still execute for every coordinate combination')
+        assert.equal(update.rows[0]?.revision, x === null || y === null ? 0 : 1)
+        const result = await database.query<{ matches: boolean; revision: number }>(
+          `select location ~= point($1, $2) as matches, revision
+           from public.point_update_probe where id = 1`,
+          [expectedX, expectedY]
+        )
+        assert.equal(result.rows[0]?.matches, true)
+        assert.equal(result.rows[0]?.revision, x === null || y === null ? 0 : 1)
+        await database.query('update public.point_update_probe set location = point(10, 20) where id = 1')
+      }
+    }
+
+    const unsafePredicateSql = `update public.point_update_probe as old_target
+      set location = old_target.location
+      where id = 1 and concat($1::text, '') <> 'blocked'`
+    const unsafePredicate = await analyze(database, unsafePredicateSql, [])
+    assert.deepEqual(unsafePredicate.statements[0]?.queries[0]?.dmlParameterNullAdmissions, [])
+
+    const negativeControls = [
+      `update public.point_update_probe set location = point($1, $2) where id = 1`,
+      `update public.point_update_probe as old_target set location = case
+         when $1::double precision is null or $2::double precision is null
+         then null else point($1, $2) end where id = 1`,
+      `update public.point_update_probe as old_target set location =
+         coalesce(point($1, $2), old_target.other_location) where id = 1`,
+      `update public.point_update_probe as old_target set location =
+         coalesce(point($1, $2), point(10, 20)) where id = 1`,
+      `update public.point_update_probe as old_target set
+         location = coalesce(point($1, $2), old_target.location), revision = $3 where id = 1`,
+      `update public.point_update_probe as old_target set location = case $1::double precision
+         when null then old_target.location else point($1, $2) end where id = 1`,
+      `update public.point_update_probe as old_target set location =
+         coalesce(point($1, $2), point(old_target.location[0], old_target.location[1])) where id = 1`,
+    ] as const
+
+    for (const sql of negativeControls) {
+      const facts = (await analyze(database, sql, [])).statements[0]?.queries[0]?.dmlParameterNullAdmissions ?? []
+      assert.equal(
+        facts.some(({ admission, paramId }) => (paramId === 1 || paramId === 2) && admission === 'accepts'),
+        false,
+        sql
+      )
+    }
+  })
+})
+
+test('native analyzer correlates nullable OLD values without bypassing CHECK enforcement', async () => {
+  await withDatabase(async (database) => {
+    await database.query(`create table public.old_value_probe (
+      id integer primary key,
+      nullable_value integer check (nullable_value <> 0),
+      required_value integer not null check (required_value <> 0),
+      divisor integer not null
+    )`)
+    await database.query(`insert into public.old_value_probe(id, nullable_value, required_value, divisor)
+      values (1, null, 1, 0)`)
+
+    const correlatedTailSql = `update public.old_value_probe as old_target
+      set nullable_value = coalesce(old_target.nullable_value, $1::integer)
+      where id = 1 returning nullable_value`
+    const correlatedTail = await analyze(database, correlatedTailSql, [])
+    assert.deepEqual(correlatedTail.statements[0]?.queries[0]?.dmlParameterNullAdmissions, [
+      { admission: 'accepts', basis: 'row_values_preserved_when_null', paramId: 1 },
+    ])
+    assert.deepEqual((await database.query(correlatedTailSql, [null])).rows, [{ nullable_value: null }])
+
+    const repeatedOldTailSql = `update public.old_value_probe as old_target
+      set nullable_value = coalesce(old_target.nullable_value, old_target.nullable_value, $1::integer)
+      where id = 1 returning nullable_value`
+    const repeatedOldTail = await analyze(database, repeatedOldTailSql, [])
+    assert.deepEqual(repeatedOldTail.statements[0]?.queries[0]?.dmlParameterNullAdmissions, [
+      { admission: 'accepts', basis: 'row_values_preserved_when_null', paramId: 1 },
+    ])
+    assert.deepEqual((await database.query(repeatedOldTailSql, [null])).rows, [{ nullable_value: null }])
+
+    const nonNullTailSql = `update public.old_value_probe as old_target
+      set nullable_value = coalesce(old_target.nullable_value, $1::integer, 0)
+      where id = 1`
+    const nonNullTail = await analyze(database, nonNullTailSql, [])
+    assert.equal(
+      nonNullTail.statements[0]?.queries[0]?.dmlParameterNullAdmissions.some(
+        ({ admission, paramId }) => paramId === 1 && admission === 'accepts'
+      ),
+      false
+    )
+    await assert.rejects(database.query(nonNullTailSql, [null]), /old_value_probe_nullable_value_check/u)
+
+    const strictArgumentSql = `update public.old_value_probe as old_target
+      set nullable_value = coalesce($1::integer + (1 / old_target.divisor), old_target.nullable_value)
+      where id = 1`
+    const strictArgument = await analyze(database, strictArgumentSql, [])
+    assert.equal(
+      strictArgument.statements[0]?.queries[0]?.dmlParameterNullAdmissions.some(
+        ({ admission, paramId }) => paramId === 1 && admission === 'accepts'
+      ),
+      false
+    )
+    await database.query('set plan_cache_mode = force_generic_plan')
+    await database.query(`prepare strict_argument_no_error_proof(integer) as ${strictArgumentSql}`)
+    await assert.rejects(database.query('execute strict_argument_no_error_proof(null)'), /division by zero/u)
+    await database.query('deallocate strict_argument_no_error_proof')
+    await database.query('reset plan_cache_mode')
+
+    const nullableOldNullTestSql = `update public.old_value_probe as old_target
+      set nullable_value = case
+        when $1::integer is null and old_target.nullable_value is null then 0
+        else old_target.nullable_value
+      end
+      where id = 1`
+    const nullableOldNullTest = await analyze(database, nullableOldNullTestSql, [])
+    assert.equal(
+      nullableOldNullTest.statements[0]?.queries[0]?.dmlParameterNullAdmissions.some(
+        ({ admission, paramId }) => paramId === 1 && admission === 'accepts'
+      ),
+      false
+    )
+    await assert.rejects(database.query(nullableOldNullTestSql, [null]), /old_value_probe_nullable_value_check/u)
+
+    const requiredOldNullTestSql = `update public.old_value_probe as old_target
+      set required_value = case
+        when $1::integer is null and old_target.required_value is null then 0
+        else old_target.required_value
+      end
+      where id = 1 returning required_value`
+    const requiredOldNullTest = await analyze(database, requiredOldNullTestSql, [])
+    assert.deepEqual(requiredOldNullTest.statements[0]?.queries[0]?.dmlParameterNullAdmissions, [
+      { admission: 'accepts', basis: 'row_values_preserved_when_null', paramId: 1 },
+    ])
+    assert.deepEqual((await database.query(requiredOldNullTestSql, [null])).rows, [{ required_value: 1 }])
+
+    await database.query('create table public.unvalidated_check_probe (value integer)')
+    await database.query('insert into public.unvalidated_check_probe(value) values (0)')
+    await database.query(`alter table public.unvalidated_check_probe
+      add constraint unvalidated_check_probe_positive check (value > 0) not valid`)
+    const unvalidatedSql = `update public.unvalidated_check_probe as old_target
+      set value = coalesce($1::integer, old_target.value)`
+    const unvalidated = await analyze(database, unvalidatedSql, [])
+    assert.equal(
+      unvalidated.statements[0]?.queries[0]?.dmlParameterNullAdmissions.some(
+        ({ admission, paramId }) => paramId === 1 && admission === 'accepts'
+      ),
+      false
+    )
+    await assert.rejects(database.query(unvalidatedSql, [null]), /unvalidated_check_probe_positive/u)
+
+    await database.query('create table public.unvalidated_not_null_probe (value integer)')
+    await database.query('insert into public.unvalidated_not_null_probe(value) values (null)')
+    await database.query(`alter table public.unvalidated_not_null_probe
+      add constraint unvalidated_not_null_probe_value not null value not valid`)
+    const unvalidatedNotNullSql = `update public.unvalidated_not_null_probe as old_target
+      set value = coalesce($1::integer, old_target.value)`
+    const unvalidatedNotNull = await analyze(database, unvalidatedNotNullSql, [])
+    assert.equal(
+      unvalidatedNotNull.statements[0]?.queries[0]?.dmlParameterNullAdmissions.some(
+        ({ admission, paramId }) => paramId === 1 && admission === 'accepts'
+      ),
+      false
+    )
+    await assert.rejects(database.query(unvalidatedNotNullSql, [null]), /violates not-null constraint/u)
+
+    await database.query('create sequence public.mutable_check_sequence start 1')
+    await database.query(`create function public.mutable_check(value integer)
+      returns boolean language sql volatile
+      as $$ select nextval('public.mutable_check_sequence') % 2 = 1 $$`)
+    await database.query(`create table public.mutable_check_probe (
+      value integer check (public.mutable_check(value))
+    )`)
+    await database.query('insert into public.mutable_check_probe(value) values (1)')
+    const mutableSql = `update public.mutable_check_probe as old_target
+      set value = coalesce($1::integer, old_target.value)`
+    const mutable = await analyze(database, mutableSql, [])
+    assert.equal(
+      mutable.statements[0]?.queries[0]?.dmlParameterNullAdmissions.some(
+        ({ admission, paramId }) => paramId === 1 && admission === 'accepts'
+      ),
+      false
+    )
+    await assert.rejects(database.query(mutableSql, [null]), /mutable_check_probe_value_check/u)
+
+    await database.query('create table public.stable_check_state (allowed boolean not null)')
+    await database.query('insert into public.stable_check_state(allowed) values (true)')
+    await database.query(`create function public.stable_check(value integer)
+      returns boolean language sql stable
+      as $$ select allowed from public.stable_check_state $$`)
+    await database.query(`create table public.stable_check_probe (
+      value integer check (public.stable_check(value))
+    )`)
+    await database.query('insert into public.stable_check_probe(value) values (1)')
+    await database.query('update public.stable_check_state set allowed = false')
+    const stableSql = `update public.stable_check_probe as old_target
+      set value = coalesce($1::integer, old_target.value)`
+    const stable = await analyze(database, stableSql, [])
+    assert.equal(
+      stable.statements[0]?.queries[0]?.dmlParameterNullAdmissions.some(
+        ({ admission, paramId }) => paramId === 1 && admission === 'accepts'
+      ),
+      false
+    )
+    await assert.rejects(database.query(stableSql, [null]), /stable_check_probe_value_check/u)
+  })
+})
+
+test('native analyzer does not admit NULL through NULLS NOT DISTINCT uniqueness', async () => {
+  await withDatabase(async (database) => {
+    await database.query(`create table public.nulls_not_distinct_probe (
+      id integer primary key,
+      value integer unique nulls not distinct
+    )`)
+    await database.query('insert into public.nulls_not_distinct_probe(id, value) values (1, null), (2, 1)')
+
+    const insertSql = 'insert into public.nulls_not_distinct_probe(id, value) values (3, $1::integer)'
+    const insert = await analyze(database, insertSql, [])
+    assert.deepEqual(insert.statements[0]?.queries[0]?.dmlParameterNullAdmissions, [
+      { admission: 'unknown', basis: 'unresolved', paramId: 1 },
+    ])
+    await assert.rejects(database.query(insertSql, [null]), /nulls_not_distinct_probe_value_key/u)
+
+    const updateSql = `update public.nulls_not_distinct_probe
+      set value = $1::integer where id = 2`
+    const update = await analyze(database, updateSql, [])
+    assert.deepEqual(update.statements[0]?.queries[0]?.dmlParameterNullAdmissions, [
+      { admission: 'unknown', basis: 'unresolved', paramId: 1 },
+    ])
+    await assert.rejects(database.query(updateSql, [null]), /nulls_not_distinct_probe_value_key/u)
   })
 })
 
@@ -2480,48 +2719,54 @@ test('native analyzer ignores volatile support for unrelated types in a shared o
 
 test('native analyzer maps direct DML parameters to PostgreSQL target columns', async () => {
   await withDatabase(async (database) => {
+    const accountColumns = await database.query<{
+      attname: 'display_name' | 'email'
+      targetAttnum: number
+      targetRelid: number
+      targetTypeOid: number
+    }>(`select
+      attribute.attname,
+      attribute.attnum as "targetAttnum",
+      attribute.attrelid as "targetRelid",
+      attribute.atttypid as "targetTypeOid"
+    from pg_catalog.pg_attribute attribute
+    where attribute.attrelid = 'public.accounts'::regclass
+      and attribute.attname in ('email', 'display_name')`)
+    const accountColumnByName = Object.fromEntries(
+      accountColumns.rows.map(({ attname, ...target }) => [attname, target])
+    ) as Record<'display_name' | 'email', Omit<NativeDmlDirectAssignment, 'paramId'>>
+
     const insert = await analyze(
       database,
       'insert into public.accounts(email, display_name) values ($1, $2), ($3, $4)',
       []
     )
-    assert.deepEqual(
-      insert.statements[0]?.queries[0]?.dmlParameterTargets.map(
-        ({ paramId, source, targetAttname, targetNullable }) => ({
-          paramId,
-          source,
-          targetAttname,
-          targetNullable,
-        })
-      ),
-      [
-        { paramId: 1, source: 'INSERT', targetAttname: 'email', targetNullable: false },
-        { paramId: 3, source: 'INSERT', targetAttname: 'email', targetNullable: false },
-        { paramId: 2, source: 'INSERT', targetAttname: 'display_name', targetNullable: true },
-        { paramId: 4, source: 'INSERT', targetAttname: 'display_name', targetNullable: true },
-      ]
-    )
-    assert.ok(
-      insert.statements[0]?.queries[0]?.dmlParameterTargets.every(
-        (target) => target.targetRelid > 0 && target.targetAttnum > 0 && target.targetTypeOid > 0
-      )
-    )
+    assert.deepEqual(insert.statements[0]?.queries[0]?.dmlParameterNullAdmissions, [
+      { admission: 'rejects', basis: 'direct_target_null_admission', paramId: 1 },
+      { admission: 'rejects', basis: 'direct_target_null_admission', paramId: 3 },
+      { admission: 'accepts', basis: 'direct_target_null_admission', paramId: 2 },
+      { admission: 'accepts', basis: 'direct_target_null_admission', paramId: 4 },
+    ])
+    assert.deepEqual(insert.statements[0]?.queries[0]?.dmlDirectAssignments, [
+      { paramId: 1, ...accountColumnByName.email },
+      { paramId: 3, ...accountColumnByName.email },
+      { paramId: 2, ...accountColumnByName.display_name },
+      { paramId: 4, ...accountColumnByName.display_name },
+    ])
 
     const repeatedInsert = await analyze(
       database,
       'insert into public.accounts(email, display_name) values ($1, $2), ($1, $2)',
       []
     )
-    assert.deepEqual(
-      repeatedInsert.statements[0]?.queries[0]?.dmlParameterTargets.map(({ paramId, targetAttname }) => ({
-        paramId,
-        targetAttname,
-      })),
-      [
-        { paramId: 1, targetAttname: 'email' },
-        { paramId: 2, targetAttname: 'display_name' },
-      ]
-    )
+    assert.deepEqual(repeatedInsert.statements[0]?.queries[0]?.dmlParameterNullAdmissions, [
+      { admission: 'rejects', basis: 'direct_target_null_admission', paramId: 1 },
+      { admission: 'accepts', basis: 'direct_target_null_admission', paramId: 2 },
+    ])
+    assert.deepEqual(repeatedInsert.statements[0]?.queries[0]?.dmlDirectAssignments, [
+      { paramId: 1, ...accountColumnByName.email },
+      { paramId: 2, ...accountColumnByName.display_name },
+    ])
 
     const cteInsert = await analyze(
       database,
@@ -2530,44 +2775,22 @@ test('native analyzer maps direct DML parameters to PostgreSQL target columns', 
        select source.email from source`,
       []
     )
-    assert.deepEqual(
-      cteInsert.statements[0]?.queries[0]?.dmlParameterTargets.map(
-        ({ paramId, source, targetAttname, targetNullable }) => ({
-          paramId,
-          source,
-          targetAttname,
-          targetNullable,
-        })
-      ),
-      [{ paramId: 1, source: 'INSERT', targetAttname: 'email', targetNullable: false }]
-    )
+    assert.deepEqual(cteInsert.statements[0]?.queries[0]?.dmlParameterNullAdmissions, [
+      { admission: 'rejects', basis: 'direct_target_null_admission', paramId: 1 },
+    ])
+    assert.deepEqual(cteInsert.statements[0]?.queries[0]?.dmlDirectAssignments, [
+      { paramId: 1, ...accountColumnByName.email },
+    ])
 
     const update = await analyze(
       database,
       'update public.accounts account set display_name = $1::text, email = $2 where account.id = $3',
       [23, 25, 20]
     )
-    assert.deepEqual(
-      update.statements[0]?.queries[0]?.dmlParameterTargets.map(
-        ({ paramId, source, targetAttname, targetNullable, targetTypeName }) => ({
-          paramId,
-          source,
-          targetAttname,
-          targetNullable,
-          targetTypeName,
-        })
-      ),
-      [
-        { paramId: 2, source: 'UPDATE', targetAttname: 'email', targetNullable: false, targetTypeName: 'text' },
-        {
-          paramId: 1,
-          source: 'UPDATE',
-          targetAttname: 'display_name',
-          targetNullable: true,
-          targetTypeName: 'text',
-        },
-      ]
-    )
+    assert.deepEqual(update.statements[0]?.queries[0]?.dmlParameterNullAdmissions, [
+      { admission: 'rejects', basis: 'direct_target_null_admission', paramId: 2 },
+      { admission: 'accepts', basis: 'direct_target_null_admission', paramId: 1 },
+    ])
 
     const upsert = await analyze(
       database,
@@ -2576,18 +2799,11 @@ test('native analyzer maps direct DML parameters to PostgreSQL target columns', 
        on conflict (email) do update set display_name = $3`,
       []
     )
-    assert.deepEqual(
-      upsert.statements[0]?.queries[0]?.dmlParameterTargets.map(({ paramId, source, targetAttname }) => ({
-        paramId,
-        source,
-        targetAttname,
-      })),
-      [
-        { paramId: 1, source: 'INSERT', targetAttname: 'email' },
-        { paramId: 2, source: 'INSERT', targetAttname: 'display_name' },
-        { paramId: 3, source: 'ON_CONFLICT_UPDATE', targetAttname: 'display_name' },
-      ]
-    )
+    assert.deepEqual(upsert.statements[0]?.queries[0]?.dmlParameterNullAdmissions, [
+      { admission: 'rejects', basis: 'direct_target_null_admission', paramId: 1 },
+      { admission: 'accepts', basis: 'direct_target_null_admission', paramId: 2 },
+      { admission: 'accepts', basis: 'direct_target_null_admission', paramId: 3 },
+    ])
 
     const merge = await analyze(
       database,
@@ -2598,18 +2814,11 @@ test('native analyzer maps direct DML parameters to PostgreSQL target columns', 
        when not matched then insert (email, display_name) values (source.email, $4)`,
       []
     )
-    assert.deepEqual(
-      merge.statements[0]?.queries[0]?.dmlParameterTargets.map(({ paramId, source, targetAttname }) => ({
-        paramId,
-        source,
-        targetAttname,
-      })),
-      [
-        { paramId: 3, source: 'MERGE_UPDATE', targetAttname: 'display_name' },
-        { paramId: 1, source: 'MERGE_INSERT', targetAttname: 'email' },
-        { paramId: 4, source: 'MERGE_INSERT', targetAttname: 'display_name' },
-      ]
-    )
+    assert.deepEqual(merge.statements[0]?.queries[0]?.dmlParameterNullAdmissions, [
+      { admission: 'accepts', basis: 'direct_target_null_admission', paramId: 3 },
+      { admission: 'unknown', basis: 'unresolved', paramId: 1 },
+      { admission: 'accepts', basis: 'direct_target_null_admission', paramId: 4 },
+    ])
 
     const modifyingCte = await analyze(
       database,
@@ -2620,16 +2829,11 @@ test('native analyzer maps direct DML parameters to PostgreSQL target columns', 
        select id from inserted`,
       []
     )
-    assert.deepEqual(modifyingCte.statements[0]?.queries[0]?.dmlParameterTargets, [])
-    assert.deepEqual(
-      modifyingCte.statements[0]?.queries[0]?.cteList[0]?.query?.dmlParameterTargets.map(
-        ({ paramId, source, targetAttname }) => ({ paramId, source, targetAttname })
-      ),
-      [
-        { paramId: 1, source: 'INSERT', targetAttname: 'email' },
-        { paramId: 2, source: 'INSERT', targetAttname: 'display_name' },
-      ]
-    )
+    assert.deepEqual(modifyingCte.statements[0]?.queries[0]?.dmlParameterNullAdmissions, [])
+    assert.deepEqual(modifyingCte.statements[0]?.queries[0]?.cteList[0]?.query?.dmlParameterNullAdmissions, [
+      { admission: 'rejects', basis: 'direct_target_null_admission', paramId: 1 },
+      { admission: 'accepts', basis: 'direct_target_null_admission', paramId: 2 },
+    ])
 
     const setOperation = await analyze(
       database,
@@ -2639,19 +2843,10 @@ test('native analyzer maps direct DML parameters to PostgreSQL target columns', 
        select coalesce($1, 'fallback')`,
       []
     )
-    assert.deepEqual(
-      setOperation.statements[0]?.queries[0]?.dmlParameterTargets.map(
-        ({ directAssignment, paramId, targetNullAdmission }) => ({
-          directAssignment,
-          paramId,
-          targetNullAdmission,
-        })
-      ),
-      [
-        { directAssignment: true, paramId: 1, targetNullAdmission: 'rejects' },
-        { directAssignment: false, paramId: 1, targetNullAdmission: 'unknown' },
-      ]
-    )
+    assert.deepEqual(setOperation.statements[0]?.queries[0]?.dmlParameterNullAdmissions, [
+      { admission: 'rejects', basis: 'direct_target_null_admission', paramId: 1 },
+      { admission: 'unknown', basis: 'unresolved', paramId: 1 },
+    ])
 
     const opaqueSetOperationPath = await analyze(
       database,
@@ -2662,20 +2857,18 @@ test('native analyzer maps direct DML parameters to PostgreSQL target columns', 
       []
     )
     assert.deepEqual(
-      opaqueSetOperationPath.statements[0]?.queries[0]?.dmlParameterTargets.map(({ paramId, targetNullAdmission }) => ({
+      opaqueSetOperationPath.statements[0]?.queries[0]?.dmlParameterNullAdmissions.map(({ paramId, admission }) => ({
         paramId,
-        targetNullAdmission,
+        admission,
       })),
       [
-        { paramId: 1, targetNullAdmission: 'accepts' },
-        { paramId: 1, targetNullAdmission: 'unknown' },
+        { paramId: 1, admission: 'accepts' },
+        { paramId: 1, admission: 'unknown' },
       ]
     )
     assert.deepEqual(
-      opaqueSetOperationPath.statements[0]?.queries[0]?.dmlParameterTargets.map(
-        ({ directAssignment }) => directAssignment
-      ),
-      [true, false]
+      opaqueSetOperationPath.statements[0]?.queries[0]?.dmlParameterNullAdmissions.map(({ basis }) => basis),
+      ['direct_target_null_admission', 'unresolved']
     )
 
     const opaqueNotNullTarget = await analyze(
@@ -2684,12 +2877,9 @@ test('native analyzer maps direct DML parameters to PostgreSQL target columns', 
        values (coalesce($1::text, 'fallback@example.com'))`,
       []
     )
-    assert.deepEqual(
-      opaqueNotNullTarget.statements[0]?.queries[0]?.dmlParameterTargets.map(
-        ({ directAssignment, targetNullAdmission }) => ({ directAssignment, targetNullAdmission })
-      ),
-      [{ directAssignment: false, targetNullAdmission: 'unknown' }]
-    )
+    assert.deepEqual(opaqueNotNullTarget.statements[0]?.queries[0]?.dmlParameterNullAdmissions, [
+      { admission: 'unknown', basis: 'unresolved', paramId: 1 },
+    ])
 
     const exceptFilter = await analyze(
       database,
@@ -2699,7 +2889,7 @@ test('native analyzer maps direct DML parameters to PostgreSQL target columns', 
        select $1::text`,
       []
     )
-    assert.deepEqual(exceptFilter.statements[0]?.queries[0]?.dmlParameterTargets, [])
+    assert.deepEqual(exceptFilter.statements[0]?.queries[0]?.dmlParameterNullAdmissions, [])
 
     const intersectFilter = await analyze(
       database,
@@ -2709,16 +2899,9 @@ test('native analyzer maps direct DML parameters to PostgreSQL target columns', 
        select 'fixed@example.com'::text`,
       []
     )
-    assert.deepEqual(
-      intersectFilter.statements[0]?.queries[0]?.dmlParameterTargets.map(
-        ({ directAssignment, paramId, targetNullAdmission }) => ({
-          directAssignment,
-          paramId,
-          targetNullAdmission,
-        })
-      ),
-      [{ directAssignment: false, paramId: 1, targetNullAdmission: 'unknown' }]
-    )
+    assert.deepEqual(intersectFilter.statements[0]?.queries[0]?.dmlParameterNullAdmissions, [
+      { admission: 'unknown', basis: 'unresolved', paramId: 1 },
+    ])
 
     const intersectRightLineageSql = `insert into public.accounts(email, display_name)
       select null::text, $1::text
@@ -2726,14 +2909,10 @@ test('native analyzer maps direct DML parameters to PostgreSQL target columns', 
       select $1::text, $1::text`
     const intersectRightLineage = await analyze(database, intersectRightLineageSql, [])
     assert.deepEqual(
-      intersectRightLineage.statements[0]?.queries[0]?.dmlParameterTargets
-        .filter(({ targetAttname }) => targetAttname === 'email')
-        .map(({ directAssignment, paramId, targetNullAdmission }) => ({
-          directAssignment,
-          paramId,
-          targetNullAdmission,
-        })),
-      [{ directAssignment: false, paramId: 1, targetNullAdmission: 'unknown' }]
+      intersectRightLineage.statements[0]?.queries[0]?.dmlParameterNullAdmissions.some(
+        ({ admission, basis, paramId }) => admission === 'unknown' && basis === 'unresolved' && paramId === 1
+      ),
+      true
     )
     await assert.rejects(database.query(intersectRightLineageSql, [null]), /null value in column "email"/u)
     await database.query(intersectRightLineageSql, ['different@example.test'])
@@ -2744,16 +2923,9 @@ test('native analyzer maps direct DML parameters to PostgreSQL target columns', 
        select $1::text where false`,
       []
     )
-    assert.deepEqual(
-      filteredProjection.statements[0]?.queries[0]?.dmlParameterTargets.map(
-        ({ directAssignment, paramId, targetNullAdmission }) => ({
-          directAssignment,
-          paramId,
-          targetNullAdmission,
-        })
-      ),
-      [{ directAssignment: false, paramId: 1, targetNullAdmission: 'unknown' }]
-    )
+    assert.deepEqual(filteredProjection.statements[0]?.queries[0]?.dmlParameterNullAdmissions, [
+      { admission: 'unknown', basis: 'unresolved', paramId: 1 },
+    ])
 
     const nullableFilteredProjection = await analyze(
       database,
@@ -2761,16 +2933,9 @@ test('native analyzer maps direct DML parameters to PostgreSQL target columns', 
        select $1::text where false`,
       []
     )
-    assert.deepEqual(
-      nullableFilteredProjection.statements[0]?.queries[0]?.dmlParameterTargets.map(
-        ({ directAssignment, paramId, targetNullAdmission }) => ({
-          directAssignment,
-          paramId,
-          targetNullAdmission,
-        })
-      ),
-      [{ directAssignment: false, paramId: 1, targetNullAdmission: 'accepts' }]
-    )
+    assert.deepEqual(nullableFilteredProjection.statements[0]?.queries[0]?.dmlParameterNullAdmissions, [
+      { admission: 'accepts', basis: 'direct_target_null_admission', paramId: 1 },
+    ])
 
     const limitedSetOperation = await analyze(
       database,
@@ -2779,16 +2944,9 @@ test('native analyzer maps direct DML parameters to PostgreSQL target columns', 
        limit 0`,
       []
     )
-    assert.deepEqual(
-      limitedSetOperation.statements[0]?.queries[0]?.dmlParameterTargets.map(
-        ({ directAssignment, paramId, targetNullAdmission }) => ({
-          directAssignment,
-          paramId,
-          targetNullAdmission,
-        })
-      ),
-      [{ directAssignment: false, paramId: 1, targetNullAdmission: 'unknown' }]
-    )
+    assert.deepEqual(limitedSetOperation.statements[0]?.queries[0]?.dmlParameterNullAdmissions, [
+      { admission: 'unknown', basis: 'unresolved', paramId: 1 },
+    ])
 
     const allSetOperationBranches = await analyze(
       database,
@@ -2801,7 +2959,7 @@ test('native analyzer maps direct DML parameters to PostgreSQL target columns', 
       []
     )
     assert.deepEqual(
-      allSetOperationBranches.statements[0]?.queries[0]?.dmlParameterTargets
+      allSetOperationBranches.statements[0]?.queries[0]?.dmlParameterNullAdmissions
         .map(({ paramId }) => paramId)
         .toSorted((left, right) => left - right),
       [1, 2, 3]
@@ -2823,7 +2981,7 @@ test('native analyzer maps direct DML parameters to PostgreSQL target columns', 
       []
     )
     assert.deepEqual(
-      longLineage.statements[0]?.queries[0]?.dmlParameterTargets.map(({ paramId }) => paramId),
+      longLineage.statements[0]?.queries[0]?.dmlParameterNullAdmissions.map(({ paramId }) => paramId),
       [1]
     )
 
@@ -2839,7 +2997,7 @@ test('native analyzer maps direct DML parameters to PostgreSQL target columns', 
       []
     )
     assert.deepEqual(
-      recursiveLineage.statements[0]?.queries[0]?.dmlParameterTargets.map(({ paramId }) => paramId),
+      recursiveLineage.statements[0]?.queries[0]?.dmlParameterNullAdmissions.map(({ paramId }) => paramId),
       [1]
     )
 
@@ -2851,7 +3009,7 @@ test('native analyzer maps direct DML parameters to PostgreSQL target columns', 
       []
     )
     assert.deepEqual(
-      joinAliasLineage.statements[0]?.queries[0]?.dmlParameterTargets.map(({ paramId }) => paramId),
+      joinAliasLineage.statements[0]?.queries[0]?.dmlParameterNullAdmissions.map(({ paramId }) => paramId),
       [1]
     )
 
@@ -2866,12 +3024,9 @@ test('native analyzer maps direct DML parameters to PostgreSQL target columns', 
        left join (values ($1::text)) candidate(value) on false`,
       []
     )
-    assert.deepEqual(
-      nullExtendedLineage.statements[0]?.queries[0]?.dmlParameterTargets.map(
-        ({ directAssignment, paramId, targetNullAdmission }) => ({ directAssignment, paramId, targetNullAdmission })
-      ),
-      [{ directAssignment: false, paramId: 1, targetNullAdmission: 'accepts' }]
-    )
+    assert.deepEqual(nullExtendedLineage.statements[0]?.queries[0]?.dmlParameterNullAdmissions, [
+      { admission: 'accepts', basis: 'direct_target_null_admission', paramId: 1 },
+    ])
 
     const repeatedValues = Array.from({ length: 256 }, () => '($1::text)').join(', ')
     const manyDuplicates = await analyze(
@@ -2879,9 +3034,16 @@ test('native analyzer maps direct DML parameters to PostgreSQL target columns', 
       `insert into public.accounts(display_name) values ${repeatedValues}`,
       []
     )
-    assert.equal(manyDuplicates.statements[0]?.queries[0]?.dmlParameterTargets.length, 1)
+    assert.equal(manyDuplicates.statements[0]?.queries[0]?.dmlParameterNullAdmissions.length, 1)
+    assert.deepEqual(
+      manyDuplicates.statements[0]?.queries[0]?.dmlDirectAssignments.map(({ paramId }) => paramId),
+      [1]
+    )
 
-    const deeplyNestedParameters = Array.from({ length: 256 }, (_, index) => `$${index + 1}::integer`).join(' + ')
+    const deeplyNestedParameters = Array.from({ length: 256 }, (_, index) => `$${index + 1}::integer`).reduceRight(
+      (tail, parameter) => `coalesce(${parameter}, ${tail})`,
+      'null::integer'
+    )
     const nestedUsage = await analyze(database, `select ${deeplyNestedParameters}`, [])
     assert.equal(nestedUsage.paramUsageNullAdmissions.length, 256)
     assert.ok(nestedUsage.paramUsageNullAdmissions.every((admission) => admission === 'accepts'))
@@ -2897,11 +3059,11 @@ test('native analyzer maps direct DML parameters to PostgreSQL target columns', 
     await database.query('alter table public.partitioned_values_one alter column value set not null')
     const checkedView = await analyze(database, 'insert into public.non_null_view(value) values ($1)', [])
     assert.deepEqual(
-      checkedView.statements[0]?.queries[0]?.dmlParameterTargets.map(({ paramId, targetNullAdmission }) => ({
+      checkedView.statements[0]?.queries[0]?.dmlParameterNullAdmissions.map(({ paramId, admission }) => ({
         paramId,
-        targetNullAdmission,
+        admission,
       })),
-      [{ paramId: 1, targetNullAdmission: 'unknown' }]
+      [{ paramId: 1, admission: 'unknown' }]
     )
     const partitionedTarget = await analyze(
       database,
@@ -2909,11 +3071,11 @@ test('native analyzer maps direct DML parameters to PostgreSQL target columns', 
       []
     )
     assert.deepEqual(
-      partitionedTarget.statements[0]?.queries[0]?.dmlParameterTargets.map(({ paramId, targetNullAdmission }) => ({
+      partitionedTarget.statements[0]?.queries[0]?.dmlParameterNullAdmissions.map(({ paramId, admission }) => ({
         paramId,
-        targetNullAdmission,
+        admission,
       })),
-      [{ paramId: 1, targetNullAdmission: 'unknown' }]
+      [{ paramId: 1, admission: 'unknown' }]
     )
 
     await database.query('create domain public.maybe_text as text')
@@ -2942,7 +3104,7 @@ test('native analyzer maps direct DML parameters to PostgreSQL target columns', 
       []
     )
     assert.deepEqual(domainTypedSource.paramTypeNullAdmissions, ['rejects'])
-    assert.equal(domainTypedSource.statements[0]?.queries[0]?.dmlParameterTargets[0]?.targetNullAdmission, 'accepts')
+    assert.equal(domainTypedSource.statements[0]?.queries[0]?.dmlParameterNullAdmissions[0]?.admission, 'accepts')
 
     const rejectingReturningUse = await analyze(
       database,
@@ -2960,17 +3122,12 @@ test('native analyzer maps direct DML parameters to PostgreSQL target columns', 
        values ($1, $2, $3, $4)`,
       []
     )
-    assert.deepEqual(
-      domainTargets.statements[0]?.queries[0]?.dmlParameterTargets.map(
-        ({ paramId, targetAttname, targetNullable }) => ({ paramId, targetAttname, targetNullable })
-      ),
-      [
-        { paramId: 1, targetAttname: 'maybe_value', targetNullable: true },
-        { paramId: 2, targetAttname: 'checked_value', targetNullable: true },
-        { paramId: 3, targetAttname: 'required_value', targetNullable: false },
-        { paramId: 4, targetAttname: 'nested_required_value', targetNullable: false },
-      ]
-    )
+    assert.deepEqual(domainTargets.statements[0]?.queries[0]?.dmlParameterNullAdmissions, [
+      { admission: 'accepts', basis: 'direct_target_null_admission', paramId: 1 },
+      { admission: 'accepts', basis: 'direct_target_null_admission', paramId: 2 },
+      { admission: 'rejects', basis: 'direct_target_null_admission', paramId: 3 },
+      { admission: 'rejects', basis: 'direct_target_null_admission', paramId: 4 },
+    ])
 
     const domainCheckAdmissions = await analyze(
       database,
@@ -2978,20 +3135,11 @@ test('native analyzer maps direct DML parameters to PostgreSQL target columns', 
        values ($1, $2, $3)`,
       []
     )
-    assert.deepEqual(
-      domainCheckAdmissions.statements[0]?.queries[0]?.dmlParameterTargets.map(
-        ({ paramId, targetNullAdmission, targetNullable }) => ({
-          paramId,
-          targetNullAdmission,
-          targetNullable,
-        })
-      ),
-      [
-        { paramId: 1, targetNullAdmission: 'accepts', targetNullable: true },
-        { paramId: 2, targetNullAdmission: 'rejects', targetNullable: false },
-        { paramId: 3, targetNullAdmission: 'unknown', targetNullable: false },
-      ]
-    )
+    assert.deepEqual(domainCheckAdmissions.statements[0]?.queries[0]?.dmlParameterNullAdmissions, [
+      { admission: 'accepts', basis: 'direct_target_null_admission', paramId: 1 },
+      { admission: 'rejects', basis: 'direct_target_null_admission', paramId: 2 },
+      { admission: 'unknown', basis: 'unresolved', paramId: 3 },
+    ])
 
     await database.query(`
       create table public.table_check_probe (
@@ -3008,14 +3156,14 @@ test('native analyzer maps direct DML parameters to PostgreSQL target columns', 
       []
     )
     assert.deepEqual(
-      tableCheckAdmissions.statements[0]?.queries[0]?.dmlParameterTargets.map(({ paramId, targetNullAdmission }) => ({
+      tableCheckAdmissions.statements[0]?.queries[0]?.dmlParameterNullAdmissions.map(({ paramId, admission }) => ({
         paramId,
-        targetNullAdmission,
+        admission,
       })),
       [
-        { paramId: 1, targetNullAdmission: 'accepts' },
-        { paramId: 2, targetNullAdmission: 'rejects' },
-        { paramId: 3, targetNullAdmission: 'accepts' },
+        { paramId: 1, admission: 'accepts' },
+        { paramId: 2, admission: 'rejects' },
+        { paramId: 3, admission: 'accepts' },
       ]
     )
 
@@ -3043,7 +3191,7 @@ test('native analyzer maps direct DML parameters to PostgreSQL target columns', 
       'insert into public.match_full_child(left_key, right_key) values ($1, 2)',
       []
     )
-    assert.equal(matchFullMixed.statements[0]?.queries[0]?.dmlParameterTargets[0]?.targetNullAdmission, 'rejects')
+    assert.equal(matchFullMixed.statements[0]?.queries[0]?.dmlParameterNullAdmissions[0]?.admission, 'rejects')
     await assert.rejects(
       database.query('insert into public.match_full_child(left_key, right_key) values ($1, 2)', [null]),
       /match_full_child_left_key_right_key_fkey/u
@@ -3054,7 +3202,7 @@ test('native analyzer maps direct DML parameters to PostgreSQL target columns', 
       'insert into public.match_full_child(left_key, right_key) values ($1, null)',
       []
     )
-    assert.equal(matchFullAllNull.statements[0]?.queries[0]?.dmlParameterTargets[0]?.targetNullAdmission, 'accepts')
+    assert.equal(matchFullAllNull.statements[0]?.queries[0]?.dmlParameterNullAdmissions[0]?.admission, 'accepts')
     await database.query('insert into public.match_full_child(left_key, right_key) values ($1, null)', [null])
 
     const matchFullSameParameter = await analyze(
@@ -3063,8 +3211,8 @@ test('native analyzer maps direct DML parameters to PostgreSQL target columns', 
       []
     )
     assert.ok(
-      matchFullSameParameter.statements[0]?.queries[0]?.dmlParameterTargets.every(
-        ({ targetNullAdmission }) => targetNullAdmission === 'accepts'
+      matchFullSameParameter.statements[0]?.queries[0]?.dmlParameterNullAdmissions.every(
+        ({ admission }) => admission === 'accepts'
       )
     )
     await database.query('insert into public.match_full_child(left_key, right_key) values ($1, $1)', [null])
@@ -3075,8 +3223,8 @@ test('native analyzer maps direct DML parameters to PostgreSQL target columns', 
       []
     )
     assert.ok(
-      matchFullUnknownPeer.statements[0]?.queries[0]?.dmlParameterTargets.every(
-        ({ targetNullAdmission }) => targetNullAdmission === 'unknown'
+      matchFullUnknownPeer.statements[0]?.queries[0]?.dmlParameterNullAdmissions.every(
+        ({ admission }) => admission === 'unknown'
       )
     )
 
@@ -3085,7 +3233,7 @@ test('native analyzer maps direct DML parameters to PostgreSQL target columns', 
       'insert into public.match_simple_child(left_key, right_key) values ($1, 2)',
       []
     )
-    assert.equal(matchSimpleMixed.statements[0]?.queries[0]?.dmlParameterTargets[0]?.targetNullAdmission, 'accepts')
+    assert.equal(matchSimpleMixed.statements[0]?.queries[0]?.dmlParameterNullAdmissions[0]?.admission, 'accepts')
     await database.query('insert into public.match_simple_child(left_key, right_key) values ($1, 2)', [null])
 
     const matchFullUnrelatedColumn = await analyze(
@@ -3094,7 +3242,7 @@ test('native analyzer maps direct DML parameters to PostgreSQL target columns', 
       []
     )
     assert.equal(
-      matchFullUnrelatedColumn.statements[0]?.queries[0]?.dmlParameterTargets[0]?.targetNullAdmission,
+      matchFullUnrelatedColumn.statements[0]?.queries[0]?.dmlParameterNullAdmissions[0]?.admission,
       'accepts'
     )
 
@@ -3102,10 +3250,7 @@ test('native analyzer maps direct DML parameters to PostgreSQL target columns', 
       value integer check (value = any (array[array[]::integer[]]))
     )`)
     const emptyNestedArrayCheck = await analyze(database, 'insert into public.any_empty_probe(value) values ($1)', [])
-    assert.equal(
-      emptyNestedArrayCheck.statements[0]?.queries[0]?.dmlParameterTargets[0]?.targetNullAdmission,
-      'rejects'
-    )
+    assert.equal(emptyNestedArrayCheck.statements[0]?.queries[0]?.dmlParameterNullAdmissions[0]?.admission, 'rejects')
     await assert.rejects(
       database.query('insert into public.any_empty_probe(value) values ($1)', [null]),
       /any_empty_probe_value_check/u
@@ -3121,12 +3266,9 @@ test('native analyzer maps direct DML parameters to PostgreSQL target columns', 
       'insert into public.any_mismatched_array_probe(value) values ($1)',
       []
     )
-    assert.deepEqual(
-      mismatchedNestedArrayCheck.statements[0]?.queries[0]?.dmlParameterTargets.map(
-        ({ targetNullAdmission, targetNullable }) => ({ targetNullAdmission, targetNullable })
-      ),
-      [{ targetNullAdmission: 'unknown', targetNullable: false }]
-    )
+    assert.deepEqual(mismatchedNestedArrayCheck.statements[0]?.queries[0]?.dmlParameterNullAdmissions, [
+      { admission: 'unknown', basis: 'unresolved', paramId: 1 },
+    ])
     await assert.rejects(
       database.query('insert into public.any_mismatched_array_probe(value) values ($1)', [null]),
       /multidimensional arrays must have array expressions with matching dimensions/u
@@ -3142,12 +3284,9 @@ test('native analyzer maps direct DML parameters to PostgreSQL target columns', 
       'insert into public.any_compatible_array_probe(value) values ($1)',
       []
     )
-    assert.deepEqual(
-      compatibleNestedArrayCheck.statements[0]?.queries[0]?.dmlParameterTargets.map(
-        ({ targetNullAdmission, targetNullable }) => ({ targetNullAdmission, targetNullable })
-      ),
-      [{ targetNullAdmission: 'accepts', targetNullable: true }]
-    )
+    assert.deepEqual(compatibleNestedArrayCheck.statements[0]?.queries[0]?.dmlParameterNullAdmissions, [
+      { admission: 'accepts', basis: 'direct_target_null_admission', paramId: 1 },
+    ])
     await database.query('insert into public.any_compatible_array_probe(value) values ($1)', [null])
 
     await database.query(`create table public.generated_probe (
@@ -3155,25 +3294,22 @@ test('native analyzer maps direct DML parameters to PostgreSQL target columns', 
       derived text generated always as (input) stored not null
     )`)
     const generatedTarget = await analyze(database, 'insert into public.generated_probe(input) values ($1)', [])
-    assert.equal(generatedTarget.statements[0]?.queries[0]?.dmlParameterTargets[0]?.targetNullAdmission, 'unknown')
+    assert.equal(generatedTarget.statements[0]?.queries[0]?.dmlParameterNullAdmissions[0]?.admission, 'unknown')
 
     await database.query('create foreign data wrapper dummy no handler')
     await database.query('create server dummy_server foreign data wrapper dummy')
     await database.query('create foreign table public.foreign_probe(value text) server dummy_server')
     const foreignTarget = await analyze(database, 'insert into public.foreign_probe(value) values ($1)', [])
-    assert.equal(foreignTarget.statements[0]?.queries[0]?.dmlParameterTargets[0]?.targetNullAdmission, 'unknown')
+    assert.equal(foreignTarget.statements[0]?.queries[0]?.dmlParameterNullAdmissions[0]?.admission, 'unknown')
 
     const explicitNonNullDomainCoercion = await analyze(
       database,
       'insert into public.domain_probe(value) values (($1::text)::public.non_null_text)',
       []
     )
-    assert.deepEqual(
-      explicitNonNullDomainCoercion.statements[0]?.queries[0]?.dmlParameterTargets.map(
-        ({ paramId, targetAttname, targetNullable }) => ({ paramId, targetAttname, targetNullable })
-      ),
-      [{ paramId: 1, targetAttname: 'value', targetNullable: false }]
-    )
+    assert.deepEqual(explicitNonNullDomainCoercion.statements[0]?.queries[0]?.dmlParameterNullAdmissions, [
+      { admission: 'rejects', basis: 'direct_target_null_admission', paramId: 1 },
+    ])
 
     const mixedDomainPaths = await analyze(
       database,
@@ -3181,15 +3317,10 @@ test('native analyzer maps direct DML parameters to PostgreSQL target columns', 
        values ($1), (($1::text)::public.non_null_text)`,
       []
     )
-    assert.deepEqual(
-      mixedDomainPaths.statements[0]?.queries[0]?.dmlParameterTargets.map(
-        ({ paramId, targetAttname, targetNullable }) => ({ paramId, targetAttname, targetNullable })
-      ),
-      [
-        { paramId: 1, targetAttname: 'value', targetNullable: true },
-        { paramId: 1, targetAttname: 'value', targetNullable: false },
-      ]
-    )
+    assert.deepEqual(mixedDomainPaths.statements[0]?.queries[0]?.dmlParameterNullAdmissions, [
+      { admission: 'accepts', basis: 'direct_target_null_admission', paramId: 1 },
+      { admission: 'rejects', basis: 'direct_target_null_admission', paramId: 1 },
+    ])
 
     const cteDomainCoercion = await analyze(
       database,
@@ -3200,12 +3331,9 @@ test('native analyzer maps direct DML parameters to PostgreSQL target columns', 
        select value from source`,
       []
     )
-    assert.deepEqual(
-      cteDomainCoercion.statements[0]?.queries[0]?.dmlParameterTargets.map(
-        ({ paramId, targetAttname, targetNullable }) => ({ paramId, targetAttname, targetNullable })
-      ),
-      [{ paramId: 1, targetAttname: 'value', targetNullable: false }]
-    )
+    assert.deepEqual(cteDomainCoercion.statements[0]?.queries[0]?.dmlParameterNullAdmissions, [
+      { admission: 'rejects', basis: 'direct_target_null_admission', paramId: 1 },
+    ])
 
     await database.query('create sequence public.domain_side_effect_sequence')
     await database.query(`create domain public.volatile_text as text
@@ -3226,7 +3354,7 @@ test('native analyzer maps direct DML parameters to PostgreSQL target columns', 
     await database.query(`create trigger reject_null before insert on public.trigger_probe
       for each row execute function public.reject_null_trigger()`)
     const triggerTarget = await analyze(database, 'insert into public.trigger_probe(value) values ($1)', [])
-    assert.equal(triggerTarget.statements[0]?.queries[0]?.dmlParameterTargets[0]?.targetNullAdmission, 'unknown')
+    assert.equal(triggerTarget.statements[0]?.queries[0]?.dmlParameterNullAdmissions[0]?.admission, 'unknown')
 
     await database.query(`create table public.trigger_checked_probe (
       value text check (value in ('allowed'))
@@ -3242,16 +3370,9 @@ test('native analyzer maps direct DML parameters to PostgreSQL target columns', 
       for each row execute function public.force_allowed_trigger()`)
     const rewrittenTriggerSql = 'insert into public.trigger_checked_probe(value) values ($1)'
     const rewrittenTriggerTarget = await analyze(database, rewrittenTriggerSql, [])
-    assert.deepEqual(
-      rewrittenTriggerTarget.statements[0]?.queries[0]?.dmlParameterTargets.map(
-        ({ directAssignment, paramId, targetNullAdmission }) => ({
-          directAssignment,
-          paramId,
-          targetNullAdmission,
-        })
-      ),
-      [{ directAssignment: false, paramId: 1, targetNullAdmission: 'unknown' }]
-    )
+    assert.deepEqual(rewrittenTriggerTarget.statements[0]?.queries[0]?.dmlParameterNullAdmissions, [
+      { admission: 'unknown', basis: 'unresolved', paramId: 1 },
+    ])
     await database.query(rewrittenTriggerSql, ['outside'])
     assert.deepEqual((await database.query<{ value: string }>('select value from public.trigger_checked_probe')).rows, [
       { value: 'allowed' },
@@ -3262,7 +3383,7 @@ test('native analyzer maps direct DML parameters to PostgreSQL target columns', 
     await database.query(`create policy require_value on public.rls_probe
       for insert with check (value is not null)`)
     const rlsTarget = await analyze(database, 'insert into public.rls_probe(value) values ($1)', [])
-    assert.equal(rlsTarget.statements[0]?.queries[0]?.dmlParameterTargets[0]?.targetNullAdmission, 'unknown')
+    assert.equal(rlsTarget.statements[0]?.queries[0]?.dmlParameterNullAdmissions[0]?.admission, 'unknown')
 
     await database.query('create table public.conditional_rule_source (value text)')
     await database.query('create table public.conditional_rule_sink (value text not null)')
@@ -3273,16 +3394,11 @@ test('native analyzer maps direct DML parameters to PostgreSQL target columns', 
     const conditionalRule = await analyze(database, 'insert into public.conditional_rule_source(value) values ($1)', [])
     assert.deepEqual(
       conditionalRule.statements[0]?.queries
-        .flatMap((query) => query.dmlParameterTargets)
-        .map(({ directAssignment, targetNullAdmission, targetNullable }) => ({
-          directAssignment,
-          targetNullAdmission,
-          targetNullable,
-        }))
-        .toSorted((left, right) => Number(left.targetNullable) - Number(right.targetNullable)),
+        .flatMap((query) => query.dmlParameterNullAdmissions)
+        .toSorted((left, right) => left.admission.localeCompare(right.admission)),
       [
-        { directAssignment: false, targetNullAdmission: 'unknown', targetNullable: false },
-        { directAssignment: true, targetNullAdmission: 'accepts', targetNullable: true },
+        { admission: 'accepts', basis: 'direct_target_null_admission', paramId: 1 },
+        { admission: 'unknown', basis: 'unresolved', paramId: 1 },
       ]
     )
   })
