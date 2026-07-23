@@ -3,6 +3,26 @@ import test from 'node:test'
 
 import { PGlite } from '../src/vendor/pglite/index.js'
 
+test('PostgreSQL prepares and executes authored casts with untyped wire parameters', async () => {
+  const database = new PGlite()
+  try {
+    await database.waitReady
+
+    const temporal = await database.query<{ readonly elapsed: unknown }>(
+      'select $1::timestamptz - $2::timestamptz as elapsed',
+      ['2026-07-23T12:00:00+09:30', '2026-07-23T11:30:00+09:30']
+    )
+    assert.equal(temporal.fields[0]?.dataTypeID, 1186)
+    assert.equal(temporal.rows.length, 1)
+
+    const bigint = await database.query<{ readonly value: unknown }>('select $1::bigint as value', ['9007199254740993'])
+    assert.equal(bigint.fields[0]?.dataTypeID, 20)
+    assert.equal(bigint.rows.length, 1)
+  } finally {
+    await database.close()
+  }
+})
+
 test('PostgreSQL result metadata flattens domains but preserves custom array and scalar OIDs', async () => {
   const database = new PGlite()
   try {

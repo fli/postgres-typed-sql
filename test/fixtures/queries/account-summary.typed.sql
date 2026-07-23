@@ -1,4 +1,3 @@
--- @param email text
 select jsonb_build_object(
   'email', a.email,
   'display_name', a.display_name,

@@ -65,15 +65,18 @@ Files ending in `.typed.sql` are generated next to their source. Named parameter
 
 ```sql
 -- src/queries/find-account-by-email.typed.sql
--- @param email text
 select id, email, display_name
 from public.accounts
 where email = :email
 ```
 
-Named parameter tokens retain their exact spelling for SQL compilation, `@param` directives, diagnostics, and runtime metadata. Generated parameter-object properties are application-facing and use conservative camel case by default, so `:platform_slug` is supplied as `{ platformSlug }`. Repeated uses of one raw token still share one positional placeholder and one public property. Set `naming.parameterProperties` to `'preserve'` only when callers deliberately use the raw token spelling.
+Named parameter tokens retain their exact spelling for SQL compilation, `@nullable` directives, diagnostics, and runtime metadata. Generated parameter-object properties are application-facing and use conservative camel case by default, so `:platform_slug` is supplied as `{ platformSlug }`. Repeated uses of one raw token still share one positional placeholder and one public property. Set `naming.parameterProperties` to `'preserve'` only when callers deliberately use the raw token spelling.
 
-Parameters are non-null to callers by default, independently of whether PostgreSQL can evaluate the statement with SQL `NULL`. Use `-- @param name ?` to request top-level SQL `NULL` while retaining PostgreSQL type inference, or append `?` to an explicit parameter type. Generation accepts either nullable form only when PostgreSQL analysis proves that every use admits `NULL`; proven rejection or incomplete evidence is an error.
+PostgreSQL infers parameter types from the authored SQL. When an expression does not provide enough context—such as an otherwise ambiguous operator—write an ordinary PostgreSQL cast at that use, for example `:cutoff::timestamptz`. The generator does not maintain a parallel annotation type system and does not inject casts into the SQL. It analyzes the exact compiled `$1`, `$2`, … text that the runtime executes, without supplying out-of-band parameter OIDs.
+
+Parameters are non-null to callers by default, independently of whether PostgreSQL can evaluate the statement with SQL `NULL`. Use `-- @nullable name` to request top-level SQL `NULL`. This changes only the caller contract; it does not provide a PostgreSQL type. Generation accepts the request only when PostgreSQL analysis proves that every use admits `NULL`; proven rejection or incomplete evidence is an error.
+
+The built-in node-postgres adapter sends only the generated SQL text and values; it does not add Parse-message parameter type OIDs. A custom adapter conforms to generated parameter typing only when it preserves that property. Supplying out-of-band type hints can make runtime preparation resolve SQL differently from the SQL-only analysis contract.
 
 Inside PostgreSQL expression subscripts, an unparenthesized top-level colon remains the native array-slice delimiter. Use `items[(:index)]` for a named subscript, and use `items[1 : :upper]` or `items[1:(:upper)]` for a named slice bound. `ARRAY[:value]` continues to treat `:value` as a named parameter because `ARRAY[...]` is an array constructor rather than a subscript.
 
@@ -129,7 +132,7 @@ export default defineConfig({
 })
 ```
 
-For example, the raw token `:account_id` is compiled to a positional placeholder but exposed to callers as `accountId`. Parameter metadata retains `name: 'account_id'` and records `propertyName: 'accountId'`; runtime `parameterNames` and `values(params)` lookup use only the public `accountId` property. `@param account_id ...` remains keyed by the raw token.
+For example, the raw token `:account_id` is compiled to a positional placeholder but exposed to callers as `accountId`. Parameter metadata retains `name: 'account_id'` and records `propertyName: 'accountId'`; runtime `parameterNames` and `values(params)` lookup use only the public `accountId` property. `@nullable account_id` remains keyed by the raw token.
 
 For result values, a PostgreSQL column `account_id` becomes the mapped row property `accountId`. A modeled JSON value such as `jsonb_build_object('display_name', display_name)` exposes `displayName`. The structured JSON policy applies recursively through inferred objects, arrays, unions, `json_agg`/`jsonb_agg`, and JSON object or array projections from derived subqueries. Opaque JSON values—including selected JSON columns and dynamically keyed objects—are not traversed, so their internal keys and object identity are preserved.
 
@@ -209,23 +212,37 @@ Directives are SQL comments at the beginning of a `.typed.sql` file:
 ```sql
 -- @name findAccount
 -- @access read
--- @param email text
--- @param inferred_cutoff ?
--- @param display_name text?
+-- @nullable inferred_cutoff
 -- @column id bigint
+
+select id
+from accounts
+where email = :email
+  and created_at >= :inferred_cutoff::timestamptz
 ```
 
 - `@name` overrides the lower-camel-case name derived from the filename.
 - `@access` can explicitly declare `read` or `write`. `read` is an assertion that analysis can prove read-only-compatible execution; it is not a trust override. `write` selects the conservative write execution route and does not necessarily claim that the statement mutates data.
-- `@param name type` supplies a PostgreSQL type when PostgreSQL cannot infer one. Parameters are non-null to callers by default.
-- `@param name ?` requests a nullable caller input while retaining PostgreSQL type inference. `@param name type?` combines the same request with an explicit PostgreSQL type. Either form is proof-gated: generation succeeds only when canonical PostgreSQL evidence is `accepts`, and fails for `rejects` or `unknown`.
+- `@nullable name` requests top-level SQL `NULL` in the generated caller type. It is proof-gated: generation succeeds only when canonical PostgreSQL evidence is `accepts`, and fails for `rejects` or `unknown`.
 - `@column` asserts that a result column exists and optionally asserts its PostgreSQL type.
 
 PostgreSQL still performs the authoritative parse, name resolution, type inference, rewriting, function/operator resolution, and catalog lookup.
 
-Caller permission and PostgreSQL admission are deliberately different facts. An accepting PostgreSQL use never widens the generated caller API without `?`; a nullable directive states the intended application contract and asks generation to verify it. Generated parameter metadata records the resolved contract as a required `nullable` boolean and does not expose analyzer admission.
+Caller permission and PostgreSQL admission are deliberately different facts. An accepting PostgreSQL use never widens the generated caller API without `@nullable`; the directive states the intended application contract and asks generation to verify it. Generated parameter metadata records the resolved contract as a required `nullable` boolean and does not expose analyzer admission.
 
 Top-level SQL `NULL` is also distinct from values nested inside a parameter. `PgArrayParameter<T>` continues to permit NULL array elements without making the outer array nullable. JSON objects may contain JSON null, and serialized JSON text such as `'null'` remains a non-null SQL parameter value; only an accepted nullable directive adds top-level SQL `null` to the generated property.
+
+### Migrating parameter annotations
+
+Parameter type annotations are intentionally unsupported. Move type information into the SQL and keep only caller-nullability intent:
+
+| Previous declaration | SQL-first form                                                                                   |
+| -------------------- | ------------------------------------------------------------------------------------------------ |
+| `@param value text`  | Remove it when PostgreSQL can infer the type; otherwise cast the relevant use as `:value::text`. |
+| `@param value ?`     | `@nullable value`                                                                                |
+| `@param value text?` | `@nullable value`, plus `:value::text` where SQL context does not infer `text`.                  |
+
+Prefer contextual inference from columns, function signatures, operators, `VALUES`, DML targets, and other ordinary SQL constructs. Add casts only where they express an actual SQL type boundary or resolve an ambiguity. Typemods such as `varchar(100)` are authored SQL semantics rather than parameter metadata and must be migrated deliberately; do not assume that a base-type cast preserves typemod behavior.
 
 Generated cardinality is derived from the analyzer's row bounds. At-most-one proofs include direct primary/unique-key lookups and supported inner-join chains in which every relation is determined through primary or unique keys. A `rowBounds.max` value of `null` means that analysis did not prove a finite upper bound, not that execution is known to produce multiple rows; the public contract remains conservatively `many`.
 

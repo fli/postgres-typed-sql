@@ -1,5 +1,3 @@
--- @param code text
--- @param metrics numeric[]
 select
   id,
   code,

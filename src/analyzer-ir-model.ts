@@ -149,7 +149,6 @@ export type TypedSqlPostgresIrColumnExpressionSource =
 export interface TypedSqlPostgresIrCompiledConfig {
   readonly name: string
   readonly parameterNames: readonly string[]
-  readonly parameterTypes?: readonly (string | undefined)[]
   readonly sourceFile: string
   readonly sql: string
 }

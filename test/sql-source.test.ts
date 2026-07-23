@@ -9,8 +9,8 @@ test('parses directives only from the leading comment header', () => {
       '-- ordinary header comment\r\n',
       '-- @name findAccount\r\n',
       '-- @access read\r\n',
-      '-- @param created_at timestamp with time zone?\r\n',
-      '-- @param inferred_value ?\r\n',
+      '-- @nullable created_at\r\n',
+      '-- @nullable inferred_value\r\n',
       '-- @column display_name character varying(100)\r\n',
       '\r\n',
       'select :created_at as display_name\r\n',
@@ -22,8 +22,8 @@ test('parses directives only from the leading comment header', () => {
   assert.deepEqual(parsed.directives, [
     { body: 'findAccount', kind: 'name', line: 2 },
     { body: 'read', kind: 'access', line: 3 },
-    { body: 'created_at timestamp with time zone?', kind: 'param', line: 4 },
-    { body: 'inferred_value ?', kind: 'param', line: 5 },
+    { body: 'created_at', kind: 'nullable', line: 4 },
+    { body: 'inferred_value', kind: 'nullable', line: 5 },
     { body: 'display_name character varying(100)', kind: 'column', line: 6 },
   ])
   assert.equal(

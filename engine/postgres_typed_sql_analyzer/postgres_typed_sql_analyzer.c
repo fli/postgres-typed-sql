@@ -3873,43 +3873,6 @@ append_query_summary(StringInfo out, const Query *query,
   appendStringInfoChar(out, '}');
 }
 
-static Oid *
-read_param_type_oids(ArrayType *array, int *count)
-{
-  Datum *values;
-  bool *nulls;
-  int value_count;
-  Oid *oids;
-
-  deconstruct_array_builtin(array, OIDOID, &values, &nulls, &value_count);
-  oids = palloc0(sizeof(Oid) * value_count);
-  for (int index = 0; index < value_count; index++)
-  {
-    if (nulls[index])
-    {
-      ereport(ERROR, (errmsg("param_type_oids must not contain nulls")));
-    }
-    oids[index] = DatumGetObjectId(values[index]);
-  }
-
-  *count = value_count;
-  return oids;
-}
-
-static bool
-param_types_need_inference(const Oid *param_types, int param_count)
-{
-  for (int index = 0; index < param_count; index++)
-  {
-    if (!OidIsValid(param_types[index]))
-    {
-      return true;
-    }
-  }
-
-  return false;
-}
-
 static void
 append_param_type_null_admissions(StringInfo out, const Oid *param_types,
                                   int param_count)
@@ -3962,10 +3925,9 @@ Datum
 postgres_typed_sql_analyze(PG_FUNCTION_ARGS)
 {
   text *sql_text = PG_GETARG_TEXT_PP(0);
-  ArrayType *param_type_array = PG_GETARG_ARRAYTYPE_P(1);
   char *sql = text_to_cstring(sql_text);
   int param_count = 0;
-  Oid *param_types = read_param_type_oids(param_type_array, &param_count);
+  Oid *param_types = NULL;
   List *raw_trees = pg_parse_query(sql);
   PtsParameterUsageEvidence *param_usage_evidence = NULL;
   int param_usage_count = 0;
@@ -3986,9 +3948,9 @@ postgres_typed_sql_analyze(PG_FUNCTION_ARGS)
   foreach(raw_cell, raw_trees)
   {
     RawStmt *raw_stmt = lfirst_node(RawStmt, raw_cell);
-    List *rewritten_queries = param_count == 0 || param_types_need_inference(param_types, param_count)
-                                ? pg_analyze_and_rewrite_varparams(raw_stmt, sql, &param_types, &param_count, NULL)
-                                : pg_analyze_and_rewrite_fixedparams(raw_stmt, sql, param_types, param_count, NULL);
+    List *rewritten_queries =
+      pg_analyze_and_rewrite_varparams(raw_stmt, sql, &param_types,
+                                       &param_count, NULL);
     bool bind_io_invokes_volatile =
       parameter_bind_io_invokes_volatile(param_types, param_count);
     ListCell *query_cell;

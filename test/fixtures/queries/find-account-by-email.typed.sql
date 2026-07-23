@@ -1,4 +1,3 @@
--- @param email text
 select
   a.id,
   a.public_id,

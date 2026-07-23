@@ -119,6 +119,7 @@ interface NativeExpr {
   readonly subLinkType?: string
   readonly subquery?: NativeQuery
   readonly tag: string
+  readonly typeOid?: number
   readonly varattno?: number
   readonly varlevelsup?: number
   readonly varnullingrels?: readonly number[]
@@ -126,14 +127,14 @@ interface NativeExpr {
   readonly varreturningtype?: 'DEFAULT' | 'NEW' | 'OLD' | 'UNRECOGNIZED'
 }
 
-async function analyze(
-  database: AnalysisDatabase,
-  sql: string,
-  paramTypeOids: readonly number[]
-): Promise<NativeAnalysis> {
+async function analyze(database: AnalysisDatabase, sql: string): Promise<NativeAnalysis> {
+  let delimiter = '$native_analyzer_sql$'
+  while (sql.includes(delimiter)) {
+    delimiter = `${delimiter.slice(0, -1)}_$`
+  }
+  await database.query('select 1')
   const result = await database.query<{ analysis: string }>(
-    'select pg_temp.postgres_typed_sql_analyze($1, $2::oid[]) as analysis',
-    [sql, paramTypeOids]
+    `select pg_temp.postgres_typed_sql_analyze(${delimiter}${sql}${delimiter}) as analysis`
   )
   const payload = result.rows[0]?.analysis
   assert.ok(typeof payload === 'string')
@@ -245,8 +246,7 @@ test('native analyzer exposes the versioned PostgreSQL query envelope', async ()
   await withDatabase(async (database) => {
     const analysis = await analyze(
       database,
-      'select exists(select 1) as present from generate_series(1, 2) generated(n) cross join (values (1)) value(n) limit $1',
-      [20]
+      'select exists(select 1) as present from generate_series(1, 2) generated(n) cross join (values (1)) value(n) limit $1'
     )
 
     assert.equal(analysis.schemaVersion, 10)
@@ -316,8 +316,7 @@ test('native analyzer emits canonical PostgreSQL coercion nullability facts', as
          nullable_integer::public.nested_required_integer_domain,
          required_integers::bigint[],
          nullable_integers::bigint[]
-       from public.coercion_envelope_probe`,
-      []
+       from public.coercion_envelope_probe`
     )
     const expressions = analysis.statements[0]?.queries[0]?.targetList.map((target) => target.expr) ?? []
 
@@ -400,8 +399,7 @@ test('native analyzer emits canonical PostgreSQL coercion nullability facts', as
     const rowtypeAnalysis = await analyze(
       database,
       `select coercion_child_row::public.coercion_parent_row
-       from public.coercion_child_row`,
-      []
+       from public.coercion_child_row`
     )
     const rowtypeCoercion = rowtypeAnalysis.statements[0]?.queries[0]?.targetList[0]?.expr
     assert.equal(rowtypeCoercion?.tag, 'ConvertRowtypeExpr')
@@ -413,11 +411,7 @@ test('native analyzer emits canonical PostgreSQL coercion nullability facts', as
 
 test('native analyzer exposes PostgreSQL-authoritative immediate RTE outputs', async () => {
   await withDatabase(async (database) => {
-    const relation = await analyze(
-      database,
-      'select account.id, account, account.ctid from public.accounts account',
-      []
-    )
+    const relation = await analyze(database, 'select account.id, account, account.ctid from public.accounts account')
     const relationQuery = relation.statements[0]?.queries[0]
     const relationRte = relationQuery?.rtable[0]
     assert.equal(relationRte?.kind, 'RELATION')
@@ -431,8 +425,7 @@ test('native analyzer exposes PostgreSQL-authoritative immediate RTE outputs', a
       database,
       `select value
        from (values (1)) left_source(value)
-       full join (values (2)) right_source(value) using (value)`,
-      []
+       full join (values (2)) right_source(value) using (value)`
     )
     const joinRte = joined.statements[0]?.queries[0]?.rtable.find((rte) => rte.kind === 'JOIN')
     assert.deepEqual(joinRte?.erefColumnNames, ['value'])
@@ -443,16 +436,12 @@ test('native analyzer exposes PostgreSQL-authoritative immediate RTE outputs', a
       [[3], [3]]
     )
 
-    const grouped = await analyze(
-      database,
-      'select source.value from (values (1)) source(value) group by source.value',
-      []
-    )
+    const grouped = await analyze(database, 'select source.value from (values (1)) source(value) group by source.value')
     const groupRte = grouped.statements[0]?.queries[0]?.rtable.find((rte) => rte.kind === 'GROUP')
     assert.deepEqual(groupRte?.erefColumnNames, ['value'])
     assert.equal(groupRte?.groupExprs?.[0]?.tag, 'Var')
 
-    const valued = await analyze(database, 'select value from (values (1), (null::integer)) source(value)', [])
+    const valued = await analyze(database, 'select value from (values (1), (null::integer)) source(value)')
     const valuesRte = valued.statements[0]?.queries[0]?.rtable[0]?.subquery?.rtable[0]
     assert.deepEqual(valuesRte?.erefColumnNames, ['column1'])
     assert.deepEqual(
@@ -464,8 +453,7 @@ test('native analyzer exposes PostgreSQL-authoritative immediate RTE outputs', a
       database,
       `select nested.value
        from (values (1)) source(value)
-       cross join lateral (select source.value) nested(value)`,
-      []
+       cross join lateral (select source.value) nested(value)`
     )
     const lateralRte = lateral.statements[0]?.queries[0]?.rtable[1]
     assert.equal(lateralRte?.kind, 'SUBQUERY')
@@ -479,8 +467,7 @@ test('native analyzer exposes PostgreSQL-authoritative immediate RTE outputs', a
          union all
          select value + 1 from source where value < 2
        )
-       select value from source`,
-      []
+       select value from source`
     )
     const recursiveCte = recursive.statements[0]?.queries[0]?.cteList[0]
     const selfReferenceRte = recursiveCte?.query?.rtable[1]?.subquery?.rtable[0]
@@ -506,8 +493,7 @@ test('native analyzer exposes PostgreSQL-authoritative immediate RTE outputs', a
          insert into public.accounts(email) values ('native-envelope@example.com')
          returning id
        )
-       select id from inserted`,
-      []
+       select id from inserted`
     )
     const modifyingCte = modifying.statements[0]?.queries[0]?.cteList[0]
     assert.equal(modifyingCte?.query?.commandType, 'INSERT')
@@ -525,8 +511,7 @@ test('native analyzer preserves PostgreSQL RETURNING row-image identity', async 
     const analysis = await analyze(
       database,
       `delete from public.returning_identity_native
-       returning OLD.id as old_id, NEW.id as new_id`,
-      []
+       returning OLD.id as old_id, NEW.id as new_id`
     )
     const outputs = analysis.statements[0]?.queries[0]?.returningList
     assert.deepEqual(
@@ -549,8 +534,7 @@ test('native analyzer resolves correlated Var metadata through one and two ances
        cross join lateral (
          select outer_row.value
          from public.correlation_inner_one inner_row
-       ) nested`,
-      []
+       ) nested`
     )
     const lateralQuery = lateral.statements[0]?.queries[0]
     const lateralSubquery = lateralQuery?.rtable.find((rte) => rte.kind === 'SUBQUERY')?.subquery
@@ -604,8 +588,7 @@ test('native analyzer resolves correlated Var metadata through one and two ances
          from public.correlation_inner_one inner_one
          limit 1
        )
-       from public.correlation_outer outer_row`,
-      []
+       from public.correlation_outer outer_row`
     )
     const firstSubquery = doublyNested.statements[0]?.queries[0]?.targetList[0]?.expr.subquery
     const secondSubquery = firstSubquery?.targetList[0]?.expr.subquery
@@ -622,13 +605,25 @@ test('native analyzer resolves correlated Var metadata through one and two ances
   })
 })
 
-test('native analyzer preserves explicit parameter OIDs while inferring zero slots', async () => {
+test('native analyzer infers every parameter type from SQL', async () => {
   await withDatabase(async (database) => {
-    const analysis = await analyze(database, 'select $1::text, $2 + 1', [25, 0])
+    const analysis = await analyze(database, 'select $1::text, $2::integer + 1')
 
     assert.deepEqual(analysis.paramTypeOids, [25, 23])
     assert.deepEqual(analysis.paramTypeNullAdmissions, ['accepts', 'accepts'])
     assert.deepEqual(analysis.paramUsageNullAdmissions, ['accepts', 'accepts'])
+
+    await assert.rejects(analyze(database, 'select length($1), $1 + 1'), /operator does not exist: text \+ integer/u)
+  })
+})
+
+test('native analyzer rejects ambiguous temporal operators until SQL authors the type boundary', async () => {
+  await withDatabase(async (database) => {
+    await assert.rejects(analyze(database, 'select $1 - $2 as elapsed'), /operator is not unique: unknown - unknown/u)
+
+    const analysis = await analyze(database, 'select $1::timestamptz - $2::timestamptz as elapsed')
+    assert.deepEqual(analysis.paramTypeOids, [1184, 1184])
+    assert.equal(analysis.statements[0]?.queries[0]?.targetList[0]?.expr.typeOid, 1186)
   })
 })
 
@@ -649,7 +644,7 @@ test('native analyzer classifies NULL admission at PostgreSQL expression context
     const rejectingFrameSql = `select
         sum(value) over (rows between $1 preceding and $2 following) as total
       from (values (1), (2)) input(value)`
-    const rejectingFrame = await analyze(database, rejectingFrameSql, [])
+    const rejectingFrame = await analyze(database, rejectingFrameSql)
     assert.deepEqual(rejectingFrame.paramUsageNullAdmissions, ['rejects', 'rejects'])
     await assert.rejects(database.query(rejectingFrameSql, [null, 0]), /frame starting offset must not be null/u)
     await assert.rejects(database.query(rejectingFrameSql, [0, null]), /frame ending offset must not be null/u)
@@ -659,13 +654,13 @@ test('native analyzer classifies NULL admission at PostgreSQL expression context
           rows between coalesce($1, 0) preceding and coalesce($2, 0) following
         ) as total
       from (values (1), (2)) input(value)`
-    const acceptingFrame = await analyze(database, acceptingFrameSql, [20, 20])
+    const acceptingFrame = await analyze(database, acceptingFrameSql)
     assert.deepEqual(acceptingFrame.paramUsageNullAdmissions, ['unknown', 'unknown'])
     assert.equal((await database.query(acceptingFrameSql, [null, null])).rows.length, 2)
 
     const rejectingSampleSql = `select value
       from public.null_admission_sample tablesample system ($1) repeatable ($2)`
-    const rejectingSample = await analyze(database, rejectingSampleSql, [])
+    const rejectingSample = await analyze(database, rejectingSampleSql)
     assert.deepEqual(rejectingSample.paramUsageNullAdmissions, ['rejects', 'rejects'])
     await assert.rejects(database.query(rejectingSampleSql, [null, 0]), /TABLESAMPLE parameter cannot be null/u)
     await assert.rejects(
@@ -675,8 +670,8 @@ test('native analyzer classifies NULL admission at PostgreSQL expression context
 
     const acceptingSampleSql = `select value
       from public.null_admission_sample
-      tablesample system (coalesce($1, 100)) repeatable (coalesce($2, 0))`
-    const acceptingSample = await analyze(database, acceptingSampleSql, [700, 701])
+      tablesample system (coalesce($1::real, 100)) repeatable (coalesce($2::double precision, 0))`
+    const acceptingSample = await analyze(database, acceptingSampleSql)
     assert.deepEqual(acceptingSample.paramUsageNullAdmissions, ['unknown', 'unknown'])
     assert.equal((await database.query(acceptingSampleSql, [null, null])).rows.length, 2)
 
@@ -685,12 +680,11 @@ test('native analyzer classifies NULL admission at PostgreSQL expression context
       `select $1::bigint,
          sum(value) over (rows between $1 preceding and current row)
        from (values (1), (2)) input(value)
-       group by value`,
-      []
+       group by value`
     )
     assert.deepEqual(mixedUse.paramUsageNullAdmissions, ['rejects'])
 
-    const utility = await analyze(database, 'call public.reject_null($1)', [])
+    const utility = await analyze(database, 'call public.reject_null($1)')
     assert.deepEqual(utility.paramUsageNullAdmissions, ['unknown'])
     await assert.rejects(database.query('call public.reject_null($1)', [null]), /procedure rejected null/u)
   })
@@ -776,7 +770,7 @@ test('native analyzer requires CHECK expressions to be safe when proving NULL ad
     ] as const
 
     for (const unsafeCase of unsafeCases) {
-      const analysis = await analyze(database, unsafeCase.sql, [])
+      const analysis = await analyze(database, unsafeCase.sql)
       assert.equal(
         analysis.statements[0]?.queries[0]?.dmlParameterNullAdmissions[0]?.admission,
         'unknown',
@@ -792,7 +786,7 @@ test('native analyzer requires CHECK expressions to be safe when proving NULL ad
     )`)
     const safeSql = `insert into public.safe_check_probe(direct_value, scalar_array_value, boolean_value)
       select $1, $2, $3`
-    const safeAnalysis = await analyze(database, safeSql, [])
+    const safeAnalysis = await analyze(database, safeSql)
     assert.ok(
       safeAnalysis.statements[0]?.queries[0]?.dmlParameterNullAdmissions.every(
         ({ admission }) => admission === 'accepts'
@@ -813,8 +807,7 @@ test('native analyzer reports row locks recursively through join predicates', as
          from public.accounts locked_account
          where locked_account.id = left_account.id
          for update
-       )`,
-      []
+       )`
     )
 
     assert.equal(analysis.statements[0]?.queries[0]?.hasRowMarks, true)
@@ -840,7 +833,7 @@ test('native analyzer follows only execution-reachable SELECT CTEs', async () =>
       select public.record_cte_reachability() as value
     )
     select 1 as value`
-    const unusedVolatile = await analyze(database, unusedVolatileSql, [])
+    const unusedVolatile = await analyze(database, unusedVolatileSql)
     assert.equal(unusedVolatile.statements[0]?.queries[0]?.hasVolatileFunctions, false)
     await database.query(unusedVolatileSql)
     assert.deepEqual((await database.query('select value from public.cte_reachability_calls')).rows, [])
@@ -849,7 +842,7 @@ test('native analyzer follows only execution-reachable SELECT CTEs', async () =>
       select public.record_cte_reachability() as value
     )
     select value from reached`
-    const referencedVolatile = await analyze(database, referencedVolatileSql, [])
+    const referencedVolatile = await analyze(database, referencedVolatileSql)
     assert.equal(referencedVolatile.statements[0]?.queries[0]?.hasVolatileFunctions, true)
     assert.deepEqual((await database.query(referencedVolatileSql)).rows, [{ value: 1 }])
 
@@ -858,8 +851,7 @@ test('native analyzer follows only execution-reachable SELECT CTEs', async () =>
       `with unused as (
          select account.id from public.accounts account for update
        )
-       select 1`,
-      []
+       select 1`
     )
     assert.equal(unusedLock.statements[0]?.queries[0]?.hasRowMarks, false)
 
@@ -868,8 +860,7 @@ test('native analyzer follows only execution-reachable SELECT CTEs', async () =>
       `with reached as (
          select account.id from public.accounts account for update
        )
-       select id from reached`,
-      []
+       select id from reached`
     )
     assert.equal(referencedLock.statements[0]?.queries[0]?.hasRowMarks, true)
 
@@ -878,7 +869,7 @@ test('native analyzer follows only execution-reachable SELECT CTEs', async () =>
       from (values (1), (2)) input(value)
     )
     select 1 as value`
-    const unusedFrame = await analyze(database, unusedFrameSql, [])
+    const unusedFrame = await analyze(database, unusedFrameSql)
     assert.deepEqual(unusedFrame.paramUsageNullAdmissions, ['unknown'])
     assert.deepEqual((await database.query(unusedFrameSql, [null])).rows, [{ value: 1 }])
 
@@ -887,7 +878,7 @@ test('native analyzer follows only execution-reachable SELECT CTEs', async () =>
       from (values (1), (2)) input(value)
     )
     select total from reached`
-    const referencedFrame = await analyze(database, referencedFrameSql, [])
+    const referencedFrame = await analyze(database, referencedFrameSql)
     assert.deepEqual(referencedFrame.paramUsageNullAdmissions, ['rejects'])
     await assert.rejects(database.query(referencedFrameSql, [null]), /frame starting offset must not be null/u)
 
@@ -897,7 +888,7 @@ test('native analyzer follows only execution-reachable SELECT CTEs', async () =>
       select value from first_unused
     )
     select 1`
-    const unusedDependencyChain = await analyze(database, unusedDependencyChainSql, [])
+    const unusedDependencyChain = await analyze(database, unusedDependencyChainSql)
     assert.equal(unusedDependencyChain.statements[0]?.queries[0]?.hasVolatileFunctions, false)
     await database.query(unusedDependencyChainSql)
     assert.deepEqual((await database.query('select count(*)::int as count from public.cte_reachability_calls')).rows, [
@@ -909,7 +900,7 @@ test('native analyzer follows only execution-reachable SELECT CTEs', async () =>
       returning value
     )
     select 1`
-    const modifyingCte = await analyze(database, modifyingCteSql, [])
+    const modifyingCte = await analyze(database, modifyingCteSql)
     assert.equal(modifyingCte.statements[0]?.queries[0]?.hasModifyingCTE, true)
     await database.query(modifyingCteSql)
     assert.deepEqual((await database.query('select value from public.cte_reachability_dml')).rows, [{ value: 1 }])
@@ -920,7 +911,7 @@ test('native analyzer follows only execution-reachable SELECT CTEs', async () =>
       select value + 1 from reached where value < 2
     )
     select value from reached order by value`
-    const recursive = await analyze(database, recursiveSql, [])
+    const recursive = await analyze(database, recursiveSql)
     assert.equal(recursive.statements[0]?.queries[0]?.hasVolatileFunctions, false)
     assert.equal(recursive.statements[0]?.queries[0]?.hasRowMarks, false)
     assert.deepEqual((await database.query(recursiveSql)).rows, [{ value: 1 }, { value: 2 }])
@@ -946,7 +937,7 @@ test('native analyzer detects reachable volatile aggregate support functions', a
     )`)
 
     const aggregateSql = 'select public.volatile_sum(value) from (values (1), (2), (3)) input(value)'
-    const aggregate = await analyze(database, aggregateSql, [])
+    const aggregate = await analyze(database, aggregateSql)
     assert.equal(aggregate.statements[0]?.queries[0]?.hasVolatileFunctions, true)
     assert.equal((await database.query(aggregateSql)).rows.length, 1)
     const aggregateSideEffects = await database.query<{ value: number }>(
@@ -956,7 +947,7 @@ test('native analyzer detects reachable volatile aggregate support functions', a
 
     await database.query('truncate public.aggregate_side_effects')
     const windowSql = 'select public.volatile_sum(value) over () from (values (1), (2), (3)) input(value)'
-    const window = await analyze(database, windowSql, [])
+    const window = await analyze(database, windowSql)
     assert.equal(window.statements[0]?.queries[0]?.hasVolatileFunctions, true)
     assert.equal((await database.query(windowSql)).rows.length, 3)
     const windowSideEffects = await database.query<{ value: number }>(
@@ -1004,14 +995,14 @@ test('native analyzer detects reachable volatile aggregate support functions', a
 
     const ordinaryMovingSql = `select public.moving_capable_sum(value) as total
       from (values (1), (2), (3)) input(value)`
-    const ordinaryMoving = await analyze(database, ordinaryMovingSql, [])
+    const ordinaryMoving = await analyze(database, ordinaryMovingSql)
     assert.equal(ordinaryMoving.statements[0]?.queries[0]?.hasVolatileFunctions, false)
     assert.deepEqual((await database.query(ordinaryMovingSql)).rows, [{ total: 6 }])
     assert.deepEqual((await database.query('select kind from public.aggregate_support_calls')).rows, [])
 
     const unboundedWindowSql = `select public.moving_capable_sum(value) over () as total
       from (values (1), (2), (3)) input(value)`
-    const unboundedWindow = await analyze(database, unboundedWindowSql, [])
+    const unboundedWindow = await analyze(database, unboundedWindowSql)
     assert.equal(unboundedWindow.statements[0]?.queries[0]?.hasVolatileFunctions, false)
     assert.deepEqual((await database.query(unboundedWindowSql)).rows, [{ total: 6 }, { total: 6 }, { total: 6 }])
     assert.deepEqual((await database.query('select kind from public.aggregate_support_calls')).rows, [])
@@ -1020,7 +1011,7 @@ test('native analyzer detects reachable volatile aggregate support functions', a
         order by value rows between 1 preceding and current row
       ) as total
       from (values (1), (2), (3)) input(value)`
-    const windowMoving = await analyze(database, windowMovingSql, [])
+    const windowMoving = await analyze(database, windowMovingSql)
     assert.equal(windowMoving.statements[0]?.queries[0]?.hasVolatileFunctions, true)
     assert.deepEqual((await database.query(windowMovingSql)).rows, [{ total: 1 }, { total: 3 }, { total: 5 }])
     assert.ok((await database.query('select kind from public.aggregate_support_calls')).rows.length > 0)
@@ -1044,14 +1035,13 @@ test('native analyzer detects reachable volatile aggregate support functions', a
 
     const ordinaryCombine = await analyze(
       database,
-      'select public.combine_capable_sum(value) from (values (1), (2)) input(value)',
-      []
+      'select public.combine_capable_sum(value) from (values (1), (2)) input(value)'
     )
     assert.equal(ordinaryCombine.statements[0]?.queries[0]?.hasVolatileFunctions, true)
 
     const windowCombineSql = `select public.combine_capable_sum(value) over () as total
       from (values (1), (2)) input(value)`
-    const windowCombine = await analyze(database, windowCombineSql, [])
+    const windowCombine = await analyze(database, windowCombineSql)
     assert.equal(windowCombine.statements[0]?.queries[0]?.hasVolatileFunctions, false)
     assert.deepEqual((await database.query(windowCombineSql)).rows, [{ total: 3 }, { total: 3 }])
     assert.deepEqual((await database.query('select kind from public.aggregate_support_calls')).rows, [])
@@ -1088,7 +1078,7 @@ test('native analyzer detects reachable volatile aggregate support functions', a
         order by value rows between 1 preceding and current row
       ) as total
       from (values (1), (2), (3)) input(value)`
-    const directMoving = await analyze(database, directMovingSql, [])
+    const directMoving = await analyze(database, directMovingSql)
     assert.equal(directMoving.statements[0]?.queries[0]?.hasVolatileFunctions, false)
     assert.deepEqual((await database.query(directMovingSql)).rows, [{ total: 1 }, { total: 3 }, { total: 5 }])
     assert.deepEqual((await database.query('select kind from public.aggregate_support_calls')).rows, [])
@@ -1099,7 +1089,7 @@ test('native analyzer detects reachable volatile aggregate support functions', a
         order by value rows between 1 preceding and current row
       ) as total
       from (values (1), (2), (3)) input(value)`
-    const subplanFallback = await analyze(database, subplanFallbackSql, [])
+    const subplanFallback = await analyze(database, subplanFallbackSql)
     assert.equal(subplanFallback.statements[0]?.queries[0]?.hasVolatileFunctions, true)
     assert.deepEqual((await database.query(subplanFallbackSql)).rows, [{ total: 1 }, { total: 3 }, { total: 5 }])
     assert.ok((await database.query('select kind from public.aggregate_support_calls')).rows.length > 0)
@@ -1119,7 +1109,7 @@ test('native analyzer classifies only support functions reachable from sort exec
         (row(2)::public.volatile_sort_key)
       ) input(value)
       order by value`
-    const volatileSort = await analyze(database, volatileSortSql, [])
+    const volatileSort = await analyze(database, volatileSortSql)
     assert.equal(volatileSort.statements[0]?.queries[0]?.hasVolatileFunctions, true)
     await database.query(volatileSortSql)
     assert.deepEqual(
@@ -1142,7 +1132,7 @@ test('native analyzer classifies only support functions reachable from sort exec
         (row(2)::public.precision_sort_key)
       ) input(value)
       order by value`
-    const precisionSort = await analyze(database, precisionSortSql, [])
+    const precisionSort = await analyze(database, precisionSortSql)
     assert.equal(precisionSort.statements[0]?.queries[0]?.hasVolatileFunctions, false)
     await database.query(precisionSortSql)
     assert.deepEqual(
@@ -1205,7 +1195,7 @@ test('native analyzer classifies only support functions reachable from sort exec
     const builtinSortSupportSql = `select value
       from (values (3), (1), (2)) input(value)
       order by value using operator(public.<~)`
-    const builtinSortSupport = await analyze(database, builtinSortSupportSql, [])
+    const builtinSortSupport = await analyze(database, builtinSortSupportSql)
     assert.equal(builtinSortSupport.statements[0]?.queries[0]?.hasVolatileFunctions, false)
     assert.deepEqual((await database.query<{ value: number }>(builtinSortSupportSql)).rows, [
       { value: 1 },
@@ -1232,14 +1222,14 @@ test('native analyzer follows grouped and excluded DML lineage and keeps inherit
     await database.query('insert into public.inherited_target(value) values (1)')
 
     const inheritedSql = 'update public.inherited_target set value = $1'
-    const inherited = await analyze(database, inheritedSql, [23])
+    const inherited = await analyze(database, inheritedSql)
     assert.deepEqual(inherited.statements[0]?.queries[0]?.dmlParameterNullAdmissions, [
       { admission: 'unknown', basis: 'unresolved', paramId: 1 },
     ])
     await assert.rejects(database.query(inheritedSql, [null]), /not-null constraint/u)
 
     const onlySql = 'update only public.inherited_target set value = $1'
-    const only = await analyze(database, onlySql, [23])
+    const only = await analyze(database, onlySql)
     assert.deepEqual(only.statements[0]?.queries[0]?.dmlParameterNullAdmissions, [
       { admission: 'accepts', basis: 'direct_target_null_admission', paramId: 1 },
     ])
@@ -1248,7 +1238,7 @@ test('native analyzer follows grouped and excluded DML lineage and keeps inherit
     await database.query('create table public.grouped_sink (value integer not null)')
     const groupedSql = `insert into public.grouped_sink(value)
       select $1::integer group by $1`
-    const grouped = await analyze(database, groupedSql, [23])
+    const grouped = await analyze(database, groupedSql)
     assert.deepEqual(grouped.statements[0]?.queries[0]?.dmlParameterNullAdmissions, [
       { admission: 'rejects', basis: 'direct_target_null_admission', paramId: 1 },
     ])
@@ -1264,7 +1254,7 @@ test('native analyzer follows grouped and excluded DML lineage and keeps inherit
       values (1, $1, 0)
       on conflict (key) do update
       set required_value = excluded.source_value`
-    const excluded = await analyze(database, excludedSql, [23])
+    const excluded = await analyze(database, excludedSql)
     assert.deepEqual(excluded.statements[0]?.queries[0]?.dmlParameterNullAdmissions, [
       { admission: 'accepts', basis: 'direct_target_null_admission', paramId: 1 },
       { admission: 'unknown', basis: 'unresolved', paramId: 1 },
@@ -1279,7 +1269,7 @@ test('native analyzer follows grouped and excluded DML lineage and keeps inherit
       values (1, $1, 0)
       on conflict (key) do update
       set required_value = public.excluded_source_value(excluded)`
-    const excludedWholeRow = await analyze(database, excludedWholeRowSql, [23])
+    const excludedWholeRow = await analyze(database, excludedWholeRowSql)
     assert.ok(
       excludedWholeRow.statements[0]?.queries[0]?.dmlParameterNullAdmissions.some(
         ({ paramId, basis, admission }) => paramId === 1 && basis === 'unresolved' && admission === 'unknown'
@@ -1290,7 +1280,7 @@ test('native analyzer follows grouped and excluded DML lineage and keeps inherit
     await database.query('create table public.function_sink (value integer not null)')
     const functionSql = `insert into public.function_sink(value)
       select value from generate_series($1::integer, $1::integer) source(value)`
-    const functionLineage = await analyze(database, functionSql, [23])
+    const functionLineage = await analyze(database, functionSql)
     assert.deepEqual(functionLineage.statements[0]?.queries[0]?.dmlParameterNullAdmissions, [
       { admission: 'unknown', basis: 'unresolved', paramId: 1 },
     ])
@@ -1329,7 +1319,7 @@ test('native analyzer proves all-or-nothing point UPDATE parameters only when th
     ] as const
 
     for (const sql of provenUpdates) {
-      const analysis = await analyze(database, sql, [])
+      const analysis = await analyze(database, sql)
       const query = analysis.statements[0]?.queries[0]
       assert.deepEqual(query?.dmlDirectAssignments, [])
       assert.deepEqual(query?.dmlParameterNullAdmissions, [
@@ -1361,7 +1351,7 @@ test('native analyzer proves all-or-nothing point UPDATE parameters only when th
     const unsafePredicateSql = `update public.point_update_probe as old_target
       set location = old_target.location
       where id = 1 and concat($1::text, '') <> 'blocked'`
-    const unsafePredicate = await analyze(database, unsafePredicateSql, [])
+    const unsafePredicate = await analyze(database, unsafePredicateSql)
     assert.deepEqual(unsafePredicate.statements[0]?.queries[0]?.dmlParameterNullAdmissions, [])
 
     const negativeControls = [
@@ -1382,7 +1372,7 @@ test('native analyzer proves all-or-nothing point UPDATE parameters only when th
     ] as const
 
     for (const sql of negativeControls) {
-      const facts = (await analyze(database, sql, [])).statements[0]?.queries[0]?.dmlParameterNullAdmissions ?? []
+      const facts = (await analyze(database, sql)).statements[0]?.queries[0]?.dmlParameterNullAdmissions ?? []
       assert.equal(
         facts.some(({ admission, paramId }) => (paramId === 1 || paramId === 2) && admission === 'accepts'),
         false,
@@ -1406,7 +1396,7 @@ test('native analyzer correlates nullable OLD values without bypassing CHECK enf
     const correlatedTailSql = `update public.old_value_probe as old_target
       set nullable_value = coalesce(old_target.nullable_value, $1::integer)
       where id = 1 returning nullable_value`
-    const correlatedTail = await analyze(database, correlatedTailSql, [])
+    const correlatedTail = await analyze(database, correlatedTailSql)
     assert.deepEqual(correlatedTail.statements[0]?.queries[0]?.dmlParameterNullAdmissions, [
       { admission: 'accepts', basis: 'row_values_preserved_when_null', paramId: 1 },
     ])
@@ -1415,7 +1405,7 @@ test('native analyzer correlates nullable OLD values without bypassing CHECK enf
     const repeatedOldTailSql = `update public.old_value_probe as old_target
       set nullable_value = coalesce(old_target.nullable_value, old_target.nullable_value, $1::integer)
       where id = 1 returning nullable_value`
-    const repeatedOldTail = await analyze(database, repeatedOldTailSql, [])
+    const repeatedOldTail = await analyze(database, repeatedOldTailSql)
     assert.deepEqual(repeatedOldTail.statements[0]?.queries[0]?.dmlParameterNullAdmissions, [
       { admission: 'accepts', basis: 'row_values_preserved_when_null', paramId: 1 },
     ])
@@ -1424,7 +1414,7 @@ test('native analyzer correlates nullable OLD values without bypassing CHECK enf
     const nonNullTailSql = `update public.old_value_probe as old_target
       set nullable_value = coalesce(old_target.nullable_value, $1::integer, 0)
       where id = 1`
-    const nonNullTail = await analyze(database, nonNullTailSql, [])
+    const nonNullTail = await analyze(database, nonNullTailSql)
     assert.equal(
       nonNullTail.statements[0]?.queries[0]?.dmlParameterNullAdmissions.some(
         ({ admission, paramId }) => paramId === 1 && admission === 'accepts'
@@ -1436,7 +1426,7 @@ test('native analyzer correlates nullable OLD values without bypassing CHECK enf
     const strictArgumentSql = `update public.old_value_probe as old_target
       set nullable_value = coalesce($1::integer + (1 / old_target.divisor), old_target.nullable_value)
       where id = 1`
-    const strictArgument = await analyze(database, strictArgumentSql, [])
+    const strictArgument = await analyze(database, strictArgumentSql)
     assert.equal(
       strictArgument.statements[0]?.queries[0]?.dmlParameterNullAdmissions.some(
         ({ admission, paramId }) => paramId === 1 && admission === 'accepts'
@@ -1455,7 +1445,7 @@ test('native analyzer correlates nullable OLD values without bypassing CHECK enf
         else old_target.nullable_value
       end
       where id = 1`
-    const nullableOldNullTest = await analyze(database, nullableOldNullTestSql, [])
+    const nullableOldNullTest = await analyze(database, nullableOldNullTestSql)
     assert.equal(
       nullableOldNullTest.statements[0]?.queries[0]?.dmlParameterNullAdmissions.some(
         ({ admission, paramId }) => paramId === 1 && admission === 'accepts'
@@ -1470,7 +1460,7 @@ test('native analyzer correlates nullable OLD values without bypassing CHECK enf
         else old_target.required_value
       end
       where id = 1 returning required_value`
-    const requiredOldNullTest = await analyze(database, requiredOldNullTestSql, [])
+    const requiredOldNullTest = await analyze(database, requiredOldNullTestSql)
     assert.deepEqual(requiredOldNullTest.statements[0]?.queries[0]?.dmlParameterNullAdmissions, [
       { admission: 'accepts', basis: 'row_values_preserved_when_null', paramId: 1 },
     ])
@@ -1482,7 +1472,7 @@ test('native analyzer correlates nullable OLD values without bypassing CHECK enf
       add constraint unvalidated_check_probe_positive check (value > 0) not valid`)
     const unvalidatedSql = `update public.unvalidated_check_probe as old_target
       set value = coalesce($1::integer, old_target.value)`
-    const unvalidated = await analyze(database, unvalidatedSql, [])
+    const unvalidated = await analyze(database, unvalidatedSql)
     assert.equal(
       unvalidated.statements[0]?.queries[0]?.dmlParameterNullAdmissions.some(
         ({ admission, paramId }) => paramId === 1 && admission === 'accepts'
@@ -1497,7 +1487,7 @@ test('native analyzer correlates nullable OLD values without bypassing CHECK enf
       add constraint unvalidated_not_null_probe_value not null value not valid`)
     const unvalidatedNotNullSql = `update public.unvalidated_not_null_probe as old_target
       set value = coalesce($1::integer, old_target.value)`
-    const unvalidatedNotNull = await analyze(database, unvalidatedNotNullSql, [])
+    const unvalidatedNotNull = await analyze(database, unvalidatedNotNullSql)
     assert.equal(
       unvalidatedNotNull.statements[0]?.queries[0]?.dmlParameterNullAdmissions.some(
         ({ admission, paramId }) => paramId === 1 && admission === 'accepts'
@@ -1516,7 +1506,7 @@ test('native analyzer correlates nullable OLD values without bypassing CHECK enf
     await database.query('insert into public.mutable_check_probe(value) values (1)')
     const mutableSql = `update public.mutable_check_probe as old_target
       set value = coalesce($1::integer, old_target.value)`
-    const mutable = await analyze(database, mutableSql, [])
+    const mutable = await analyze(database, mutableSql)
     assert.equal(
       mutable.statements[0]?.queries[0]?.dmlParameterNullAdmissions.some(
         ({ admission, paramId }) => paramId === 1 && admission === 'accepts'
@@ -1537,7 +1527,7 @@ test('native analyzer correlates nullable OLD values without bypassing CHECK enf
     await database.query('update public.stable_check_state set allowed = false')
     const stableSql = `update public.stable_check_probe as old_target
       set value = coalesce($1::integer, old_target.value)`
-    const stable = await analyze(database, stableSql, [])
+    const stable = await analyze(database, stableSql)
     assert.equal(
       stable.statements[0]?.queries[0]?.dmlParameterNullAdmissions.some(
         ({ admission, paramId }) => paramId === 1 && admission === 'accepts'
@@ -1557,7 +1547,7 @@ test('native analyzer does not admit NULL through NULLS NOT DISTINCT uniqueness'
     await database.query('insert into public.nulls_not_distinct_probe(id, value) values (1, null), (2, 1)')
 
     const insertSql = 'insert into public.nulls_not_distinct_probe(id, value) values (3, $1::integer)'
-    const insert = await analyze(database, insertSql, [])
+    const insert = await analyze(database, insertSql)
     assert.deepEqual(insert.statements[0]?.queries[0]?.dmlParameterNullAdmissions, [
       { admission: 'unknown', basis: 'unresolved', paramId: 1 },
     ])
@@ -1565,7 +1555,7 @@ test('native analyzer does not admit NULL through NULLS NOT DISTINCT uniqueness'
 
     const updateSql = `update public.nulls_not_distinct_probe
       set value = $1::integer where id = 2`
-    const update = await analyze(database, updateSql, [])
+    const update = await analyze(database, updateSql)
     assert.deepEqual(update.statements[0]?.queries[0]?.dmlParameterNullAdmissions, [
       { admission: 'unknown', basis: 'unresolved', paramId: 1 },
     ])
@@ -1594,7 +1584,7 @@ test('native analyzer closes JSON conversion over casts, arrays, constructors, a
       "select to_json(array['calm'::public.json_mood])",
       "select json_scalar('calm'::public.json_mood)",
     ]) {
-      const analysis = await analyze(database, sql, [])
+      const analysis = await analyze(database, sql)
       assert.equal(analysis.statements[0]?.queries[0]?.hasVolatileFunctions, true, sql)
       await database.query(sql)
     }
@@ -1611,7 +1601,7 @@ test('native analyzer closes JSON conversion over casts, arrays, constructors, a
       'select json_agg(value) from (values (1)) input(value)',
       'select json_scalar(1)',
     ]) {
-      const analysis = await analyze(database, sql, [])
+      const analysis = await analyze(database, sql)
       assert.equal(analysis.statements[0]?.queries[0]?.hasVolatileFunctions, false, sql)
     }
   })
@@ -1629,7 +1619,7 @@ test('native analyzer closes SQL/XML conversion over reachable type output funct
       "select xmlelement(name moods, array['calm'::public.xml_mood])",
       "select xmlelement(name moods, array['calm'::public.xml_mood]::public.xml_mood_array)",
     ]) {
-      const analysis = await analyze(database, sql, [])
+      const analysis = await analyze(database, sql)
       assert.equal(analysis.statements[0]?.queries[0]?.hasVolatileFunctions, true, sql)
       assert.equal((await database.query(sql)).rows.length, 1)
     }
@@ -1654,7 +1644,7 @@ test('native analyzer closes SQL/XML conversion over reachable type output funct
       decode('00ff', 'hex'),
       array[true]
     )`
-    const specialTypes = await analyze(database, specialTypesSql, [])
+    const specialTypes = await analyze(database, specialTypesSql)
     assert.equal(specialTypes.statements[0]?.queries[0]?.hasVolatileFunctions, false)
     assert.equal((await database.query(specialTypesSql)).rows.length, 1)
   })
@@ -1663,7 +1653,7 @@ test('native analyzer closes SQL/XML conversion over reachable type output funct
 test('native analyzer preserves explicit variadic function-call structure', async () => {
   await withDatabase(async (database) => {
     const literalSql = "select jsonb_build_object(variadic array['answer', '42']) as payload"
-    const literalAnalysis = await analyze(database, literalSql, [])
+    const literalAnalysis = await analyze(database, literalSql)
     const literalCall = literalAnalysis.statements[0]?.queries[0]?.targetList[0]?.expr
     assert.equal(literalCall?.tag, 'FuncExpr')
     assert.equal(literalCall?.funcVariadic, true)
@@ -1673,14 +1663,14 @@ test('native analyzer preserves explicit variadic function-call structure', asyn
     assert.equal(literalCall?.args?.[0]?.elements?.length, 2)
     assert.deepEqual((await database.query(literalSql)).rows, [{ payload: { answer: '42' } }])
 
-    const dynamicAnalysis = await analyze(database, 'select jsonb_build_object(variadic $1)', [1009])
+    const dynamicAnalysis = await analyze(database, 'select jsonb_build_object(variadic $1::text[])')
     const dynamicCall = dynamicAnalysis.statements[0]?.queries[0]?.targetList[0]?.expr
     assert.equal(dynamicCall?.funcVariadic, true)
     assert.equal(dynamicCall?.args?.length, 1)
     assert.equal(dynamicCall?.args?.[0]?.tag, 'Param')
 
-    const flatCall = (await analyze(database, "select jsonb_build_object('answer', '42')", [])).statements[0]
-      ?.queries[0]?.targetList[0]?.expr
+    const flatCall = (await analyze(database, "select jsonb_build_object('answer', '42')")).statements[0]?.queries[0]
+      ?.targetList[0]?.expr
     assert.equal(flatCall?.funcVariadic, false)
     assert.equal(flatCall?.args?.length, 2)
   })
@@ -1698,28 +1688,27 @@ test('native analyzer marks stable and dynamic utility result surfaces', async (
       language plpgsql
       as $$ begin output_value := input_value * 2; end $$`)
 
-    const noResultCall = (await analyze(database, 'call public.native_no_result(1)', [])).statements[0]?.queries[0]
+    const noResultCall = (await analyze(database, 'call public.native_no_result(1)')).statements[0]?.queries[0]
     assert.equal(noResultCall?.utilityKind, 'CALL')
     assert.equal(noResultCall?.utilityReturnsTuples, false)
 
-    const outResultCall = (await analyze(database, 'call public.native_out_result(2, null)', [])).statements[0]
-      ?.queries[0]
+    const outResultCall = (await analyze(database, 'call public.native_out_result(2, null)')).statements[0]?.queries[0]
     assert.equal(outResultCall?.utilityKind, 'CALL')
     assert.equal(outResultCall?.utilityReturnsTuples, true)
 
-    const show = (await analyze(database, 'show timezone', [])).statements[0]?.queries[0]
+    const show = (await analyze(database, 'show timezone')).statements[0]?.queries[0]
     assert.equal(show?.utilityKind, 'SHOW')
     assert.equal(show?.utilityReturnsTuples, true)
 
-    const explain = (await analyze(database, 'explain select 1', [])).statements[0]?.queries[0]
+    const explain = (await analyze(database, 'explain select 1')).statements[0]?.queries[0]
     assert.equal(explain?.utilityKind, 'EXPLAIN')
     assert.equal(explain?.utilityReturnsTuples, true)
 
-    const fetch = (await analyze(database, 'fetch all from missing_cursor', [])).statements[0]?.queries[0]
+    const fetch = (await analyze(database, 'fetch all from missing_cursor')).statements[0]?.queries[0]
     assert.equal(fetch?.utilityKind, 'FETCH')
     assert.equal(fetch?.utilityReturnsTuples, true)
 
-    const execute = (await analyze(database, 'execute missing_statement', [])).statements[0]?.queries[0]
+    const execute = (await analyze(database, 'execute missing_statement')).statements[0]?.queries[0]
     assert.equal(execute?.utilityKind, 'EXECUTE')
     assert.equal(execute?.utilityReturnsTuples, true)
   })
@@ -1735,7 +1724,7 @@ test('native analyzer closes array comparison over concrete element support', as
     const arraySql = `select
       array[row(1)::public.array_element_key] =
       array[row(1)::public.array_element_key] as equal`
-    const arrayAnalysis = await analyze(database, arraySql, [])
+    const arrayAnalysis = await analyze(database, arraySql)
     assert.equal(arrayAnalysis.statements[0]?.queries[0]?.hasVolatileFunctions, true)
     assert.deepEqual((await database.query<{ equal: boolean }>(arraySql)).rows, [{ equal: true }])
     assert.deepEqual(
@@ -1747,7 +1736,7 @@ test('native analyzer closes array comparison over concrete element support', as
       [{ called: true }]
     )
 
-    const builtinArray = await analyze(database, 'select array[1] = array[1] as equal', [])
+    const builtinArray = await analyze(database, 'select array[1] = array[1] as equal')
     assert.equal(builtinArray.statements[0]?.queries[0]?.hasVolatileFunctions, false)
   })
 })
@@ -1768,7 +1757,7 @@ test('native analyzer closes minmax and row comparison over concrete container s
         (array[row(1)::public.nested_compare_key], 0) <
         (array[row(2)::public.nested_compare_key], 0) as ordered`,
     ]) {
-      const analysis = await analyze(database, sql, [])
+      const analysis = await analyze(database, sql)
       assert.equal(analysis.statements[0]?.queries[0]?.hasVolatileFunctions, true, sql)
 
       await database.query(`truncate public.nested_compare_key_calls`)
@@ -1788,7 +1777,7 @@ test('native analyzer closes minmax and row comparison over concrete container s
     const singleMinmaxSql = `select greatest(
       row(1)::public.nested_compare_key
     ) as greatest_value`
-    const singleMinmax = await analyze(database, singleMinmaxSql, [])
+    const singleMinmax = await analyze(database, singleMinmaxSql)
     assert.equal(singleMinmax.statements[0]?.queries[0]?.hasVolatileFunctions, false)
     await database.query(singleMinmaxSql)
     assert.deepEqual((await database.query('select called from public.nested_compare_key_calls')).rows, [])
@@ -1804,7 +1793,7 @@ test('native analyzer closes minmax and row comparison over concrete container s
     const volatileChildSql = `select greatest(
       public.volatile_nested_compare_key(row(1)::public.nested_compare_key)
     ) as greatest_value`
-    const volatileChild = await analyze(database, volatileChildSql, [])
+    const volatileChild = await analyze(database, volatileChildSql)
     assert.equal(volatileChild.statements[0]?.queries[0]?.hasVolatileFunctions, true)
     await database.query(volatileChildSql)
     assert.deepEqual((await database.query('select called from public.nested_compare_key_calls')).rows, [
@@ -1829,7 +1818,7 @@ test('native analyzer closes generic executor support over concrete container ty
       params: readonly unknown[],
       callsTable: 'executor_compare_key_calls' | 'executor_equal_key_calls'
     ): Promise<void> => {
-      const analysis = await analyze(database, sql, [])
+      const analysis = await analyze(database, sql)
       assert.equal(analysis.statements[0]?.queries[0]?.hasVolatileFunctions, true, sql)
 
       await database.query(`truncate public.${callsTable}`)
@@ -1863,7 +1852,7 @@ test('native analyzer closes generic executor support over concrete container ty
     const arrayLengthSql = `select array_length(
       array[row($1)::public.executor_equal_key], 1
     ) as length`
-    const arrayLength = await analyze(database, arrayLengthSql, [])
+    const arrayLength = await analyze(database, arrayLengthSql)
     assert.equal(arrayLength.statements[0]?.queries[0]?.hasVolatileFunctions, false)
     await database.query('truncate public.executor_equal_key_calls')
     assert.deepEqual((await database.query(arrayLengthSql, [1])).rows, [{ length: 1 }])
@@ -1959,18 +1948,18 @@ test('native analyzer closes generic executor support over concrete container ty
       [`select range_merge(value, value) as value from public.executor_int4_ranges`, []],
       [`select $1::text::int4range as value`, ['[1,2]']],
     ] as const) {
-      const analysis = await analyze(database, sql, [])
+      const analysis = await analyze(database, sql)
       assert.equal(analysis.statements[0]?.queries[0]?.hasVolatileFunctions, true, sql)
       assert.deepEqual((await database.query(sql, params)).rows, [{ value: '[1,3)' }], sql)
     }
 
     const rangeLowerSql = 'select lower(value) from public.executor_int4_ranges'
-    const rangeLower = await analyze(database, rangeLowerSql, [])
+    const rangeLower = await analyze(database, rangeLowerSql)
     assert.equal(rangeLower.statements[0]?.queries[0]?.hasVolatileFunctions, false)
     assert.deepEqual((await database.query(rangeLowerSql)).rows, [{ lower: 1 }])
 
     await database.query('alter function pg_catalog.int4range_canonical(int4range) immutable')
-    const immutableCanonical = await analyze(database, `select int4range($1, $2, '[]') as value`, [])
+    const immutableCanonical = await analyze(database, `select int4range($1, $2, '[]') as value`)
     assert.equal(immutableCanonical.statements[0]?.queries[0]?.hasVolatileFunctions, false)
   })
 })
@@ -1986,7 +1975,7 @@ test('native analyzer closes external parameter and CoerceViaIO container input 
     )`)
 
     const rangeSql = 'select $1::public.io_compare_range as value'
-    const rangeAnalysis = await analyze(database, rangeSql, [])
+    const rangeAnalysis = await analyze(database, rangeSql)
     assert.equal(rangeAnalysis.statements[0]?.queries[0]?.hasVolatileFunctions, true)
     await database.query('truncate public.io_compare_key_calls')
     await database.query(rangeSql, ['["(1)","(3)"]'])
@@ -2018,19 +2007,19 @@ test('native analyzer closes external parameter and CoerceViaIO container input 
     }
 
     const arrayParamSql = 'select $1::public.volatile_io_text[] as value'
-    const arrayParam = await analyze(database, arrayParamSql, [])
+    const arrayParam = await analyze(database, arrayParamSql)
     assert.equal(arrayParam.statements[0]?.queries[0]?.hasVolatileFunctions, true)
     await database.query(arrayParamSql, ['{array}'])
     await assertSequenceAdvanced('1')
 
     const compositeParamSql = 'select $1::public.volatile_io_envelope as value'
-    const compositeParam = await analyze(database, compositeParamSql, [])
+    const compositeParam = await analyze(database, compositeParamSql)
     assert.equal(compositeParam.statements[0]?.queries[0]?.hasVolatileFunctions, true)
     await database.query(compositeParamSql, ['("{composite}")'])
     await assertSequenceAdvanced('2')
 
     const coerceViaIoSql = 'select ($1::text)::public.volatile_io_text[] as value'
-    const coerceViaIo = await analyze(database, coerceViaIoSql, [])
+    const coerceViaIo = await analyze(database, coerceViaIoSql)
     assert.equal(coerceViaIo.statements[0]?.queries[0]?.hasVolatileFunctions, true)
     await database.query(coerceViaIoSql, ['{coerced}'])
     await assertSequenceAdvanced('3')
@@ -2045,7 +2034,7 @@ test('native analyzer closes external parameter and CoerceViaIO container input 
       'select ($1::text)::int4[]',
       'select array[$1::text]::text',
     ]) {
-      const analysis = await analyze(database, sql, [])
+      const analysis = await analyze(database, sql)
       assert.equal(analysis.statements[0]?.queries[0]?.hasVolatileFunctions, false, sql)
     }
   })
@@ -2062,20 +2051,14 @@ test('native analyzer retains Bind input dependencies after rewrite removes para
       on insert to public.rewritten_bind_source
       do instead insert into public.rewritten_bind_target(value) values ('fixed')`)
 
-    const domainOid = Number(
-      (await database.query<{ oid: number }>(`select 'public.rewritten_bind_domain'::regtype::oid as oid`)).rows[0]?.oid
-    )
     const sql = 'insert into public.rewritten_bind_source(value) values ($1)'
-    const analysis = await analyze(database, sql, [domainOid])
+    const analysis = await analyze(database, sql)
     const query = analysis.statements[0]?.queries[0]
 
     assert.equal(analysis.statements[0]?.rewrittenQueryCount, 1)
     assert.equal(query?.hasVolatileFunctions, true)
     assert.equal(query?.targetList[0]?.expr.tag, 'Const')
     assert.equal(JSON.stringify(query).includes('"tag":"Param"'), false)
-
-    const stableBind = await analyze(database, sql, [25])
-    assert.equal(stableBind.statements[0]?.queries[0]?.hasVolatileFunctions, false)
 
     await database.query(`prepare rewritten_bind_statement(public.rewritten_bind_domain) as ${sql}`)
     await database.query(`execute rewritten_bind_statement('nonnull')`)
@@ -2127,7 +2110,7 @@ test('native analyzer closes protocol result I/O over externally emitted contain
       ["select '{(,)}'::public.result_io_mood_multirange as value", false],
       ["select '{[calm,)}'::public.result_io_mood_multirange as value", true],
     ] as const) {
-      const analysis = await analyze(database, sql, [])
+      const analysis = await analyze(database, sql)
       const query = analysis.statements[0]?.queries[0]
 
       assert.equal(query?.targetList[0]?.expr.tag, 'Const', sql)
@@ -2142,19 +2125,19 @@ test('native analyzer closes protocol result I/O over externally emitted contain
       "select '{}'::public.result_io_mood[] as value",
       "select '{NULL}'::public.result_io_mood[] as value",
     ]) {
-      const analysis = await analyze(database, sql, [])
+      const analysis = await analyze(database, sql)
       assert.equal(analysis.statements[0]?.queries[0]?.hasVolatileFunctions, true, sql)
     }
     await database.query('alter function pg_catalog.array_out(anyarray) immutable')
     await database.query('alter function pg_catalog.array_send(anyarray) immutable')
 
     await database.query('alter function pg_catalog.int2out(smallint) volatile')
-    const vectorTextOutput = await analyze(database, "select '1 2'::int2vector as value", [])
+    const vectorTextOutput = await analyze(database, "select '1 2'::int2vector as value")
     assert.equal(vectorTextOutput.statements[0]?.queries[0]?.hasVolatileFunctions, false)
     await database.query('alter function pg_catalog.int2out(smallint) immutable')
 
     await database.query('alter function pg_catalog.int2send(smallint) volatile')
-    const vectorBinarySend = await analyze(database, "select '1 2'::int2vector as value", [])
+    const vectorBinarySend = await analyze(database, "select '1 2'::int2vector as value")
     assert.equal(vectorBinarySend.statements[0]?.queries[0]?.hasVolatileFunctions, true)
     await database.query('alter function pg_catalog.int2send(smallint) immutable')
 
@@ -2173,7 +2156,7 @@ test('native analyzer closes protocol result I/O over externally emitted contain
     ] as const
 
     for (const sql of resultSql) {
-      const analysis = await analyze(database, sql, [])
+      const analysis = await analyze(database, sql)
       assert.equal(analysis.statements[0]?.queries[0]?.hasVolatileFunctions, true, sql)
       assert.equal((await database.query(sql)).rows.length, 1, sql)
     }
@@ -2196,7 +2179,7 @@ test('native analyzer closes protocol result I/O over externally emitted contain
          select 'calm'::public.result_io_mood as protocol_hidden
        ) as visible`,
     ]) {
-      const analysis = await analyze(database, sql, [])
+      const analysis = await analyze(database, sql)
       assert.equal(analysis.statements[0]?.queries[0]?.hasVolatileFunctions, false, sql)
       assert.equal((await database.query(sql)).rows.length, 1, sql)
     }
@@ -2208,7 +2191,7 @@ test('native analyzer closes protocol result I/O over externally emitted contain
        set value = 'busy' returning value`,
       'delete from public.result_io_values returning value',
     ]) {
-      const analysis = await analyze(database, sql, [])
+      const analysis = await analyze(database, sql)
       const query = analysis.statements[0]?.queries[0]
       assert.equal(query?.canSetTag, true, sql)
       assert.equal(query?.hasVolatileFunctions, true, sql)
@@ -2219,7 +2202,7 @@ test('native analyzer closes protocol result I/O over externally emitted contain
     await database.query('alter function pg_catalog.enum_out(anyenum) immutable')
     await database.query('alter function pg_catalog.enum_send(anyenum) volatile')
     for (const sql of resultSql) {
-      const analysis = await analyze(database, sql, [])
+      const analysis = await analyze(database, sql)
       assert.equal(analysis.statements[0]?.queries[0]?.hasVolatileFunctions, true, sql)
       assert.equal((await database.query(sql)).rows.length, 1, sql)
     }
@@ -2273,14 +2256,14 @@ test('native analyzer closes relation operators over volatile access-method supp
 
     const constantSql = `select row(1)::public.hash_key
       operator(public.=) row(1)::public.hash_key as equal`
-    const constant = await analyze(database, constantSql, [])
+    const constant = await analyze(database, constantSql)
     assert.equal(constant.statements[0]?.queries[0]?.hasVolatileFunctions, false)
 
     const joinSql = `select left_value.value
       from public.hash_key_left left_value
       join public.hash_key_right right_value
         on left_value.value operator(public.=) right_value.value`
-    const join = await analyze(database, joinSql, [])
+    const join = await analyze(database, joinSql)
     assert.equal(join.statements[0]?.queries[0]?.hasVolatileFunctions, true)
 
     const derivedJoinSql = `with left_values as (
@@ -2292,7 +2275,7 @@ test('native analyzer closes relation operators over volatile access-method supp
       from left_values left_value
       join right_values right_value
         on left_value.value operator(public.=) right_value.value`
-    const derivedJoin = await analyze(database, derivedJoinSql, [])
+    const derivedJoin = await analyze(database, derivedJoinSql)
     assert.equal(derivedJoin.statements[0]?.queries[0]?.hasVolatileFunctions, true)
 
     await database.query(`create function public.stable_hash_key_identity(
@@ -2305,7 +2288,7 @@ test('native analyzer closes relation operators over volatile access-method supp
     const linearScalarArraySql = `select public.stable_hash_key_identity(
       $1::public.hash_key
     ) operator(public.=) any(array[row(1)::public.hash_key]) as present`
-    const linearScalarArray = await analyze(database, linearScalarArraySql, [])
+    const linearScalarArray = await analyze(database, linearScalarArraySql)
     assert.equal(linearScalarArray.statements[0]?.queries[0]?.hasVolatileFunctions, false)
 
     const hashedScalarArraySql = `select public.stable_hash_key_identity(
@@ -2319,7 +2302,7 @@ test('native analyzer closes relation operators over volatile access-method supp
         row(9)::public.hash_key
       ]
     ) as present`
-    const hashedScalarArray = await analyze(database, hashedScalarArraySql, [])
+    const hashedScalarArray = await analyze(database, hashedScalarArraySql)
     assert.equal(hashedScalarArray.statements[0]?.queries[0]?.hasVolatileFunctions, true)
 
     const hashedScalarArrayAllSql = `select public.stable_hash_key_identity(
@@ -2333,14 +2316,10 @@ test('native analyzer closes relation operators over volatile access-method supp
         row(9)::public.hash_key
       ]
     ) as absent`
-    const hashedScalarArrayAll = await analyze(database, hashedScalarArrayAllSql, [])
+    const hashedScalarArrayAll = await analyze(database, hashedScalarArrayAllSql)
     assert.equal(hashedScalarArrayAll.statements[0]?.queries[0]?.hasVolatileFunctions, true)
 
-    const builtinScalarArray = await analyze(
-      database,
-      'select 1 = any(array[1, 2, 3, 4, 5, 6, 7, 8, 9]) as present',
-      []
-    )
+    const builtinScalarArray = await analyze(database, 'select 1 = any(array[1, 2, 3, 4, 5, 6, 7, 8, 9]) as present')
     assert.equal(builtinScalarArray.statements[0]?.queries[0]?.hasVolatileFunctions, false)
 
     await database.query('set enable_nestloop = off')
@@ -2428,7 +2407,7 @@ test('native analyzer skips unreachable scalar-array operator support for empty 
         null,
       ],
     ] as const) {
-      const analysis = await analyze(database, sql, [])
+      const analysis = await analyze(database, sql)
       assert.equal(analysis.statements[0]?.queries[0]?.hasVolatileFunctions, false, sql)
       assert.deepEqual((await database.query(sql)).rows, [{ result: expected }], sql)
       assert.deepEqual((await database.query('select kind from public.empty_saop_calls')).rows, [], sql)
@@ -2443,7 +2422,7 @@ test('native analyzer skips unreachable scalar-array operator support for empty 
     $$`)
     const volatileChildSql = `select public.volatile_empty_saop_key()
       operator(public.=) any('{}'::public.empty_saop_key[]) as result`
-    const volatileChild = await analyze(database, volatileChildSql, [])
+    const volatileChild = await analyze(database, volatileChildSql)
     assert.equal(volatileChild.statements[0]?.queries[0]?.hasVolatileFunctions, true)
     assert.deepEqual((await database.query(volatileChildSql)).rows, [{ result: false }])
     assert.deepEqual((await database.query('select kind from public.empty_saop_calls')).rows, [{ kind: 'child' }])
@@ -2483,7 +2462,7 @@ test('native analyzer selects only execution-reachable access-method support rol
     const btreeSql = `select value
       from public.precision_sort_key_values
       where value operator(public.=) row(1)::public.precision_sort_key`
-    const unreachableInRange = await analyze(database, btreeSql, [])
+    const unreachableInRange = await analyze(database, btreeSql)
     assert.equal(unreachableInRange.statements[0]?.queries[0]?.hasVolatileFunctions, false)
     assert.equal((await database.query(btreeSql)).rows.length, 1)
     assert.deepEqual((await database.query('select called from public.precision_sort_key_calls')).rows, [])
@@ -2500,7 +2479,7 @@ test('native analyzer selects only execution-reachable access-method support rol
       end;
     end
     $$`)
-    const reachableComparator = await analyze(database, btreeSql, [])
+    const reachableComparator = await analyze(database, btreeSql)
     assert.equal(reachableComparator.statements[0]?.queries[0]?.hasVolatileFunctions, true)
     await database.query('truncate public.precision_sort_key_calls')
     assert.equal((await database.query(btreeSql)).rows.length, 1)
@@ -2524,7 +2503,7 @@ test('native analyzer selects only execution-reachable access-method support rol
     const sortSupportSql = `select left_value.value
       from public.ssort_left left_value
       join public.ssort_right right_value on left_value.value = right_value.value`
-    const reachableSortSupport = await analyze(database, sortSupportSql, [])
+    const reachableSortSupport = await analyze(database, sortSupportSql)
     assert.equal(reachableSortSupport.statements[0]?.queries[0]?.hasVolatileFunctions, true)
     await database.query('set enable_hashjoin = off')
     await database.query('set enable_nestloop = off')
@@ -2577,7 +2556,7 @@ test('native analyzer selects only execution-reachable access-method support rol
     const directionalSql = `select value
       from public.direction_values
       where value operator(public.=~) row(1)::public.direction_right`
-    const directional = await analyze(database, directionalSql, [])
+    const directional = await analyze(database, directionalSql)
     assert.equal(directional.statements[0]?.queries[0]?.hasVolatileFunctions, false)
     assert.equal((await database.query(directionalSql)).rows.length, 1)
     assert.deepEqual((await database.query('select called from public.direction_calls')).rows, [])
@@ -2626,7 +2605,7 @@ test('native analyzer selects only execution-reachable access-method support rol
     const extendedHashSql = `select value
       from public.extended_hash_values
       where value operator(public.=) row(1)::public.extended_hash_key`
-    const reachableExtendedHash = await analyze(database, extendedHashSql, [])
+    const reachableExtendedHash = await analyze(database, extendedHashSql)
     assert.equal(reachableExtendedHash.statements[0]?.queries[0]?.hasVolatileFunctions, true)
     assert.equal((await database.query(extendedHashSql)).rows.length, 1)
     await database.query(`insert into public.extended_hash_values
@@ -2703,7 +2682,7 @@ test('native analyzer ignores volatile support for unrelated types in a shared o
     const sql = `select value
       from public.shared_family_values
       where value operator(public.=) row(1)::public.shared_family_left`
-    const analysis = await analyze(database, sql, [])
+    const analysis = await analyze(database, sql)
     assert.equal(analysis.statements[0]?.queries[0]?.hasVolatileFunctions, false)
     assert.equal((await database.query(sql)).rows.length, 1)
     assert.deepEqual(
@@ -2736,11 +2715,7 @@ test('native analyzer maps direct DML parameters to PostgreSQL target columns', 
       accountColumns.rows.map(({ attname, ...target }) => [attname, target])
     ) as Record<'display_name' | 'email', Omit<NativeDmlDirectAssignment, 'paramId'>>
 
-    const insert = await analyze(
-      database,
-      'insert into public.accounts(email, display_name) values ($1, $2), ($3, $4)',
-      []
-    )
+    const insert = await analyze(database, 'insert into public.accounts(email, display_name) values ($1, $2), ($3, $4)')
     assert.deepEqual(insert.statements[0]?.queries[0]?.dmlParameterNullAdmissions, [
       { admission: 'rejects', basis: 'direct_target_null_admission', paramId: 1 },
       { admission: 'rejects', basis: 'direct_target_null_admission', paramId: 3 },
@@ -2756,8 +2731,7 @@ test('native analyzer maps direct DML parameters to PostgreSQL target columns', 
 
     const repeatedInsert = await analyze(
       database,
-      'insert into public.accounts(email, display_name) values ($1, $2), ($1, $2)',
-      []
+      'insert into public.accounts(email, display_name) values ($1, $2), ($1, $2)'
     )
     assert.deepEqual(repeatedInsert.statements[0]?.queries[0]?.dmlParameterNullAdmissions, [
       { admission: 'rejects', basis: 'direct_target_null_admission', paramId: 1 },
@@ -2772,8 +2746,7 @@ test('native analyzer maps direct DML parameters to PostgreSQL target columns', 
       database,
       `with source(email) as (select $1::text)
        insert into public.accounts(email)
-       select source.email from source`,
-      []
+       select source.email from source`
     )
     assert.deepEqual(cteInsert.statements[0]?.queries[0]?.dmlParameterNullAdmissions, [
       { admission: 'rejects', basis: 'direct_target_null_admission', paramId: 1 },
@@ -2784,8 +2757,7 @@ test('native analyzer maps direct DML parameters to PostgreSQL target columns', 
 
     const update = await analyze(
       database,
-      'update public.accounts account set display_name = $1::text, email = $2 where account.id = $3',
-      [23, 25, 20]
+      'update public.accounts account set display_name = $1::text, email = $2 where account.id = $3'
     )
     assert.deepEqual(update.statements[0]?.queries[0]?.dmlParameterNullAdmissions, [
       { admission: 'rejects', basis: 'direct_target_null_admission', paramId: 2 },
@@ -2796,8 +2768,7 @@ test('native analyzer maps direct DML parameters to PostgreSQL target columns', 
       database,
       `insert into public.accounts(email, display_name)
        values ($1, $2)
-       on conflict (email) do update set display_name = $3`,
-      []
+       on conflict (email) do update set display_name = $3`
     )
     assert.deepEqual(upsert.statements[0]?.queries[0]?.dmlParameterNullAdmissions, [
       { admission: 'rejects', basis: 'direct_target_null_admission', paramId: 1 },
@@ -2811,8 +2782,7 @@ test('native analyzer maps direct DML parameters to PostgreSQL target columns', 
        using (values ($1::text, $2::text)) source(email, display_name)
        on account.email = source.email
        when matched then update set display_name = $3
-       when not matched then insert (email, display_name) values (source.email, $4)`,
-      []
+       when not matched then insert (email, display_name) values (source.email, $4)`
     )
     assert.deepEqual(merge.statements[0]?.queries[0]?.dmlParameterNullAdmissions, [
       { admission: 'accepts', basis: 'direct_target_null_admission', paramId: 3 },
@@ -2826,8 +2796,7 @@ test('native analyzer maps direct DML parameters to PostgreSQL target columns', 
          insert into public.accounts(email, display_name) values ($1, $2)
          returning id
        )
-       select id from inserted`,
-      []
+       select id from inserted`
     )
     assert.deepEqual(modifyingCte.statements[0]?.queries[0]?.dmlParameterNullAdmissions, [])
     assert.deepEqual(modifyingCte.statements[0]?.queries[0]?.cteList[0]?.query?.dmlParameterNullAdmissions, [
@@ -2840,8 +2809,7 @@ test('native analyzer maps direct DML parameters to PostgreSQL target columns', 
       `insert into public.accounts(email)
        select $1::text
        union all
-       select coalesce($1, 'fallback')`,
-      []
+       select coalesce($1, 'fallback')`
     )
     assert.deepEqual(setOperation.statements[0]?.queries[0]?.dmlParameterNullAdmissions, [
       { admission: 'rejects', basis: 'direct_target_null_admission', paramId: 1 },
@@ -2853,8 +2821,7 @@ test('native analyzer maps direct DML parameters to PostgreSQL target columns', 
       `insert into public.accounts(display_name)
        select $1::text
        union all
-       select coalesce($1, 'fallback')`,
-      []
+       select coalesce($1, 'fallback')`
     )
     assert.deepEqual(
       opaqueSetOperationPath.statements[0]?.queries[0]?.dmlParameterNullAdmissions.map(({ paramId, admission }) => ({
@@ -2874,8 +2841,7 @@ test('native analyzer maps direct DML parameters to PostgreSQL target columns', 
     const opaqueNotNullTarget = await analyze(
       database,
       `insert into public.accounts(email)
-       values (coalesce($1::text, 'fallback@example.com'))`,
-      []
+       values (coalesce($1::text, 'fallback@example.com'))`
     )
     assert.deepEqual(opaqueNotNullTarget.statements[0]?.queries[0]?.dmlParameterNullAdmissions, [
       { admission: 'unknown', basis: 'unresolved', paramId: 1 },
@@ -2886,8 +2852,7 @@ test('native analyzer maps direct DML parameters to PostgreSQL target columns', 
       `insert into public.accounts(email)
        select 'fixed@example.com'::text
        except
-       select $1::text`,
-      []
+       select $1::text`
     )
     assert.deepEqual(exceptFilter.statements[0]?.queries[0]?.dmlParameterNullAdmissions, [])
 
@@ -2896,8 +2861,7 @@ test('native analyzer maps direct DML parameters to PostgreSQL target columns', 
       `insert into public.accounts(email)
        select $1::text
        intersect
-       select 'fixed@example.com'::text`,
-      []
+       select 'fixed@example.com'::text`
     )
     assert.deepEqual(intersectFilter.statements[0]?.queries[0]?.dmlParameterNullAdmissions, [
       { admission: 'unknown', basis: 'unresolved', paramId: 1 },
@@ -2907,7 +2871,7 @@ test('native analyzer maps direct DML parameters to PostgreSQL target columns', 
       select null::text, $1::text
       intersect
       select $1::text, $1::text`
-    const intersectRightLineage = await analyze(database, intersectRightLineageSql, [])
+    const intersectRightLineage = await analyze(database, intersectRightLineageSql)
     assert.deepEqual(
       intersectRightLineage.statements[0]?.queries[0]?.dmlParameterNullAdmissions.some(
         ({ admission, basis, paramId }) => admission === 'unknown' && basis === 'unresolved' && paramId === 1
@@ -2920,8 +2884,7 @@ test('native analyzer maps direct DML parameters to PostgreSQL target columns', 
     const filteredProjection = await analyze(
       database,
       `insert into public.accounts(email)
-       select $1::text where false`,
-      []
+       select $1::text where false`
     )
     assert.deepEqual(filteredProjection.statements[0]?.queries[0]?.dmlParameterNullAdmissions, [
       { admission: 'unknown', basis: 'unresolved', paramId: 1 },
@@ -2930,8 +2893,7 @@ test('native analyzer maps direct DML parameters to PostgreSQL target columns', 
     const nullableFilteredProjection = await analyze(
       database,
       `insert into public.accounts(display_name)
-       select $1::text where false`,
-      []
+       select $1::text where false`
     )
     assert.deepEqual(nullableFilteredProjection.statements[0]?.queries[0]?.dmlParameterNullAdmissions, [
       { admission: 'accepts', basis: 'direct_target_null_admission', paramId: 1 },
@@ -2941,8 +2903,7 @@ test('native analyzer maps direct DML parameters to PostgreSQL target columns', 
       database,
       `insert into public.accounts(email)
        (select $1::text union all select 'fixed@example.com'::text)
-       limit 0`,
-      []
+       limit 0`
     )
     assert.deepEqual(limitedSetOperation.statements[0]?.queries[0]?.dmlParameterNullAdmissions, [
       { admission: 'unknown', basis: 'unresolved', paramId: 1 },
@@ -2955,8 +2916,7 @@ test('native analyzer maps direct DML parameters to PostgreSQL target columns', 
        union all
        select $2::text
        union
-       select $3::text`,
-      []
+       select $3::text`
     )
     assert.deepEqual(
       allSetOperationBranches.statements[0]?.queries[0]?.dmlParameterNullAdmissions
@@ -2977,8 +2937,7 @@ test('native analyzer maps direct DML parameters to PostgreSQL target columns', 
       database,
       `with ${longCteSql}
        insert into public.accounts(display_name)
-       select value from ${longCteNames.at(-1)}`,
-      []
+       select value from ${longCteNames.at(-1)}`
     )
     assert.deepEqual(
       longLineage.statements[0]?.queries[0]?.dmlParameterNullAdmissions.map(({ paramId }) => paramId),
@@ -2993,8 +2952,7 @@ test('native analyzer maps direct DML parameters to PostgreSQL target columns', 
          select value from source where false
        )
        insert into public.accounts(display_name)
-       select value from source`,
-      []
+       select value from source`
     )
     assert.deepEqual(
       recursiveLineage.statements[0]?.queries[0]?.dmlParameterNullAdmissions.map(({ paramId }) => paramId),
@@ -3005,8 +2963,7 @@ test('native analyzer maps direct DML parameters to PostgreSQL target columns', 
       database,
       `insert into public.accounts(display_name)
        select joined.value
-       from ((values ($1::text)) source(value) cross join (values (1)) marker(n)) joined`,
-      []
+       from ((values ($1::text)) source(value) cross join (values (1)) marker(n)) joined`
     )
     assert.deepEqual(
       joinAliasLineage.statements[0]?.queries[0]?.dmlParameterNullAdmissions.map(({ paramId }) => paramId),
@@ -3021,19 +2978,14 @@ test('native analyzer maps direct DML parameters to PostgreSQL target columns', 
       `insert into public.outer_join_probe(value)
        select candidate.value
        from (values (1)) guaranteed(marker)
-       left join (values ($1::text)) candidate(value) on false`,
-      []
+       left join (values ($1::text)) candidate(value) on false`
     )
     assert.deepEqual(nullExtendedLineage.statements[0]?.queries[0]?.dmlParameterNullAdmissions, [
       { admission: 'accepts', basis: 'direct_target_null_admission', paramId: 1 },
     ])
 
     const repeatedValues = Array.from({ length: 256 }, () => '($1::text)').join(', ')
-    const manyDuplicates = await analyze(
-      database,
-      `insert into public.accounts(display_name) values ${repeatedValues}`,
-      []
-    )
+    const manyDuplicates = await analyze(database, `insert into public.accounts(display_name) values ${repeatedValues}`)
     assert.equal(manyDuplicates.statements[0]?.queries[0]?.dmlParameterNullAdmissions.length, 1)
     assert.deepEqual(
       manyDuplicates.statements[0]?.queries[0]?.dmlDirectAssignments.map(({ paramId }) => paramId),
@@ -3044,7 +2996,7 @@ test('native analyzer maps direct DML parameters to PostgreSQL target columns', 
       (tail, parameter) => `coalesce(${parameter}, ${tail})`,
       'null::integer'
     )
-    const nestedUsage = await analyze(database, `select ${deeplyNestedParameters}`, [])
+    const nestedUsage = await analyze(database, `select ${deeplyNestedParameters}`)
     assert.equal(nestedUsage.paramUsageNullAdmissions.length, 256)
     assert.ok(nestedUsage.paramUsageNullAdmissions.every((admission) => admission === 'accepts'))
 
@@ -3057,7 +3009,7 @@ test('native analyzer maps direct DML parameters to PostgreSQL target columns', 
     await database.query(`create table public.partitioned_values_one
       partition of public.partitioned_values for values in (1)`)
     await database.query('alter table public.partitioned_values_one alter column value set not null')
-    const checkedView = await analyze(database, 'insert into public.non_null_view(value) values ($1)', [])
+    const checkedView = await analyze(database, 'insert into public.non_null_view(value) values ($1)')
     assert.deepEqual(
       checkedView.statements[0]?.queries[0]?.dmlParameterNullAdmissions.map(({ paramId, admission }) => ({
         paramId,
@@ -3067,8 +3019,7 @@ test('native analyzer maps direct DML parameters to PostgreSQL target columns', 
     )
     const partitionedTarget = await analyze(
       database,
-      'insert into public.partitioned_values(bucket, value) values (1, $1)',
-      []
+      'insert into public.partitioned_values(bucket, value) values (1, $1)'
     )
     assert.deepEqual(
       partitionedTarget.statements[0]?.queries[0]?.dmlParameterNullAdmissions.map(({ paramId, admission }) => ({
@@ -3100,8 +3051,7 @@ test('native analyzer maps direct DML parameters to PostgreSQL target columns', 
 
     const domainTypedSource = await analyze(
       database,
-      'insert into public.domain_probe(value) values ($1::public.non_null_text)',
-      []
+      'insert into public.domain_probe(value) values ($1::public.non_null_text)'
     )
     assert.deepEqual(domainTypedSource.paramTypeNullAdmissions, ['rejects'])
     assert.equal(domainTypedSource.statements[0]?.queries[0]?.dmlParameterNullAdmissions[0]?.admission, 'accepts')
@@ -3110,8 +3060,7 @@ test('native analyzer maps direct DML parameters to PostgreSQL target columns', 
       database,
       `insert into public.domain_probe(value)
        values ($1::text)
-       returning ($1::text)::public.non_null_text`,
-      []
+       returning ($1::text)::public.non_null_text`
     )
     assert.deepEqual(rejectingReturningUse.paramTypeNullAdmissions, ['accepts'])
     assert.deepEqual(rejectingReturningUse.paramUsageNullAdmissions, ['rejects'])
@@ -3119,8 +3068,7 @@ test('native analyzer maps direct DML parameters to PostgreSQL target columns', 
     const domainTargets = await analyze(
       database,
       `insert into public.domain_probe(maybe_value, checked_value, required_value, nested_required_value)
-       values ($1, $2, $3, $4)`,
-      []
+       values ($1, $2, $3, $4)`
     )
     assert.deepEqual(domainTargets.statements[0]?.queries[0]?.dmlParameterNullAdmissions, [
       { admission: 'accepts', basis: 'direct_target_null_admission', paramId: 1 },
@@ -3132,8 +3080,7 @@ test('native analyzer maps direct DML parameters to PostgreSQL target columns', 
     const domainCheckAdmissions = await analyze(
       database,
       `insert into public.domain_probe(accepting_value, rejecting_value, unknown_value)
-       values ($1, $2, $3)`,
-      []
+       values ($1, $2, $3)`
     )
     assert.deepEqual(domainCheckAdmissions.statements[0]?.queries[0]?.dmlParameterNullAdmissions, [
       { admission: 'accepts', basis: 'direct_target_null_admission', paramId: 1 },
@@ -3152,8 +3099,7 @@ test('native analyzer maps direct DML parameters to PostgreSQL target columns', 
     const tableCheckAdmissions = await analyze(
       database,
       `insert into public.table_check_probe(accepting_value, rejecting_value, unknown_value)
-       values ($1, $2, $3)`,
-      []
+       values ($1, $2, $3)`
     )
     assert.deepEqual(
       tableCheckAdmissions.statements[0]?.queries[0]?.dmlParameterNullAdmissions.map(({ paramId, admission }) => ({
@@ -3188,8 +3134,7 @@ test('native analyzer maps direct DML parameters to PostgreSQL target columns', 
 
     const matchFullMixed = await analyze(
       database,
-      'insert into public.match_full_child(left_key, right_key) values ($1, 2)',
-      []
+      'insert into public.match_full_child(left_key, right_key) values ($1, 2)'
     )
     assert.equal(matchFullMixed.statements[0]?.queries[0]?.dmlParameterNullAdmissions[0]?.admission, 'rejects')
     await assert.rejects(
@@ -3199,16 +3144,14 @@ test('native analyzer maps direct DML parameters to PostgreSQL target columns', 
 
     const matchFullAllNull = await analyze(
       database,
-      'insert into public.match_full_child(left_key, right_key) values ($1, null)',
-      []
+      'insert into public.match_full_child(left_key, right_key) values ($1, null)'
     )
     assert.equal(matchFullAllNull.statements[0]?.queries[0]?.dmlParameterNullAdmissions[0]?.admission, 'accepts')
     await database.query('insert into public.match_full_child(left_key, right_key) values ($1, null)', [null])
 
     const matchFullSameParameter = await analyze(
       database,
-      'insert into public.match_full_child(left_key, right_key) values ($1, $1)',
-      []
+      'insert into public.match_full_child(left_key, right_key) values ($1, $1)'
     )
     assert.ok(
       matchFullSameParameter.statements[0]?.queries[0]?.dmlParameterNullAdmissions.every(
@@ -3219,8 +3162,7 @@ test('native analyzer maps direct DML parameters to PostgreSQL target columns', 
 
     const matchFullUnknownPeer = await analyze(
       database,
-      'insert into public.match_full_child(left_key, right_key) values ($1, $2)',
-      []
+      'insert into public.match_full_child(left_key, right_key) values ($1, $2)'
     )
     assert.ok(
       matchFullUnknownPeer.statements[0]?.queries[0]?.dmlParameterNullAdmissions.every(
@@ -3230,16 +3172,14 @@ test('native analyzer maps direct DML parameters to PostgreSQL target columns', 
 
     const matchSimpleMixed = await analyze(
       database,
-      'insert into public.match_simple_child(left_key, right_key) values ($1, 2)',
-      []
+      'insert into public.match_simple_child(left_key, right_key) values ($1, 2)'
     )
     assert.equal(matchSimpleMixed.statements[0]?.queries[0]?.dmlParameterNullAdmissions[0]?.admission, 'accepts')
     await database.query('insert into public.match_simple_child(left_key, right_key) values ($1, 2)', [null])
 
     const matchFullUnrelatedColumn = await analyze(
       database,
-      'insert into public.match_full_child(left_key, right_key, payload) values (null, null, $1)',
-      []
+      'insert into public.match_full_child(left_key, right_key, payload) values (null, null, $1)'
     )
     assert.equal(
       matchFullUnrelatedColumn.statements[0]?.queries[0]?.dmlParameterNullAdmissions[0]?.admission,
@@ -3249,7 +3189,7 @@ test('native analyzer maps direct DML parameters to PostgreSQL target columns', 
     await database.query(`create table public.any_empty_probe (
       value integer check (value = any (array[array[]::integer[]]))
     )`)
-    const emptyNestedArrayCheck = await analyze(database, 'insert into public.any_empty_probe(value) values ($1)', [])
+    const emptyNestedArrayCheck = await analyze(database, 'insert into public.any_empty_probe(value) values ($1)')
     assert.equal(emptyNestedArrayCheck.statements[0]?.queries[0]?.dmlParameterNullAdmissions[0]?.admission, 'rejects')
     await assert.rejects(
       database.query('insert into public.any_empty_probe(value) values ($1)', [null]),
@@ -3263,8 +3203,7 @@ test('native analyzer maps direct DML parameters to PostgreSQL target columns', 
     )`)
     const mismatchedNestedArrayCheck = await analyze(
       database,
-      'insert into public.any_mismatched_array_probe(value) values ($1)',
-      []
+      'insert into public.any_mismatched_array_probe(value) values ($1)'
     )
     assert.deepEqual(mismatchedNestedArrayCheck.statements[0]?.queries[0]?.dmlParameterNullAdmissions, [
       { admission: 'unknown', basis: 'unresolved', paramId: 1 },
@@ -3281,8 +3220,7 @@ test('native analyzer maps direct DML parameters to PostgreSQL target columns', 
     )`)
     const compatibleNestedArrayCheck = await analyze(
       database,
-      'insert into public.any_compatible_array_probe(value) values ($1)',
-      []
+      'insert into public.any_compatible_array_probe(value) values ($1)'
     )
     assert.deepEqual(compatibleNestedArrayCheck.statements[0]?.queries[0]?.dmlParameterNullAdmissions, [
       { admission: 'accepts', basis: 'direct_target_null_admission', paramId: 1 },
@@ -3293,19 +3231,18 @@ test('native analyzer maps direct DML parameters to PostgreSQL target columns', 
       input text,
       derived text generated always as (input) stored not null
     )`)
-    const generatedTarget = await analyze(database, 'insert into public.generated_probe(input) values ($1)', [])
+    const generatedTarget = await analyze(database, 'insert into public.generated_probe(input) values ($1)')
     assert.equal(generatedTarget.statements[0]?.queries[0]?.dmlParameterNullAdmissions[0]?.admission, 'unknown')
 
     await database.query('create foreign data wrapper dummy no handler')
     await database.query('create server dummy_server foreign data wrapper dummy')
     await database.query('create foreign table public.foreign_probe(value text) server dummy_server')
-    const foreignTarget = await analyze(database, 'insert into public.foreign_probe(value) values ($1)', [])
+    const foreignTarget = await analyze(database, 'insert into public.foreign_probe(value) values ($1)')
     assert.equal(foreignTarget.statements[0]?.queries[0]?.dmlParameterNullAdmissions[0]?.admission, 'unknown')
 
     const explicitNonNullDomainCoercion = await analyze(
       database,
-      'insert into public.domain_probe(value) values (($1::text)::public.non_null_text)',
-      []
+      'insert into public.domain_probe(value) values (($1::text)::public.non_null_text)'
     )
     assert.deepEqual(explicitNonNullDomainCoercion.statements[0]?.queries[0]?.dmlParameterNullAdmissions, [
       { admission: 'rejects', basis: 'direct_target_null_admission', paramId: 1 },
@@ -3314,8 +3251,7 @@ test('native analyzer maps direct DML parameters to PostgreSQL target columns', 
     const mixedDomainPaths = await analyze(
       database,
       `insert into public.domain_probe(value)
-       values ($1), (($1::text)::public.non_null_text)`,
-      []
+       values ($1), (($1::text)::public.non_null_text)`
     )
     assert.deepEqual(mixedDomainPaths.statements[0]?.queries[0]?.dmlParameterNullAdmissions, [
       { admission: 'accepts', basis: 'direct_target_null_admission', paramId: 1 },
@@ -3328,8 +3264,7 @@ test('native analyzer maps direct DML parameters to PostgreSQL target columns', 
          select ($1::text)::public.non_null_text
        )
        insert into public.domain_probe(value)
-       select value from source`,
-      []
+       select value from source`
     )
     assert.deepEqual(cteDomainCoercion.statements[0]?.queries[0]?.dmlParameterNullAdmissions, [
       { admission: 'rejects', basis: 'direct_target_null_admission', paramId: 1 },
@@ -3338,7 +3273,7 @@ test('native analyzer maps direct DML parameters to PostgreSQL target columns', 
     await database.query('create sequence public.domain_side_effect_sequence')
     await database.query(`create domain public.volatile_text as text
       check (nextval('public.domain_side_effect_sequence') > 0)`)
-    const volatileDomain = await analyze(database, 'select $1::public.volatile_text', [])
+    const volatileDomain = await analyze(database, 'select $1::public.volatile_text')
     assert.equal(volatileDomain.statements[0]?.queries[0]?.hasVolatileFunctions, true)
 
     await database.query('create table public.trigger_probe (value text)')
@@ -3353,7 +3288,7 @@ test('native analyzer maps direct DML parameters to PostgreSQL target columns', 
       $$`)
     await database.query(`create trigger reject_null before insert on public.trigger_probe
       for each row execute function public.reject_null_trigger()`)
-    const triggerTarget = await analyze(database, 'insert into public.trigger_probe(value) values ($1)', [])
+    const triggerTarget = await analyze(database, 'insert into public.trigger_probe(value) values ($1)')
     assert.equal(triggerTarget.statements[0]?.queries[0]?.dmlParameterNullAdmissions[0]?.admission, 'unknown')
 
     await database.query(`create table public.trigger_checked_probe (
@@ -3369,7 +3304,7 @@ test('native analyzer maps direct DML parameters to PostgreSQL target columns', 
     await database.query(`create trigger force_allowed before insert on public.trigger_checked_probe
       for each row execute function public.force_allowed_trigger()`)
     const rewrittenTriggerSql = 'insert into public.trigger_checked_probe(value) values ($1)'
-    const rewrittenTriggerTarget = await analyze(database, rewrittenTriggerSql, [])
+    const rewrittenTriggerTarget = await analyze(database, rewrittenTriggerSql)
     assert.deepEqual(rewrittenTriggerTarget.statements[0]?.queries[0]?.dmlParameterNullAdmissions, [
       { admission: 'unknown', basis: 'unresolved', paramId: 1 },
     ])
@@ -3382,7 +3317,7 @@ test('native analyzer maps direct DML parameters to PostgreSQL target columns', 
     await database.query('alter table public.rls_probe enable row level security')
     await database.query(`create policy require_value on public.rls_probe
       for insert with check (value is not null)`)
-    const rlsTarget = await analyze(database, 'insert into public.rls_probe(value) values ($1)', [])
+    const rlsTarget = await analyze(database, 'insert into public.rls_probe(value) values ($1)')
     assert.equal(rlsTarget.statements[0]?.queries[0]?.dmlParameterNullAdmissions[0]?.admission, 'unknown')
 
     await database.query('create table public.conditional_rule_source (value text)')
@@ -3391,7 +3326,7 @@ test('native analyzer maps direct DML parameters to PostgreSQL target columns', 
       on insert to public.conditional_rule_source
       where new.value is not null
       do also insert into public.conditional_rule_sink(value) values (new.value)`)
-    const conditionalRule = await analyze(database, 'insert into public.conditional_rule_source(value) values ($1)', [])
+    const conditionalRule = await analyze(database, 'insert into public.conditional_rule_source(value) values ($1)')
     assert.deepEqual(
       conditionalRule.statements[0]?.queries
         .flatMap((query) => query.dmlParameterNullAdmissions)

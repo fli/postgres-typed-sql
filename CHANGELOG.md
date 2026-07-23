@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.0-beta.11
+
+- Breaking: removed `@param` and all out-of-band parameter type OIDs. PostgreSQL now infers parameter types exclusively from the exact compiled SQL executed at runtime; ambiguous uses must be resolved with authored SQL casts.
+- Added proof-gated `@nullable name` as the sole parameter contract directive. It controls only top-level caller NULL permission and never supplies or changes a PostgreSQL type.
+- The native analyzer now always uses PostgreSQL variable-parameter analysis and accepts only SQL text, preventing static analysis from succeeding through type hints that the runtime query never sends.
+
 ## 0.1.0-beta.10
 
 - Added sound nullable-parameter admission for guarded DML assignments, including correlated `CASE` and `COALESCE` tails that preserve nullable old values as a group.
@@ -31,7 +37,7 @@
 
 ## 0.1.0-beta.6
 
-- Breaking: generated parameter-object properties now use conservative camel case by default while SQL tokens, `@param` directives, analyzer labels, and parameter metadata retain their raw spelling. Configure `naming.parameterProperties: 'preserve'` only for a deliberate exact-name API; post-transform collisions are rejected.
+- Breaking: generated parameter-object properties now use conservative camel case by default while SQL tokens, parameter directives, analyzer labels, and parameter metadata retain their raw spelling. Configure `naming.parameterProperties: 'preserve'` only for a deliberate exact-name API; post-transform collisions are rejected.
 - Replaced the closed `scalarProfile` switch with composable codec profiles. Applications can now define exact result-OID mappings or portable schema/name hooks, independently model result, parameter, and nested-JSON representations, inherit built-in behavior, declare structured-JSON capability, and expose custom scalar imports.
 - Added the selected codec profile name to generated statement and catalog headers, and applied codec behavior consistently to catalog columns, JSON shape rendering, enum/CHECK literal refinement, parameters, and results.
 - Moved node-postgres query options, client typing, and execution helpers from `postgres-typed-sql/runtime` to `postgres-typed-sql/adapters/node-postgres`. The core runtime now contains only driver-neutral statement and mapping behavior. Replace `scalarProfile` with `codecProfile`, import execution helpers from the adapter, and regenerate checked-in output.

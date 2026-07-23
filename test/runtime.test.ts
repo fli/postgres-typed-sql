@@ -84,6 +84,7 @@ test('runtime binds named parameters in generated order', async () => {
       async query(config: NodePostgresTypedSqlQueryConfig) {
         assert.deepEqual(config.values, ['reader@example.test'])
         assert.equal(config.rowMode, 'array')
+        assert.equal(Object.hasOwn(config, 'types'), false)
         return {
           rowCount: 1,
           rows: [['reader@example.test']],

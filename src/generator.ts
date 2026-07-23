@@ -63,13 +63,14 @@ const ignoredDiscoveryDirectories = new Set([
   'test-results',
 ])
 
-interface SqlParameterDeclaration {
-  readonly allowsNull: boolean
+interface NullableParameterDeclaration {
+  readonly line: number
   readonly name: string
-  readonly pgType?: string
 }
 
-interface SqlParameter extends SqlParameterDeclaration {
+interface SqlParameter {
+  readonly name: string
+  readonly nullableRequestLine?: number
   readonly propertyName: string
 }
 
@@ -82,8 +83,8 @@ interface TypedSqlConfig {
   readonly access?: TypedSqlAccess
   readonly columns: readonly SqlColumn[]
   readonly name: string
+  readonly nullableParameters: readonly NullableParameterDeclaration[]
   readonly outputPath: string
-  readonly parameters: readonly SqlParameterDeclaration[]
   readonly sourceFile: string
   readonly sourcePath: string
   readonly sql: string
@@ -267,26 +268,6 @@ function accessConcernDescription(concern: TypedSqlPostgresIrAccessConcern): str
   }
 }
 
-function parseDirectivePgType(pgType: string | undefined): {
-  readonly allowsNull: boolean
-  readonly pgType?: string
-} {
-  if (!pgType) {
-    return { allowsNull: false }
-  }
-
-  if (pgType === '?') {
-    return { allowsNull: true }
-  }
-
-  if (pgType.endsWith('?')) {
-    const typeWithoutSuffix = pgType.slice(0, -1).trimEnd()
-    return { allowsNull: true, ...(typeWithoutSuffix ? { pgType: typeWithoutSuffix } : {}) }
-  }
-
-  return { allowsNull: false, pgType }
-}
-
 async function walkTypedSqlFiles(directory: string, output: string[]): Promise<void> {
   const entries = await readdir(directory, { withFileTypes: true })
   for (const entry of entries) {
@@ -343,12 +324,12 @@ async function readTypedSqlConfigs(generatorConfig: ResolvedPostgresTypedSqlConf
     const defaultName = lowerCamelCaseFromPathBase(basename(sourceFile, typedSqlSourceSuffix))
     let access: TypedSqlAccess | undefined
     let name = defaultName
-    const parameters: SqlParameterDeclaration[] = []
+    const nullableParameters: NullableParameterDeclaration[] = []
     const columns: SqlColumn[] = []
     let firstAccessLocation: string | undefined
     let firstNameLocation: string | undefined
     const firstColumnDirectiveByName = new Map<string, string>()
-    const firstParameterDirectiveByName = new Map<string, string>()
+    const firstNullableDirectiveByName = new Map<string, string>()
 
     for (const directive of parsedSource.directives) {
       const location = `${sourceFile}:${directive.line}`
@@ -356,8 +337,6 @@ async function readTypedSqlConfigs(generatorConfig: ResolvedPostgresTypedSqlConf
       const bodyParts = /^(\S+)(?:\s+([\s\S]*))?$/u.exec(directive.body)
       const identifier = bodyParts?.[1]
       const rawPgType = bodyParts?.[2]?.trim()
-      const parsedPgType = parseDirectivePgType(rawPgType)
-      const pgType = parsedPgType.pgType
       if (kind === 'name') {
         if (!identifier || rawPgType) {
           throw new Error(`${location}: @name requires exactly one identifier.`)
@@ -384,37 +363,36 @@ async function readTypedSqlConfigs(generatorConfig: ResolvedPostgresTypedSqlConf
         continue
       }
 
-      if (kind !== 'param' && kind !== 'column') {
+      if (kind !== 'nullable' && kind !== 'column') {
         throw new Error(`${location}: unsupported typed SQL directive @${kind}.`)
       }
 
       if (!identifier) {
         throw new Error(`${location}: @${kind} requires a name.`)
       }
-      if (kind === 'param' && !/^[A-Za-z_][A-Za-z0-9_]*$/u.test(identifier)) {
-        throw new Error(`${location}: @param requires a named-parameter identifier.`)
+      if (kind === 'nullable' && (rawPgType || !/^[A-Za-z_][A-Za-z0-9_]*$/u.test(identifier))) {
+        throw new Error(`${location}: @nullable requires exactly one named-parameter identifier.`)
       }
-      if (kind === 'column' && parsedPgType.allowsNull) {
+      if (kind === 'column' && rawPgType?.endsWith('?')) {
         throw new Error(`${location}: @column does not support ?; PostgreSQL determines result nullability.`)
       }
 
-      const firstDirectiveByName = kind === 'param' ? firstParameterDirectiveByName : firstColumnDirectiveByName
+      const firstDirectiveByName = kind === 'nullable' ? firstNullableDirectiveByName : firstColumnDirectiveByName
       const firstLocation = firstDirectiveByName.get(identifier)
       if (firstLocation) {
         throw new Error(`${location}: duplicate @${kind} ${identifier}; first declared at ${firstLocation}.`)
       }
       firstDirectiveByName.set(identifier, location)
 
-      if (kind === 'param') {
-        parameters.push({
-          allowsNull: parsedPgType.allowsNull,
+      if (kind === 'nullable') {
+        nullableParameters.push({
+          line: directive.line,
           name: identifier,
-          pgType,
         })
       } else {
         columns.push({
           name: identifier,
-          pgType,
+          pgType: rawPgType,
         })
       }
     }
@@ -423,8 +401,8 @@ async function readTypedSqlConfigs(generatorConfig: ResolvedPostgresTypedSqlConf
       access,
       columns,
       name,
+      nullableParameters,
       outputPath: generatedOutputPath(sourcePath),
-      parameters,
       sourceFile,
       sourcePath,
       sql: parsedSource.sql,
@@ -446,12 +424,13 @@ function assertUniqueTypedSqlNames(configs: readonly TypedSqlConfig[]): void {
 }
 
 function compileTypedSql(config: TypedSqlConfig, parameterNaming: PostgresTypedSqlPropertyNaming): CompiledTypedSql {
-  const parametersByName = new Map(config.parameters.map((parameter) => [parameter.name, parameter]))
+  const nullableByName = new Map(config.nullableParameters.map((parameter) => [parameter.name, parameter]))
   const compiled = compileNamedParameters(config.sql, config.sourceFile)
   const parameters = compiled.parameterNames.map((name): SqlParameter => {
-    const declaration = parametersByName.get(name) ?? { allowsNull: false, name }
+    const nullable = nullableByName.get(name)
     return {
-      ...declaration,
+      name,
+      ...(nullable ? { nullableRequestLine: nullable.line } : {}),
       propertyName: propertyNameForNaming(name, parameterNaming),
     }
   })
@@ -461,13 +440,12 @@ function compileTypedSql(config: TypedSqlConfig, parameterNaming: PostgresTypedS
     config.sourceFile
   )
 
-  const unusedParameters = config.parameters.filter(
+  const unusedParameters = config.nullableParameters.filter(
     (parameter) => !parameters.some((used) => used.name === parameter.name)
   )
   if (unusedParameters.length > 0) {
-    throw new Error(
-      `${config.sourceFile}: declared parameter(s) not used: ${unusedParameters.map((parameter) => parameter.name).join(', ')}.`
-    )
+    const first = unusedParameters[0] as NullableParameterDeclaration
+    throw new Error(`${config.sourceFile}:${first.line}: @nullable parameter ${first.name} is not used by the SQL.`)
   }
 
   return {
@@ -1042,7 +1020,6 @@ async function resolveTypedSqlWithAnalyzer(
     configs.map((config) => ({
       name: config.name,
       parameterNames: config.parameters.map((parameter) => parameter.name),
-      parameterTypes: config.parameters.map((parameter) => parameter.pgType),
       sourceFile: config.sourceFile,
       sql: config.sql,
     }))
@@ -1145,16 +1122,18 @@ async function resolveTypedSqlWithAnalyzer(
             }
           : resolveTypeScriptParameterTypeForPostgresType(analyzed, generatorConfig.codecProfile)
       collectTypeResolutionDependencies(typeDependencies, resolution)
-      if (parameter.allowsNull && analyzed.nullAdmission !== 'accepts') {
+      if (parameter.nullableRequestLine !== undefined && analyzed.nullAdmission !== 'accepts') {
         const reason =
           analyzed.nullAdmission === 'rejects'
             ? 'PostgreSQL proves that one of its uses rejects NULL'
             : 'PostgreSQL could not prove that every use accepts NULL'
-        throw new Error(`${config.sourceFile}: @param ${parameter.name} cannot be nullable because ${reason}.`)
+        throw new Error(
+          `${config.sourceFile}:${parameter.nullableRequestLine}: @nullable ${parameter.name} cannot be satisfied because ${reason}.`
+        )
       }
       return {
         name: parameter.name,
-        nullable: parameter.allowsNull,
+        nullable: parameter.nullableRequestLine !== undefined,
         pgType: analyzed.pgType,
         pgTypeName: analyzed.pgTypeName,
         pgTypeSchema: analyzed.pgTypeSchema,

@@ -26,16 +26,10 @@ type AnalyzerSourceIsAbsent = AssertTrue<IsExactly<Extract<keyof TypedSqlPostgre
 
 const analyzerSourceTypeAssertions: [AnalyzerExpressionSourceIsRequired, AnalyzerSourceIsAbsent] = [true, true]
 
-function config(
-  name: string,
-  sql: string,
-  parameterNames: readonly string[] = [],
-  parameterTypes?: readonly (string | undefined)[]
-): TypedSqlPostgresIrCompiledConfig {
+function config(name: string, sql: string, parameterNames: readonly string[] = []): TypedSqlPostgresIrCompiledConfig {
   return {
     name,
     parameterNames,
-    ...(parameterTypes ? { parameterTypes } : {}),
     sourceFile: `queries/${name}.typed.sql`,
     sql,
   }
@@ -1131,7 +1125,7 @@ test('rejects unmodeled PostgreSQL utilities while write-routing an opaque no-re
       as $$ begin output_value := input_value * 2; end $$`)
 
     const result = await buildTypedSqlPostgresIrFromCompiledConfigs(database, [
-      config('noResultCall', 'call public.ir_no_result($1)', ['value'], ['integer']),
+      config('noResultCall', 'call public.ir_no_result($1::integer)', ['value']),
     ])
     const call = result.queries[0]
     assert.equal(call?.command, 'UTILITY')
@@ -1197,24 +1191,21 @@ test('normalizes PostgreSQL statement, nullability, DML, and cardinality facts c
       ),
       config(
         'andRefinement',
-        'select account.display_name from public.accounts account where account.display_name is not null and $1',
-        ['include'],
-        ['boolean']
+        'select account.display_name from public.accounts account where account.display_name is not null and $1::boolean',
+        ['include']
       ),
       config(
         'orRefinement',
-        'select account.display_name from public.accounts account where account.display_name is not null or $1',
-        ['include'],
-        ['boolean']
+        'select account.display_name from public.accounts account where account.display_name is not null or $1::boolean',
+        ['include']
       ),
       config(
         'orIntersectionRefinement',
         `select account.display_name
          from public.accounts account
-         where (account.display_name is not null and $1)
-            or (account.display_name is not null and not $1)`,
-        ['include'],
-        ['boolean']
+         where (account.display_name is not null and $1::boolean)
+            or (account.display_name is not null and not $1::boolean)`,
+        ['include']
       ),
       config(
         'notRefinement',
@@ -1279,21 +1270,25 @@ test('normalizes PostgreSQL statement, nullability, DML, and cardinality facts c
       config(
         'rowPreservingPointUpdate',
         `update public.null_admission_place
-         set required_location = coalesce(point($1, $2), required_location)
+         set required_location = coalesce(
+           point($1::double precision, $2::double precision),
+           required_location
+         )
          where id = 1`,
-        ['latitude', 'longitude'],
-        ['double precision', 'double precision']
+        ['latitude', 'longitude']
       ),
       config(
         'rowPreservingPointCaseUpdate',
         `update public.null_admission_place
          set required_location = coalesce(
-           case when $1 is not null and $2 is not null then point($1, $2) end,
+           case
+             when $1::double precision is not null and $2::double precision is not null
+               then point($1::double precision, $2::double precision)
+           end,
            required_location
          )
          where id = 1`,
-        ['latitude', 'longitude'],
-        ['double precision', 'double precision']
+        ['latitude', 'longitude']
       ),
       config('uniqueLookup', 'select account.id from public.accounts account where account.id = $1', ['id']),
       config(

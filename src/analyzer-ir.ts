@@ -77,12 +77,23 @@ export type {
 const ANALYZER_SCHEMA_VERSION = 10
 const ANALYZER_SQL_FUNCTION = 'pg_temp.postgres_typed_sql_analyze'
 
+function dollarQuotedSqlText(sql: string): string {
+  let delimiter = '$postgres_typed_sql$'
+  while (sql.includes(delimiter)) {
+    delimiter = `${delimiter.slice(0, -1)}_$`
+  }
+  return `${delimiter}${sql}${delimiter}`
+}
+
 export async function bindTypedSqlPostgresAnalyzer(client: PostgresQueryable): Promise<void> {
   await client.query(`
-    create function ${ANALYZER_SQL_FUNCTION}(text, oid[]) returns text
+    create function ${ANALYZER_SQL_FUNCTION}(text) returns text
     as '$libdir/postgres_typed_sql_analyzer', 'postgres_typed_sql_analyze'
     language c strict
   `)
+  // PGlite lazily finishes loading a newly bound C module on the next
+  // statement. Keep that bootstrap statement separate from analyzer work.
+  await client.query('select 1')
 }
 
 interface AnalyzedCompiledConfig {
@@ -141,38 +152,6 @@ export interface TypedSqlPostgresIrBuildResult {
     readonly uniqueIndexes: number
   }
   readonly queries: readonly TypedSqlPostgresIr[]
-}
-
-async function explicitCompiledParamTypeOids(
-  client: PostgresQueryable,
-  config: TypedSqlPostgresIrCompiledConfig
-): Promise<readonly number[]> {
-  const parameterTypes = config.parameterTypes ?? []
-  if (parameterTypes.every((pgType) => !pgType)) {
-    return []
-  }
-
-  const typeOids: number[] = []
-  for (const [index, pgType] of parameterTypes.entries()) {
-    if (!pgType) {
-      typeOids.push(0)
-      continue
-    }
-
-    const result = await client.query<{ readonly oid: number | null }>('select to_regtype($1)::oid::int as oid', [
-      pgType,
-    ])
-    const oid = result.rows[0]?.oid
-    if (!oid) {
-      throw new Error(
-        `${config.sourceFile}: unknown explicit parameter type ${pgType} for parameter ${
-          config.parameterNames[index] ?? index + 1
-        }.`
-      )
-    }
-    typeOids.push(oid)
-  }
-  return typeOids
 }
 
 function walkExpr(expr: PgAnalyzerExpr | null | undefined, visit: (expr: PgAnalyzerExpr) => void): void {
@@ -2456,7 +2435,7 @@ function normalizeCompiledIr(catalog: CatalogFacts, analyzed: AnalyzedCompiledCo
   )
   const params = config.parameterNames.map((name, index): TypedSqlPostgresIrParam => {
     const oid = analysis.paramTypeOids[index]
-    const typeFact = typeFactForOid(catalog, oid, config.parameterTypes?.[index])
+    const typeFact = typeFactForOid(catalog, oid, undefined)
     const checkConstraintType = checkConstraintParamTypes.get(index + 1)
     const nullAdmission = nullAdmissionByParamId.get(index + 1) ?? 'unknown'
     return {
@@ -2540,9 +2519,12 @@ async function analyzeCompiledConfig(
   client: PostgresQueryable,
   config: TypedSqlPostgresIrCompiledConfig
 ): Promise<AnalyzedCompiledConfig> {
+  // PGlite can retain extended-query parameter state from the preceding
+  // catalog lookup. Enter the re-entrant variable-parameter analyzer from a
+  // parameter-free statement boundary.
+  await client.query('select 1')
   const result = await client.query<{ readonly analysis: PgAnalyzerResult }>(
-    `select ${ANALYZER_SQL_FUNCTION}($1, $2::oid[])::jsonb as analysis`,
-    [config.sql, await explicitCompiledParamTypeOids(client, config)]
+    `select ${ANALYZER_SQL_FUNCTION}(${dollarQuotedSqlText(config.sql)})::jsonb as analysis`
   )
   const analysis = result.rows[0]?.analysis
   if (!analysis || analysis.schemaVersion !== ANALYZER_SCHEMA_VERSION) {
@@ -2621,7 +2603,13 @@ export async function buildTypedSqlPostgresIrFromCompiledConfigs(
       analyses.push(await analyzeCompiledConfig(client, config))
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
-      throw new Error(`${config.sourceFile}: failed to analyze typed SQL ${config.name}: ${message}`, {
+      const parameterMap =
+        config.parameterNames.length === 0
+          ? ''
+          : ` Compiled parameter map: ${config.parameterNames
+              .map((name, index) => `$${index + 1} = :${name}`)
+              .join(', ')}.`
+      throw new Error(`${config.sourceFile}: failed to analyze typed SQL ${config.name}: ${message}${parameterMap}`, {
         cause: error,
       })
     }

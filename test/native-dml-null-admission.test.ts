@@ -27,9 +27,13 @@ interface DmlAnalysis {
 }
 
 async function analyze(database: AnalysisDatabase, sql: string): Promise<DmlAnalysis> {
+  let delimiter = '$native_analyzer_sql$'
+  while (sql.includes(delimiter)) {
+    delimiter = `${delimiter.slice(0, -1)}_$`
+  }
+  await database.query('select 1')
   const result = await database.query<{ readonly analysis: string }>(
-    'select pg_temp.postgres_typed_sql_analyze($1, $2::oid[]) as analysis',
-    [sql, []]
+    `select pg_temp.postgres_typed_sql_analyze(${delimiter}${sql}${delimiter}) as analysis`
   )
   const payload = result.rows[0]?.analysis
   assert.ok(typeof payload === 'string')

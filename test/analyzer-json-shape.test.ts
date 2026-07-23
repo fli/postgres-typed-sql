@@ -11,16 +11,10 @@ import { createAnalysisDatabase } from '../src/engine.js'
 
 const schemaFile = resolve(import.meta.dirname, 'fixtures/schema.sql')
 
-function config(
-  name: string,
-  sql: string,
-  parameterNames: readonly string[] = [],
-  parameterTypes?: readonly (string | undefined)[]
-): TypedSqlPostgresIrCompiledConfig {
+function config(name: string, sql: string, parameterNames: readonly string[] = []): TypedSqlPostgresIrCompiledConfig {
   return {
     name,
     parameterNames,
-    ...(parameterTypes ? { parameterTypes } : {}),
     sourceFile: `queries/${name}.typed.sql`,
     sql,
   }
@@ -41,7 +35,7 @@ test('infers build-object shapes only from proven complete argument lists', asyn
     `)
     const result = await buildTypedSqlPostgresIrFromCompiledConfigs(database, [
       config('literalVariadicJson', "select json_build_object(variadic array['answer', '42']) as payload"),
-      config('dynamicVariadicJson', 'select jsonb_build_object(variadic $1) as payload', ['entries'], ['text[]']),
+      config('dynamicVariadicJson', 'select jsonb_build_object(variadic $1::text[]) as payload', ['entries']),
       config('nullVariadicJson', 'select jsonb_build_object(variadic null::text[]) as payload'),
       config(
         'nullableVarVariadicJson',

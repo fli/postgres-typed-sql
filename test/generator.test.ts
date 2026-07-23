@@ -29,8 +29,7 @@ test('camel-cases only conventional generated property names', () => {
 test('camel-cases parameter properties by default while preserving raw SQL metadata', async () => {
   const root = await createMinimalFixture(
     'select 1;\n',
-    `-- @param platform_slug text
-select
+    `select
   :platform_slug::text is not distinct from :platform_slug::text
   and :alreadyCamel::text is not null
   and :URL::text is not null
@@ -319,14 +318,14 @@ test('requires explicit caller null permission even when PostgreSQL proves NULL 
   assert.match(output, /export interface QueryParams \{[\s\S]*readonly value: string\n/u)
   assert.match(output, /name: 'value',[\s\S]*?nullable: false/u)
 
-  await writeFile(queryFile, '-- @param value ?\nselect :value::text as value\n')
+  await writeFile(queryFile, '-- @nullable value\nselect :value::text as value\n')
   await generateTypedSql(config)
   output = await readFile(outputFile, 'utf8')
   assert.match(output, /export interface QueryParams \{[\s\S]*readonly value: string \| null/u)
   assert.match(output, /name: 'value',[\s\S]*?nullable: true/u)
   assert.match(output, /pgType: 'text'/u)
 
-  await writeFile(queryFile, '-- @param value text?\nselect :value as value\n')
+  await writeFile(queryFile, '-- @nullable value\nselect :value::text as value\n')
   await generateTypedSql(config)
   output = await readFile(outputFile, 'utf8')
   assert.match(output, /export interface QueryParams \{[\s\S]*readonly value: string \| null/u)
@@ -444,7 +443,7 @@ test('keeps array elements and JSON contents independent from explicit top-level
   assert.match(output, /readonly values: PgArrayParameter<bigint \| number \| string> \| string\n/u)
   assert.match(output, /name: 'values',[\s\S]*?nullable: false/u)
 
-  await writeFile(queryFile, '-- @param values ?\nselect :values::integer[] as values\n')
+  await writeFile(queryFile, '-- @nullable values\nselect :values::integer[] as values\n')
   await generateTypedSql(config)
   output = await readFile(outputFile, 'utf8')
   assert.match(output, /readonly values: PgArrayParameter<bigint \| number \| string> \| string \| null/u)
@@ -456,7 +455,7 @@ test('keeps array elements and JSON contents independent from explicit top-level
   assert.match(output, /readonly payload: DbJsonParameter\n/u)
   assert.match(output, /name: 'payload',[\s\S]*?nullable: false/u)
 
-  await writeFile(queryFile, '-- @param payload jsonb?\nselect :payload as payload\n')
+  await writeFile(queryFile, '-- @nullable payload\nselect :payload::jsonb as payload\n')
   await generateTypedSql(config)
   output = await readFile(outputFile, 'utf8')
   assert.match(output, /readonly payload: DbJsonParameter \| null/u)
@@ -505,7 +504,7 @@ test('rejects unresolved parameter types instead of generating a phantom Unknown
       codecProfile: 'node-postgres',
       schema: 'schema.sql',
     }),
-    /could not determine data type of parameter \$1/u
+    /could not determine data type of parameter \$1[\s\S]*Compiled parameter map: \$1 = :value/u
   )
   await assert.rejects(
     readFile(join(root, 'queries/unresolved-parameter.typed-sql.ts'), 'utf8'),
@@ -733,13 +732,12 @@ test('preserves non-code parameter text and limits directives to the header', as
   await writeFile(
     join(root, 'queries/lexical-contexts.typed.sql'),
     `-- @name lexicalContexts
--- @param cutoff timestamp with time zone?
--- @param email text
+-- @nullable cutoff
 -- @column cutoff timestamp with time zone
 select
   ':not_a_parameter' as literal_value,
   $$:also_not$$ as dollar_value,
-  :cutoff as cutoff,
+  :cutoff::timestamp with time zone as cutoff,
   account.display_name
 from public.accounts account
 where account.email = :email
@@ -795,13 +793,12 @@ select 1
   )
 })
 
-test('preserves explicit parameter types while PostgreSQL infers unspecified parameter types', async () => {
+test('uses authored SQL casts while PostgreSQL infers contextual parameter types', async () => {
   const root = await copyFixture()
   await writeFile(
-    join(root, 'queries/mixed-parameter-oids.typed.sql'),
-    `-- @name mixedParameterOids
--- @param label text
-select :label as label
+    join(root, 'queries/mixed-parameter-inference.typed.sql'),
+    `-- @name mixedParameterInference
+select :label::text as label
 from public.accounts account
 where account.id = :account_id
 `
@@ -815,12 +812,32 @@ where account.id = :account_id
   })
 
   assert.equal(result.statementCount, 5)
-  const output = await readFile(join(root, 'queries/mixed-parameter-oids.typed-sql.ts'), 'utf8')
+  const output = await readFile(join(root, 'queries/mixed-parameter-inference.typed-sql.ts'), 'utf8')
   assert.match(output, /parameterNames: \['label', 'accountId'\]/u)
   assert.match(output, /readonly label: string/u)
   assert.match(output, /readonly accountId: bigint \| number \| string/u)
   assert.match(output, /name: 'label',[\s\S]*?pgType: 'text'/u)
   assert.match(output, /name: 'account_id',[\s\S]*?pgType: 'bigint'/u)
+})
+
+test('emits authored temporal casts in the exact runtime SQL', async () => {
+  const root = await createMinimalFixture(
+    'select 1;\n',
+    'select :later::timestamptz - :earlier::timestamptz as elapsed\n'
+  )
+
+  await generateTypedSql({
+    include: ['queries'],
+    rootDir: root,
+    codecProfile: 'node-postgres',
+    schema: 'schema.sql',
+  })
+
+  const output = await readFile(join(root, 'queries/query.typed-sql.ts'), 'utf8')
+  assert.match(output, /readonly later: Date \| number \| string/u)
+  assert.match(output, /readonly earlier: Date \| number \| string/u)
+  assert.match(output, /text: 'select \$1::timestamptz - \$2::timestamptz as elapsed'/u)
+  assert.match(output, /parameterNames: \['later', 'earlier'\]/u)
 })
 
 test('uses native DML facts for parameter nullability and nested write access', async () => {
@@ -880,7 +897,6 @@ returning id
   await writeFile(
     join(root, 'queries/modifying-cte.typed.sql'),
     `-- @name modifyingCte
--- @param email text
 with inserted as (
   insert into public.accounts(email, display_name)
   values (:email, :display_name)
@@ -1125,9 +1141,14 @@ test('rejects duplicate, reserved, and colliding generated names before emission
       sql: '-- @name createTypedSqlStatement\nselect 1\n',
     },
     {
-      error: /duplicate @param value/u,
-      file: 'duplicate-parameter.typed.sql',
-      sql: '-- @param value text\n-- @param value integer\nselect :value\n',
+      error: /duplicate @nullable value/u,
+      file: 'duplicate-nullable.typed.sql',
+      sql: '-- @nullable value\n-- @nullable value\nselect :value::text\n',
+    },
+    {
+      error: /unsupported typed SQL directive @param/u,
+      file: 'removed-param.typed.sql',
+      sql: '-- @param value text\nselect :value::text\n',
     },
   ] as const
 
@@ -1461,7 +1482,7 @@ as assignment;
 
   const rejectingOverrideRoot = await createMinimalFixture(
     'create table public.required_values (value text not null);\n',
-    `-- @param value text?
+    `-- @nullable value
 insert into public.required_values(value) values (:value)
 `
   )
@@ -1472,7 +1493,7 @@ insert into public.required_values(value) values (:value)
       codecProfile: 'node-postgres',
       schema: 'schema.sql',
     }),
-    /@param value cannot be nullable because PostgreSQL proves that one of its uses rejects NULL/u
+    /@nullable value cannot be satisfied because PostgreSQL proves that one of its uses rejects NULL/u
   )
 })
 
@@ -1483,7 +1504,7 @@ create domain public.required_text as text not null;
 create table public.nullable_targets (value text);
 create table public.required_targets (value text not null);
 `,
-    '-- @param value ?\nselect :value::public.optional_text as value\n'
+    '-- @nullable value\nselect :value::public.optional_text as value\n'
   )
   const config = {
     include: ['queries'],
@@ -1499,22 +1520,22 @@ create table public.required_targets (value text not null);
   assert.match(output, /readonly value: string \| null/u)
   assert.match(output, /name: 'value',[\s\S]*?nullable: true/u)
 
-  await writeFile(queryFile, '-- @param value public.required_text?\nselect :value::public.required_text as value\n')
+  await writeFile(queryFile, '-- @nullable value\nselect :value::public.required_text as value\n')
   await assert.rejects(
     generateTypedSql(config),
-    /@param value cannot be nullable because PostgreSQL proves that one of its uses rejects NULL/u
+    /@nullable value cannot be satisfied because PostgreSQL proves that one of its uses rejects NULL/u
   )
 
-  await writeFile(queryFile, '-- @param value ?\ninsert into public.nullable_targets(value) values (:value)\n')
+  await writeFile(queryFile, '-- @nullable value\ninsert into public.nullable_targets(value) values (:value)\n')
   await generateTypedSql(config)
   output = await readFile(outputFile, 'utf8')
   assert.match(output, /readonly value: string \| null/u)
   assert.match(output, /name: 'value',[\s\S]*?nullable: true/u)
 
-  await writeFile(queryFile, '-- @param value text?\ninsert into public.required_targets(value) values (:value)\n')
+  await writeFile(queryFile, '-- @nullable value\ninsert into public.required_targets(value) values (:value)\n')
   await assert.rejects(
     generateTypedSql(config),
-    /@param value cannot be nullable because PostgreSQL proves that one of its uses rejects NULL/u
+    /@nullable value cannot be satisfied because PostgreSQL proves that one of its uses rejects NULL/u
   )
 })
 
@@ -1537,44 +1558,38 @@ test('accepts nullable coordinates when a DML assignment preserves the old point
   const queryFile = join(root, 'queries/query.typed.sql')
   const outputFile = join(root, 'queries/query.typed-sql.ts')
   const expressions = [
-    'coalesce(point(:latitude, :longitude), required_location)',
+    'coalesce(point(:latitude::float8, :longitude::float8), required_location)',
     `coalesce(
   case when :latitude::float8 is not null and :longitude::float8 is not null
-    then point(:latitude, :longitude)
+    then point(:latitude::float8, :longitude::float8)
   end,
   required_location
 )`,
   ] as const
-  const directiveSets = [
-    '-- @param latitude ?\n-- @param longitude ?',
-    '-- @param latitude float8?\n-- @param longitude float8?',
-  ] as const
-
   for (const expression of expressions) {
-    for (const directives of directiveSets) {
-      await writeFile(
-        queryFile,
-        `${directives}
+    await writeFile(
+      queryFile,
+      `-- @nullable latitude
+-- @nullable longitude
 update public.places
 set required_location = ${expression}
 where id = 1
 `
-      )
-      await generateTypedSql(config)
-      const output = await readFile(outputFile, 'utf8')
-      assert.match(output, /readonly latitude: bigint \| number \| string \| null/u)
-      assert.match(output, /readonly longitude: bigint \| number \| string \| null/u)
-      assert.match(output, /name: 'latitude',[\s\S]*?nullable: true/u)
-      assert.match(output, /name: 'longitude',[\s\S]*?nullable: true/u)
-    }
+    )
+    await generateTypedSql(config)
+    const output = await readFile(outputFile, 'utf8')
+    assert.match(output, /readonly latitude: bigint \| number \| string \| null/u)
+    assert.match(output, /readonly longitude: bigint \| number \| string \| null/u)
+    assert.match(output, /name: 'latitude',[\s\S]*?nullable: true/u)
+    assert.match(output, /name: 'longitude',[\s\S]*?nullable: true/u)
   }
 
   await writeFile(
     queryFile,
-    `-- @param latitude float8?
--- @param longitude float8?
+    `-- @nullable latitude
+-- @nullable longitude
 update public.places
-set fallback_location = coalesce(point(:latitude, :longitude), fallback_location)
+set fallback_location = coalesce(point(:latitude::float8, :longitude::float8), fallback_location)
 where id = 1
 `
   )
@@ -1584,14 +1599,14 @@ where id = 1
   assert.match(output, /readonly longitude: bigint \| number \| string \| null/u)
 
   for (const expression of [
-    'point(:latitude, :longitude)',
-    'coalesce(point(:latitude, :longitude), point(0, 0))',
-    'coalesce(point(:latitude, :longitude), fallback_location)',
+    'point(:latitude::float8, :longitude::float8)',
+    'coalesce(point(:latitude::float8, :longitude::float8), point(0, 0))',
+    'coalesce(point(:latitude::float8, :longitude::float8), fallback_location)',
   ]) {
     await writeFile(
       queryFile,
-      `-- @param latitude float8?
--- @param longitude float8?
+      `-- @nullable latitude
+-- @nullable longitude
 update public.places
 set required_location = ${expression}
 where id = 1
@@ -1599,24 +1614,23 @@ where id = 1
     )
     await assert.rejects(
       generateTypedSql(config),
-      /@param latitude cannot be nullable because PostgreSQL could not prove that every use accepts NULL/u
+      /@nullable latitude cannot be satisfied because PostgreSQL could not prove that every use accepts NULL/u
     )
   }
 
   for (const nullableCoordinate of ['latitude', 'longitude'] as const) {
     await writeFile(
       queryFile,
-      `-- @param latitude float8${nullableCoordinate === 'latitude' ? '?' : ''}
--- @param longitude float8${nullableCoordinate === 'longitude' ? '?' : ''}
+      `-- @nullable ${nullableCoordinate}
 update public.places
-set required_location = point(:latitude, :longitude)
+set required_location = point(:latitude::float8, :longitude::float8)
 where id = 1
 `
     )
     await assert.rejects(
       generateTypedSql(config),
       new RegExp(
-        `@param ${nullableCoordinate} cannot be nullable because PostgreSQL could not prove that every use accepts NULL`,
+        `@nullable ${nullableCoordinate} cannot be satisfied because PostgreSQL could not prove that every use accepts NULL`,
         'u'
       )
     )
@@ -1656,7 +1670,7 @@ create table public.mutable_contract (
 );
 insert into public.mutable_contract(value) values (1);
 `,
-    `-- @param value integer?
+    `-- @nullable value
 update public.old_value_contract
 set value = coalesce(value, :value)
 `
@@ -1698,16 +1712,16 @@ set value = coalesce(:value, old_target.value)`,
   ] as const
 
   for (const sql of rejectedSql) {
-    await writeFile(queryFile, `-- @param value integer?\n${sql}\n`)
+    await writeFile(queryFile, `-- @nullable value\n${sql}\n`)
     await assert.rejects(
       generateTypedSql(config),
-      /@param value cannot be nullable because PostgreSQL could not prove that every use accepts NULL/u,
+      /@nullable value cannot be satisfied because PostgreSQL could not prove that every use accepts NULL/u,
       sql
     )
   }
 })
 
-test('proof-gates both nullable parameter syntaxes through final PostgreSQL admission', async () => {
+test('proof-gates nullable parameters through final PostgreSQL admission', async () => {
   const root = await createMinimalFixture(
     `create table public.null_admission_sample (value integer);
 create procedure public.accept_null(value integer)
@@ -1732,19 +1746,17 @@ from (values (1), (2)) input(value)
   assert.match(output, /readonly offset: bigint \| number \| string\n/u)
   assert.match(output, /name: 'offset',[\s\S]*?nullable: false/u)
 
-  for (const directive of ['-- @param offset ?', '-- @param offset bigint?']) {
-    await writeFile(
-      queryFile,
-      `${directive}
+  await writeFile(
+    queryFile,
+    `-- @nullable offset
 select sum(value) over (rows between :offset preceding and current row) as total
 from (values (1), (2)) input(value)
 `
-    )
-    await assert.rejects(
-      generateTypedSql(config),
-      /@param offset cannot be nullable because PostgreSQL proves that one of its uses rejects NULL/u
-    )
-  }
+  )
+  await assert.rejects(
+    generateTypedSql(config),
+    /@nullable offset cannot be satisfied because PostgreSQL proves that one of its uses rejects NULL/u
+  )
 
   await writeFile(
     queryFile,
@@ -1757,21 +1769,19 @@ from (values (1), (2)) input(value)
   assert.match(output, /readonly offset: bigint \| number \| string\n/u)
   assert.match(output, /name: 'offset',[\s\S]*?nullable: false/u)
 
-  for (const directive of ['-- @param offset ?', '-- @param offset bigint?']) {
-    await writeFile(
-      queryFile,
-      `${directive}
+  await writeFile(
+    queryFile,
+    `-- @nullable offset
 select sum(value) over (rows between coalesce(:offset, 0) preceding and current row) as total
 from (values (1), (2)) input(value)
 `
-    )
-    await assert.rejects(
-      generateTypedSql(config),
-      /@param offset cannot be nullable because PostgreSQL could not prove that every use accepts NULL/u
-    )
-  }
+  )
+  await assert.rejects(
+    generateTypedSql(config),
+    /@nullable offset cannot be satisfied because PostgreSQL could not prove that every use accepts NULL/u
+  )
 
-  await writeFile(queryFile, '-- @param value integer\ncall public.accept_null(:value)\n')
+  await writeFile(queryFile, 'call public.accept_null(:value)\n')
   await generateTypedSql(config)
   output = await readFile(outputFile, 'utf8')
   assert.match(output, /readonly value: bigint \| number \| string\n/u)
@@ -1779,7 +1789,7 @@ from (values (1), (2)) input(value)
 
   await writeFile(
     queryFile,
-    `-- @param offset bigint?
+    `-- @nullable offset
 select :offset::bigint,
   sum(value) over (rows between :offset preceding and current row) as total
 from (values (1), (2)) input(value)
@@ -1788,7 +1798,7 @@ group by value
   )
   await assert.rejects(
     generateTypedSql(config),
-    /@param offset cannot be nullable because PostgreSQL proves that one of its uses rejects NULL/u
+    /@nullable offset cannot be satisfied because PostgreSQL proves that one of its uses rejects NULL/u
   )
 })
 
@@ -1811,8 +1821,7 @@ test('narrows CHECK parameters only for direct value-preserving assignments', as
 
   await writeFile(
     join(root, 'queries/query.typed.sql'),
-    `-- @param value text
-insert into public.checked_values(value) values (coalesce(:value, 'A'))
+    `insert into public.checked_values(value) values (coalesce(:value::text, 'A'))
 `
   )
   await generateTypedSql(config)
@@ -1822,9 +1831,9 @@ insert into public.checked_values(value) values (coalesce(:value, 'A'))
 
   await writeFile(
     join(root, 'queries/query.typed.sql'),
-    `-- @param value text?
+    `-- @nullable value
 update public.checked_values
-set value = coalesce(:value, value)
+set value = coalesce(:value::text, value)
 `
   )
   await generateTypedSql(config)
@@ -1938,8 +1947,7 @@ from public.checked_text_values
 
   await writeFile(
     join(root, 'queries/query.typed.sql'),
-    `-- @param value text
-insert into public.checked_text_values(value) values (:value::integer::text)
+    `insert into public.checked_text_values(value) values (:value::text::integer::text)
 `
   )
   await generateTypedSql(config)
@@ -2155,8 +2163,7 @@ test('generates build-object contracts only from proven complete argument lists'
 
   await writeFile(
     queryFile,
-    `-- @param entries text[]
-select jsonb_build_object(variadic :entries) as payload
+    `select jsonb_build_object(variadic :entries::text[]) as payload
 `
   )
   await generateTypedSql(config)
@@ -2192,8 +2199,7 @@ create procedure public.generator_out_result(input_value integer, out output_val
 language plpgsql
 as $$ begin output_value := input_value * 2; end $$;
 `,
-    `-- @param value integer
-call public.generator_no_result(:value)
+    `call public.generator_no_result(:value)
 `
   )
   const config = {
