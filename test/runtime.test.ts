@@ -59,12 +59,15 @@ test('runtime binds named parameters in generated order', async () => {
   assert.notEqual(rawQuery.values, secondRawQuery.values)
   assert.equal(Object.hasOwn(statement, 'type'), false)
   assert.equal(Object.hasOwn(rawQuery, 'type'), false)
+  assert.equal(Object.hasOwn(rawQuery, 'name'), false)
   assert.deepEqual(rawQuery.values, ['reader@example.test'])
   rawQuery.values.push('mutable-driver-value')
   assert.deepEqual(rawQuery.values, ['reader@example.test', 'mutable-driver-value'])
 
   // @ts-expect-error A direct query config cannot claim the generated result row type.
   void rawQuery.type
+  // @ts-expect-error Human statement names do not opt driver query configs into named preparation.
+  void rawQuery.name
   // @ts-expect-error Driver query options belong to adapters, not the core query config.
   void rawQuery.rowMode
 
@@ -84,6 +87,7 @@ test('runtime binds named parameters in generated order', async () => {
       async query(config: NodePostgresTypedSqlQueryConfig) {
         assert.deepEqual(config.values, ['reader@example.test'])
         assert.equal(config.rowMode, 'array')
+        assert.equal(Object.hasOwn(config, 'name'), false)
         assert.equal(Object.hasOwn(config, 'types'), false)
         return {
           rowCount: 1,
@@ -140,7 +144,6 @@ test('node-postgres adapter reports command row counts without adding a driver c
     {
       async query(config) {
         assert.deepEqual(config, {
-          name: 'deleteAccount',
           text: 'delete from accounts where id = $1',
           values: [42],
         })
@@ -151,6 +154,36 @@ test('node-postgres adapter reports command row counts without adding a driver c
     { id: 42 }
   )
   assert.equal(affected, 1)
+})
+
+test('human statement names never become node-postgres prepared-statement names', async () => {
+  const first = createTypedSqlStatement<Record<string, never>, Record<string, never>>({
+    name: 'findById',
+    parameterNames: [],
+    text: 'select 1',
+  })
+  const second = createTypedSqlStatement<Record<string, never>, Record<string, never>>({
+    name: 'findById',
+    parameterNames: [],
+    text: 'select 2',
+  })
+  const configs: NodePostgresTypedSqlQueryConfig[] = []
+  const client: NodePostgresTypedSqlClient = {
+    async query(config) {
+      configs.push(config)
+      return { rows: [] }
+    },
+  }
+
+  await executeTypedSql(client, first, {})
+  await executeTypedSql(client, second, {})
+
+  assert.deepEqual(configs, [
+    { text: 'select 1', values: [] },
+    { text: 'select 2', values: [] },
+  ])
+  assert.equal(first.name, 'findById')
+  assert.equal(second.name, 'findById')
 })
 
 test('node-postgres adapter rejects rows that do not match the requested mapping representation', async () => {

@@ -7,7 +7,7 @@ test('parses directives only from the leading comment header', () => {
   const parsed = parseTypedSqlSource(
     [
       '-- ordinary header comment\r\n',
-      '-- @name findAccount\r\n',
+      '-- @custom findAccount\r\n',
       '-- @access read\r\n',
       '-- @nullable created_at\r\n',
       '-- @nullable inferred_value\r\n',
@@ -16,11 +16,11 @@ test('parses directives only from the leading comment header', () => {
       'select :created_at as display_name\r\n',
       '-- @todo this is SQL body text\r\n',
     ].join(''),
-    'queries/find-account.typed.sql'
+    'queries/findAccount.typed.sql'
   )
 
   assert.deepEqual(parsed.directives, [
-    { body: 'findAccount', kind: 'name', line: 2 },
+    { body: 'findAccount', kind: 'custom', line: 2 },
     { body: 'read', kind: 'access', line: 3 },
     { body: 'created_at', kind: 'nullable', line: 4 },
     { body: 'inferred_value', kind: 'nullable', line: 5 },

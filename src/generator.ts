@@ -149,37 +149,6 @@ interface TypeScriptDependencies {
   readonly scalar: Set<string>
 }
 
-function requireSqlName(value: string, sourceFile: string): string {
-  if (!/^[a-z][A-Za-z0-9]*$/u.test(value)) {
-    throw new Error(`${sourceFile}: @name must be a lower camel-case identifier.`)
-  }
-  assertTypeScriptBindingIdentifier(value, `${sourceFile}: @name`)
-  if (value === 'createTypedSqlStatement') {
-    throw new Error(`${sourceFile}: @name createTypedSqlStatement collides with the generated runtime import.`)
-  }
-
-  return value
-}
-
-function lowerCamelCaseFromPathBase(base: string): string {
-  const parts = base.split(/[^A-Za-z0-9]+/u).filter((part) => part.length > 0)
-  if (parts.length === 0) {
-    throw new Error(`${base}: typed SQL filename must contain at least one identifier segment.`)
-  }
-
-  const [head, ...tail] = parts
-  if (!head) {
-    throw new Error(`${base}: typed SQL filename must contain at least one identifier segment.`)
-  }
-
-  const identifier = [
-    head.toLowerCase(),
-    ...tail.map((part) => `${part.slice(0, 1).toUpperCase()}${part.slice(1).toLowerCase()}`),
-  ].join('')
-
-  return requireSqlName(identifier, base)
-}
-
 function quoteString(value: string): string {
   const escaped = value
     .replaceAll('\\', '\\\\')
@@ -321,13 +290,12 @@ async function readTypedSqlConfigs(generatorConfig: ResolvedPostgresTypedSqlConf
     const sourceFile = relativePath(generatorConfig, sourcePath)
     const text = readFileSync(sourcePath, 'utf8')
     const parsedSource = parseTypedSqlSource(text, sourceFile)
-    const defaultName = lowerCamelCaseFromPathBase(basename(sourceFile, typedSqlSourceSuffix))
+    const name = basename(sourceFile, typedSqlSourceSuffix)
+    assertTypeScriptBindingIdentifier(name, `${sourceFile}: typed SQL filename`)
     let access: TypedSqlAccess | undefined
-    let name = defaultName
     const nullableParameters: NullableParameterDeclaration[] = []
     const columns: SqlColumn[] = []
     let firstAccessLocation: string | undefined
-    let firstNameLocation: string | undefined
     const firstColumnDirectiveByName = new Map<string, string>()
     const firstNullableDirectiveByName = new Map<string, string>()
 
@@ -337,19 +305,6 @@ async function readTypedSqlConfigs(generatorConfig: ResolvedPostgresTypedSqlConf
       const bodyParts = /^(\S+)(?:\s+([\s\S]*))?$/u.exec(directive.body)
       const identifier = bodyParts?.[1]
       const rawPgType = bodyParts?.[2]?.trim()
-      if (kind === 'name') {
-        if (!identifier || rawPgType) {
-          throw new Error(`${location}: @name requires exactly one identifier.`)
-        }
-
-        if (firstNameLocation) {
-          throw new Error(`${location}: duplicate @name; first declared at ${firstNameLocation}.`)
-        }
-        firstNameLocation = location
-        name = requireSqlName(identifier, location)
-        continue
-      }
-
       if (kind === 'access') {
         if ((identifier !== 'read' && identifier !== 'write') || rawPgType) {
           throw new Error(`${location}: @access requires exactly read or write.`)
@@ -410,17 +365,6 @@ async function readTypedSqlConfigs(generatorConfig: ResolvedPostgresTypedSqlConf
   }
 
   return configs
-}
-
-function assertUniqueTypedSqlNames(configs: readonly TypedSqlConfig[]): void {
-  const firstSourceByName = new Map<string, string>()
-  for (const config of configs) {
-    const firstSource = firstSourceByName.get(config.name)
-    if (firstSource) {
-      throw new Error(`${config.sourceFile}: typed SQL statement name ${config.name} already used by ${firstSource}.`)
-    }
-    firstSourceByName.set(config.name, config.sourceFile)
-  }
 }
 
 function compileTypedSql(config: TypedSqlConfig, parameterNaming: PostgresTypedSqlPropertyNaming): CompiledTypedSql {
@@ -1496,14 +1440,13 @@ export async function generateTypedSql(config: PostgresTypedSqlConfig): Promise<
 
   try {
     const resolvedConfig = resolveConfig(config)
+    const rawConfigs = await readTypedSqlConfigs(resolvedConfig)
+    const configs = rawConfigs.map((config) => compileTypedSql(config, resolvedConfig.naming.parameterProperties))
     database = await createAnalysisDatabase({
       extensions: resolvedConfig.extensions,
       schemaFiles: resolvedConfig.schemaFiles,
     })
     const catalogContents = await buildCatalogTypes(database, resolvedConfig)
-    const rawConfigs = await readTypedSqlConfigs(resolvedConfig)
-    assertUniqueTypedSqlNames(rawConfigs)
-    const configs = rawConfigs.map((config) => compileTypedSql(config, resolvedConfig.naming.parameterProperties))
     const resolvedConfigs = await resolveTypedSqlWithAnalyzer(configs, database, resolvedConfig)
 
     const staleFiles = await findStaleGeneratedFiles(resolvedConfigs, resolvedConfig)

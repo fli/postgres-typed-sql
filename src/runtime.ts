@@ -13,7 +13,6 @@ export interface TypedSqlRowBounds {
 }
 
 export interface TypedSqlQueryConfig {
-  readonly name?: string
   readonly text: string
   readonly values: unknown[]
 }
@@ -183,7 +182,6 @@ export function createTypedSqlStatement<
     text: definition.text,
     query(params) {
       return {
-        name: definition.name,
         text: definition.text,
         values: [...this.values(params)],
       }

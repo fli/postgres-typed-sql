@@ -21,7 +21,7 @@ test('analysis failure leaves every existing output and stale file untouched', a
   await generate(root)
 
   const catalogPath = join(root, 'postgres-typed-sql.types.ts')
-  const queryPath = join(root, 'queries/find-account-by-email.typed-sql.ts')
+  const queryPath = join(root, 'queries/findAccountByEmail.typed-sql.ts')
   const stalePath = join(root, 'queries/stale.typed-sql.ts')
   const catalogBefore = await readFile(catalogPath, 'utf8')
   const queryBefore = await readFile(queryPath, 'utf8')
@@ -41,10 +41,7 @@ test('unchanged generation preserves output modification times', async () => {
   const root = await copyFixture()
   await generate(root)
 
-  const outputPaths = [
-    join(root, 'postgres-typed-sql.types.ts'),
-    join(root, 'queries/find-account-by-email.typed-sql.ts'),
-  ]
+  const outputPaths = [join(root, 'postgres-typed-sql.types.ts'), join(root, 'queries/findAccountByEmail.typed-sql.ts')]
   const oldTimestamp = new Date('2001-02-03T04:05:06.000Z')
   for (const outputPath of outputPaths) {
     await utimes(outputPath, oldTimestamp, oldTimestamp)
@@ -95,8 +92,8 @@ test('staging failure cannot partially replace other valid outputs', async () =>
   await generate(root)
 
   const catalogPath = join(root, 'postgres-typed-sql.types.ts')
-  const firstQueryPath = join(root, 'queries/find-account-by-email.typed-sql.ts')
-  const blockedQueryPath = join(root, 'queries/list-accounts-with-posts.typed-sql.ts')
+  const firstQueryPath = join(root, 'queries/findAccountByEmail.typed-sql.ts')
+  const blockedQueryPath = join(root, 'queries/listAccountsWithPosts.typed-sql.ts')
   const catalogBefore = await readFile(catalogPath, 'utf8')
   const firstQueryBefore = await readFile(firstQueryPath, 'utf8')
 
@@ -105,7 +102,7 @@ test('staging failure cannot partially replace other valid outputs', async () =>
     schemaPath,
     `${await readFile(schemaPath, 'utf8')}\ncreate type public.pending_state as enum ('pending');\n`
   )
-  const firstSourcePath = join(root, 'queries/find-account-by-email.typed.sql')
+  const firstSourcePath = join(root, 'queries/findAccountByEmail.typed.sql')
   await writeFile(firstSourcePath, `${await readFile(firstSourcePath, 'utf8')}\n`)
   await rm(blockedQueryPath)
   await mkdir(blockedQueryPath)
@@ -125,7 +122,7 @@ test('stale deletion failure rolls back every generated output', async () => {
   await generate(root)
 
   const catalogPath = join(root, 'postgres-typed-sql.types.ts')
-  const queryPath = join(root, 'queries/find-account-by-email.typed-sql.ts')
+  const queryPath = join(root, 'queries/findAccountByEmail.typed-sql.ts')
   const catalogBefore = await readFile(catalogPath, 'utf8')
   const queryBefore = await readFile(queryPath, 'utf8')
   const lockedDirectory = join(root, 'queries/locked')
@@ -138,7 +135,7 @@ test('stale deletion failure rolls back every generated output', async () => {
     schemaPath,
     `${await readFile(schemaPath, 'utf8')}\ncreate type public.pending_state as enum ('pending');\n`
   )
-  const sourcePath = join(root, 'queries/find-account-by-email.typed.sql')
+  const sourcePath = join(root, 'queries/findAccountByEmail.typed.sql')
   await writeFile(sourcePath, `${await readFile(sourcePath, 'utf8')}\n`)
   await chmod(lockedDirectory, 0o555)
   try {
@@ -154,7 +151,7 @@ test('stale deletion failure rolls back every generated output', async () => {
 
 test('catalog and statement outputs cannot claim the same destination', async () => {
   const root = await copyFixture()
-  const conflictingPath = join(root, 'queries/find-account-by-email.typed-sql.ts')
+  const conflictingPath = join(root, 'queries/findAccountByEmail.typed-sql.ts')
 
   await assert.rejects(
     generateTypedSql({
@@ -203,7 +200,7 @@ test('uses canonical destination identity through symlinked parent directories',
       rootDir: collisionRoot,
       codecProfile: 'node-postgres',
       schema: 'schema.sql',
-      typesOutput: 'query-link/find-account-by-email.typed-sql.ts',
+      typesOutput: 'query-link/findAccountByEmail.typed-sql.ts',
     }),
     /same filesystem destination.*claimed more than once/u
   )
@@ -229,16 +226,16 @@ test('uses the destination filesystem rather than the host platform for case ide
     rootDir: root,
     codecProfile: 'node-postgres',
     schema: 'schema.sql',
-    typesOutput: 'queries/FIND-ACCOUNT-BY-EMAIL.typed-sql.ts',
+    typesOutput: 'queries/FINDAccountByEmail.typed-sql.ts',
   })
   if (caseSensitive) {
     await generation
     assert.match(
-      await readFile(join(root, 'queries/FIND-ACCOUNT-BY-EMAIL.typed-sql.ts'), 'utf8'),
+      await readFile(join(root, 'queries/FINDAccountByEmail.typed-sql.ts'), 'utf8'),
       /export interface CatalogDb/u
     )
     assert.match(
-      await readFile(join(root, 'queries/find-account-by-email.typed-sql.ts'), 'utf8'),
+      await readFile(join(root, 'queries/findAccountByEmail.typed-sql.ts'), 'utf8'),
       /createTypedSqlStatement/u
     )
   } else {
@@ -261,7 +258,7 @@ test('catalog output symlinks are rejected before any generated output is mutate
   assert.equal((await lstat(catalogPath)).isSymbolicLink(), true)
   assert.equal(await readFile(catalogTargetPath, 'utf8'), targetContents)
   await assert.rejects(
-    readFile(join(root, 'queries/find-account-by-email.typed-sql.ts'), 'utf8'),
+    readFile(join(root, 'queries/findAccountByEmail.typed-sql.ts'), 'utf8'),
     (error: unknown) => error instanceof Error && 'code' in error && error.code === 'ENOENT'
   )
 })
@@ -270,7 +267,7 @@ test('statement output symlinks are rejected before catalog or sibling outputs a
   const root = await copyFixture()
   const catalogPath = join(root, 'postgres-typed-sql.types.ts')
   const catalogContents = 'export const existingCatalog = true\n'
-  const statementPath = join(root, 'queries/find-account-by-email.typed-sql.ts')
+  const statementPath = join(root, 'queries/findAccountByEmail.typed-sql.ts')
   const statementTargetPath = join(root, 'statement-target.ts')
   const targetContents = 'export const statementTarget = true\n'
   await writeFile(catalogPath, catalogContents)
@@ -279,13 +276,13 @@ test('statement output symlinks are rejected before catalog or sibling outputs a
 
   await assert.rejects(
     generate(root),
-    /Generated output path .*find-account-by-email\.typed-sql\.ts must not be a symbolic link/u
+    /Generated output path .*findAccountByEmail\.typed-sql\.ts must not be a symbolic link/u
   )
   assert.equal(await readFile(catalogPath, 'utf8'), catalogContents)
   assert.equal((await lstat(statementPath)).isSymbolicLink(), true)
   assert.equal(await readFile(statementTargetPath, 'utf8'), targetContents)
   await assert.rejects(
-    readFile(join(root, 'queries/list-accounts-with-posts.typed-sql.ts'), 'utf8'),
+    readFile(join(root, 'queries/listAccountsWithPosts.typed-sql.ts'), 'utf8'),
     (error: unknown) => error instanceof Error && 'code' in error && error.code === 'ENOENT'
   )
   const stagingArtifacts = [...(await readdir(root)), ...(await readdir(join(root, 'queries')))].filter(

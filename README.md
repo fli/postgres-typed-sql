@@ -64,11 +64,17 @@ Add a script:
 Files ending in `.typed.sql` are generated next to their source. Named parameters use `:name` syntax:
 
 ```sql
--- src/queries/find-account-by-email.typed.sql
+-- src/queries/findAccountByEmail.typed.sql
 select id, email, display_name
 from public.accounts
 where email = :email
 ```
+
+Each file contains exactly one PostgreSQL statement. The filename basename is used verbatim as the generated
+statement export and runtime display name, so it must be a supported non-reserved TypeScript binding identifier:
+an ASCII letter, `_`, or `$`, followed by ASCII letters, digits, `_`, or `$`. Lower camel case is recommended but
+not required. Filenames are validated rather than normalized: `findAccountByEmail.typed.sql` exports
+`findAccountByEmail`, while `find-account-by-email.typed.sql` is rejected.
 
 Named parameter tokens retain their exact spelling for SQL compilation, `@nullable` directives, diagnostics, and runtime metadata. Generated parameter-object properties are application-facing and use conservative camel case by default, so `:platform_slug` is supplied as `{ platformSlug }`. Repeated uses of one raw token still share one positional placeholder and one public property. Set `naming.parameterProperties` to `'preserve'` only when callers deliberately use the raw token spelling.
 
@@ -80,7 +86,7 @@ The built-in node-postgres adapter sends only the generated SQL text and values;
 
 Inside PostgreSQL expression subscripts, an unparenthesized top-level colon remains the native array-slice delimiter. Use `items[(:index)]` for a named subscript, and use `items[1 : :upper]` or `items[1:(:upper)]` for a named slice bound. `ARRAY[:value]` continues to treat `:value` as a named parameter because `ARRAY[...]` is an array constructor rather than a subscript.
 
-Running `npm run generate:sql` creates `find-account-by-email.typed-sql.ts` containing:
+Running `npm run generate:sql` creates `findAccountByEmail.typed-sql.ts` containing:
 
 - parameter and result-row interfaces
 - PostgreSQL types and nullability
@@ -98,7 +104,11 @@ import type { TypedSqlRawRow } from 'postgres-typed-sql/runtime'
 const result = await client.query<TypedSqlRawRow>(findAccountByEmail.query({ email }))
 ```
 
-Direct driver execution returns driver-defined raw object rows whose scalar values should be treated as `unknown`, because `query()` controls neither row construction nor scalar parsers. The node-postgres result-row generic is not inferred from a query configuration object, so a direct unannotated `client.query(statement.query(params))` call defaults to `any`; pass `TypedSqlRawRow` explicitly as shown above.
+`query()` returns only the compiled SQL text and a fresh values array; it does not opt the driver into named prepared
+statements. Direct driver execution returns driver-defined raw object rows whose scalar values should be treated as
+`unknown`, because `query()` controls neither row construction nor scalar parsers. The node-postgres result-row
+generic is not inferred from a query configuration object, so a direct unannotated
+`client.query(statement.query(params))` call defaults to `any`; pass `TypedSqlRawRow` explicitly as shown above.
 
 The core runtime is driver-neutral. It owns statement construction, named-parameter ordering, result metadata, positional/object row mapping, structured-JSON mapping, and affected-row-count normalization. Driver query options and execution live in adapters. For node-postgres:
 
@@ -210,7 +220,6 @@ A profile that decodes `json`/`jsonb` into traversable objects and arrays may se
 Directives are SQL comments at the beginning of a `.typed.sql` file:
 
 ```sql
--- @name findAccount
 -- @access read
 -- @nullable inferred_cutoff
 -- @column id bigint
@@ -221,7 +230,6 @@ where email = :email
   and created_at >= :inferred_cutoff::timestamptz
 ```
 
-- `@name` overrides the lower-camel-case name derived from the filename.
 - `@access` can explicitly declare `read` or `write`. `read` is an assertion that analysis can prove read-only-compatible execution; it is not a trust override. `write` selects the conservative write execution route and does not necessarily claim that the statement mutates data.
 - `@nullable name` requests top-level SQL `NULL` in the generated caller type. It is proof-gated: generation succeeds only when canonical PostgreSQL evidence is `accepts`, and fails for `rejects` or `unknown`.
 - `@column` asserts that a result column exists and optionally asserts its PostgreSQL type.

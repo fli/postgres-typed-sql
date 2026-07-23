@@ -48,21 +48,16 @@ export async function executeTypedSql<Params extends TypedSqlParams, Row>(
   statement: TypedSqlStatement<Params, Row>,
   params: Params
 ): Promise<Row[]> {
+  const query = statement.query(params)
   if (statement.resultRowMapping === 'positional') {
     const result = await client.query({
-      name: statement.name,
+      ...query,
       rowMode: 'array',
-      text: statement.text,
-      values: [...statement.values(params)],
     })
     return mapTypedSqlRows(statement, positionalRows(statement.name, result.rows))
   }
 
-  const result = await client.query({
-    name: statement.name,
-    text: statement.text,
-    values: [...statement.values(params)],
-  })
+  const result = await client.query(query)
   return mapTypedSqlRows(statement, objectRows(statement.name, result.rows))
 }
 

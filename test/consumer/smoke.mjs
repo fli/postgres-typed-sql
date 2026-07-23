@@ -22,7 +22,7 @@ const result = await generateTypedSql({
 })
 assert.equal(result.statementCount, 3)
 
-const output = await readFile('find-widget.typed-sql.ts', 'utf8')
+const output = await readFile('findWidget.typed-sql.ts', 'utf8')
 assert.match(output, /cardinality: 'optional'/u)
 assert.match(output, /readonly label: string \| null/u)
 assert.match(output, /readonly state: "active" \| "archived"/u)
@@ -34,7 +34,7 @@ assert.match(output, /readonly displayName: string \| null/u)
 assert.match(output, /readonly count: number/u)
 assert.doesNotMatch(output, /import type \{ URL \}/u)
 
-const echoBytes = await readFile('echo-bytes.typed-sql.ts', 'utf8')
+const echoBytes = await readFile('echoBytes.typed-sql.ts', 'utf8')
 assert.match(echoBytes, /import type \{ PgArray, PgArrayParameter, PgByteaHexString \}/u)
 assert.match(echoBytes, /readonly payloads: PgArrayParameter<PgByteaHexString> \| string/u)
 assert.match(echoBytes, /readonly payloads: PgArray<Uint8Array> \| null/u)
@@ -50,7 +50,7 @@ const conservativeResult = await generateTypedSql({
 })
 assert.equal(conservativeResult.statementCount, 3)
 
-const conservativeInsert = await readFile('insert-widget.typed-sql.ts', 'utf8')
+const conservativeInsert = await readFile('insertWidget.typed-sql.ts', 'utf8')
 assert.match(conservativeInsert, /readonly code: NonNullable<unknown>/u)
 assert.match(conservativeInsert, /readonly widgetLabel: NonNullable<unknown> \| null/u)
 

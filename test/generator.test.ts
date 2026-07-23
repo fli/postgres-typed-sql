@@ -114,7 +114,7 @@ test('generates PostgreSQL-derived types, nullability, and cardinality', async (
   })
 
   assert.equal(result.statementCount, 4)
-  const account = await readFile(join(root, 'queries/find-account-by-email.typed-sql.ts'), 'utf8')
+  const account = await readFile(join(root, 'queries/findAccountByEmail.typed-sql.ts'), 'utf8')
   assert.match(account, /cardinality: 'optional'/u)
   assert.match(account, /readonly display_name: string \| null/u)
   assert.match(account, /readonly status: "active" \| "suspended"/u)
@@ -122,7 +122,7 @@ test('generates PostgreSQL-derived types, nullability, and cardinality', async (
   assert.doesNotMatch(account, /postgres-typed-sql\.types/u)
   assert.match(account, /postgres-typed-sql\/runtime/u)
 
-  const joined = await readFile(join(root, 'queries/list-accounts-with-posts.typed-sql.ts'), 'utf8')
+  const joined = await readFile(join(root, 'queries/listAccountsWithPosts.typed-sql.ts'), 'utf8')
   assert.match(joined, /readonly title: string \| null/u)
   assert.match(joined, /readonly published_at: Date \| number \| null/u)
 
@@ -206,7 +206,7 @@ test('defaults to conservative unknown driver scalar values', async () => {
     schema: 'schema.sql',
   })
 
-  const account = await readFile(join(root, 'queries/find-account-by-email.typed-sql.ts'), 'utf8')
+  const account = await readFile(join(root, 'queries/findAccountByEmail.typed-sql.ts'), 'utf8')
   assert.match(account, /export interface FindAccountByEmailParams \{[\s\S]*readonly email: NonNullable<unknown>/u)
   assert.match(account, /export interface FindAccountByEmailRow \{[\s\S]*readonly email: unknown/u)
   assert.match(account, /readonly display_name: unknown \| null/u)
@@ -495,7 +495,7 @@ test('configuration failure releases the in-process generation guard', async () 
 
 test('rejects unresolved parameter types instead of generating a phantom Unknown import', async () => {
   const root = await copyFixture()
-  await writeFile(join(root, 'queries/unresolved-parameter.typed.sql'), 'select pg_typeof(:value)\n')
+  await writeFile(join(root, 'queries/unresolvedParameter.typed.sql'), 'select pg_typeof(:value)\n')
 
   await assert.rejects(
     generateTypedSql({
@@ -507,7 +507,7 @@ test('rejects unresolved parameter types instead of generating a phantom Unknown
     /could not determine data type of parameter \$1[\s\S]*Compiled parameter map: \$1 = :value/u
   )
   await assert.rejects(
-    readFile(join(root, 'queries/unresolved-parameter.typed-sql.ts'), 'utf8'),
+    readFile(join(root, 'queries/unresolvedParameter.typed-sql.ts'), 'utf8'),
     (error: unknown) => error instanceof Error && 'code' in error && error.code === 'ENOENT'
   )
 })
@@ -515,7 +515,7 @@ test('rejects unresolved parameter types instead of generating a phantom Unknown
 test('does not allow directives to downgrade PostgreSQL write access', async () => {
   const root = await copyFixture()
   await writeFile(
-    join(root, 'queries/downgraded-write.typed.sql'),
+    join(root, 'queries/downgradedWrite.typed.sql'),
     '-- @access read\ndelete from public.posts where id = :id\n'
   )
 
@@ -730,9 +730,8 @@ order by value
 test('preserves non-code parameter text and limits directives to the header', async () => {
   const root = await copyFixture()
   await writeFile(
-    join(root, 'queries/lexical-contexts.typed.sql'),
-    `-- @name lexicalContexts
--- @nullable cutoff
+    join(root, 'queries/lexicalContexts.typed.sql'),
+    `-- @nullable cutoff
 -- @column cutoff timestamp with time zone
 select
   ':not_a_parameter' as literal_value,
@@ -755,7 +754,7 @@ where account.email = :email
   })
 
   assert.equal(result.statementCount, 5)
-  const output = await readFile(join(root, 'queries/lexical-contexts.typed-sql.ts'), 'utf8')
+  const output = await readFile(join(root, 'queries/lexicalContexts.typed-sql.ts'), 'utf8')
   assert.match(output, /parameterNames: \['cutoff', 'email'\]/u)
   assert.match(output, /readonly cutoff: Date \| number \| string \| null/u)
   assert.match(output, /name: 'cutoff',[\s\S]*?nullable: true/u)
@@ -767,7 +766,7 @@ where account.email = :email
   assert.doesNotMatch(output, /Unknown/u)
 })
 
-test('rejects duplicate singular header directives instead of using the last value', async () => {
+test('rejects removed and duplicate singular header directives', async () => {
   const root = await createMinimalFixture(
     'select 1;\n',
     `-- @name firstName
@@ -777,7 +776,7 @@ select 1
   )
   await assert.rejects(
     generateTypedSql({ include: ['queries'], rootDir: root, schema: 'schema.sql' }),
-    /duplicate @name; first declared/u
+    /unsupported typed SQL directive @name/u
   )
 
   await writeFile(
@@ -796,9 +795,8 @@ select 1
 test('uses authored SQL casts while PostgreSQL infers contextual parameter types', async () => {
   const root = await copyFixture()
   await writeFile(
-    join(root, 'queries/mixed-parameter-inference.typed.sql'),
-    `-- @name mixedParameterInference
-select :label::text as label
+    join(root, 'queries/mixedParameterInference.typed.sql'),
+    `select :label::text as label
 from public.accounts account
 where account.id = :account_id
 `
@@ -812,7 +810,7 @@ where account.id = :account_id
   })
 
   assert.equal(result.statementCount, 5)
-  const output = await readFile(join(root, 'queries/mixed-parameter-inference.typed-sql.ts'), 'utf8')
+  const output = await readFile(join(root, 'queries/mixedParameterInference.typed-sql.ts'), 'utf8')
   assert.match(output, /parameterNames: \['label', 'accountId'\]/u)
   assert.match(output, /readonly label: string/u)
   assert.match(output, /readonly accountId: bigint \| number \| string/u)
@@ -879,25 +877,22 @@ create table public.unsafe_insert_select (
 `
   )
   await writeFile(
-    join(root, 'queries/native-dml-facts.typed.sql'),
-    `-- @name nativeDmlFacts
-insert into public.accounts(email, display_name)
+    join(root, 'queries/nativeDmlFacts.typed.sql'),
+    `insert into public.accounts(email, display_name)
 values (:email, :display_name), (:second_email, :display_name)
 returning id
 `
   )
   await writeFile(
-    join(root, 'queries/mixed-dml-target.typed.sql'),
-    `-- @name mixedDmlTarget
-insert into public.accounts(email, display_name)
+    join(root, 'queries/mixedDmlTarget.typed.sql'),
+    `insert into public.accounts(email, display_name)
 values (:value, :value)
 returning id
 `
   )
   await writeFile(
-    join(root, 'queries/modifying-cte.typed.sql'),
-    `-- @name modifyingCte
-with inserted as (
+    join(root, 'queries/modifyingCte.typed.sql'),
+    `with inserted as (
   insert into public.accounts(email, display_name)
   values (:email, :display_name)
   returning id
@@ -906,26 +901,26 @@ select id from inserted
 `
   )
   await writeFile(
-    join(root, 'queries/domain-nullability.typed.sql'),
+    join(root, 'queries/domainNullability.typed.sql'),
     `insert into public.domain_inputs(maybe_value, checked_value, required_value, nested_required_value)
 values (:maybe_value, :checked_value, :required_value, :nested_required_value)
 `
   )
   await writeFile(
-    join(root, 'queries/mixed-domain-path.typed.sql'),
+    join(root, 'queries/mixedDomainPath.typed.sql'),
     `insert into public.domain_inputs(raw_value)
 values (:value), ((:value::text)::public.required_text)
 `
   )
   await writeFile(
-    join(root, 'queries/rejecting-returning-use.typed.sql'),
+    join(root, 'queries/rejectingReturningUse.typed.sql'),
     `insert into public.domain_inputs(raw_value)
 values (:value::text)
 returning (:value::text)::public.required_text
 `
   )
   await writeFile(
-    join(root, 'queries/null-extended-input.typed.sql'),
+    join(root, 'queries/nullExtendedInput.typed.sql'),
     `insert into public.outer_join_inputs(value)
 select candidate.value
 from (values (1)) guaranteed(marker)
@@ -933,7 +928,7 @@ left join (values (:value::text)) candidate(value) on false
 `
   )
   await writeFile(
-    join(root, 'queries/unsafe-insert-select.typed.sql'),
+    join(root, 'queries/unsafeInsertSelect.typed.sql'),
     `insert into public.unsafe_insert_select(value)
 select :value
 `
@@ -948,39 +943,39 @@ select :value
 
   assert.equal(result.statementCount, 12)
 
-  const nativeFacts = await readFile(join(root, 'queries/native-dml-facts.typed-sql.ts'), 'utf8')
+  const nativeFacts = await readFile(join(root, 'queries/nativeDmlFacts.typed-sql.ts'), 'utf8')
   assert.match(nativeFacts, /readonly email: string\n/u)
   assert.match(nativeFacts, /readonly displayName: string\n/u)
   assert.match(nativeFacts, /readonly secondEmail: string\n/u)
 
-  const mixedTarget = await readFile(join(root, 'queries/mixed-dml-target.typed-sql.ts'), 'utf8')
+  const mixedTarget = await readFile(join(root, 'queries/mixedDmlTarget.typed-sql.ts'), 'utf8')
   assert.match(mixedTarget, /readonly value: string\n/u)
   assert.doesNotMatch(mixedTarget, /readonly value: string \| null/u)
 
-  const modifyingCte = await readFile(join(root, 'queries/modifying-cte.typed-sql.ts'), 'utf8')
+  const modifyingCte = await readFile(join(root, 'queries/modifyingCte.typed-sql.ts'), 'utf8')
   assert.match(modifyingCte, /access: 'write'/u)
   assert.match(modifyingCte, /readonly email: string\n/u)
   assert.match(modifyingCte, /readonly displayName: string\n/u)
 
-  const domainNullability = await readFile(join(root, 'queries/domain-nullability.typed-sql.ts'), 'utf8')
+  const domainNullability = await readFile(join(root, 'queries/domainNullability.typed-sql.ts'), 'utf8')
   assert.match(domainNullability, /readonly maybeValue: string\n/u)
   assert.match(domainNullability, /readonly checkedValue: string\n/u)
   assert.match(domainNullability, /readonly requiredValue: string\n/u)
   assert.match(domainNullability, /readonly nestedRequiredValue: string\n/u)
 
-  const mixedDomainPath = await readFile(join(root, 'queries/mixed-domain-path.typed-sql.ts'), 'utf8')
+  const mixedDomainPath = await readFile(join(root, 'queries/mixedDomainPath.typed-sql.ts'), 'utf8')
   assert.match(mixedDomainPath, /readonly value: string\n/u)
   assert.doesNotMatch(mixedDomainPath, /readonly value: string \| null/u)
 
-  const rejectingReturningUse = await readFile(join(root, 'queries/rejecting-returning-use.typed-sql.ts'), 'utf8')
+  const rejectingReturningUse = await readFile(join(root, 'queries/rejectingReturningUse.typed-sql.ts'), 'utf8')
   assert.match(rejectingReturningUse, /readonly value: string\n/u)
   assert.doesNotMatch(rejectingReturningUse, /readonly value: string \| null/u)
 
-  const nullExtendedInput = await readFile(join(root, 'queries/null-extended-input.typed-sql.ts'), 'utf8')
+  const nullExtendedInput = await readFile(join(root, 'queries/nullExtendedInput.typed-sql.ts'), 'utf8')
   assert.match(nullExtendedInput, /readonly value: string\n/u)
   assert.doesNotMatch(nullExtendedInput, /OuterJoinInputs__Value/u)
 
-  const unsafeInsertSelect = await readFile(join(root, 'queries/unsafe-insert-select.typed-sql.ts'), 'utf8')
+  const unsafeInsertSelect = await readFile(join(root, 'queries/unsafeInsertSelect.typed-sql.ts'), 'utf8')
   assert.match(unsafeInsertSelect, /readonly value: bigint \| number \| string\n/u)
   assert.doesNotMatch(unsafeInsertSelect, /readonly value: bigint \| number \| string \| null/u)
 })
@@ -988,9 +983,8 @@ select :value
 test('preserves exact parameter, result, JSON, relation, and schema-qualified type names', async () => {
   const root = await copyFixture()
   await writeFile(
-    join(root, 'queries/exact-names.typed.sql'),
-    `-- @name exactNames
-select
+    join(root, 'queries/exactNames.typed.sql'),
+    `select
   :user_id::text as user_id,
   :userId::text as "userId",
   jsonb_build_object(
@@ -1032,7 +1026,7 @@ create table audit.events (
 `
   )
   await writeFile(
-    join(root, 'queries/audit-event.typed.sql'),
+    join(root, 'queries/auditEvent.typed.sql'),
     `select
   event_id,
   event_status,
@@ -1063,7 +1057,7 @@ where event_id = :event_id
   })
 
   assert.equal(result.statementCount, 6)
-  const exact = await readFile(join(root, 'queries/exact-names.typed-sql.ts'), 'utf8')
+  const exact = await readFile(join(root, 'queries/exactNames.typed-sql.ts'), 'utf8')
   assert.match(
     exact,
     /parameterNames: \['user_id', 'userId', 'json_value', 'url_value', 'json_numbers', 'json_values', 'prototype_value'\]/u
@@ -1086,7 +1080,7 @@ where event_id = :event_id
   assert.match(exact, /import type \{ DbJsonParameter, DbJsonSelected, PgArray, PgArrayParameter \}/u)
   assert.doesNotMatch(exact, /import type \{ URL \}/u)
 
-  const audit = await readFile(join(root, 'queries/audit-event.typed-sql.ts'), 'utf8')
+  const audit = await readFile(join(root, 'queries/auditEvent.typed-sql.ts'), 'utf8')
   assert.doesNotMatch(audit, /Audit_AccountStatus/u)
   assert.match(audit, /readonly event_record: string/u)
   assert.match(audit, /readonly event_id: PgInt8String/u)
@@ -1127,33 +1121,39 @@ test('rejects duplicate, reserved, and colliding generated names before emission
   const invalidSources = [
     {
       error: /duplicate result column name "duplicate"/u,
-      file: 'duplicate-result.typed.sql',
+      file: 'duplicateResult.typed.sql',
       sql: 'select 1 as duplicate, 2 as duplicate\n',
     },
     {
-      error: /@name: "class" is not a legal non-reserved TypeScript binding/u,
-      file: 'reserved-statement.typed.sql',
-      sql: '-- @name class\nselect 1\n',
+      error: /typed SQL filename: "find-account" is not a legal non-reserved TypeScript binding/u,
+      file: 'find-account.typed.sql',
+      sql: 'select 1\n',
     },
     {
-      error: /@name createTypedSqlStatement collides with the generated runtime import/u,
-      file: 'runtime-import-collision.typed.sql',
-      sql: '-- @name createTypedSqlStatement\nselect 1\n',
+      error: /typed SQL filename: "class" is not a legal non-reserved TypeScript binding/u,
+      file: 'class.typed.sql',
+      sql: 'select 1\n',
+    },
+    {
+      error:
+        /generated TypeScript binding createTypedSqlStatement for exported statement constant collides with generated runtime import/u,
+      file: 'createTypedSqlStatement.typed.sql',
+      sql: 'select 1\n',
     },
     {
       error: /duplicate @nullable value/u,
-      file: 'duplicate-nullable.typed.sql',
+      file: 'duplicateNullable.typed.sql',
       sql: '-- @nullable value\n-- @nullable value\nselect :value::text\n',
     },
     {
       error: /unsupported typed SQL directive @param/u,
-      file: 'removed-param.typed.sql',
+      file: 'removedParam.typed.sql',
       sql: '-- @param value text\nselect :value::text\n',
     },
   ] as const
 
   for (const invalid of invalidSources) {
-    const root = await copyFixture()
+    const root = await createMinimalFixture('select 1;\n', 'select 1\n')
     await writeFile(join(root, 'queries', invalid.file), invalid.sql)
     await assert.rejects(
       generateTypedSql({
@@ -2688,7 +2688,7 @@ select 'active'::public.asserted_status as status
 test('rejects nullable column assertions because PostgreSQL determines result nullability', async () => {
   const root = await copyFixture()
   await writeFile(
-    join(root, 'queries/invalid-column-nullability.typed.sql'),
+    join(root, 'queries/invalidColumnNullability.typed.sql'),
     '-- @column id bigint?\nselect id from public.accounts\n'
   )
 
@@ -2699,6 +2699,6 @@ test('rejects nullable column assertions because PostgreSQL determines result nu
       codecProfile: 'node-postgres',
       schema: 'schema.sql',
     }),
-    /queries\/invalid-column-nullability\.typed\.sql:1: @column does not support \?; PostgreSQL determines result nullability/u
+    /queries\/invalidColumnNullability\.typed\.sql:1: @column does not support \?; PostgreSQL determines result nullability/u
   )
 })

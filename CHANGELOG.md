@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.1.0-beta.12
+
+- Breaking: removed `@name`. Every `.typed.sql` file contains exactly one PostgreSQL statement, and its basename is
+  now validated as a supported non-reserved TypeScript binding and used verbatim as the generated statement export
+  and runtime display name. Rename kebab-case sources such as `find-account.typed.sql` to identifier basenames such
+  as `findAccount.typed.sql`, update generated-module import paths, and remove `@name` directives.
+- Breaking: core and node-postgres query configurations no longer include the human-readable statement name, so
+  generated execution no longer implicitly opts into node-postgres named prepared statements. `statement.name`
+  remains available for metadata and diagnostics.
+- Statement names no longer occupy a generator-wide namespace. Separate directories may contain the same valid
+  `.typed.sql` basename because their generated modules and output paths provide the namespace.
+
 ## 0.1.0-beta.11
 
 - Breaking: removed `@param` and all out-of-band parameter type OIDs. PostgreSQL now infers parameter types exclusively from the exact compiled SQL executed at runtime; ambiguous uses must be resolved with authored SQL casts.
