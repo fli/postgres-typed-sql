@@ -15,7 +15,8 @@ The `0.1.x` line is a public beta. Its compatibility contract is deliberately na
 - no native compilation or lifecycle scripts during installation
 - no fallback analyzer
 
-Supported extensions are `btree_gin`, `btree_gist`, `pg_trgm`, `pgcrypto`, `plpgsql`, and `uuid-ossp`.
+Supported extensions are `btree_gin`, `btree_gist`, `citext`, `hstore`,
+`pg_stat_statements`, `pg_trgm`, `pgcrypto`, `plpgsql`, and `uuid-ossp`.
 
 ## Install
 

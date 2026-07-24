@@ -3,6 +3,9 @@ import { readFile } from 'node:fs/promises'
 import { PGlite } from './vendor/pglite/index.js'
 import { btree_gin } from './vendor/pglite/contrib/btree_gin.js'
 import { btree_gist } from './vendor/pglite/contrib/btree_gist.js'
+import { citext } from './vendor/pglite/contrib/citext.js'
+import { hstore } from './vendor/pglite/contrib/hstore.js'
+import { pg_stat_statements } from './vendor/pglite/contrib/pg_stat_statements.js'
 import { pg_trgm } from './vendor/pglite/contrib/pg_trgm.js'
 import { pgcrypto } from './vendor/pglite/contrib/pgcrypto.js'
 import { uuid_ossp } from './vendor/pglite/contrib/uuid_ossp.js'
@@ -12,7 +15,17 @@ import type { PostgresQueryable } from './database.js'
 
 export const postgresVersion = '18.3' as const
 
-export const supportedExtensions = ['btree_gin', 'btree_gist', 'pg_trgm', 'pgcrypto', 'plpgsql', 'uuid-ossp'] as const
+export const supportedExtensions = [
+  'btree_gin',
+  'btree_gist',
+  'citext',
+  'hstore',
+  'pg_stat_statements',
+  'pg_trgm',
+  'pgcrypto',
+  'plpgsql',
+  'uuid-ossp',
+] as const
 
 export type SupportedExtension = (typeof supportedExtensions)[number]
 
@@ -39,6 +52,9 @@ const extensionRegistry = {
   analyzer: analyzerExtension,
   btree_gin,
   btree_gist,
+  citext,
+  hstore,
+  pg_stat_statements,
   pg_trgm,
   pgcrypto,
   uuid_ossp,
