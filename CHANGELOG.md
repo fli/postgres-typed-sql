@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.1.0-beta.13
+
+- Breaking: built-in `json_build_array` and `jsonb_build_array` results now preserve the existing inferred JSON array
+  container and recursively modeled static element shapes. Ordinary calls are correctly non-null, explicit `VARIADIC`
+  calls follow the array expression's nullability, and dynamic variadic inputs retain an array with opaque elements.
+  Regenerate checked-in typed SQL outputs. A newly generated array of structured JSON object interfaces is not
+  generally assignable or directly castable to `DbJsonSelected` because TypeScript interfaces do not implicitly
+  satisfy its recursive string index signature.
+
 ## 0.1.0-beta.12
 
 - Breaking: removed `@name`. Every `.typed.sql` file contains exactly one PostgreSQL statement, and its basename is

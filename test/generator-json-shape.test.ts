@@ -82,6 +82,89 @@ cross join generate_series(1, 2) generated(value)
   assert.match(output, /name: 'value',[\s\S]*?nullable: true/u)
 })
 
+test('renders JSON build-array element structures through existing unions, naming, and opaque fallbacks', async () => {
+  const root = await createMinimalFixture(
+    'select 1;\n',
+    `select jsonb_build_array(
+  jsonb_build_object('state', 'ready', 'display_name', 'Reader'::text),
+  jsonb_build_object('state', 'missing', 'error_code', null::text)
+) as payload
+`
+  )
+  const config = {
+    codecProfile: 'node-postgres' as const,
+    include: ['queries'],
+    naming: {
+      structuredJsonFields: 'camelCase' as const,
+    },
+    rootDir: root,
+    schema: 'schema.sql',
+  }
+  const queryFile = join(root, 'queries/query.typed.sql')
+  const outputFile = join(root, 'queries/query.typed-sql.ts')
+
+  await generateTypedSql(config)
+  let output = await readFile(outputFile, 'utf8')
+  assert.match(output, /interface QueryJ7_payloadJsonJ7_elementJ12_alternative1 \{/u)
+  assert.match(output, /readonly state: 'ready'/u)
+  assert.match(output, /readonly displayName: 'Reader'/u)
+  assert.match(output, /interface QueryJ7_payloadJsonJ7_elementJ12_alternative2 \{/u)
+  assert.match(output, /readonly state: 'missing'/u)
+  assert.match(output, /readonly errorCode: string \| null/u)
+  assert.match(
+    output,
+    /readonly payload: readonly \(QueryJ7_payloadJsonJ7_elementJ12_alternative1 \| QueryJ7_payloadJsonJ7_elementJ12_alternative2\)\[\]\n/u
+  )
+  assert.doesNotMatch(output, /readonly payload: DbJsonSelected/u)
+  assert.doesNotMatch(output, /readonly payload: .*\[\] \| null/u)
+  assert.match(output, /"arrayElement":\{"fields":/u)
+  assert.match(output, /"name":"display_name","propertyName":"displayName"/u)
+  assert.match(output, /"name":"error_code","propertyName":"errorCode"/u)
+
+  await writeFile(queryFile, 'select jsonb_build_array() as payload\n')
+  await generateTypedSql(config)
+  output = await readFile(outputFile, 'utf8')
+  assert.match(output, /readonly payload: readonly \(DbJsonSelected\)\[\]\n/u)
+  assert.doesNotMatch(output, /readonly payload: .*\[\] \| null/u)
+
+  await writeFile(queryFile, 'select jsonb_build_array(variadic :entries::text[]) as payload\n')
+  await generateTypedSql(config)
+  output = await readFile(outputFile, 'utf8')
+  assert.match(output, /readonly payload: readonly \(DbJsonSelected \| null\)\[\] \| null/u)
+
+  const customOpaqueJsonProfile = definePostgresCodecProfile({
+    extends: 'node-postgres',
+    name: 'custom-opaque-json',
+    opaqueJsonType: postgresTypeScriptType('OpaqueJsonValue', {
+      scalarImports: ['OpaqueJsonValue'],
+    }),
+    structuredJson: true,
+  })
+  await generateTypedSql({ ...config, codecProfile: customOpaqueJsonProfile })
+  output = await readFile(outputFile, 'utf8')
+  assert.match(output, /import type \{ [^}]*OpaqueJsonValue[^}]* \} from 'postgres-typed-sql\/scalars'/u)
+  assert.match(output, /readonly payload: readonly \(OpaqueJsonValue \| null\)\[\] \| null/u)
+
+  await writeFile(queryFile, 'select jsonb_build_array() as payload\n')
+  await generateTypedSql({ ...config, codecProfile: customOpaqueJsonProfile })
+  output = await readFile(outputFile, 'utf8')
+  assert.match(output, /readonly payload: readonly \(OpaqueJsonValue\)\[\]\n/u)
+  assert.doesNotMatch(output, /OpaqueJsonValue \| null/u)
+
+  await writeFile(
+    queryFile,
+    "select jsonb_build_array(jsonb_build_object('display_name', 'Reader'::text)) as payload\n"
+  )
+  await generateTypedSql({
+    ...config,
+    codecProfile: 'conservative',
+    naming: { structuredJsonFields: 'preserve' },
+  })
+  output = await readFile(outputFile, 'utf8')
+  assert.match(output, /readonly payload: unknown/u)
+  assert.doesNotMatch(output, /interface QueryJ7_payloadJson/u)
+})
+
 test('keeps I/O-cast JSON shapes opaque and strict conversion results nullable', async () => {
   const root = await createMinimalFixture(
     'select 1;\n',
