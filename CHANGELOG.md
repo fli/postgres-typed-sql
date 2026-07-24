@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.0-beta.14
+
+- Generation now reports every recoverable typed SQL analysis failure observed in a completed batch. Rejected native
+  analyzer invocations are accumulated only after a fixed health probe proves that batch continuation remains safe;
+  analyzer contract, session, and persistent native-mechanism failures remain fail-fast.
+
 ## 0.1.0-beta.13
 
 - Breaking: built-in `json_build_array` and `jsonb_build_array` results now preserve the existing inferred JSON array
@@ -20,9 +26,6 @@
   remains available for metadata and diagnostics.
 - Statement names no longer occupy a generator-wide namespace. Separate directories may contain the same valid
   `.typed.sql` basename because their generated modules and output paths provide the namespace.
-- Generation now reports every recoverable typed SQL analysis failure observed in a completed batch. Rejected native
-  analyzer invocations are accumulated only after a fixed health probe proves that batch continuation remains safe;
-  analyzer contract, session, and persistent native-mechanism failures remain fail-fast.
 
 ## 0.1.0-beta.11
 
