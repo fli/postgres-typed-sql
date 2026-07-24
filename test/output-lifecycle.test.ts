@@ -16,7 +16,7 @@ function generate(root: string, include: readonly string[] = ['queries']) {
   })
 }
 
-test('analysis failure leaves every existing output and stale file untouched', async () => {
+test('aggregate analysis failure leaves every existing output and stale file untouched', async () => {
   const root = await copyFixture()
   await generate(root)
 
@@ -29,9 +29,16 @@ test('analysis failure leaves every existing output and stale file untouched', a
 
   const schemaPath = join(root, 'schema.sql')
   await writeFile(schemaPath, `${await readFile(schemaPath, 'utf8')}\ncreate type public.new_status as enum ('new');\n`)
-  await writeFile(join(root, 'queries/invalid.typed.sql'), 'select missing_column from public.accounts\n')
+  await writeFile(join(root, 'queries/invalidAccount.typed.sql'), 'select * from public.analysis_missing_accounts\n')
+  await writeFile(join(root, 'queries/invalidEvent.typed.sql'), 'select * from public.analysis_missing_events\n')
 
-  await assert.rejects(generate(root), /column "missing_column" does not exist/u)
+  await assert.rejects(generate(root), (error: unknown) => {
+    assert.ok(error instanceof AggregateError)
+    assert.equal(error.errors.length, 2)
+    assert.match(error.message, /relation "public\.analysis_missing_accounts" does not exist/u)
+    assert.match(error.message, /relation "public\.analysis_missing_events" does not exist/u)
+    return true
+  })
   assert.equal(await readFile(catalogPath, 'utf8'), catalogBefore)
   assert.equal(await readFile(queryPath, 'utf8'), queryBefore)
   assert.equal(await readFile(stalePath, 'utf8'), `${generatedMarker}\nexport const stale = true\n`)

@@ -2549,42 +2549,55 @@ function validateDmlQueryEnvelope(query: PgAnalyzerQuery, parameterCount: number
   })
 }
 
-async function analyzeCompiledConfig(
-  client: PostgresQueryable,
-  config: TypedSqlPostgresIrCompiledConfig
-): Promise<AnalyzedCompiledConfig> {
-  // PGlite can retain extended-query parameter state from the preceding
-  // catalog lookup. Enter the re-entrant variable-parameter analyzer from a
-  // parameter-free statement boundary.
-  await client.query('select 1')
+type AnalyzedCompiledConfigAttempt =
+  | { readonly cause: unknown; readonly kind: 'failure' }
+  | { readonly kind: 'success'; readonly value: AnalyzedCompiledConfig }
+
+interface ValidatedAnalyzerEnvelope {
+  readonly primaryQuery: PgAnalyzerQuery
+  readonly rewrittenQueries: readonly PgAnalyzerQuery[]
+}
+
+const nativeAnalyzerProbeSql = 'select 1'
+
+async function invokeNativeAnalyzer(client: PostgresQueryable, sql: string): Promise<PgAnalyzerResult | undefined> {
   const result = await client.query<{ readonly analysis: PgAnalyzerResult }>(
-    `select ${ANALYZER_SQL_FUNCTION}(${dollarQuotedSqlText(config.sql)})::jsonb as analysis`
+    `select ${ANALYZER_SQL_FUNCTION}(${dollarQuotedSqlText(sql)})::jsonb as analysis`
   )
-  const analysis = result.rows[0]?.analysis
+  return result.rows[0]?.analysis
+}
+
+function validateAnalyzerSchema(analysis: PgAnalyzerResult | undefined): asserts analysis is PgAnalyzerResult {
   if (!analysis || analysis.schemaVersion !== ANALYZER_SCHEMA_VERSION) {
     throw new Error(
       `analyzer returned unsupported schema version ${analysis?.schemaVersion ?? 'missing'}; expected ${ANALYZER_SCHEMA_VERSION}.`
     )
   }
+}
+
+function validateSingleStatementAnalyzerEnvelope(
+  analysis: PgAnalyzerResult,
+  parameterCount: number
+): ValidatedAnalyzerEnvelope {
   if (analysis.rawStatementCount !== 1) {
-    throw new Error(`typed SQL must contain exactly one PostgreSQL statement; received ${analysis.rawStatementCount}.`)
+    throw new Error(`analyzer returned ${analysis.rawStatementCount} raw statements for a single-statement envelope.`)
   }
   if (analysis.statements.length !== 1) {
     throw new Error(`analyzer returned ${analysis.statements.length} statement envelopes for one raw statement.`)
   }
-  if (analysis.paramTypeOids.length !== config.parameterNames.length) {
+  if (analysis.paramTypeOids.length !== parameterCount) {
     throw new Error(
-      `analyzer returned ${analysis.paramTypeOids.length} parameter types for ${config.parameterNames.length} compiled parameters.`
+      `analyzer returned ${analysis.paramTypeOids.length} parameter types for ${parameterCount} compiled parameters.`
     )
   }
-  if (analysis.paramTypeNullAdmissions.length !== config.parameterNames.length) {
+  if (analysis.paramTypeNullAdmissions.length !== parameterCount) {
     throw new Error(
-      `analyzer returned ${analysis.paramTypeNullAdmissions.length} parameter type NULL admissions for ${config.parameterNames.length} compiled parameters.`
+      `analyzer returned ${analysis.paramTypeNullAdmissions.length} parameter type NULL admissions for ${parameterCount} compiled parameters.`
     )
   }
-  if (analysis.paramUsageNullAdmissions.length !== config.parameterNames.length) {
+  if (analysis.paramUsageNullAdmissions.length !== parameterCount) {
     throw new Error(
-      `analyzer returned ${analysis.paramUsageNullAdmissions.length} parameter usage NULL admissions for ${config.parameterNames.length} compiled parameters.`
+      `analyzer returned ${analysis.paramUsageNullAdmissions.length} parameter usage NULL admissions for ${parameterCount} compiled parameters.`
     )
   }
 
@@ -2593,38 +2606,156 @@ async function analyzeCompiledConfig(
     throw new Error('analyzer returned an inconsistent rewritten-query envelope.')
   }
   for (const query of statement.queries) {
-    validateDmlQueryEnvelope(query, config.parameterNames.length)
+    validateDmlQueryEnvelope(query, parameterCount)
   }
   const tagSettingQueries = statement.queries.filter((query) => query.canSetTag)
   if (tagSettingQueries.length !== 1) {
     throw new Error(`expected exactly one tag-setting rewritten query; received ${tagSettingQueries.length}.`)
   }
-  const primaryQuery = tagSettingQueries[0] as PgAnalyzerQuery
+  return {
+    primaryQuery: tagSettingQueries[0] as PgAnalyzerQuery,
+    rewrittenQueries: statement.queries,
+  }
+}
+
+function asError(cause: unknown): Error {
+  return cause instanceof Error ? cause : new Error(String(cause))
+}
+
+function indentedMessage(message: string, prefix: string): string {
+  const [first = '', ...continuation] = message.split(/\r?\n/u)
+  return [`${prefix}${first}`, ...continuation.map((line) => `  ${line}`)].join('\n')
+}
+
+function validateNativeAnalyzerProbe(probe: ValidatedAnalyzerEnvelope): void {
+  if (probe.rewrittenQueries.length !== 1 || probe.primaryQuery.commandType !== 'SELECT') {
+    throw new Error(
+      `native analyzer health probe returned ${probe.rewrittenQueries.length} rewritten queries with command type ${probe.primaryQuery.commandType}; expected one SELECT query.`
+    )
+  }
+  const targets = probe.primaryQuery.targetList ?? []
+  const target = targets[0]
+  if (
+    targets.length !== 1 ||
+    target?.resjunk === true ||
+    target?.expr?.tag !== 'Const' ||
+    target.expr.typeOid !== 23 ||
+    target.expr.constInteger !== '1'
+  ) {
+    throw new Error('native analyzer health probe returned an unexpected SELECT 1 target.')
+  }
+}
+
+async function assertNativeAnalyzerHealthy(client: PostgresQueryable, rejectedInvocationCause: unknown): Promise<void> {
+  try {
+    // Re-establish the same parameter-free boundary before probing the native
+    // analyzer itself. This is a continuation gate, not a retry of user SQL.
+    await client.query('select 1')
+    const analysis = await invokeNativeAnalyzer(client, nativeAnalyzerProbeSql)
+    validateAnalyzerSchema(analysis)
+    const probe = validateSingleStatementAnalyzerEnvelope(analysis, 0)
+    validateNativeAnalyzerProbe(probe)
+  } catch (probeCause) {
+    const invocationError = asError(rejectedInvocationCause)
+    const probeError = asError(probeCause)
+    throw new AggregateError(
+      [invocationError, probeError],
+      [
+        'The native analyzer health probe failed after the current analyzer invocation rejected; batch continuation is unsafe.',
+        indentedMessage(invocationError.message, 'Original invocation: '),
+        indentedMessage(probeError.message, 'Health probe: '),
+      ].join('\n')
+    )
+  }
+}
+
+async function attemptAnalyzeCompiledConfig(
+  client: PostgresQueryable,
+  config: TypedSqlPostgresIrCompiledConfig
+): Promise<AnalyzedCompiledConfigAttempt> {
+  // PGlite can retain extended-query parameter state from the preceding
+  // catalog lookup. Enter the re-entrant variable-parameter analyzer from a
+  // parameter-free statement boundary.
+  await client.query('select 1')
+
+  let analysis: PgAnalyzerResult | undefined
+  try {
+    analysis = await invokeNativeAnalyzer(client, config.sql)
+  } catch (cause) {
+    await assertNativeAnalyzerHealthy(client, cause)
+    return { cause, kind: 'failure' }
+  }
+
+  validateAnalyzerSchema(analysis)
+  if (analysis.rawStatementCount !== 1) {
+    return {
+      cause: new Error(
+        `typed SQL must contain exactly one PostgreSQL statement; received ${analysis.rawStatementCount}.`
+      ),
+      kind: 'failure',
+    }
+  }
+
+  const { primaryQuery, rewrittenQueries } = validateSingleStatementAnalyzerEnvelope(
+    analysis,
+    config.parameterNames.length
+  )
   if (primaryQuery.commandType === 'UTILITY') {
     if (primaryQuery.utilityKind === 'CALL' && primaryQuery.utilityReturnsTuples === false) {
       return {
-        analysis,
-        config,
-        primaryQuery,
-        rewrittenQueries: statement.queries,
+        kind: 'success',
+        value: {
+          analysis,
+          config,
+          primaryQuery,
+          rewrittenQueries,
+        },
       }
     }
     if (primaryQuery.utilityKind === 'CALL' && primaryQuery.utilityReturnsTuples === true) {
-      throw new Error('PostgreSQL CALL statements with result rows are not supported by typed SQL.')
+      return {
+        cause: new Error('PostgreSQL CALL statements with result rows are not supported by typed SQL.'),
+        kind: 'failure',
+      }
     }
 
     const utilityKind = primaryQuery.utilityKind ?? 'UNKNOWN'
-    throw new Error(
-      `PostgreSQL ${utilityKind} utility statements are not supported by typed SQL; only CALL statements without result rows are supported.`
-    )
+    return {
+      cause: new Error(
+        `PostgreSQL ${utilityKind} utility statements are not supported by typed SQL; only CALL statements without result rows are supported.`
+      ),
+      kind: 'failure',
+    }
   }
 
   return {
-    analysis,
-    config,
-    primaryQuery,
-    rewrittenQueries: statement.queries,
+    kind: 'success',
+    value: {
+      analysis,
+      config,
+      primaryQuery,
+      rewrittenQueries,
+    },
   }
+}
+
+function contextualizedAnalysisFailure(config: TypedSqlPostgresIrCompiledConfig, cause: unknown): Error {
+  const message = cause instanceof Error ? cause.message : String(cause)
+  const parameterMap =
+    config.parameterNames.length === 0
+      ? ''
+      : ` Compiled parameter map: ${config.parameterNames.map((name, index) => `$${index + 1} = :${name}`).join(', ')}.`
+  return new Error(`${config.sourceFile}: failed to analyze typed SQL ${config.name}: ${message}${parameterMap}`, {
+    cause,
+  })
+}
+
+function formatTypedSqlAnalysisFailures(failures: readonly Error[]): string {
+  const entries = failures.map((failure, index) => {
+    const [first = '', ...continuation] = failure.message.split(/\r?\n/u)
+    return [`${index + 1}. ${first}`, ...continuation.map((line) => `   ${line}`)].join('\n')
+  })
+  return `Failed to analyze ${failures.length} typed SQL statements:\n${entries.join('\n')}`
 }
 
 export async function buildTypedSqlPostgresIrFromCompiledConfigs(
@@ -2632,21 +2763,27 @@ export async function buildTypedSqlPostgresIrFromCompiledConfigs(
   configs: readonly TypedSqlPostgresIrCompiledConfig[]
 ): Promise<TypedSqlPostgresIrBuildResult> {
   const analyses: AnalyzedCompiledConfig[] = []
+  const failures: Error[] = []
   for (const config of configs) {
+    let attempt: AnalyzedCompiledConfigAttempt
     try {
-      analyses.push(await analyzeCompiledConfig(client, config))
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error)
-      const parameterMap =
-        config.parameterNames.length === 0
-          ? ''
-          : ` Compiled parameter map: ${config.parameterNames
-              .map((name, index) => `$${index + 1} = :${name}`)
-              .join(', ')}.`
-      throw new Error(`${config.sourceFile}: failed to analyze typed SQL ${config.name}: ${message}${parameterMap}`, {
-        cause: error,
-      })
+      attempt = await attemptAnalyzeCompiledConfig(client, config)
+    } catch (cause) {
+      throw contextualizedAnalysisFailure(config, cause)
     }
+
+    if (attempt.kind === 'failure') {
+      failures.push(contextualizedAnalysisFailure(config, attempt.cause))
+    } else {
+      analyses.push(attempt.value)
+    }
+  }
+
+  if (failures.length === 1) {
+    throw failures[0]
+  }
+  if (failures.length > 1) {
+    throw new AggregateError(failures, formatTypedSqlAnalysisFailures(failures))
   }
 
   const catalog = await loadCatalog(

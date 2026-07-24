@@ -71,6 +71,284 @@ function firstEnvelopeQuery(analysis: MutableEnvelopeObject): MutableEnvelopeObj
   return envelopeObject(envelopeArray(statement.queries)[0])
 }
 
+test('aggregates probe-gated analyzer rejections in config order without loading shared catalog facts', async () => {
+  const database = await createAnalysisDatabase({ schemaFiles: [schemaFile] })
+  try {
+    const analyzerInvocations: string[] = []
+    let sharedCatalogQueries = 0
+    const observedClient: PostgresQueryable = {
+      async query<Row>(text: string, params?: readonly unknown[]) {
+        if (text.includes('postgres_typed_sql_analyze')) {
+          analyzerInvocations.push(text)
+        }
+        if (text.includes('a.attnotnull') && text.includes('from pg_class c')) {
+          sharedCatalogQueries += 1
+        }
+        return database.query<Row>(text, params)
+      },
+    }
+
+    await assert.rejects(
+      buildTypedSqlPostgresIrFromCompiledConfigs(observedClient, [
+        config('missingAccounts', 'select * from public.analysis_missing_accounts'),
+        config('validBetweenFailures', 'select 2 as value'),
+        config('missingEvents', 'select * from public.analysis_missing_events'),
+      ]),
+      (error: unknown) => {
+        assert.ok(error instanceof AggregateError)
+        assert.equal(error.errors.length, 2)
+        const [accounts, events] = error.errors
+        assert.ok(accounts instanceof Error)
+        assert.ok(events instanceof Error)
+        assert.match(
+          accounts.message,
+          /queries\/missingAccounts\.typed\.sql: failed to analyze typed SQL missingAccounts: relation "public\.analysis_missing_accounts" does not exist/u
+        )
+        assert.match(
+          events.message,
+          /queries\/missingEvents\.typed\.sql: failed to analyze typed SQL missingEvents: relation "public\.analysis_missing_events" does not exist/u
+        )
+        assert.ok(accounts.cause instanceof Error)
+        assert.ok(events.cause instanceof Error)
+        assert.match(error.message, /^Failed to analyze 2 typed SQL statements:\n1\. queries\/missingAccounts/u)
+        assert.match(error.message, /\n2\. queries\/missingEvents/u)
+        return true
+      }
+    )
+
+    assert.equal(analyzerInvocations.length, 5)
+    assert.equal(
+      analyzerInvocations.filter((text) => text.includes('$postgres_typed_sql$select 1$postgres_typed_sql$')).length,
+      2
+    )
+    assert.equal(
+      analyzerInvocations.filter((text) => text.includes('$postgres_typed_sql$select 2 as value$postgres_typed_sql$'))
+        .length,
+      1
+    )
+    assert.equal(sharedCatalogQueries, 0)
+  } finally {
+    await database.close()
+  }
+})
+
+test('aggregates source-policy failures without probing the healthy analyzer', async () => {
+  const database = await createAnalysisDatabase({ schemaFiles: [schemaFile] })
+  try {
+    const analyzerInvocations: string[] = []
+    const observedClient: PostgresQueryable = {
+      async query<Row>(text: string, params?: readonly unknown[]) {
+        if (text.includes('postgres_typed_sql_analyze')) {
+          analyzerInvocations.push(text)
+        }
+        return database.query<Row>(text, params)
+      },
+    }
+
+    await assert.rejects(
+      buildTypedSqlPostgresIrFromCompiledConfigs(observedClient, [
+        config('multipleStatements', 'select 1; select 2'),
+        config('unsupportedShow', 'show timezone'),
+      ]),
+      (error: unknown) => {
+        assert.ok(error instanceof AggregateError)
+        assert.equal(error.errors.length, 2)
+        assert.match(String(error.errors[0]), /typed SQL must contain exactly one PostgreSQL statement; received 2/u)
+        assert.match(String(error.errors[1]), /PostgreSQL SHOW utility statements are not supported/u)
+        return true
+      }
+    )
+
+    assert.equal(analyzerInvocations.length, 2)
+  } finally {
+    await database.close()
+  }
+})
+
+test('stops after an invalid analyzer envelope instead of multiplying a batch-fatal failure', async () => {
+  const database = await createAnalysisDatabase({ schemaFiles: [schemaFile] })
+  try {
+    let analyzerInvocations = 0
+    const corrupted = corruptAnalyzerEnvelope(database, (analysis) => {
+      analysis.schemaVersion = 6
+    })
+    const observedClient: PostgresQueryable = {
+      async query<Row>(text: string, params?: readonly unknown[]) {
+        if (text.includes('postgres_typed_sql_analyze')) {
+          analyzerInvocations += 1
+        }
+        return corrupted.query<Row>(text, params)
+      },
+    }
+
+    await assert.rejects(
+      buildTypedSqlPostgresIrFromCompiledConfigs(observedClient, [
+        config('staleAnalyzerFirst', 'select 1'),
+        config('staleAnalyzerSecond', 'select 2'),
+      ]),
+      (error: unknown) => {
+        assert.ok(error instanceof Error)
+        assert.ok(!(error instanceof AggregateError))
+        assert.match(error.message, /queries\/staleAnalyzerFirst\.typed\.sql/u)
+        assert.match(error.message, /analyzer returned unsupported schema version 6; expected 10/u)
+        return true
+      }
+    )
+    assert.equal(analyzerInvocations, 1)
+  } finally {
+    await database.close()
+  }
+})
+
+test('makes a failed native analyzer probe batch-fatal with both diagnostics visible', async () => {
+  const database = await createAnalysisDatabase({ schemaFiles: [schemaFile] })
+  try {
+    await database.query('drop function pg_temp.postgres_typed_sql_analyze(text)')
+    let analyzerInvocations = 0
+    const observedClient: PostgresQueryable = {
+      async query<Row>(text: string, params?: readonly unknown[]) {
+        if (text.includes('postgres_typed_sql_analyze')) {
+          analyzerInvocations += 1
+        }
+        return database.query<Row>(text, params)
+      },
+    }
+
+    await assert.rejects(
+      buildTypedSqlPostgresIrFromCompiledConfigs(observedClient, [
+        config('unavailableAnalyzerFirst', 'select 1'),
+        config('unavailableAnalyzerSecond', 'select 2'),
+      ]),
+      (error: unknown) => {
+        assert.ok(error instanceof Error)
+        assert.ok(!(error instanceof AggregateError))
+        assert.ok(error.cause instanceof AggregateError)
+        assert.equal(error.cause.errors.length, 2)
+        assert.match(error.message, /queries\/unavailableAnalyzerFirst\.typed\.sql/u)
+        assert.match(error.message, /native analyzer health probe failed/u)
+        assert.match(error.message, /Original invocation: .*postgres_typed_sql_analyze/u)
+        assert.match(error.message, /Health probe: .*postgres_typed_sql_analyze/u)
+        return true
+      }
+    )
+    assert.equal(analyzerInvocations, 2)
+  } finally {
+    await database.close()
+  }
+})
+
+test('discards earlier recoverable failures when a later session boundary is batch-fatal', async () => {
+  const database = await createAnalysisDatabase({ schemaFiles: [schemaFile] })
+  try {
+    let parameterFreeBoundaries = 0
+    let analyzerInvocations = 0
+    const observedClient: PostgresQueryable = {
+      async query<Row>(text: string, params?: readonly unknown[]) {
+        if (text === 'select 1') {
+          parameterFreeBoundaries += 1
+          if (parameterFreeBoundaries === 3) {
+            throw new Error('parameter-free boundary unavailable')
+          }
+        }
+        if (text.includes('postgres_typed_sql_analyze')) {
+          analyzerInvocations += 1
+        }
+        return database.query<Row>(text, params)
+      },
+    }
+
+    await assert.rejects(
+      buildTypedSqlPostgresIrFromCompiledConfigs(observedClient, [
+        config('recoverableBeforeFatal', 'select * from public.analysis_missing_before_fatal'),
+        config('fatalBoundary', 'select 2'),
+        config('neverAttempted', 'select 3'),
+      ]),
+      (error: unknown) => {
+        assert.ok(error instanceof Error)
+        assert.ok(!(error instanceof AggregateError))
+        assert.match(error.message, /queries\/fatalBoundary\.typed\.sql/u)
+        assert.match(error.message, /parameter-free boundary unavailable/u)
+        assert.doesNotMatch(error.message, /analysis_missing_before_fatal/u)
+        return true
+      }
+    )
+
+    assert.equal(parameterFreeBoundaries, 3)
+    assert.equal(analyzerInvocations, 2)
+  } finally {
+    await database.close()
+  }
+})
+
+test('indents multiline analyzer failures while preserving child causes', async () => {
+  const database = await createAnalysisDatabase({ schemaFiles: [schemaFile] })
+  try {
+    const firstCause = new Error('first rejection\nDETAIL: first detail')
+    const secondCause = new Error('second rejection\nHINT: second hint')
+    const observedClient: PostgresQueryable = {
+      async query<Row>(text: string, params?: readonly unknown[]) {
+        if (text.includes('$postgres_typed_sql$select 1001$postgres_typed_sql$')) {
+          throw firstCause
+        }
+        if (text.includes('$postgres_typed_sql$select 1002$postgres_typed_sql$')) {
+          throw secondCause
+        }
+        return database.query<Row>(text, params)
+      },
+    }
+
+    await assert.rejects(
+      buildTypedSqlPostgresIrFromCompiledConfigs(observedClient, [
+        config('firstMultiline', 'select 1001'),
+        config('secondMultiline', 'select 1002'),
+      ]),
+      (error: unknown) => {
+        assert.ok(error instanceof AggregateError)
+        assert.equal((error.errors[0] as Error).cause, firstCause)
+        assert.equal((error.errors[1] as Error).cause, secondCause)
+        assert.match(error.message, /\n {3}DETAIL: first detail\n2\. queries\/secondMultiline/u)
+        assert.match(error.message, /\n {3}HINT: second hint$/u)
+        return true
+      }
+    )
+  } finally {
+    await database.close()
+  }
+})
+
+test('preserves singular parameterized analysis error shape and cause after a successful probe', async () => {
+  const database = await createAnalysisDatabase({ schemaFiles: [schemaFile] })
+  try {
+    const cause = new Error('singular rejection')
+    const observedClient: PostgresQueryable = {
+      async query<Row>(text: string, params?: readonly unknown[]) {
+        if (text.includes('$postgres_typed_sql$select $1::integer$postgres_typed_sql$')) {
+          throw cause
+        }
+        return database.query<Row>(text, params)
+      },
+    }
+
+    await assert.rejects(
+      buildTypedSqlPostgresIrFromCompiledConfigs(observedClient, [
+        config('singularParameterized', 'select $1::integer', ['value']),
+      ]),
+      (error: unknown) => {
+        assert.ok(error instanceof Error)
+        assert.ok(!(error instanceof AggregateError))
+        assert.equal(error.cause, cause)
+        assert.equal(
+          error.message,
+          'queries/singularParameterized.typed.sql: failed to analyze typed SQL singularParameterized: singular rejection Compiled parameter map: $1 = :value.'
+        )
+        return true
+      }
+    )
+  } finally {
+    await database.close()
+  }
+})
+
 test('loads every referenced relation attribute consistently in large and focused batches', async () => {
   const database = await createAnalysisDatabase({ schemaFiles: [schemaFile] })
   try {
