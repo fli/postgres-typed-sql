@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.0-beta.15
+
+- Added bundled analysis support for the `citext`, `hstore`, and `pg_stat_statements` extensions.
+
 ## 0.1.0-beta.14
 
 - Generation now reports every recoverable typed SQL analysis failure observed in a completed batch. Rejected native
