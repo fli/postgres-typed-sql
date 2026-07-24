@@ -46,6 +46,7 @@ import type { PostgresQueryable } from './database.js'
 import { loadPostgresTypeFacts } from './postgres-type-facts.js'
 import {
   analyzerExprChildren as exprChildren,
+  staticVariadicFunctionArguments,
   targetExprFromAggregateArg,
   type PgAnalyzerCte,
   type PgAnalyzerExpr,
@@ -1921,17 +1922,18 @@ function expressionNullability(
             'strict_json_conversion'
           )
     }
-    if (
-      isBuiltinPgProcNamed(catalog, expr.funcid, 'jsonb_build_object') ||
-      isBuiltinPgProcNamed(catalog, expr.funcid, 'json_build_object')
-    ) {
-      if (expr.funcVariadic !== true) {
-        return { basis: 'json_build_object', kind: 'nonNull' }
+    const jsonBuildKind = builtinJsonBuildKind(catalog, expr)
+    if (jsonBuildKind) {
+      if (expr.funcVariadic === false) {
+        return { basis: `json_build_${jsonBuildKind}`, kind: 'nonNull' }
       }
-      const args = expr.args?.map(targetExprFromAggregateArg)
-      return args?.length === 1
-        ? expressionNullability(catalog, scope, args[0], seen)
-        : { kind: 'unknown', reason: 'variadic_json_build_object_arguments' }
+      if (expr.funcVariadic === true) {
+        const args = expr.args?.map(targetExprFromAggregateArg)
+        return args?.length === 1
+          ? expressionNullability(catalog, scope, args[0], seen)
+          : { kind: 'unknown', reason: `variadic_json_build_${jsonBuildKind}_arguments` }
+      }
+      return { kind: 'unknown', reason: `missing_json_build_${jsonBuildKind}_variadic_fact` }
     }
 
     if ((expr.coercionForm === 'EXPLICIT_CAST' || expr.coercionForm === 'IMPLICIT_CAST') && expr.args?.length === 1) {
@@ -2045,6 +2047,24 @@ function isBuiltinPgProcNamed(catalog: CatalogFacts, oid: number | undefined, na
   return proc?.is_builtin === true && proc.proname === name
 }
 
+type JsonBuildKind = 'array' | 'object'
+
+function builtinJsonBuildKind(catalog: CatalogFacts, expr: PgAnalyzerExpr): JsonBuildKind | null {
+  if (
+    isBuiltinPgProcNamed(catalog, expr.funcid, 'json_build_array') ||
+    isBuiltinPgProcNamed(catalog, expr.funcid, 'jsonb_build_array')
+  ) {
+    return 'array'
+  }
+  if (
+    isBuiltinPgProcNamed(catalog, expr.funcid, 'json_build_object') ||
+    isBuiltinPgProcNamed(catalog, expr.funcid, 'jsonb_build_object')
+  ) {
+    return 'object'
+  }
+  return null
+}
+
 function scopeProvesUnaryFunctionResultNonNull(scope: QueryScope, funcid: number, argument: PgAnalyzerExpr): boolean {
   const location = varLocation(scope, unwrapValuePreservingExpr(argument))
   return Boolean(
@@ -2119,24 +2139,8 @@ function isEmptyJsonArrayConst(expr: PgAnalyzerExpr | null | undefined): boolean
 }
 
 function jsonBuildObjectArguments(expr: PgAnalyzerExpr): readonly PgAnalyzerExpr[] | null {
-  const args = expr.args?.map(targetExprFromAggregateArg)
-  if (!args || args.some((arg) => !arg)) {
-    return null
-  }
-
-  let objectArgs = args as readonly PgAnalyzerExpr[]
-  if (expr.funcVariadic === true) {
-    if (objectArgs.length !== 1) {
-      return null
-    }
-    const array = unwrapValuePreservingExpr(objectArgs[0])
-    if (!array || array.tag !== 'ArrayExpr' || array.multidims === true || !array.elements) {
-      return null
-    }
-    objectArgs = array.elements
-  }
-
-  return objectArgs.length % 2 === 0 ? objectArgs : null
+  const decoded = staticVariadicFunctionArguments(expr)
+  return decoded.kind === 'known' && decoded.arguments.length % 2 === 0 ? decoded.arguments : null
 }
 
 function jsonLeafShapeForExpr(
@@ -2194,6 +2198,31 @@ function jsonShapeForCaseArm(
   return unwrapped?.tag === 'Const' && unwrapped.constIsNull === true
     ? null
     : jsonShapeForExpr(catalog, arm.scope, arm.result, seen)
+}
+
+function jsonBuildArrayElementShape(
+  catalog: CatalogFacts,
+  scope: QueryScope,
+  expr: PgAnalyzerExpr,
+  seen: readonly VarLocation[]
+): TypedSqlPostgresIrJsonShape {
+  const decoded = staticVariadicFunctionArguments(expr)
+  if (decoded.kind === 'unavailable') {
+    return {
+      kind: 'opaque',
+      nullability: { kind: 'unknown', reason: 'dynamic_variadic_json_build_array_element' },
+    }
+  }
+
+  const [firstElementShape, ...remainingElementShapes] = decoded.arguments.map((argument) =>
+    jsonShapeForExpr(catalog, scope, argument, seen)
+  )
+  return firstElementShape
+    ? joinJsonShapes([firstElementShape, ...remainingElementShapes], firstElementShape)
+    : {
+        kind: 'opaque',
+        nullability: { basis: 'empty_json_build_array_element', kind: 'nonNull' },
+      }
 }
 
 function inferQueryOutputJsonShape(
@@ -2293,11 +2322,8 @@ function inferStructuredJsonShape(
         }
   }
 
-  if (
-    unwrapped.tag === 'FuncExpr' &&
-    (isBuiltinPgProcNamed(catalog, unwrapped.funcid, 'jsonb_build_object') ||
-      isBuiltinPgProcNamed(catalog, unwrapped.funcid, 'json_build_object'))
-  ) {
+  const jsonBuildKind = unwrapped.tag === 'FuncExpr' ? builtinJsonBuildKind(catalog, unwrapped) : null
+  if (jsonBuildKind === 'object') {
     const args = jsonBuildObjectArguments(unwrapped)
     if (!args) {
       return {
@@ -2327,6 +2353,14 @@ function inferStructuredJsonShape(
     return {
       fields: [...fields.values()],
       kind: 'object',
+      nullability: expressionNullability(catalog, scope, unwrapped, seen),
+    }
+  }
+
+  if (jsonBuildKind === 'array') {
+    return {
+      element: jsonBuildArrayElementShape(catalog, scope, unwrapped, seen),
+      kind: 'array',
       nullability: expressionNullability(catalog, scope, unwrapped, seen),
     }
   }

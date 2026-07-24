@@ -111,6 +111,186 @@ test('infers build-object shapes only from proven complete argument lists', asyn
   }
 })
 
+test('infers JSON build-array containers, elements, and variadic nullability without crossing opaque boundaries', async () => {
+  const database = await createAnalysisDatabase({ schemaFiles: [schemaFile] })
+  try {
+    await database.query(`
+      create table public.json_array_inputs (
+        nullable_entries text[],
+        required_entries text[] not null,
+        existing_payload jsonb
+      )
+    `)
+    await database.query(`
+      create function public.json_build_array(value text)
+      returns json
+      language sql
+      immutable
+      as $$ select pg_catalog.json_build_object('shadow', value) $$
+    `)
+    const result = await buildTypedSqlPostgresIrFromCompiledConfigs(database, [
+      config(
+        'jsonArrayObject',
+        "select pg_catalog.json_build_array(pg_catalog.json_build_object('id', 1, 'state', 'ready')) as payload"
+      ),
+      config(
+        'jsonbArrayObject',
+        "select pg_catalog.jsonb_build_array(pg_catalog.jsonb_build_object('id', 1, 'state', 'ready')) as payload"
+      ),
+      config('emptyJsonArray', 'select jsonb_build_array() as payload'),
+      config('nullableJsonArrayElement', 'select jsonb_build_array(null::text) as payload'),
+      config(
+        'heterogeneousJsonArray',
+        `select jsonb_build_array(
+          jsonb_build_object('state', 'ready'),
+          jsonb_build_object('state', 'missing', 'detail', null::text)
+        ) as payload`
+      ),
+      config(
+        'nestedJsonArray',
+        "select jsonb_build_object('items', jsonb_build_array(jsonb_build_object('id', 1))) as payload"
+      ),
+      config('ordinarySqlArrayElement', 'select jsonb_build_array(null::text[]) as payload'),
+      config('literalVariadicArray', "select jsonb_build_array(variadic array['a', 'b']) as payload"),
+      config('literalEmptyVariadicArray', 'select jsonb_build_array(variadic array[]::text[]) as payload'),
+      config('dynamicVariadicArray', 'select jsonb_build_array(variadic $1::text[]) as payload', ['entries']),
+      config('nullVariadicArray', 'select jsonb_build_array(variadic null::text[]) as payload'),
+      config(
+        'nullableColumnVariadicArray',
+        'select jsonb_build_array(variadic nullable_entries) as payload from public.json_array_inputs'
+      ),
+      config(
+        'requiredColumnVariadicArray',
+        'select jsonb_build_array(variadic required_entries) as payload from public.json_array_inputs'
+      ),
+      config(
+        'selectedJsonElement',
+        'select jsonb_build_array(existing_payload) as payload from public.json_array_inputs'
+      ),
+      config('dynamicObjectKeyElement', 'select jsonb_build_array(jsonb_build_object($1::text, 42)) as payload', [
+        'key',
+      ]),
+      config('shadowedBuildArray', "select public.json_build_array('value') as payload"),
+    ])
+    const column = (name: string) => {
+      const query = result.queries.find((candidate) => candidate.name === name)
+      assert.ok(query, `expected ${name}`)
+      const resolved = query.resultColumns[0]
+      assert.ok(resolved, `expected ${name} result column`)
+      return resolved
+    }
+
+    for (const name of ['jsonArrayObject', 'jsonbArrayObject']) {
+      const resolved = column(name)
+      assert.equal(resolved.nullability.kind, 'nonNull')
+      assert.equal(resolved.jsonShape?.kind, 'array')
+      if (resolved.jsonShape?.kind === 'array') {
+        assert.equal(resolved.jsonShape.nullability.kind, 'nonNull')
+        assert.equal(resolved.jsonShape.element.kind, 'object')
+        if (resolved.jsonShape.element.kind === 'object') {
+          assert.deepEqual(
+            resolved.jsonShape.element.fields.map((field) => field.name),
+            ['id', 'state']
+          )
+        }
+      }
+    }
+
+    const empty = column('emptyJsonArray').jsonShape
+    assert.equal(empty?.kind, 'array')
+    if (empty?.kind === 'array') {
+      assert.equal(empty.nullability.kind, 'nonNull')
+      assert.equal(empty.element.kind, 'opaque')
+      assert.equal(empty.element.nullability.kind, 'nonNull')
+    }
+
+    const nullableElement = column('nullableJsonArrayElement').jsonShape
+    assert.equal(nullableElement?.kind, 'array')
+    if (nullableElement?.kind === 'array') {
+      assert.equal(nullableElement.nullability.kind, 'nonNull')
+      assert.equal(nullableElement.element.nullability.kind, 'nullable')
+    }
+
+    const heterogeneous = column('heterogeneousJsonArray').jsonShape
+    assert.equal(heterogeneous?.kind, 'array')
+    if (heterogeneous?.kind === 'array') {
+      assert.equal(heterogeneous.element.kind, 'union')
+      assert.equal(heterogeneous.element.nullability.kind, 'nonNull')
+      if (heterogeneous.element.kind === 'union') {
+        assert.equal(heterogeneous.element.alternatives.length, 2)
+        assert.ok(heterogeneous.element.alternatives.every((alternative) => alternative.kind === 'object'))
+      }
+    }
+
+    const nested = column('nestedJsonArray').jsonShape
+    assert.equal(nested?.kind, 'object')
+    if (nested?.kind === 'object') {
+      const items = nested.fields.find((field) => field.name === 'items')?.shape
+      assert.equal(items?.kind, 'array')
+      assert.equal(items?.kind === 'array' ? items.element.kind : null, 'object')
+    }
+
+    const ordinarySqlArray = column('ordinarySqlArrayElement').jsonShape
+    assert.equal(ordinarySqlArray?.kind, 'array')
+    if (ordinarySqlArray?.kind === 'array') {
+      assert.equal(ordinarySqlArray.nullability.kind, 'nonNull')
+      assert.equal(ordinarySqlArray.element.kind, 'scalar')
+      assert.equal(ordinarySqlArray.element.nullability.kind, 'nullable')
+    }
+
+    const literalVariadic = column('literalVariadicArray').jsonShape
+    assert.equal(literalVariadic?.kind, 'array')
+    if (literalVariadic?.kind === 'array') {
+      assert.equal(literalVariadic.nullability.kind, 'nonNull')
+      assert.equal(literalVariadic.element.kind, 'union')
+    }
+
+    const literalEmptyVariadic = column('literalEmptyVariadicArray').jsonShape
+    assert.equal(literalEmptyVariadic?.kind, 'array')
+    if (literalEmptyVariadic?.kind === 'array') {
+      assert.equal(literalEmptyVariadic.nullability.kind, 'nonNull')
+      assert.equal(literalEmptyVariadic.element.kind, 'opaque')
+      assert.equal(literalEmptyVariadic.element.nullability.kind, 'nonNull')
+    }
+
+    const dynamicVariadic = column('dynamicVariadicArray').jsonShape
+    assert.equal(dynamicVariadic?.kind, 'array')
+    if (dynamicVariadic?.kind === 'array') {
+      assert.equal(dynamicVariadic.nullability.kind, 'unknown')
+      assert.equal(dynamicVariadic.element.kind, 'opaque')
+      assert.equal(dynamicVariadic.element.nullability.kind, 'unknown')
+    }
+
+    const nullVariadic = column('nullVariadicArray').jsonShape
+    assert.equal(nullVariadic?.kind, 'array')
+    assert.equal(nullVariadic?.nullability.kind, 'nullable')
+    assert.equal(column('nullableColumnVariadicArray').jsonShape?.nullability.kind, 'nullable')
+    assert.equal(column('requiredColumnVariadicArray').jsonShape?.nullability.kind, 'nonNull')
+
+    const selectedJson = column('selectedJsonElement').jsonShape
+    assert.equal(selectedJson?.kind, 'array')
+    assert.equal(selectedJson?.kind === 'array' ? selectedJson.element.kind : null, 'opaque')
+
+    const dynamicObjectKey = column('dynamicObjectKeyElement').jsonShape
+    assert.equal(dynamicObjectKey?.kind, 'array')
+    if (dynamicObjectKey?.kind === 'array') {
+      assert.equal(dynamicObjectKey.nullability.kind, 'nonNull')
+      assert.equal(dynamicObjectKey.element.kind, 'opaque')
+    }
+
+    assert.equal(column('shadowedBuildArray').jsonShape?.kind, 'opaque')
+
+    assert.deepEqual((await database.query('select json_build_array(null::text[]) as payload')).rows, [
+      { payload: [null] },
+    ])
+    assert.deepEqual((await database.query('select json_build_array(variadic null::text[]) as payload')).rows, [
+      { payload: null },
+    ])
+  } finally {
+    await database.close()
+  }
+})
+
 test('infers CASE JSON unions with scoped branch facts and exact string constants', async () => {
   const database = await createAnalysisDatabase({ schemaFiles: [schemaFile] })
   try {

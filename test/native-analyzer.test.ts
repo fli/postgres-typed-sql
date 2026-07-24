@@ -1652,6 +1652,21 @@ test('native analyzer closes SQL/XML conversion over reachable type output funct
 
 test('native analyzer preserves explicit variadic function-call structure', async () => {
   await withDatabase(async (database) => {
+    const emptyArrayCall = (await analyze(database, 'select jsonb_build_array()')).statements[0]?.queries[0]
+      ?.targetList[0]?.expr
+    assert.equal(emptyArrayCall?.tag, 'FuncExpr')
+    assert.equal(emptyArrayCall?.funcVariadic, false)
+    assert.deepEqual(emptyArrayCall?.args, [])
+
+    const ordinaryArrayCall = (await analyze(database, "select jsonb_build_array(array['answer', '42'])")).statements[0]
+      ?.queries[0]?.targetList[0]?.expr
+    assert.equal(ordinaryArrayCall?.tag, 'FuncExpr')
+    assert.equal(ordinaryArrayCall?.funcVariadic, false)
+    assert.equal(ordinaryArrayCall?.args?.length, 1)
+    assert.equal(ordinaryArrayCall?.args?.[0]?.tag, 'ArrayExpr')
+    assert.equal(ordinaryArrayCall?.args?.[0]?.multidims, false)
+    assert.equal(ordinaryArrayCall?.args?.[0]?.elements?.length, 2)
+
     const literalSql = "select jsonb_build_object(variadic array['answer', '42']) as payload"
     const literalAnalysis = await analyze(database, literalSql)
     const literalCall = literalAnalysis.statements[0]?.queries[0]?.targetList[0]?.expr
@@ -1673,6 +1688,28 @@ test('native analyzer preserves explicit variadic function-call structure', asyn
       ?.targetList[0]?.expr
     assert.equal(flatCall?.funcVariadic, false)
     assert.equal(flatCall?.args?.length, 2)
+
+    const literalArrayCall = (await analyze(database, "select jsonb_build_array(variadic array['answer', '42'])"))
+      .statements[0]?.queries[0]?.targetList[0]?.expr
+    assert.equal(literalArrayCall?.tag, 'FuncExpr')
+    assert.equal(literalArrayCall?.funcVariadic, true)
+    assert.equal(literalArrayCall?.args?.length, 1)
+    assert.equal(literalArrayCall?.args?.[0]?.tag, 'ArrayExpr')
+    assert.equal(literalArrayCall?.args?.[0]?.multidims, false)
+    assert.equal(literalArrayCall?.args?.[0]?.elements?.length, 2)
+
+    const dynamicArrayCall = (await analyze(database, 'select jsonb_build_array(variadic $1::text[])')).statements[0]
+      ?.queries[0]?.targetList[0]?.expr
+    assert.equal(dynamicArrayCall?.funcVariadic, true)
+    assert.equal(dynamicArrayCall?.args?.length, 1)
+    assert.equal(dynamicArrayCall?.args?.[0]?.tag, 'Param')
+
+    assert.deepEqual((await database.query('select json_build_array(null::text[]) as payload')).rows, [
+      { payload: [null] },
+    ])
+    assert.deepEqual((await database.query('select json_build_array(variadic null::text[]) as payload')).rows, [
+      { payload: null },
+    ])
   })
 })
 

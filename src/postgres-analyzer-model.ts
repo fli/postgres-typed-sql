@@ -235,6 +235,45 @@ export function unwrapValuePreservingExpr(expr: PgAnalyzerExpr | null | undefine
   return current
 }
 
+export type StaticVariadicFunctionArguments =
+  | {
+      readonly arguments: readonly PgAnalyzerExpr[]
+      readonly kind: 'known'
+    }
+  | {
+      readonly kind: 'unavailable'
+    }
+
+export function staticVariadicFunctionArguments(expr: PgAnalyzerExpr): StaticVariadicFunctionArguments {
+  if (expr.tag !== 'FuncExpr' || expr.truncated === true || typeof expr.funcVariadic !== 'boolean' || !expr.args) {
+    return { kind: 'unavailable' }
+  }
+
+  const args: PgAnalyzerExpr[] = []
+  for (const rawArgument of expr.args) {
+    const argument = targetExprFromAggregateArg(rawArgument)
+    if (!argument) {
+      return { kind: 'unavailable' }
+    }
+    args.push(argument)
+  }
+
+  if (expr.funcVariadic === false) {
+    return { arguments: args, kind: 'known' }
+  }
+  if (args.length !== 1) {
+    return { kind: 'unavailable' }
+  }
+
+  const array = unwrapValuePreservingExpr(args[0])
+  return array?.tag === 'ArrayExpr' &&
+    array.truncated !== true &&
+    array.multidims === false &&
+    array.elements !== undefined
+    ? { arguments: array.elements, kind: 'known' }
+    : { kind: 'unavailable' }
+}
+
 export function analyzerExprChildren(expr: PgAnalyzerExpr): readonly PgAnalyzerExpr[] {
   const children: PgAnalyzerExpr[] = []
   for (const key of ['arg', 'condition', 'defresult', 'elementExpr', 'expr', 'result', 'testExpr'] as const) {
