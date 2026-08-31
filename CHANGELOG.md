@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.1.0-beta.16
+
+- Added predicate narrowing for strict comparisons, supported inner-join conditions, boolean tests, CASE fallthrough,
+  outer-row presence, and matching aggregate expressions in HAVING, with SQL three-valued logic and DML row images
+  preserved. Finite text refinements compose through OR alternatives, exclusions, exact equality chains, CASE,
+  COALESCE, and derived outputs. Impossible predicates now prove empty results where the query form permits it.
+- Added audited non-null inference for mixed numeric arithmetic, text expressions, supported built-ins and casts,
+  DISTINCT FROM, NULLIF, PostgreSQL GREATEST/LEAST, and supported aggregates over known nonempty inputs. Matching
+  count-based HAVING predicates can establish aggregate input presence. Window rules cover safe lag/lead defaults,
+  ranking functions, and frames guaranteed to contain the current row.
+- Preserved row bounds through ordinary windows, DISTINCT/grouping, unique LEFT joins, bounded lateral subqueries,
+  immutable unique-key lookup expressions, and constant OFFSET values. Added projected CTE/subquery keys, finite
+  IN/OR lookups, finite grouping domains, and guarded partial/expression/NULLS NOT DISTINCT unique-index proofs.
+- Preserved structured JSON through general COALESCE, scalar/array/base-row JSON conversion, supported known-object
+  projections and concatenation, and aggregate FILTER predicates. Constant JSON values, paths, positional array
+  access, and known-object deletion preserve shapes while tracking JSON null separately from SQL NULL.
+  Known JSON literal objects now participate in the configured structured field naming and runtime key mapping.
+- Refined proven one-dimensional SQL array constructors and scalar ARRAY subqueries to readonly arrays with inferred
+  element nullability under the exact built-in node-postgres profile. Custom codecs and unknown array shapes retain
+  their existing contracts. These shape proofs now propagate through CTEs, subqueries, CASE, and COALESCE.
+- Validated, enforced, inheritable CHECK constraints can establish result non-nullability when they reject NULL;
+  CHECK expressions that merely evaluate to UNKNOWN do not.
+- Native analyzer schema 12 carries the additional expression, aggregate, window, JSON, and grouping evidence. Regenerate checked-in
+  typed SQL output to adopt the more precise result types and cardinality contracts.
+- Fixed correlated RETURNING row-image availability and guarded reuse of UPDATE input predicates when triggers,
+  inherited targets, or generated columns can change an unassigned result value.
+
 ## 0.1.0-beta.15
 
 - Added bundled analysis support for the `citext`, `hstore`, and `pg_stat_statements` extensions.

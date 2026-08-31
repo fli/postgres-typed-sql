@@ -22,11 +22,15 @@ export interface PgAnalyzerQuery {
   readonly dmlDirectAssignments: readonly PgAnalyzerDmlDirectAssignment[]
   readonly dmlParameterNullAdmissions: readonly PgAnalyzerDmlParameterNullAdmission[]
   readonly distinctClauseCount?: number
+  readonly distinctExpressions?: readonly PgAnalyzerExpr[]
   readonly fromTree: PgAnalyzerFromNode | null
   readonly groupClauseCount?: number
+  readonly groupExpressions?: readonly PgAnalyzerExpr[]
   readonly groupingSetsCount?: number
   readonly hasAggs?: boolean
+  readonly hasDistinctOn?: boolean
   readonly hasHavingQual?: boolean
+  readonly havingQual?: PgAnalyzerExpr | null
   readonly hasLimitOffset?: boolean
   readonly hasLimitCount?: boolean
   readonly hasModifyingCTE?: boolean
@@ -36,6 +40,7 @@ export interface PgAnalyzerQuery {
   readonly hasVolatileFunctions?: boolean
   readonly hasWindowFuncs?: boolean
   readonly limitCount?: PgAnalyzerExpr | null
+  readonly limitOffset?: PgAnalyzerExpr | null
   readonly limitWithTies?: boolean
   readonly returningList?: readonly PgAnalyzerTarget[]
   readonly resultRelation?: number
@@ -168,13 +173,25 @@ export type PgAnalyzerFromNode =
     }
 
 export interface PgAnalyzerExpr {
+  readonly aggDistinctCount?: number
+  readonly aggOrderCount?: number
+  readonly aggfilter?: PgAnalyzerExpr | null
   readonly aggfnoid?: number
+  readonly agglevelsup?: number
   readonly aggname?: string
+  readonly aggstar?: boolean
+  readonly alwaysNonNull?: boolean
   readonly arg?: PgAnalyzerExpr | null
-  readonly args?: readonly (PgAnalyzerExpr | { readonly expr?: PgAnalyzerExpr | null })[]
+  readonly argIsRow?: boolean
+  readonly args?: readonly (PgAnalyzerExpr | PgAnalyzerTarget)[]
   readonly attname?: string
   readonly boolOp?: string
+  readonly boolTestType?: string
+  readonly constBoolean?: boolean
   readonly constInteger?: string
+  readonly constJson?: string
+  /** Complete direct text[] constants, restricted to at most one dimension and 256 elements. */
+  readonly constTextArray?: readonly (string | null)[]
   readonly constEmptyJsonArray?: boolean
   readonly constIsNull?: boolean
   readonly constString?: string
@@ -190,6 +207,9 @@ export interface PgAnalyzerExpr {
   readonly funcVariadic?: boolean
   readonly inputCollationOid?: number
   readonly inputFunctionOid?: number
+  readonly isImmutable?: boolean
+  readonly isStrict?: boolean
+  readonly minMaxOp?: 'GREATEST' | 'LEAST'
   readonly multidims?: boolean
   readonly nullTestType?: string
   readonly nullInputProducesNull?: boolean
@@ -203,19 +223,29 @@ export interface PgAnalyzerExpr {
   readonly relid?: number
   readonly relname?: string | null
   readonly result?: PgAnalyzerExpr | null
+  readonly returnsSet?: boolean
+  readonly sqlValueFunction?: string
   readonly subLinkType?: string
   readonly subquery?: PgAnalyzerQuery | null
   readonly tag: string
   readonly testExpr?: PgAnalyzerExpr | null
+  readonly textEqualityIsExact?: boolean
+  readonly textInequalityIsExact?: boolean
   readonly truncated?: boolean
   readonly typeName?: string
   readonly typeOid?: number
+  readonly useOr?: boolean
   readonly varattno?: number
   readonly varlevelsup?: number
   readonly varno?: number
   readonly varnullingrels?: readonly number[]
   readonly varreturningtype?: 'DEFAULT' | 'NEW' | 'OLD' | 'UNRECOGNIZED'
   readonly whenClauses?: readonly PgAnalyzerExpr[]
+  readonly winagg?: boolean
+  readonly winfnoid?: number
+  readonly winname?: string
+  readonly windowFrameIncludesCurrentRow?: boolean
+  readonly winref?: number
 }
 
 export function targetExprFromAggregateArg(
@@ -276,7 +306,16 @@ export function staticVariadicFunctionArguments(expr: PgAnalyzerExpr): StaticVar
 
 export function analyzerExprChildren(expr: PgAnalyzerExpr): readonly PgAnalyzerExpr[] {
   const children: PgAnalyzerExpr[] = []
-  for (const key of ['arg', 'condition', 'defresult', 'elementExpr', 'expr', 'result', 'testExpr'] as const) {
+  for (const key of [
+    'aggfilter',
+    'arg',
+    'condition',
+    'defresult',
+    'elementExpr',
+    'expr',
+    'result',
+    'testExpr',
+  ] as const) {
     const child = expr[key]
     if (child) {
       children.push(child)

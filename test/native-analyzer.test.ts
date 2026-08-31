@@ -225,7 +225,7 @@ testWithDatabase('native analyzer exposes the versioned PostgreSQL query envelop
     'select exists(select 1) as present from generate_series(1, 2) generated(n) cross join (values (1)) value(n) limit $1'
   )
 
-  assert.equal(analysis.schemaVersion, 10)
+  assert.equal(analysis.schemaVersion, 12)
   assert.equal(analysis.postgresVersionNum, 180003)
   assert.equal(analysis.rawStatementCount, 1)
   assert.deepEqual(analysis.paramTypeOids, [20])
@@ -311,7 +311,7 @@ testWithDatabase('native analyzer emits canonical PostgreSQL coercion nullabilit
     assert.equal(expression.tag, 'FuncExpr')
     assert.equal(expression.coercionForm, 'EXPLICIT_CAST')
     assert.equal(expression.nullInputProducesNull, true)
-    assert.equal(expression.nonNullInputProducesNonNull, false)
+    assert.equal(expression.nonNullInputProducesNonNull, true)
   }
 
   for (const expression of expressions.slice(6, 8)) {
@@ -380,6 +380,20 @@ testWithDatabase('native analyzer emits canonical PostgreSQL coercion nullabilit
   assert.equal(rowtypeCoercion?.coercionForm, 'EXPLICIT_CAST')
   assert.equal(rowtypeCoercion?.nullInputProducesNull, true)
   assert.equal(rowtypeCoercion?.nonNullInputProducesNonNull, true)
+
+  await database.query("create type public.opaque_coercion_source as enum ('value')")
+  await database.query(`create function public.opaque_to_integer(public.opaque_coercion_source) returns integer
+      language sql immutable strict as 'select null::integer'`)
+  await database.query(`create cast (public.opaque_coercion_source as integer)
+      with function public.opaque_to_integer(public.opaque_coercion_source)`)
+  const opaqueSql = "select 'value'::public.opaque_coercion_source::integer as value"
+  const opaqueAnalysis = await analyze(database, opaqueSql)
+  const opaqueCoercion = opaqueAnalysis.statements[0]?.queries[0]?.targetList[0]?.expr
+  assert.equal(opaqueCoercion?.tag, 'FuncExpr')
+  assert.equal(opaqueCoercion?.coercionForm, 'EXPLICIT_CAST')
+  assert.equal(opaqueCoercion?.nullInputProducesNull, true)
+  assert.equal(opaqueCoercion?.nonNullInputProducesNonNull, false)
+  assert.deepEqual((await database.query(opaqueSql)).rows, [{ value: null }])
 })
 
 testWithDatabase('native analyzer exposes PostgreSQL-authoritative immediate RTE outputs', async (database) => {

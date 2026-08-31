@@ -155,6 +155,39 @@ Structured JSON field naming requires a codec profile with `structuredJson: true
 
 Structured JSON fields use the same predicate-aware nullability analysis as top-level result expressions. For PostgreSQL ranges, `lower(value)` is non-null only when the active predicate proves that the range is nonempty and has a finite lower bound; `upper(value)` uses the corresponding upper-bound proof. `not isempty(value)` alone is insufficient because a nonempty range may still be unbounded.
 
+Predicate analysis also uses strict comparisons, supported inner-join conditions, boolean tests, and CASE fallthrough.
+For example, `WHERE score > 0` proves that a selected `score` is non-null, and
+`CASE WHEN score IS NULL THEN 0 ELSE score END` is non-null. An ELSE branch can still include SQL UNKNOWN: the
+analysis does not treat failure to satisfy a condition as proof that the condition is false. Outer-join ON conditions
+do not constrain preserved rows. A predicate proving that a joined row exists can recover that row's declared
+non-null columns without removing nullability from its genuinely nullable columns.
+`RETURNING` keeps OLD and NEW row images separate, including inside correlated subqueries. Reusing an UPDATE input
+predicate for an unchanged NEW value also requires catalog evidence that triggers, inherited targets, and generated
+columns cannot rewrite that value.
+
+Exact text predicates also compose: `a = b AND b = 'ready'` refines both values to `'ready'`, while
+`a = 'ready' OR a = 'queued'` produces their literal union. Exclusions can narrow an existing CHECK domain.
+Repeated proven conditions remove unreachable CASE arms, and contradictory qualifiers can establish an empty result.
+Validated, enforced, inheritable CHECK constraints such as `CHECK (value IS NOT NULL)` also establish result
+non-nullability. `CHECK (value > 0)` does not, because SQL UNKNOWN satisfies a CHECK.
+
+Common integer, numeric, and floating-point arithmetic and casts, text functions, supported windows, PostgreSQL `GREATEST`/`LEAST`, and selected
+aggregates have audited nullability rules. These rules use PostgreSQL function identities; declaring an arbitrary
+function `STRICT` does not prove that it returns a non-null value for non-null arguments. Aggregate inference keeps
+ordinary nonempty groups separate from empty global inputs, grouping sets, and filters that can remove every input.
+Known nonempty VALUES inputs and matching `HAVING count(value) > 0` predicates provide additional aggregate proofs.
+Window inference uses native frame metadata; frames that may be empty or exclude the current row remain conservative.
+Supported lag/lead defaults must cover both the value and an absent row, and a NULL offset still permits a NULL result.
+CASE facts about the current row do not constrain values fetched from other rows by window functions.
+
+Known JSON shapes survive general `COALESCE`, supported `to_json`/`to_jsonb` conversions, literal-key object
+projections, and concatenation of known JSON objects. Object concatenation uses the right operand's value for duplicate
+keys. Aggregate FILTER predicates refine the modeled element shape. Constant JSON literals, known constant paths and
+array positions, and deletion of known object keys preserve structural information. SQL NULL and JSON null are tracked
+separately, so `COALESCE` cannot incorrectly erase a JSON null value. Custom codecs retain their declared contracts.
+Known JSON literal objects also participate in `naming.structuredJsonFields` and the corresponding runtime key mapping;
+the default `preserve` setting keeps their original keys.
+
 ## Codec profiles
 
 Drivers choose how PostgreSQL values become JavaScript values, and applications can replace those parsers. Postgres Typed SQL therefore does not claim one universal decoded scalar type.
@@ -162,6 +195,13 @@ Drivers choose how PostgreSQL values become JavaScript values, and applications 
 The default `conservative` profile emits `unknown` for parameter and result scalar values. It is safe when the generator does not know the driver's conversion rules.
 
 Set `codecProfile: 'node-postgres'` only when execution uses the `pg-types` 2.2.0 default text-parser contract used by the supported node-postgres 8.x releases. This profile models parsed JSON, JavaScript numbers for the built-in integer and floating-point parsers, structural objects for `point`, `circle`, and `interval`, strings for scalar `bigint` and `numeric` values, and `Date | number` for `date`/`timestamp`/`timestamptz` because PostgreSQL infinity values decode to numeric infinities. In contrast to scalar `numeric`, the registered `numeric[]` parser applies `parseFloat` to each non-NULL element, so generated `numeric[]` results contain JavaScript numbers and can lose decimal precision. Registered built-in array results use a recursive `PgArray<T>` type that includes multidimensional arrays and SQL `NULL` elements. Unregistered result OIDs—including user-defined enum and domain arrays, composites, and ranges—use node-postgres's raw-string fallback; scalar enums are narrowed to their database labels. PostgreSQL reports scalar domains using their recursively resolved base result type, so a domain over `integer` is a number while a domain over `integer[]` uses the registered array parser. Comma-delimited array parameters use `PgArrayParameter<T> | string`: the array form accepts one-dimensional JavaScript arrays and SQL `NULL` elements, while a serialized PostgreSQL array-literal string is the escape hatch for valid multidimensional values. Nested JavaScript arrays are excluded because TypeScript cannot prove that their dimensions are rectangular or rule out `NULL` subarrays. Non-comma-delimited arrays use serialized strings, domains over arrays use one serialized string per outer element, and `bytea[]` elements use `PgByteaHexString` for compatibility across supported node-postgres 8.x releases. Interval objects and temporal infinity numbers can be passed back as parameters. Root `json`/`jsonb` parameters follow node-postgres serialization: objects are JSON-stringified, while JSON arrays, JSON strings, and JSON null should be supplied as serialized JSON text because root JavaScript arrays and `null` mean PostgreSQL arrays and SQL `NULL`. If the application installs custom type parsers, uses binary result mode, or uses a node-postgres release with a different default parser table, use the conservative profile unless those parser results still match the generated contract.
+
+Under the exact built-in node-postgres profile, SQL array expressions with a proven single dimension can use a
+narrower readonly array type. For example, `ARRAY[1, 2]` produces `readonly number[]`, while nullable elements remain
+in the element union. Scalar `ARRAY(SELECT ...)` expressions can use the same refinement. Array columns with unknown
+dimensions, nested array expressions, unregistered array decoders, and custom codec profiles keep their existing
+types. Proofs propagate through CTEs, derived outputs, CASE, and COALESCE only when every reachable non-null alternative
+has a known shape. Element types follow the array decoder, including the numeric-array parser's number representation.
 
 ### Custom codecs and OIDs
 
@@ -254,6 +294,16 @@ Parameter type annotations are intentionally unsupported. Move type information 
 Prefer contextual inference from columns, function signatures, operators, `VALUES`, DML targets, and other ordinary SQL constructs. Add casts only where they express an actual SQL type boundary or resolve an ambiguity. Typemods such as `varchar(100)` are authored SQL semantics rather than parameter metadata and must be migrated deliberately; do not assume that a base-type cast preserves typemod behavior.
 
 Generated cardinality is derived from the analyzer's row bounds. At-most-one proofs include direct primary/unique-key lookups and supported inner-join chains in which every relation is determined through primary or unique keys. A `rowBounds.max` value of `null` means that analysis did not prove a finite upper bound, not that execution is known to produce multiple rows; the public contract remains conservatively `many`.
+
+Bounds also compose through ordinary window functions, supported DISTINCT and grouping, directional LEFT joins with
+unique matches, and bounded lateral subqueries. Unique-key lookups may use supported immutable expressions over
+parameters and constants, such as `email = lower(:email)`. Constant OFFSET values reduce proven bounds before LIMIT
+is applied. Set-returning expressions, grouping sets, unsupported join forms, and volatile lookup expressions retain
+conservative bounds.
+Simple CTEs and subqueries can retain projected candidate keys. Finite IN/OR alternatives and finite DISTINCT/GROUP BY
+domains can establish upper bounds greater than one. Partial and expression indexes are usable only when their native
+expressions and predicates match the supported proof rules; NULL lookups require `NULLS NOT DISTINCT`. Operator-family,
+collation, index validity, and inheritance checks still apply.
 
 ## Schema input
 

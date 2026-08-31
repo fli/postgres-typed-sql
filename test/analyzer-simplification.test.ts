@@ -29,7 +29,12 @@ testWithDatabase('preserves uniqueness proofs and source bounds across shared in
       ['id'],
       { max: null, min: 0, proof: 'unbounded' },
     ],
-    ['computed', 'select id from proof_parent where id = $1 + 1', ['id'], { max: null, min: 0, proof: 'unbounded' }],
+    [
+      'computed',
+      'select id from proof_parent where id = $1 + 1',
+      ['id'],
+      { max: 1, min: 0, proof: 'primary_key_equality:proof_parent_pkey' },
+    ],
     [
       'joined',
       `select child.label from proof_parent parent join proof_child child

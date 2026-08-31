@@ -170,7 +170,7 @@ testWithDatabase(
         assert.ok(error instanceof Error)
         assert.ok(!(error instanceof AggregateError))
         assert.match(error.message, /queries\/staleAnalyzerFirst\.typed\.sql/u)
-        assert.match(error.message, /analyzer returned unsupported schema version 6; expected 10/u)
+        assert.match(error.message, /analyzer returned unsupported schema version 6; expected 12/u)
         return true
       }
     )
@@ -563,7 +563,10 @@ testWithDatabase(
       evidence: 'coalesce_all_arms_nullable',
       kind: 'nullable',
     })
-    assert.equal(column('fullUsing').checkConstraintType, undefined)
+    assert.deepEqual(column('fullUsing').checkConstraintType, {
+      kind: 'literalUnion',
+      labels: ['left', 'right'],
+    })
 
     assert.equal(column('groupOutput').nullability.kind, 'nonNull')
     assert.deepEqual(column('groupOutput').checkConstraintType, leftCheck)
@@ -725,9 +728,9 @@ testWithDatabase('composes canonical row bounds with scalar EXPR subquery output
     proof: 'subquery_projection:values_5_rows+constant_fetch_with_ties_2',
   })
   assert.deepEqual(query('offsetValues').rowBounds, {
-    max: 2,
-    min: 0,
-    proof: 'values_2_rows+offset_can_drop_rows',
+    max: 1,
+    min: 1,
+    proof: 'values_2_rows+constant_offset_1',
   })
   assert.deepEqual(query('dynamicLimitedValues').rowBounds, {
     max: 2,
@@ -906,7 +909,7 @@ testWithDatabase(
         { evidence: 'nullable_column:coercion_probe.nullable_integer', kind: 'nullable' },
         { basis: 'not_null_column:coercion_probe.required_integer', kind: 'nonNull' },
         { evidence: 'nullable_column:coercion_probe.nullable_integer', kind: 'nullable' },
-        { kind: 'unknown', reason: 'opaque_non_null_coercion:FuncExpr' },
+        { basis: 'not_null_column:coercion_probe.required_integer', kind: 'nonNull' },
         { evidence: 'nullable_column:coercion_probe.nullable_integer', kind: 'nullable' },
         { basis: 'not_null_column:coercion_probe.required_integer', kind: 'nonNull' },
         { evidence: 'nullable_column:coercion_probe.nullable_integer', kind: 'nullable' },
@@ -995,7 +998,7 @@ testWithDatabase(
         corrupt(analysis) {
           analysis.schemaVersion = 6
         },
-        error: /analyzer returned unsupported schema version 6; expected 10/u,
+        error: /analyzer returned unsupported schema version 6; expected 12/u,
         name: 'staleSchema',
         sql: 'select account.id from public.accounts account',
       },
@@ -1531,7 +1534,7 @@ testWithDatabase(
         `select jsonb_build_object(
            'role', role,
            'status', status,
-           'scores', array[]::public.account_score[]
+           'scores', array[1::public.account_score]
          ) as value
          from public.accounts`
       ),
@@ -1630,9 +1633,9 @@ testWithDatabase(
     })
     assert.deepEqual(query('noFromSelect').rowBounds, { max: 1, min: 1, proof: 'select_without_from' })
     assert.deepEqual(query('noFromHaving').rowBounds, {
-      max: 1,
+      max: 0,
       min: 0,
-      proof: 'select_without_from_with_qual',
+      proof: 'contradictory_qual',
     })
     assert.deepEqual(query('noFromGroupingSets').rowBounds, {
       max: null,
@@ -1645,9 +1648,9 @@ testWithDatabase(
       proof: 'select_without_from',
     })
     assert.deepEqual(query('zeroColumnNoFromHaving').rowBounds, {
-      max: 1,
+      max: 0,
       min: 0,
-      proof: 'select_without_from_with_qual',
+      proof: 'contradictory_qual',
     })
     assert.deepEqual(query('zeroColumnNoFromGroupingSets').rowBounds, {
       max: null,
@@ -1731,11 +1734,13 @@ testWithDatabase(
           labels: ['member', 'admin'],
         })
       }
-      assert.equal(scoresShape?.kind, 'scalar')
-      if (scoresShape?.kind === 'scalar') {
-        assert.equal(scoresShape.pgTypeKind, 'array')
-        assert.equal(scoresShape.pgArrayElementType?.pgTypeKind, 'domain')
-        assert.equal(scoresShape.pgArrayElementType?.pgBaseType?.pgTypeName, 'int4')
+      assert.equal(scoresShape?.kind, 'array')
+      if (scoresShape?.kind === 'array') {
+        assert.equal(scoresShape.element.kind, 'scalar')
+        if (scoresShape.element.kind === 'scalar') {
+          assert.equal(scoresShape.element.pgTypeKind, 'domain')
+          assert.equal(scoresShape.element.pgBaseType?.pgTypeName, 'int4')
+        }
       }
       assert.equal(statusShape?.kind, 'scalar')
       if (statusShape?.kind === 'scalar') {
