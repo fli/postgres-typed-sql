@@ -1,17 +1,13 @@
 import assert from 'node:assert/strict'
-import { resolve } from 'node:path'
-import test from 'node:test'
 
 import {
   buildTypedSqlPostgresIrFromCompiledConfigs,
   type TypedSqlPostgresIr,
   type TypedSqlPostgresIrColumn,
-  type TypedSqlPostgresIrCompiledConfig,
 } from '../src/analyzer-ir.js'
 import type { PostgresQueryable } from '../src/database.js'
-import { createAnalysisDatabase } from '../src/engine.js'
 
-const schemaFile = resolve(import.meta.dirname, 'fixtures/schema.sql')
+import { analysisConfig as config, testWithDatabase } from './analyzer-test-support.js'
 
 type IsExactly<Left, Right> =
   (<Value>() => Value extends Left ? 1 : 2) extends <Value>() => Value extends Right ? 1 : 2 ? true : false
@@ -25,15 +21,6 @@ type AnalyzerExpressionSourceIsRequired = AssertTrue<
 type AnalyzerSourceIsAbsent = AssertTrue<IsExactly<Extract<keyof TypedSqlPostgresIrColumn, 'source'>, never>>
 
 const analyzerSourceTypeAssertions: [AnalyzerExpressionSourceIsRequired, AnalyzerSourceIsAbsent] = [true, true]
-
-function config(name: string, sql: string, parameterNames: readonly string[] = []): TypedSqlPostgresIrCompiledConfig {
-  return {
-    name,
-    parameterNames,
-    sourceFile: `queries/${name}.typed.sql`,
-    sql,
-  }
-}
 
 type MutableEnvelopeObject = Record<string, unknown>
 
@@ -71,9 +58,9 @@ function firstEnvelopeQuery(analysis: MutableEnvelopeObject): MutableEnvelopeObj
   return envelopeObject(envelopeArray(statement.queries)[0])
 }
 
-test('aggregates probe-gated analyzer rejections in config order without loading shared catalog facts', async () => {
-  const database = await createAnalysisDatabase({ schemaFiles: [schemaFile] })
-  try {
+testWithDatabase(
+  'aggregates probe-gated analyzer rejections in config order without loading shared catalog facts',
+  async (database) => {
     const analyzerInvocations: string[] = []
     let sharedCatalogQueries = 0
     const observedClient: PostgresQueryable = {
@@ -127,47 +114,40 @@ test('aggregates probe-gated analyzer rejections in config order without loading
       1
     )
     assert.equal(sharedCatalogQueries, 0)
-  } finally {
-    await database.close()
   }
-})
+)
 
-test('aggregates source-policy failures without probing the healthy analyzer', async () => {
-  const database = await createAnalysisDatabase({ schemaFiles: [schemaFile] })
-  try {
-    const analyzerInvocations: string[] = []
-    const observedClient: PostgresQueryable = {
-      async query<Row>(text: string, params?: readonly unknown[]) {
-        if (text.includes('postgres_typed_sql_analyze')) {
-          analyzerInvocations.push(text)
-        }
-        return database.query<Row>(text, params)
-      },
-    }
-
-    await assert.rejects(
-      buildTypedSqlPostgresIrFromCompiledConfigs(observedClient, [
-        config('multipleStatements', 'select 1; select 2'),
-        config('unsupportedShow', 'show timezone'),
-      ]),
-      (error: unknown) => {
-        assert.ok(error instanceof AggregateError)
-        assert.equal(error.errors.length, 2)
-        assert.match(String(error.errors[0]), /typed SQL must contain exactly one PostgreSQL statement; received 2/u)
-        assert.match(String(error.errors[1]), /PostgreSQL SHOW utility statements are not supported/u)
-        return true
+testWithDatabase('aggregates source-policy failures without probing the healthy analyzer', async (database) => {
+  const analyzerInvocations: string[] = []
+  const observedClient: PostgresQueryable = {
+    async query<Row>(text: string, params?: readonly unknown[]) {
+      if (text.includes('postgres_typed_sql_analyze')) {
+        analyzerInvocations.push(text)
       }
-    )
-
-    assert.equal(analyzerInvocations.length, 2)
-  } finally {
-    await database.close()
+      return database.query<Row>(text, params)
+    },
   }
+
+  await assert.rejects(
+    buildTypedSqlPostgresIrFromCompiledConfigs(observedClient, [
+      config('multipleStatements', 'select 1; select 2'),
+      config('unsupportedShow', 'show timezone'),
+    ]),
+    (error: unknown) => {
+      assert.ok(error instanceof AggregateError)
+      assert.equal(error.errors.length, 2)
+      assert.match(String(error.errors[0]), /typed SQL must contain exactly one PostgreSQL statement; received 2/u)
+      assert.match(String(error.errors[1]), /PostgreSQL SHOW utility statements are not supported/u)
+      return true
+    }
+  )
+
+  assert.equal(analyzerInvocations.length, 2)
 })
 
-test('stops after an invalid analyzer envelope instead of multiplying a batch-fatal failure', async () => {
-  const database = await createAnalysisDatabase({ schemaFiles: [schemaFile] })
-  try {
+testWithDatabase(
+  'stops after an invalid analyzer envelope instead of multiplying a batch-fatal failure',
+  async (database) => {
     let analyzerInvocations = 0
     const corrupted = corruptAnalyzerEnvelope(database, (analysis) => {
       analysis.schemaVersion = 6
@@ -195,51 +175,44 @@ test('stops after an invalid analyzer envelope instead of multiplying a batch-fa
       }
     )
     assert.equal(analyzerInvocations, 1)
-  } finally {
-    await database.close()
   }
-})
+)
 
-test('makes a failed native analyzer probe batch-fatal with both diagnostics visible', async () => {
-  const database = await createAnalysisDatabase({ schemaFiles: [schemaFile] })
-  try {
-    await database.query('drop function pg_temp.postgres_typed_sql_analyze(text)')
-    let analyzerInvocations = 0
-    const observedClient: PostgresQueryable = {
-      async query<Row>(text: string, params?: readonly unknown[]) {
-        if (text.includes('postgres_typed_sql_analyze')) {
-          analyzerInvocations += 1
-        }
-        return database.query<Row>(text, params)
-      },
-    }
-
-    await assert.rejects(
-      buildTypedSqlPostgresIrFromCompiledConfigs(observedClient, [
-        config('unavailableAnalyzerFirst', 'select 1'),
-        config('unavailableAnalyzerSecond', 'select 2'),
-      ]),
-      (error: unknown) => {
-        assert.ok(error instanceof Error)
-        assert.ok(!(error instanceof AggregateError))
-        assert.ok(error.cause instanceof AggregateError)
-        assert.equal(error.cause.errors.length, 2)
-        assert.match(error.message, /queries\/unavailableAnalyzerFirst\.typed\.sql/u)
-        assert.match(error.message, /native analyzer health probe failed/u)
-        assert.match(error.message, /Original invocation: .*postgres_typed_sql_analyze/u)
-        assert.match(error.message, /Health probe: .*postgres_typed_sql_analyze/u)
-        return true
+testWithDatabase('makes a failed native analyzer probe batch-fatal with both diagnostics visible', async (database) => {
+  await database.query('drop function pg_temp.postgres_typed_sql_analyze(text)')
+  let analyzerInvocations = 0
+  const observedClient: PostgresQueryable = {
+    async query<Row>(text: string, params?: readonly unknown[]) {
+      if (text.includes('postgres_typed_sql_analyze')) {
+        analyzerInvocations += 1
       }
-    )
-    assert.equal(analyzerInvocations, 2)
-  } finally {
-    await database.close()
+      return database.query<Row>(text, params)
+    },
   }
+
+  await assert.rejects(
+    buildTypedSqlPostgresIrFromCompiledConfigs(observedClient, [
+      config('unavailableAnalyzerFirst', 'select 1'),
+      config('unavailableAnalyzerSecond', 'select 2'),
+    ]),
+    (error: unknown) => {
+      assert.ok(error instanceof Error)
+      assert.ok(!(error instanceof AggregateError))
+      assert.ok(error.cause instanceof AggregateError)
+      assert.equal(error.cause.errors.length, 2)
+      assert.match(error.message, /queries\/unavailableAnalyzerFirst\.typed\.sql/u)
+      assert.match(error.message, /native analyzer health probe failed/u)
+      assert.match(error.message, /Original invocation: .*postgres_typed_sql_analyze/u)
+      assert.match(error.message, /Health probe: .*postgres_typed_sql_analyze/u)
+      return true
+    }
+  )
+  assert.equal(analyzerInvocations, 2)
 })
 
-test('discards earlier recoverable failures when a later session boundary is batch-fatal', async () => {
-  const database = await createAnalysisDatabase({ schemaFiles: [schemaFile] })
-  try {
+testWithDatabase(
+  'discards earlier recoverable failures when a later session boundary is batch-fatal',
+  async (database) => {
     let parameterFreeBoundaries = 0
     let analyzerInvocations = 0
     const observedClient: PostgresQueryable = {
@@ -275,50 +248,43 @@ test('discards earlier recoverable failures when a later session boundary is bat
 
     assert.equal(parameterFreeBoundaries, 3)
     assert.equal(analyzerInvocations, 2)
-  } finally {
-    await database.close()
   }
-})
+)
 
-test('indents multiline analyzer failures while preserving child causes', async () => {
-  const database = await createAnalysisDatabase({ schemaFiles: [schemaFile] })
-  try {
-    const firstCause = new Error('first rejection\nDETAIL: first detail')
-    const secondCause = new Error('second rejection\nHINT: second hint')
-    const observedClient: PostgresQueryable = {
-      async query<Row>(text: string, params?: readonly unknown[]) {
-        if (text.includes('$postgres_typed_sql$select 1001$postgres_typed_sql$')) {
-          throw firstCause
-        }
-        if (text.includes('$postgres_typed_sql$select 1002$postgres_typed_sql$')) {
-          throw secondCause
-        }
-        return database.query<Row>(text, params)
-      },
-    }
-
-    await assert.rejects(
-      buildTypedSqlPostgresIrFromCompiledConfigs(observedClient, [
-        config('firstMultiline', 'select 1001'),
-        config('secondMultiline', 'select 1002'),
-      ]),
-      (error: unknown) => {
-        assert.ok(error instanceof AggregateError)
-        assert.equal((error.errors[0] as Error).cause, firstCause)
-        assert.equal((error.errors[1] as Error).cause, secondCause)
-        assert.match(error.message, /\n {3}DETAIL: first detail\n2\. queries\/secondMultiline/u)
-        assert.match(error.message, /\n {3}HINT: second hint$/u)
-        return true
+testWithDatabase('indents multiline analyzer failures while preserving child causes', async (database) => {
+  const firstCause = new Error('first rejection\nDETAIL: first detail')
+  const secondCause = new Error('second rejection\nHINT: second hint')
+  const observedClient: PostgresQueryable = {
+    async query<Row>(text: string, params?: readonly unknown[]) {
+      if (text.includes('$postgres_typed_sql$select 1001$postgres_typed_sql$')) {
+        throw firstCause
       }
-    )
-  } finally {
-    await database.close()
+      if (text.includes('$postgres_typed_sql$select 1002$postgres_typed_sql$')) {
+        throw secondCause
+      }
+      return database.query<Row>(text, params)
+    },
   }
+
+  await assert.rejects(
+    buildTypedSqlPostgresIrFromCompiledConfigs(observedClient, [
+      config('firstMultiline', 'select 1001'),
+      config('secondMultiline', 'select 1002'),
+    ]),
+    (error: unknown) => {
+      assert.ok(error instanceof AggregateError)
+      assert.equal((error.errors[0] as Error).cause, firstCause)
+      assert.equal((error.errors[1] as Error).cause, secondCause)
+      assert.match(error.message, /\n {3}DETAIL: first detail\n2\. queries\/secondMultiline/u)
+      assert.match(error.message, /\n {3}HINT: second hint$/u)
+      return true
+    }
+  )
 })
 
-test('preserves singular parameterized analysis error shape and cause after a successful probe', async () => {
-  const database = await createAnalysisDatabase({ schemaFiles: [schemaFile] })
-  try {
+testWithDatabase(
+  'preserves singular parameterized analysis error shape and cause after a successful probe',
+  async (database) => {
     const cause = new Error('singular rejection')
     const observedClient: PostgresQueryable = {
       async query<Row>(text: string, params?: readonly unknown[]) {
@@ -344,14 +310,12 @@ test('preserves singular parameterized analysis error shape and cause after a su
         return true
       }
     )
-  } finally {
-    await database.close()
   }
-})
+)
 
-test('loads every referenced relation attribute consistently in large and focused batches', async () => {
-  const database = await createAnalysisDatabase({ schemaFiles: [schemaFile] })
-  try {
+testWithDatabase(
+  'loads every referenced relation attribute consistently in large and focused batches',
+  async (database) => {
     const stressColumnCount = 1_501
     const stressColumns = Array.from(
       { length: stressColumnCount },
@@ -412,14 +376,12 @@ test('loads every referenced relation attribute consistently in large and focuse
     })
     assert.equal(displayName?.nullability.kind, 'nonNull')
     assert.equal(payload?.jsonShape?.kind, 'object')
-  } finally {
-    await database.close()
   }
-})
+)
 
-test('exposes only immediate expressionSource metadata for direct, derived, and multi-source expressions', async () => {
-  const database = await createAnalysisDatabase({ schemaFiles: [schemaFile] })
-  try {
+testWithDatabase(
+  'exposes only immediate expressionSource metadata for direct, derived, and multi-source expressions',
+  async (database) => {
     const result = await buildTypedSqlPostgresIrFromCompiledConfigs(database, [
       config('direct', 'select account.id from public.accounts account'),
       config('derived', 'select value from (select account.id as value from public.accounts account) derived'),
@@ -492,49 +454,42 @@ test('exposes only immediate expressionSource metadata for direct, derived, and 
       kind: 'expression',
       tag: 'OpExpr',
     })
-  } finally {
-    await database.close()
   }
-})
+)
 
-test('preserves base alias, outer-join, whole-row, and system-attribute distinctions', async () => {
-  const database = await createAnalysisDatabase({ schemaFiles: [schemaFile] })
-  try {
-    const result = await buildTypedSqlPostgresIrFromCompiledConfigs(database, [
-      config('directAlias', 'select account.id from public.accounts account'),
-      config(
-        'qualifiedOuterJoin',
-        `select account.id as account_id, post.id as post_id
+testWithDatabase('preserves base alias, outer-join, whole-row, and system-attribute distinctions', async (database) => {
+  const result = await buildTypedSqlPostgresIrFromCompiledConfigs(database, [
+    config('directAlias', 'select account.id from public.accounts account'),
+    config(
+      'qualifiedOuterJoin',
+      `select account.id as account_id, post.id as post_id
          from public.accounts account
          left join public.posts post
            on post.account_id = account.id`
-      ),
-      config('wholeRowAndSystemAttribute', 'select account as account_row, account.ctid from public.accounts account'),
-    ])
-    const queries = new Map(result.queries.map((query) => [query.name, query]))
+    ),
+    config('wholeRowAndSystemAttribute', 'select account as account_row, account.ctid from public.accounts account'),
+  ])
+  const queries = new Map(result.queries.map((query) => [query.name, query]))
 
-    assert.equal(queries.get('directAlias')?.resultColumns[0]?.nullability.kind, 'nonNull')
-    assert.equal(queries.get('qualifiedOuterJoin')?.resultColumns[0]?.nullability.kind, 'nonNull')
-    assert.deepEqual(queries.get('qualifiedOuterJoin')?.resultColumns[1]?.nullability, {
-      evidence: 'outer_join_column',
-      kind: 'nullable',
-    })
-    assert.deepEqual(queries.get('wholeRowAndSystemAttribute')?.resultColumns[0]?.nullability, {
-      basis: 'whole_row',
-      kind: 'nonNull',
-    })
-    assert.deepEqual(queries.get('wholeRowAndSystemAttribute')?.resultColumns[1]?.nullability, {
-      kind: 'unknown',
-      reason: 'system_attribute:-1',
-    })
-  } finally {
-    await database.close()
-  }
+  assert.equal(queries.get('directAlias')?.resultColumns[0]?.nullability.kind, 'nonNull')
+  assert.equal(queries.get('qualifiedOuterJoin')?.resultColumns[0]?.nullability.kind, 'nonNull')
+  assert.deepEqual(queries.get('qualifiedOuterJoin')?.resultColumns[1]?.nullability, {
+    evidence: 'outer_join_column',
+    kind: 'nullable',
+  })
+  assert.deepEqual(queries.get('wholeRowAndSystemAttribute')?.resultColumns[0]?.nullability, {
+    basis: 'whole_row',
+    kind: 'nonNull',
+  })
+  assert.deepEqual(queries.get('wholeRowAndSystemAttribute')?.resultColumns[1]?.nullability, {
+    kind: 'unknown',
+    reason: 'system_attribute:-1',
+  })
 })
 
-test('resolves immediate JOIN, GROUP, VALUES, CTE, and opaque RTE sources once for every consumer', async () => {
-  const database = await createAnalysisDatabase({ schemaFiles: [schemaFile] })
-  try {
+testWithDatabase(
+  'resolves immediate JOIN, GROUP, VALUES, CTE, and opaque RTE sources once for every consumer',
+  async (database) => {
     await database.query("create table public.immediate_left (value text not null check (value in ('left')))")
     await database.query("create table public.immediate_right (value text not null check (value in ('right')))")
 
@@ -643,221 +598,209 @@ test('resolves immediate JOIN, GROUP, VALUES, CTE, and opaque RTE sources once f
     assert.deepEqual(fieldNames('jsonJoinOutput'), [['joined']])
     assert.deepEqual(fieldNames('jsonGroupOutput'), [['grouped']])
     assert.deepEqual(fieldNames('jsonValuesOutput'), [['left'], ['right']])
-  } finally {
-    await database.close()
   }
-})
+)
 
-test('composes canonical row bounds with scalar EXPR subquery output nullability', async () => {
-  const database = await createAnalysisDatabase({ schemaFiles: [schemaFile] })
-  try {
-    const result = await buildTypedSqlPostgresIrFromCompiledConfigs(database, [
-      config('zeroValues', '(values (1)) limit 0'),
-      config('oneValue', 'values (1)'),
-      config('manyValues', 'values (1), (2), (3)'),
-      config('projectedValues', 'select value from (values (1), (2)) source(value)'),
-      config('guaranteedSelect', 'select 1 as value'),
-      config('qualifiedSelect', 'select 1 as value where $1', ['include']),
-      config('globalAggregate', 'select count(*) as value from public.accounts'),
-      config('qualifiedGlobalAggregate', 'select count(*) as value from public.accounts having $1', ['include']),
-      config('groupedValues', 'select value from (values (1), (2)) source(value) group by value'),
-      config('unionAllValues', 'select 1 as value union all select 2'),
-      config('unionValues', 'select 1 as value union select 2'),
-      config('intersectValues', 'select 1 as value intersect select 1'),
-      config('exceptValues', 'select 1 as value except select 2'),
-      config('exceptEmpty', 'select 1 as value except (select 2 limit 0)'),
-      config('limitedValues', '(values (1), (2)) limit 1'),
-      config(
-        'fetchWithTiesValues',
-        `select value
+testWithDatabase('composes canonical row bounds with scalar EXPR subquery output nullability', async (database) => {
+  const result = await buildTypedSqlPostgresIrFromCompiledConfigs(database, [
+    config('zeroValues', '(values (1)) limit 0'),
+    config('oneValue', 'values (1)'),
+    config('manyValues', 'values (1), (2), (3)'),
+    config('projectedValues', 'select value from (values (1), (2)) source(value)'),
+    config('guaranteedSelect', 'select 1 as value'),
+    config('qualifiedSelect', 'select 1 as value where $1', ['include']),
+    config('globalAggregate', 'select count(*) as value from public.accounts'),
+    config('qualifiedGlobalAggregate', 'select count(*) as value from public.accounts having $1', ['include']),
+    config('groupedValues', 'select value from (values (1), (2)) source(value) group by value'),
+    config('unionAllValues', 'select 1 as value union all select 2'),
+    config('unionValues', 'select 1 as value union select 2'),
+    config('intersectValues', 'select 1 as value intersect select 1'),
+    config('exceptValues', 'select 1 as value except select 2'),
+    config('exceptEmpty', 'select 1 as value except (select 2 limit 0)'),
+    config('limitedValues', '(values (1), (2)) limit 1'),
+    config(
+      'fetchWithTiesValues',
+      `select value
          from (values (1), (2), (3), (4), (5)) source(value)
          order by value
          fetch first 2 rows with ties`
-      ),
-      config('offsetValues', '(values (1), (2)) offset 1'),
-      config('dynamicLimitedValues', '(values (1), (2)) limit $1', ['limit']),
-      config(
-        'projectedSetOutput',
-        `select value
+    ),
+    config('offsetValues', '(values (1), (2)) offset 1'),
+    config('dynamicLimitedValues', '(values (1), (2)) limit $1', ['limit']),
+    config(
+      'projectedSetOutput',
+      `select value
          from (select 1 as value union all select null::integer) source`
-      ),
-      config('emptyScalar', 'select (select 1 limit 0) as value'),
-      config('nonNullScalar', 'select (select 1) as value'),
-      config('nullableScalar', 'select (select null::integer) as value'),
-      config('unknownScalar', 'select (select $1::integer) as value', ['value']),
-      config('unresolvedNonNullScalar', 'select (select 1 from public.accounts limit 1) as value'),
-      config('unresolvedNullableScalar', 'select (select display_name from public.accounts limit 1) as value'),
-      config('unresolvedUnknownScalar', 'select (select $1::text from public.accounts limit 1) as value', ['value']),
-      config('possibleMultipleRowsScalar', 'select (values (1), (2)) as value'),
-      config(
-        'nestedSetScalar',
-        `select (
+    ),
+    config('emptyScalar', 'select (select 1 limit 0) as value'),
+    config('nonNullScalar', 'select (select 1) as value'),
+    config('nullableScalar', 'select (select null::integer) as value'),
+    config('unknownScalar', 'select (select $1::integer) as value', ['value']),
+    config('unresolvedNonNullScalar', 'select (select 1 from public.accounts limit 1) as value'),
+    config('unresolvedNullableScalar', 'select (select display_name from public.accounts limit 1) as value'),
+    config('unresolvedUnknownScalar', 'select (select $1::text from public.accounts limit 1) as value', ['value']),
+    config('possibleMultipleRowsScalar', 'select (values (1), (2)) as value'),
+    config(
+      'nestedSetScalar',
+      `select (
            select value
            from (select 1 as value union all select null::integer) source
          ) as value`
-      ),
-    ])
-    const queries = new Map(result.queries.map((query) => [query.name, query]))
-    const query = (name: string): TypedSqlPostgresIr => {
-      const value = queries.get(name)
-      assert.ok(value, `missing normalized query ${name}`)
-      return value
-    }
-    const nullability = (name: string) => query(name).resultColumns[0]?.nullability
+    ),
+  ])
+  const queries = new Map(result.queries.map((query) => [query.name, query]))
+  const query = (name: string): TypedSqlPostgresIr => {
+    const value = queries.get(name)
+    assert.ok(value, `missing normalized query ${name}`)
+    return value
+  }
+  const nullability = (name: string) => query(name).resultColumns[0]?.nullability
 
-    assert.deepEqual(query('zeroValues').rowBounds, {
-      max: 0,
-      min: 0,
-      proof: 'values_1_rows+constant_limit_0',
-    })
-    assert.deepEqual(query('oneValue').rowBounds, { max: 1, min: 1, proof: 'values_1_rows' })
-    assert.deepEqual(query('manyValues').rowBounds, { max: 3, min: 3, proof: 'values_3_rows' })
-    assert.deepEqual(query('projectedValues').rowBounds, {
-      max: 2,
-      min: 2,
-      proof: 'subquery_projection:values_2_rows',
-    })
-    assert.deepEqual(query('guaranteedSelect').rowBounds, {
-      max: 1,
-      min: 1,
-      proof: 'select_without_from',
-    })
-    assert.deepEqual(query('qualifiedSelect').rowBounds, {
-      max: 1,
-      min: 0,
-      proof: 'select_without_from_with_qual',
-    })
-    assert.deepEqual(query('globalAggregate').rowBounds, { max: 1, min: 1, proof: 'global_aggregate' })
-    assert.deepEqual(query('qualifiedGlobalAggregate').rowBounds, {
-      max: 1,
-      min: 0,
-      proof: 'global_aggregate_with_having',
-    })
-    assert.deepEqual(query('groupedValues').rowBounds, {
-      max: 2,
-      min: 1,
-      proof: 'subquery_grouping:values_2_rows',
-    })
-    assert.deepEqual(query('unionAllValues').rowBounds, {
-      max: 2,
-      min: 2,
-      proof: 'union_all(select_without_from,select_without_from)',
-    })
-    assert.deepEqual(query('unionValues').rowBounds, {
-      max: 2,
-      min: 1,
-      proof: 'union(select_without_from,select_without_from)',
-    })
-    assert.deepEqual(query('intersectValues').rowBounds, {
-      max: 1,
-      min: 0,
-      proof: 'intersect(select_without_from,select_without_from)',
-    })
-    assert.deepEqual(query('exceptValues').rowBounds, {
-      max: 1,
-      min: 0,
-      proof: 'except(select_without_from,select_without_from)',
-    })
-    assert.deepEqual(query('exceptEmpty').rowBounds, {
-      max: 1,
-      min: 1,
-      proof: 'except(select_without_from,select_without_from+constant_limit_0)',
-    })
-    assert.deepEqual(query('limitedValues').rowBounds, {
-      max: 1,
-      min: 1,
-      proof: 'values_2_rows+constant_limit_1',
-    })
-    assert.deepEqual(query('fetchWithTiesValues').rowBounds, {
-      max: 5,
-      min: 2,
-      proof: 'subquery_projection:values_5_rows+constant_fetch_with_ties_2',
-    })
-    assert.deepEqual(query('offsetValues').rowBounds, {
-      max: 2,
-      min: 0,
-      proof: 'values_2_rows+offset_can_drop_rows',
-    })
-    assert.deepEqual(query('dynamicLimitedValues').rowBounds, {
-      max: 2,
-      min: 0,
-      proof: 'values_2_rows+dynamic_limit_can_drop_rows',
-    })
-    assert.deepEqual(query('projectedSetOutput').rowBounds, {
-      max: 2,
-      min: 2,
-      proof: 'subquery_projection:union_all(select_without_from,select_without_from)',
-    })
-    assert.equal(nullability('projectedSetOutput')?.kind, 'nullable')
+  assert.deepEqual(query('zeroValues').rowBounds, {
+    max: 0,
+    min: 0,
+    proof: 'values_1_rows+constant_limit_0',
+  })
+  assert.deepEqual(query('oneValue').rowBounds, { max: 1, min: 1, proof: 'values_1_rows' })
+  assert.deepEqual(query('manyValues').rowBounds, { max: 3, min: 3, proof: 'values_3_rows' })
+  assert.deepEqual(query('projectedValues').rowBounds, {
+    max: 2,
+    min: 2,
+    proof: 'subquery_projection:values_2_rows',
+  })
+  assert.deepEqual(query('guaranteedSelect').rowBounds, {
+    max: 1,
+    min: 1,
+    proof: 'select_without_from',
+  })
+  assert.deepEqual(query('qualifiedSelect').rowBounds, {
+    max: 1,
+    min: 0,
+    proof: 'select_without_from_with_qual',
+  })
+  assert.deepEqual(query('globalAggregate').rowBounds, { max: 1, min: 1, proof: 'global_aggregate' })
+  assert.deepEqual(query('qualifiedGlobalAggregate').rowBounds, {
+    max: 1,
+    min: 0,
+    proof: 'global_aggregate_with_having',
+  })
+  assert.deepEqual(query('groupedValues').rowBounds, {
+    max: 2,
+    min: 1,
+    proof: 'subquery_grouping:values_2_rows',
+  })
+  assert.deepEqual(query('unionAllValues').rowBounds, {
+    max: 2,
+    min: 2,
+    proof: 'union_all(select_without_from,select_without_from)',
+  })
+  assert.deepEqual(query('unionValues').rowBounds, {
+    max: 2,
+    min: 1,
+    proof: 'union(select_without_from,select_without_from)',
+  })
+  assert.deepEqual(query('intersectValues').rowBounds, {
+    max: 1,
+    min: 0,
+    proof: 'intersect(select_without_from,select_without_from)',
+  })
+  assert.deepEqual(query('exceptValues').rowBounds, {
+    max: 1,
+    min: 0,
+    proof: 'except(select_without_from,select_without_from)',
+  })
+  assert.deepEqual(query('exceptEmpty').rowBounds, {
+    max: 1,
+    min: 1,
+    proof: 'except(select_without_from,select_without_from+constant_limit_0)',
+  })
+  assert.deepEqual(query('limitedValues').rowBounds, {
+    max: 1,
+    min: 1,
+    proof: 'values_2_rows+constant_limit_1',
+  })
+  assert.deepEqual(query('fetchWithTiesValues').rowBounds, {
+    max: 5,
+    min: 2,
+    proof: 'subquery_projection:values_5_rows+constant_fetch_with_ties_2',
+  })
+  assert.deepEqual(query('offsetValues').rowBounds, {
+    max: 2,
+    min: 0,
+    proof: 'values_2_rows+offset_can_drop_rows',
+  })
+  assert.deepEqual(query('dynamicLimitedValues').rowBounds, {
+    max: 2,
+    min: 0,
+    proof: 'values_2_rows+dynamic_limit_can_drop_rows',
+  })
+  assert.deepEqual(query('projectedSetOutput').rowBounds, {
+    max: 2,
+    min: 2,
+    proof: 'subquery_projection:union_all(select_without_from,select_without_from)',
+  })
+  assert.equal(nullability('projectedSetOutput')?.kind, 'nullable')
 
-    assert.deepEqual(nullability('emptyScalar'), {
-      evidence: 'scalar_sublink_empty_query',
-      kind: 'nullable',
-    })
-    assert.equal(nullability('nonNullScalar')?.kind, 'nonNull')
-    assert.equal(nullability('nullableScalar')?.kind, 'nullable')
-    assert.equal(nullability('unknownScalar')?.kind, 'unknown')
-    assert.deepEqual(nullability('unresolvedNonNullScalar'), {
-      kind: 'unknown',
-      reason: 'scalar_sublink_row_presence_unresolved',
-    })
-    assert.equal(nullability('unresolvedNullableScalar')?.kind, 'nullable')
-    assert.deepEqual(nullability('unresolvedUnknownScalar'), {
-      kind: 'unknown',
-      reason: 'scalar_sublink_row_presence_unresolved',
-    })
-    assert.equal(nullability('possibleMultipleRowsScalar')?.kind, 'nonNull')
-    assert.equal(nullability('nestedSetScalar')?.kind, 'nullable')
-  } finally {
-    await database.close()
+  assert.deepEqual(nullability('emptyScalar'), {
+    evidence: 'scalar_sublink_empty_query',
+    kind: 'nullable',
+  })
+  assert.equal(nullability('nonNullScalar')?.kind, 'nonNull')
+  assert.equal(nullability('nullableScalar')?.kind, 'nullable')
+  assert.equal(nullability('unknownScalar')?.kind, 'unknown')
+  assert.deepEqual(nullability('unresolvedNonNullScalar'), {
+    kind: 'unknown',
+    reason: 'scalar_sublink_row_presence_unresolved',
+  })
+  assert.equal(nullability('unresolvedNullableScalar')?.kind, 'nullable')
+  assert.deepEqual(nullability('unresolvedUnknownScalar'), {
+    kind: 'unknown',
+    reason: 'scalar_sublink_row_presence_unresolved',
+  })
+  assert.equal(nullability('possibleMultipleRowsScalar')?.kind, 'nonNull')
+  assert.equal(nullability('nestedSetScalar')?.kind, 'nullable')
+})
+
+testWithDatabase('throws on malformed and cyclic scalar EXPR subquery ownership', async (database) => {
+  const cases: readonly {
+    readonly corrupt: (analysis: MutableEnvelopeObject) => void
+    readonly error: RegExp
+    readonly name: string
+  }[] = [
+    {
+      corrupt(analysis) {
+        const query = firstEnvelopeQuery(analysis)
+        const target = envelopeObject(envelopeArray(query.targetList)[0])
+        const subquery = envelopeObject(envelopeObject(target.expr).subquery)
+        subquery.targetList = []
+      },
+      error: /EXPR SubLink query has 0 result outputs; expected exactly 1/u,
+      name: 'missingScalarOutput',
+    },
+    {
+      corrupt(analysis) {
+        const query = firstEnvelopeQuery(analysis)
+        const target = envelopeObject(envelopeArray(query.targetList)[0])
+        envelopeObject(target.expr).subquery = query
+      },
+      error: /cyclic nested-query ownership/u,
+      name: 'cyclicScalarQuery',
+    },
+  ]
+
+  for (const fixture of cases) {
+    await assert.rejects(
+      buildTypedSqlPostgresIrFromCompiledConfigs(corruptAnalyzerEnvelope(database, fixture.corrupt), [
+        config(fixture.name, 'select (select 1) as value'),
+      ]),
+      fixture.error
+    )
   }
 })
 
-test('throws on malformed and cyclic scalar EXPR subquery ownership', async () => {
-  const database = await createAnalysisDatabase({ schemaFiles: [schemaFile] })
-  try {
-    const cases: readonly {
-      readonly corrupt: (analysis: MutableEnvelopeObject) => void
-      readonly error: RegExp
-      readonly name: string
-    }[] = [
-      {
-        corrupt(analysis) {
-          const query = firstEnvelopeQuery(analysis)
-          const target = envelopeObject(envelopeArray(query.targetList)[0])
-          const subquery = envelopeObject(envelopeObject(target.expr).subquery)
-          subquery.targetList = []
-        },
-        error: /EXPR SubLink query has 0 result outputs; expected exactly 1/u,
-        name: 'missingScalarOutput',
-      },
-      {
-        corrupt(analysis) {
-          const query = firstEnvelopeQuery(analysis)
-          const target = envelopeObject(envelopeArray(query.targetList)[0])
-          envelopeObject(target.expr).subquery = query
-        },
-        error: /cyclic nested-query ownership/u,
-        name: 'cyclicScalarQuery',
-      },
-    ]
-
-    for (const fixture of cases) {
-      await assert.rejects(
-        buildTypedSqlPostgresIrFromCompiledConfigs(corruptAnalyzerEnvelope(database, fixture.corrupt), [
-          config(fixture.name, 'select (select 1) as value'),
-        ]),
-        fixture.error
-      )
-    }
-  } finally {
-    await database.close()
-  }
-})
-
-test('derives cast and domain nullability once without unsafe CHECK or JSON unwrapping', async () => {
-  const database = await createAnalysisDatabase({ schemaFiles: [schemaFile] })
-  try {
+testWithDatabase(
+  'derives cast and domain nullability once without unsafe CHECK or JSON unwrapping',
+  async (database) => {
     await database.query('create domain public.nullable_integer_domain as integer')
     await database.query('create domain public.required_integer_domain as integer not null')
     await database.query('create domain public.checked_required_integer_domain as integer check (value is not null)')
@@ -1006,49 +949,42 @@ test('derives cast and domain nullability once without unsafe CHECK or JSON unwr
     }
     assert.notEqual(column('unsafeJsonLiteralRefinement').jsonShape?.kind, 'stringLiteral')
     assert.equal(column('unsafeEmptyArrayRefinement').jsonShape?.kind, 'opaque')
-  } finally {
-    await database.close()
   }
-})
+)
 
-test('throws when a positive base Var is missing its required catalog column fact', async () => {
-  const database = await createAnalysisDatabase({ schemaFiles: [schemaFile] })
-  try {
-    const missingPostIdClient: PostgresQueryable = {
-      async query<Row>(text: string, params?: readonly unknown[]) {
-        const result = await database.query<Row>(text, params)
-        if (!text.includes('a.attnotnull') || !text.includes('from pg_class c')) {
-          return result
-        }
-        return {
-          rows: result.rows.filter((row) => {
-            const column = row as { readonly attname?: string; readonly relname?: string }
-            return column.relname !== 'posts' || column.attname !== 'id'
-          }),
-        }
-      },
-    }
+testWithDatabase('throws when a positive base Var is missing its required catalog column fact', async (database) => {
+  const missingPostIdClient: PostgresQueryable = {
+    async query<Row>(text: string, params?: readonly unknown[]) {
+      const result = await database.query<Row>(text, params)
+      if (!text.includes('a.attnotnull') || !text.includes('from pg_class c')) {
+        return result
+      }
+      return {
+        rows: result.rows.filter((row) => {
+          const column = row as { readonly attname?: string; readonly relname?: string }
+          return column.relname !== 'posts' || column.attname !== 'id'
+        }),
+      }
+    },
+  }
 
-    await assert.rejects(
-      buildTypedSqlPostgresIrFromCompiledConfigs(missingPostIdClient, [
-        config(
-          'missingOuterJoinedColumnFact',
-          `select post.id
+  await assert.rejects(
+    buildTypedSqlPostgresIrFromCompiledConfigs(missingPostIdClient, [
+      config(
+        'missingOuterJoinedColumnFact',
+        `select post.id
            from public.accounts account
            left join public.posts post
              on post.account_id = account.id`
-        ),
-      ]),
-      /queries\/missingOuterJoinedColumnFact\.typed\.sql: failed to build typed SQL IR missingOuterJoinedColumnFact: internal analyzer catalog inconsistency: missing positive base-column fact for relation OID \d+, attribute number 1 in SELECT query/u
-    )
-  } finally {
-    await database.close()
-  }
+      ),
+    ]),
+    /queries\/missingOuterJoinedColumnFact\.typed\.sql: failed to build typed SQL IR missingOuterJoinedColumnFact: internal analyzer catalog inconsistency: missing positive base-column fact for relation OID \d+, attribute number 1 in SELECT query/u
+  )
 })
 
-test('throws on malformed owner identity, output indices, aligned expressions, and schema versions', async () => {
-  const database = await createAnalysisDatabase({ schemaFiles: [schemaFile] })
-  try {
+testWithDatabase(
+  'throws on malformed owner identity, output indices, aligned expressions, and schema versions',
+  async (database) => {
     const cases: readonly {
       readonly corrupt: (analysis: MutableEnvelopeObject) => void
       readonly error: RegExp
@@ -1236,18 +1172,14 @@ test('throws on malformed owner identity, output indices, aligned expressions, a
         fixture.error
       )
     }
-  } finally {
-    await database.close()
   }
-})
+)
 
-test('infers structured JSON from scalar subqueries and derived whole rows', async () => {
-  const database = await createAnalysisDatabase({ schemaFiles: [schemaFile] })
-  try {
-    const result = await buildTypedSqlPostgresIrFromCompiledConfigs(database, [
-      config(
-        'jsonArrayFrom',
-        `select coalesce(
+testWithDatabase('infers structured JSON from scalar subqueries and derived whole rows', async (database) => {
+  const result = await buildTypedSqlPostgresIrFromCompiledConfigs(database, [
+    config(
+      'jsonArrayFrom',
+      `select coalesce(
           (
             select jsonb_agg(nested_row)
             from (
@@ -1257,10 +1189,10 @@ test('infers structured JSON from scalar subqueries and derived whole rows', asy
           ),
           '[]'::jsonb
         ) as accounts`
-      ),
-      config(
-        'jsonObjectFrom',
-        `select (
+    ),
+    config(
+      'jsonObjectFrom',
+      `select (
           select to_jsonb(nested_row)
           from (
             select account.id as account_id, account.display_name
@@ -1268,50 +1200,47 @@ test('infers structured JSON from scalar subqueries and derived whole rows', asy
             limit 1
           ) nested_row
         ) as account`
-      ),
-      config(
-        'directJsonObject',
-        `select to_jsonb(nested_row) as account
+    ),
+    config(
+      'directJsonObject',
+      `select to_jsonb(nested_row) as account
         from (
           select account.id as account_id, account.display_name
           from public.accounts account
         ) nested_row`
-      ),
-    ])
+    ),
+  ])
 
-    const arrayShape = result.queries.find((query) => query.name === 'jsonArrayFrom')?.resultColumns[0]?.jsonShape
-    assert.equal(arrayShape?.kind, 'array')
-    if (arrayShape?.kind === 'array') {
-      assert.equal(arrayShape.nullability.kind, 'nonNull')
-      assert.equal(arrayShape.element.kind, 'object')
-      if (arrayShape.element.kind === 'object') {
-        assert.deepEqual(
-          arrayShape.element.fields.map((field) => field.name),
-          ['account_id', 'display_name']
-        )
-      }
-    }
-
-    const objectShape = result.queries.find((query) => query.name === 'jsonObjectFrom')?.resultColumns[0]?.jsonShape
-    assert.equal(objectShape?.kind, 'object')
-    if (objectShape?.kind === 'object') {
+  const arrayShape = result.queries.find((query) => query.name === 'jsonArrayFrom')?.resultColumns[0]?.jsonShape
+  assert.equal(arrayShape?.kind, 'array')
+  if (arrayShape?.kind === 'array') {
+    assert.equal(arrayShape.nullability.kind, 'nonNull')
+    assert.equal(arrayShape.element.kind, 'object')
+    if (arrayShape.element.kind === 'object') {
       assert.deepEqual(
-        objectShape.fields.map((field) => field.name),
+        arrayShape.element.fields.map((field) => field.name),
         ['account_id', 'display_name']
       )
     }
-    const directObjectShape = result.queries.find((query) => query.name === 'directJsonObject')?.resultColumns[0]
-      ?.jsonShape
-    assert.equal(directObjectShape?.kind, 'object')
-    assert.equal(directObjectShape?.nullability.kind, 'nonNull')
-  } finally {
-    await database.close()
   }
+
+  const objectShape = result.queries.find((query) => query.name === 'jsonObjectFrom')?.resultColumns[0]?.jsonShape
+  assert.equal(objectShape?.kind, 'object')
+  if (objectShape?.kind === 'object') {
+    assert.deepEqual(
+      objectShape.fields.map((field) => field.name),
+      ['account_id', 'display_name']
+    )
+  }
+  const directObjectShape = result.queries.find((query) => query.name === 'directJsonObject')?.resultColumns[0]
+    ?.jsonShape
+  assert.equal(directObjectShape?.kind, 'object')
+  assert.equal(directObjectShape?.nullability.kind, 'nonNull')
 })
 
-test('models exposed whole-row names, set operations, and each JSON sublink result kind', async () => {
-  const database = await createAnalysisDatabase({ schemaFiles: [schemaFile] })
-  try {
+testWithDatabase(
+  'models exposed whole-row names, set operations, and each JSON sublink result kind',
+  async (database) => {
     const result = await buildTypedSqlPostgresIrFromCompiledConfigs(database, [
       config('aliasedDerivedRow', 'select to_jsonb(r) as payload from (select 1 as account_id) r(user_id)'),
       config('aliasedCteRow', 'with r(user_id) as (select 1 as account_id) select to_jsonb(r) as payload from r'),
@@ -1384,14 +1313,12 @@ test('models exposed whole-row names, set operations, and each JSON sublink resu
         assert.equal(predicateShape.pgTypeName, 'bool')
       }
     }
-  } finally {
-    await database.close()
   }
-})
+)
 
-test('rejects unmodeled PostgreSQL utilities while write-routing an opaque no-result CALL', async () => {
-  const database = await createAnalysisDatabase({ schemaFiles: [schemaFile] })
-  try {
+testWithDatabase(
+  'rejects unmodeled PostgreSQL utilities while write-routing an opaque no-result CALL',
+  async (database) => {
     await database.query(`create procedure public.ir_no_result(value integer)
       language plpgsql
       as $$ begin null; end $$`)
@@ -1425,14 +1352,12 @@ test('rejects unmodeled PostgreSQL utilities while write-routing an opaque no-re
     ] as const) {
       await assert.rejects(buildTypedSqlPostgresIrFromCompiledConfigs(database, [config(name, sql)]), error)
     }
-  } finally {
-    await database.close()
   }
-})
+)
 
-test('normalizes PostgreSQL statement, nullability, DML, and cardinality facts conservatively', async () => {
-  const database = await createAnalysisDatabase({ schemaFiles: [schemaFile] })
-  try {
+testWithDatabase(
+  'normalizes PostgreSQL statement, nullability, DML, and cardinality facts conservatively',
+  async (database) => {
     await database.query("create table public.rule_source (value text check (value in ('source_a', 'source_b')))")
     await database.query("create table public.rule_sink (value text not null check (value in ('sink_a', 'sink_b')))")
     await database.query('create domain public.account_score as integer check (value >= 0)')
@@ -1885,14 +1810,12 @@ test('normalizes PostgreSQL statement, nullability, DML, and cardinality facts c
       buildTypedSqlPostgresIrFromCompiledConfigs(database, [config('multipleStatements', 'select 1; select 2')]),
       /typed SQL must contain exactly one PostgreSQL statement; received 2/u
     )
-  } finally {
-    await database.close()
   }
-})
+)
 
-test('preserves correlated CHECK metadata and folds CHECK result types through set operations', async () => {
-  const database = await createAnalysisDatabase({ schemaFiles: [schemaFile] })
-  try {
+testWithDatabase(
+  'preserves correlated CHECK metadata and folds CHECK result types through set operations',
+  async (database) => {
     for (const sql of [
       `create table public.outer_correlation (
          value text check (value in ('outer_only'))
@@ -2024,32 +1947,28 @@ test('preserves correlated CHECK metadata and folds CHECK result types through s
        order by value`
     )
     assert.deepEqual(unionRows.rows, [{ value: 'left_only' }, { value: 'right_only' }, { value: 'shared' }])
-  } finally {
-    await database.close()
   }
-})
+)
 
-test('resolves correlated derived provenance from the Var owner query scope', async () => {
-  const database = await createAnalysisDatabase({ schemaFiles: [schemaFile] })
-  try {
-    for (const sql of [
-      `create table public.scope_outer_left (
+testWithDatabase('resolves correlated derived provenance from the Var owner query scope', async (database) => {
+  for (const sql of [
+    `create table public.scope_outer_left (
          value text check (value in ('outer_left'))
        )`,
-      `create table public.scope_outer_right (
+    `create table public.scope_outer_right (
          value text check (value in ('outer_right'))
        )`,
-      `create table public.scope_inner (
+    `create table public.scope_inner (
          value text not null check (value in ('inner'))
        )`,
-      "insert into public.scope_outer_left(value) values ('outer_left')",
-      "insert into public.scope_outer_right(value) values ('outer_right')",
-      "insert into public.scope_inner(value) values ('inner')",
-    ]) {
-      await database.query(sql)
-    }
+    "insert into public.scope_outer_left(value) values ('outer_left')",
+    "insert into public.scope_outer_right(value) values ('outer_right')",
+    "insert into public.scope_inner(value) values ('inner')",
+  ]) {
+    await database.query(sql)
+  }
 
-    const outerDerivedSql = `select lateral_value.value, lateral_value.nullable_value, lateral_value.payload
+  const outerDerivedSql = `select lateral_value.value, lateral_value.nullable_value, lateral_value.payload
       from (
         select
           value,
@@ -2073,7 +1992,7 @@ test('resolves correlated derived provenance from the Var owner query scope', as
           from public.scope_inner
         ) unrelated_inner
       ) lateral_value`
-    const levelTwoSql = `select level_one.value
+  const levelTwoSql = `select level_one.value
       from (
         select value from public.scope_outer_left
         union all
@@ -2088,59 +2007,56 @@ test('resolves correlated derived provenance from the Var owner query scope', as
         ) level_two
       ) level_one`
 
-    const result = await buildTypedSqlPostgresIrFromCompiledConfigs(database, [
-      config('outerDerivedScope', outerDerivedSql),
-      config('levelTwoScope', levelTwoSql),
-    ])
-    const queries = new Map(result.queries.map((query) => [query.name, query]))
-    const outerDerived = queries.get('outerDerivedScope')
-    const levelTwo = queries.get('levelTwoScope')
-    const left = { kind: 'literalUnion', labels: ['outer_left'] } as const
-    const right = { kind: 'literalUnion', labels: ['outer_right'] } as const
+  const result = await buildTypedSqlPostgresIrFromCompiledConfigs(database, [
+    config('outerDerivedScope', outerDerivedSql),
+    config('levelTwoScope', levelTwoSql),
+  ])
+  const queries = new Map(result.queries.map((query) => [query.name, query]))
+  const outerDerived = queries.get('outerDerivedScope')
+  const levelTwo = queries.get('levelTwoScope')
+  const left = { kind: 'literalUnion', labels: ['outer_left'] } as const
+  const right = { kind: 'literalUnion', labels: ['outer_right'] } as const
 
-    assert.deepEqual(outerDerived?.resultColumns[0]?.checkConstraintType, {
-      kind: 'union',
-      members: [left, right],
-    })
-    assert.notDeepEqual(outerDerived?.resultColumns[0]?.checkConstraintType, {
-      kind: 'literalUnion',
-      labels: ['inner'],
-    })
-    assert.equal(outerDerived?.resultColumns[1]?.nullability.kind, 'nullable')
+  assert.deepEqual(outerDerived?.resultColumns[0]?.checkConstraintType, {
+    kind: 'union',
+    members: [left, right],
+  })
+  assert.notDeepEqual(outerDerived?.resultColumns[0]?.checkConstraintType, {
+    kind: 'literalUnion',
+    labels: ['inner'],
+  })
+  assert.equal(outerDerived?.resultColumns[1]?.nullability.kind, 'nullable')
 
-    const jsonShape = outerDerived?.resultColumns[2]?.jsonShape
-    assert.equal(jsonShape?.kind, 'union')
-    if (jsonShape?.kind === 'union') {
-      assert.deepEqual(
-        jsonShape.alternatives.map((alternative) =>
-          alternative.kind === 'object' ? alternative.fields.map((field) => field.name) : alternative.kind
-        ),
-        [['outer_left'], ['outer_right']]
-      )
-    }
-
-    assert.deepEqual(levelTwo?.resultColumns[0]?.checkConstraintType, {
-      kind: 'union',
-      members: [left, right],
-    })
-
-    const executed = await database.query<{
-      readonly nullable_value: string | null
-      readonly payload: unknown
-      readonly value: string
-    }>(`${outerDerivedSql} order by value`)
-    assert.deepEqual(executed.rows, [
-      { nullable_value: null, payload: { outer_left: 'outer_left' }, value: 'outer_left' },
-      { nullable_value: 'present', payload: { outer_right: 'outer_right' }, value: 'outer_right' },
-    ])
-  } finally {
-    await database.close()
+  const jsonShape = outerDerived?.resultColumns[2]?.jsonShape
+  assert.equal(jsonShape?.kind, 'union')
+  if (jsonShape?.kind === 'union') {
+    assert.deepEqual(
+      jsonShape.alternatives.map((alternative) =>
+        alternative.kind === 'object' ? alternative.fields.map((field) => field.name) : alternative.kind
+      ),
+      [['outer_left'], ['outer_right']]
+    )
   }
+
+  assert.deepEqual(levelTwo?.resultColumns[0]?.checkConstraintType, {
+    kind: 'union',
+    members: [left, right],
+  })
+
+  const executed = await database.query<{
+    readonly nullable_value: string | null
+    readonly payload: unknown
+    readonly value: string
+  }>(`${outerDerivedSql} order by value`)
+  assert.deepEqual(executed.rows, [
+    { nullable_value: null, payload: { outer_left: 'outer_left' }, value: 'outer_left' },
+    { nullable_value: 'present', payload: { outer_right: 'outer_right' }, value: 'outer_right' },
+  ])
 })
 
-test('uses exact PostgreSQL proof objects for uniqueness, inheritance, checks, and expression completeness', async () => {
-  const database = await createAnalysisDatabase({ schemaFiles: [schemaFile] })
-  try {
+testWithDatabase(
+  'uses exact PostgreSQL proof objects for uniqueness, inheritance, checks, and expression completeness',
+  async (database) => {
     for (const sql of [
       'create table public.operator_unique (id integer primary key, payload text)',
       "insert into public.operator_unique values (1, 'first'), (2, 'second')",
@@ -2239,7 +2155,5 @@ test('uses exact PostgreSQL proof objects for uniqueness, inheritance, checks, a
     } finally {
       await database.query('rollback')
     }
-  } finally {
-    await database.close()
   }
-})
+)

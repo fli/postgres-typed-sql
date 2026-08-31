@@ -3,7 +3,7 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import test from 'node:test'
 
-import { createMinimalFixture, generateTypedSql } from './generator-test-support.js'
+import { createMinimalFixture, generateTypedSql, generateFixture } from './generator-test-support.js'
 
 test('uses valid TypeScript filename basenames verbatim as statement names', async () => {
   const root = await createMinimalFixture('select 1;\n', 'select 1::integer as value\n')
@@ -18,12 +18,7 @@ test('uses valid TypeScript filename basenames verbatim as statement names', asy
     cases.map(({ name }) => writeFile(join(root, 'queries', `${name}.typed.sql`), 'select 1::integer as value\n'))
   )
 
-  const result = await generateTypedSql({
-    include: ['queries'],
-    rootDir: root,
-    codecProfile: 'node-postgres',
-    schema: 'schema.sql',
-  })
+  const result = await generateFixture(root)
 
   assert.equal(result.statementCount, cases.length + 1)
   for (const { name, typeName } of cases) {
@@ -42,12 +37,7 @@ test('allows matching statement basenames in separate module directories', async
   await writeFile(join(root, 'queries/accounts/findById.typed.sql'), 'select 1::integer as account_id\n')
   await writeFile(join(root, 'queries/orders/findById.typed.sql'), 'select 2::integer as order_id\n')
 
-  const result = await generateTypedSql({
-    include: ['queries'],
-    rootDir: root,
-    codecProfile: 'node-postgres',
-    schema: 'schema.sql',
-  })
+  const result = await generateFixture(root)
 
   assert.equal(result.statementCount, 3)
   const account = await readFile(join(root, 'queries/accounts/findById.typed-sql.ts'), 'utf8')

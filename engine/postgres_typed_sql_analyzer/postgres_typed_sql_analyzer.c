@@ -35,6 +35,7 @@
 #include "utils/catcache.h"
 #include "utils/fmgroids.h"
 #include "utils/hsearch.h"
+#include "utils/json.h"
 #include "utils/jsonb.h"
 #include "utils/jsonfuncs.h"
 #include "utils/lsyscache.h"
@@ -514,52 +515,13 @@ sublink_type_name(SubLinkType sublink_type)
 static void
 append_json_string(StringInfo out, const char *value)
 {
-  const unsigned char *cursor;
-
   if (value == NULL)
   {
     appendStringInfoString(out, "null");
     return;
   }
 
-  appendStringInfoChar(out, '"');
-  for (cursor = (const unsigned char *) value; *cursor != '\0'; cursor++)
-  {
-    switch (*cursor)
-    {
-      case '"':
-        appendStringInfoString(out, "\\\"");
-        break;
-      case '\\':
-        appendStringInfoString(out, "\\\\");
-        break;
-      case '\b':
-        appendStringInfoString(out, "\\b");
-        break;
-      case '\f':
-        appendStringInfoString(out, "\\f");
-        break;
-      case '\n':
-        appendStringInfoString(out, "\\n");
-        break;
-      case '\r':
-        appendStringInfoString(out, "\\r");
-        break;
-      case '\t':
-        appendStringInfoString(out, "\\t");
-        break;
-      default:
-        if (*cursor < 0x20)
-        {
-          appendStringInfo(out, "\\u%04x", *cursor);
-        }
-        else
-        {
-          appendStringInfoChar(out, (char) *cursor);
-        }
-    }
-  }
-  appendStringInfoChar(out, '"');
+  escape_json(out, value);
 }
 
 static void

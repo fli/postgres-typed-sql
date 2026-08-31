@@ -16,9 +16,12 @@ import {
   type PredicateFacts,
 } from './analyzer-predicate-facts.js'
 import {
+  collectUniqueConstraints,
   collectUniqueJoinProofInput,
   inferUniqueJoinClosure,
+  uniqueEqualityOperatorKey,
   type UniqueJoinRelation as UniqueJoinClosureRelation,
+  type UniqueJoinSource,
 } from './analyzer-unique-joins.js'
 import {
   checkConstraintTypeKey,
@@ -52,6 +55,7 @@ import {
   type PgAnalyzerExpr,
   type PgAnalyzerQuery,
   type PgAnalyzerResult,
+  type PgAnalyzerRte,
   type PgAnalyzerRteKind,
   type PgAnalyzerSetOperation,
   type PgAnalyzerTarget,
@@ -529,13 +533,7 @@ function applyLimitBounds(
   }
 }
 
-interface UniqueProofRelation {
-  readonly inh: boolean
-  readonly relid: number
-  readonly varno: number
-}
-
-function uniqueProofRelation(query: PgAnalyzerQuery): UniqueProofRelation | null {
+function uniqueProofRelation(query: PgAnalyzerQuery): UniqueJoinSource | null {
   const rtable = query.rtable ?? []
   if (query.commandType === 'SELECT') {
     const rowSources = rtable.map((rte, index) => ({ rte, varno: index + 1 })).filter(({ rte }) => rte.kind !== 'JOIN')
@@ -559,93 +557,6 @@ function uniqueProofRelation(query: PgAnalyzerQuery): UniqueProofRelation | null
     : null
 }
 
-function isParamOrConstValue(expr: PgAnalyzerExpr | null | undefined): boolean {
-  const unwrapped = unwrapValuePreservingExpr(expr)
-  return unwrapped?.tag === 'Param' || unwrapped?.tag === 'Const'
-}
-
-interface EqualityConstraint {
-  readonly attnum: number
-  readonly inputCollationOid: number
-  readonly opno: number
-}
-
-function equalityConstraintsFromQual(
-  expr: PgAnalyzerExpr | null | undefined,
-  relation: UniqueProofRelation,
-  output: EqualityConstraint[] = []
-): readonly EqualityConstraint[] {
-  if (!expr) {
-    return output
-  }
-
-  if (expr.tag === 'BoolExpr' && expr.boolOp === 'AND') {
-    for (const child of exprChildren(expr)) {
-      equalityConstraintsFromQual(child, relation, output)
-    }
-    return output
-  }
-
-  if (expr.tag !== 'OpExpr' || !expr.opno || expr.args?.length !== 2) {
-    return output
-  }
-
-  const left = targetExprFromAggregateArg(expr.args[0])
-  const right = targetExprFromAggregateArg(expr.args[1])
-  const leftVar = unwrapValuePreservingExpr(left)
-  const rightVar = unwrapValuePreservingExpr(right)
-  let attnum: number | undefined
-  if (
-    leftVar?.tag === 'Var' &&
-    leftVar.relid === relation.relid &&
-    leftVar.varno === relation.varno &&
-    (leftVar.varlevelsup ?? 0) === 0 &&
-    leftVar.varattno &&
-    isParamOrConstValue(right)
-  ) {
-    attnum = leftVar.varattno
-  } else if (
-    rightVar?.tag === 'Var' &&
-    rightVar.relid === relation.relid &&
-    rightVar.varno === relation.varno &&
-    (rightVar.varlevelsup ?? 0) === 0 &&
-    rightVar.varattno &&
-    isParamOrConstValue(left)
-  ) {
-    attnum = rightVar.varattno
-  }
-  if (attnum) {
-    output.push({
-      attnum,
-      inputCollationOid: expr.inputCollationOid ?? 0,
-      opno: expr.opno,
-    })
-  }
-
-  return output
-}
-
-function uniqueEqualityOperatorKey(opfamilyOid: number, operatorOid: number): string {
-  return `${opfamilyOid}:${operatorOid}`
-}
-
-function uniqueIndexIsConstrained(
-  catalog: CatalogFacts,
-  index: UniqueIndexCatalogRow,
-  constraints: readonly EqualityConstraint[]
-): boolean {
-  return index.attnums.every((attnum, keyIndex) =>
-    constraints.some(
-      (constraint) =>
-        constraint.attnum === attnum &&
-        constraint.inputCollationOid === index.collation_oids[keyIndex] &&
-        catalog.uniqueEqualityOperators.has(
-          uniqueEqualityOperatorKey(index.opfamily_oids[keyIndex] ?? 0, constraint.opno)
-        )
-    )
-  )
-}
-
 function compareUniqueIndexCatalogRows(left: UniqueIndexCatalogRow, right: UniqueIndexCatalogRow): number {
   if (left.indisprimary !== right.indisprimary) {
     return left.indisprimary ? -1 : 1
@@ -664,18 +575,40 @@ function compareUniqueIndexCatalogRows(left: UniqueIndexCatalogRow, right: Uniqu
   return left.indexrelid - right.indexrelid
 }
 
-function uniqueIndexRowBounds(catalog: CatalogFacts, query: PgAnalyzerQuery): TypedSqlPostgresIrRowBounds | null {
-  if (query.commandType !== 'SELECT' && query.commandType !== 'UPDATE' && query.commandType !== 'DELETE') {
-    return null
+function uniqueClosureRelation(
+  catalog: CatalogFacts,
+  relation: UniqueJoinSource,
+  proofKind: 'equality' | 'join'
+): UniqueJoinClosureRelation {
+  return {
+    indexes: (catalog.uniqueIndexesByRelid.get(relation.relid) ?? [])
+      .filter((index) => !(relation.inh && index.has_inheritors && index.relkind !== 'p'))
+      .map((index) => ({
+        attnums: index.attnums,
+        collationOids: index.collation_oids,
+        opfamilyOids: index.opfamily_oids,
+        proof: `${index.indisprimary ? 'primary_key' : 'unique_index'}${proofKind === 'equality' ? '_equality' : ''}:${index.index_name}`,
+      })),
+    varno: relation.varno,
   }
-  if (
+}
+
+function hasSimpleProjection(query: PgAnalyzerQuery): boolean {
+  return !(
     query.hasAggs === true ||
     query.hasSetOperations === true ||
     query.hasTargetSRFs === true ||
     query.hasWindowFuncs === true ||
     (query.groupClauseCount ?? 0) > 0 ||
     (query.groupingSetsCount ?? 0) > 0
-  ) {
+  )
+}
+
+function uniqueIndexRowBounds(catalog: CatalogFacts, query: PgAnalyzerQuery): TypedSqlPostgresIrRowBounds | null {
+  if (query.commandType !== 'SELECT' && query.commandType !== 'UPDATE' && query.commandType !== 'DELETE') {
+    return null
+  }
+  if (!hasSimpleProjection(query)) {
     return null
   }
 
@@ -684,35 +617,17 @@ function uniqueIndexRowBounds(catalog: CatalogFacts, query: PgAnalyzerQuery): Ty
     return null
   }
 
-  const constraints = equalityConstraintsFromQual(query.whereQual, relation)
-  const uniqueIndex = catalog.uniqueIndexesByRelid
-    .get(relation.relid)
-    ?.find(
-      (index) =>
-        !(relation.inh && index.has_inheritors && index.relkind !== 'p') &&
-        uniqueIndexIsConstrained(catalog, index, constraints)
-    )
-  if (!uniqueIndex) {
-    return null
-  }
-
-  return {
-    max: 1,
-    min: 0,
-    proof: `${uniqueIndex.indisprimary ? 'primary_key' : 'unique_index'}_equality:${uniqueIndex.index_name}`,
-  }
+  const proofs = inferUniqueJoinClosure(
+    [uniqueClosureRelation(catalog, relation, 'equality')],
+    collectUniqueConstraints(query.whereQual, [relation]),
+    catalog.uniqueEqualityOperators
+  )
+  const proof = proofs?.[0]
+  return proof ? { max: 1, min: 0, proof } : null
 }
 
 function uniqueJoinRowBounds(catalog: CatalogFacts, query: PgAnalyzerQuery): TypedSqlPostgresIrRowBounds | null {
-  if (
-    query.commandType !== 'SELECT' ||
-    query.hasAggs === true ||
-    query.hasSetOperations === true ||
-    query.hasTargetSRFs === true ||
-    query.hasWindowFuncs === true ||
-    (query.groupClauseCount ?? 0) > 0 ||
-    (query.groupingSetsCount ?? 0) > 0
-  ) {
+  if (query.commandType !== 'SELECT' || !hasSimpleProjection(query)) {
     return null
   }
   const input = collectUniqueJoinProofInput(query)
@@ -720,20 +635,24 @@ function uniqueJoinRowBounds(catalog: CatalogFacts, query: PgAnalyzerQuery): Typ
     return null
   }
 
-  const relations: UniqueJoinClosureRelation[] = input.sources.map((relation) => ({
-    indexes: (catalog.uniqueIndexesByRelid.get(relation.relid) ?? [])
-      .filter((index) => !(relation.inh && index.has_inheritors && index.relkind !== 'p'))
-      .map((index) => ({
-        attnums: index.attnums,
-        collationOids: index.collation_oids,
-        opfamilyOids: index.opfamily_oids,
-        proof: `${index.indisprimary ? 'primary_key' : 'unique_index'}:${index.index_name}`,
-      })),
-    varno: relation.varno,
-  }))
+  const relations = input.sources.map((relation) => uniqueClosureRelation(catalog, relation, 'join'))
   const proofs = inferUniqueJoinClosure(relations, input.constraints, catalog.uniqueEqualityOperators)
 
   return proofs ? { max: 1, min: 0, proof: `unique_join_closure(${proofs.join(',')})` } : null
+}
+
+function rowBoundSource(
+  query: PgAnalyzerQuery,
+  source: PgAnalyzerRte | undefined
+): { readonly kind: 'cte' | 'subquery'; readonly query: PgAnalyzerQuery } | null {
+  if (source?.kind === 'SUBQUERY') {
+    return source.subquery ? { kind: 'subquery', query: source.subquery } : null
+  }
+  if (source?.kind === 'CTE') {
+    const cte = cteByName(query, source.cteName)
+    return cte?.query && cte.recursive !== true ? { kind: 'cte', query: cte.query } : null
+  }
+  return null
 }
 
 function projectionSourceRowBounds(
@@ -743,58 +662,32 @@ function projectionSourceRowBounds(
 ): TypedSqlPostgresIrRowBounds | null {
   if (
     query.commandType !== 'SELECT' ||
-    query.hasAggs === true ||
-    query.hasSetOperations === true ||
-    query.hasTargetSRFs === true ||
-    query.hasWindowFuncs === true ||
+    !hasSimpleProjection(query) ||
     query.hasHavingQual === true ||
-    (query.groupClauseCount ?? 0) > 0 ||
-    (query.groupingSetsCount ?? 0) > 0 ||
     (query.distinctClauseCount ?? 0) > 0
   ) {
     return null
   }
 
-  const sourceRte = query.rtable?.length === 1 ? query.rtable[0] : undefined
-  let sourceQuery: PgAnalyzerQuery | undefined
-  let sourceKind: string
-  if (sourceRte?.kind === 'SUBQUERY') {
-    sourceQuery = sourceRte.subquery
-    sourceKind = 'subquery'
-  } else if (sourceRte?.kind === 'CTE') {
-    const cte = cteByName(query, sourceRte.cteName)
-    if (cte?.recursive === true) {
-      return null
-    }
-    sourceQuery = cte?.query
-    sourceKind = 'cte'
-  } else {
+  const source = rowBoundSource(query, query.rtable?.length === 1 ? query.rtable[0] : undefined)
+  if (!source) {
     return null
   }
 
-  if (!sourceQuery) {
-    return null
-  }
-
-  const sourceBounds = inferRowBounds(catalog, sourceQuery, seen)
+  const sourceBounds = inferRowBounds(catalog, source.query, seen)
   return {
     max: sourceBounds.max,
     min: query.whereQual ? 0 : sourceBounds.min,
-    proof: `${sourceKind}_projection:${sourceBounds.proof}${query.whereQual ? '+outer_qual_can_filter' : ''}`,
+    proof: `${source.kind}_projection:${sourceBounds.proof}${query.whereQual ? '+outer_qual_can_filter' : ''}`,
   }
 }
 
 function exactValuesRowBounds(query: PgAnalyzerQuery): TypedSqlPostgresIrRowBounds | null {
   if (
     query.commandType !== 'SELECT' ||
-    query.hasAggs === true ||
-    query.hasSetOperations === true ||
-    query.hasTargetSRFs === true ||
-    query.hasWindowFuncs === true ||
+    !hasSimpleProjection(query) ||
     query.whereQual ||
     query.hasHavingQual === true ||
-    (query.groupClauseCount ?? 0) > 0 ||
-    (query.groupingSetsCount ?? 0) > 0 ||
     (query.distinctClauseCount ?? 0) > 0
   ) {
     return null
@@ -828,34 +721,21 @@ function groupedSourceRowBounds(
 
   const rowSources = (query.rtable ?? []).filter((rte) => rte.kind !== 'GROUP')
   const source = rowSources.length === 1 ? rowSources[0] : undefined
-  let sourceQuery: PgAnalyzerQuery | undefined
-  let sourceKind: string
-  if (source?.kind === 'SUBQUERY') {
-    sourceQuery = source.subquery
-    sourceKind = 'subquery'
-  } else if (source?.kind === 'CTE') {
-    const cte = cteByName(query, source.cteName)
-    if (cte?.recursive === true) {
-      return null
-    }
-    sourceQuery = cte?.query
-    sourceKind = 'cte'
-  } else if (source?.kind === 'VALUES' && source.valuesLists) {
+  if (source?.kind === 'VALUES' && source.valuesLists) {
     const count = source.valuesLists.length
     const min = query.whereQual || count === 0 ? 0 : 1
     return { max: count, min, proof: `values_grouping_${count}_rows${query.whereQual ? '+qual_can_filter' : ''}` }
-  } else {
-    return null
   }
+  const sourceQuery = rowBoundSource(query, source)
   if (!sourceQuery) {
     return null
   }
 
-  const sourceBounds = inferRowBounds(catalog, sourceQuery, seen)
+  const sourceBounds = inferRowBounds(catalog, sourceQuery.query, seen)
   return {
     max: sourceBounds.max,
     min: query.whereQual || sourceBounds.min === 0 ? 0 : 1,
-    proof: `${sourceKind}_grouping:${sourceBounds.proof}${query.whereQual ? '+qual_can_filter' : ''}`,
+    proof: `${sourceQuery.kind}_grouping:${sourceBounds.proof}${query.whereQual ? '+qual_can_filter' : ''}`,
   }
 }
 
@@ -1363,6 +1243,13 @@ function typeFactForOid(
 
 type ReturningRowImage = 'actionDefault' | 'new' | 'old' | 'possiblyUnavailable' | 'unavailable' | 'unknown'
 
+const returningRowImages = {
+  DELETE: { DEFAULT: 'old', NEW: 'unavailable', OLD: 'old' },
+  INSERT: { DEFAULT: 'new', NEW: 'new', OLD: 'unavailable' },
+  MERGE: { DEFAULT: 'actionDefault', NEW: 'possiblyUnavailable', OLD: 'possiblyUnavailable' },
+  UPDATE: { DEFAULT: 'new', NEW: 'new', OLD: 'old' },
+} as const
+
 function isDmlTargetVar(scope: QueryScope, expr: PgAnalyzerExpr): boolean {
   return (
     ['DELETE', 'INSERT', 'MERGE', 'UPDATE'].includes(scope.query.commandType) &&
@@ -1375,58 +1262,11 @@ function returningRowImage(scope: QueryScope, expr: PgAnalyzerExpr): ReturningRo
     return null
   }
 
-  switch (scope.query.commandType) {
-    case 'DELETE':
-      switch (expr.varreturningtype) {
-        case 'DEFAULT':
-        case 'OLD':
-          return 'old'
-        case 'NEW':
-          return 'unavailable'
-        case 'UNRECOGNIZED':
-        case undefined:
-          return 'unknown'
-      }
-      break
-    case 'INSERT':
-      switch (expr.varreturningtype) {
-        case 'DEFAULT':
-        case 'NEW':
-          return 'new'
-        case 'OLD':
-          return 'unavailable'
-        case 'UNRECOGNIZED':
-        case undefined:
-          return 'unknown'
-      }
-      break
-    case 'UPDATE':
-      switch (expr.varreturningtype) {
-        case 'DEFAULT':
-        case 'NEW':
-          return 'new'
-        case 'OLD':
-          return 'old'
-        case 'UNRECOGNIZED':
-        case undefined:
-          return 'unknown'
-      }
-      break
-    case 'MERGE':
-      switch (expr.varreturningtype) {
-        case 'DEFAULT':
-          return 'actionDefault'
-        case 'NEW':
-        case 'OLD':
-          return 'possiblyUnavailable'
-        case 'UNRECOGNIZED':
-        case undefined:
-          return 'unknown'
-      }
-      break
-  }
-
-  return 'unknown'
+  const { commandType } = scope.query
+  const rowType = expr.varreturningtype
+  return isDataModifyingCommand(commandType) && (rowType === 'DEFAULT' || rowType === 'NEW' || rowType === 'OLD')
+    ? returningRowImages[commandType][rowType]
+    : 'unknown'
 }
 
 function updateAssignsAttribute(scope: QueryScope, expr: PgAnalyzerExpr): boolean {

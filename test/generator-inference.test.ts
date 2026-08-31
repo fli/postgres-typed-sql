@@ -1,12 +1,11 @@
 import assert from 'node:assert/strict'
-import { readFile } from 'node:fs/promises'
-import { join } from 'node:path'
+
 import test from 'node:test'
 
-import { createMinimalFixture, generateTypedSql } from './generator-test-support.js'
+import { renderQuery } from './generator-test-support.js'
 
 test('generates precise range JSON fields and optional cardinality through a unique join chain', async () => {
-  const root = await createMinimalFixture(
+  const output = await renderQuery(
     `create table public.trainers (
   id bigint primary key,
   active_span int4range not null
@@ -35,15 +34,6 @@ where trainer.id = :trainer_id
   and not upper_inf(trainer.active_span)
 `
   )
-
-  await generateTypedSql({
-    codecProfile: 'node-postgres',
-    include: ['queries'],
-    rootDir: root,
-    schema: 'schema.sql',
-  })
-
-  const output = await readFile(join(root, 'queries/query.typed-sql.ts'), 'utf8')
   assert.match(output, /cardinality: 'optional'/u)
   assert.match(output, /readonly lower: number\n/u)
   assert.match(output, /readonly upper: number\n/u)
