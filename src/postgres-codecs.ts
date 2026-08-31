@@ -80,6 +80,19 @@ export interface ResolvedPostgresCodecProfile {
 }
 
 const resolvedProfileCache = new WeakMap<object, ResolvedPostgresCodecProfile>()
+const builtinArrayProfiles = new WeakMap<
+  ResolvedPostgresCodecProfile,
+  ResolvedPostgresCodecProfile['resolveResultType']
+>()
+const builtinArrayElements = new WeakMap<PostgresTypeScriptResolution, PostgresTypeScriptResolution>()
+const builtinJsonProfiles = new WeakMap<
+  ResolvedPostgresCodecProfile,
+  {
+    readonly result: ResolvedPostgresCodecProfile['resolveResultType']
+    readonly scalar: ResolvedPostgresCodecProfile['resolveJsonScalarType']
+    readonly literal: ResolvedPostgresCodecProfile['supportsStringLiteralRefinement']
+  }
+>()
 
 type ResolvedProfileHooks = Pick<
   PostgresCodecProfileDefinition,
@@ -165,10 +178,12 @@ function uniqueBindings(bindings: readonly string[]): readonly string[] {
 }
 
 function pgResultArrayResolution(element: PostgresTypeScriptResolution): PostgresTypeScriptResolution {
-  return postgresTypeScriptType(`PgArray<${element.type}>`, {
+  const resolution = postgresTypeScriptType(`PgArray<${element.type}>`, {
     ambientBindings: element.ambientBindings,
     scalarImports: uniqueBindings(['PgArray', ...element.scalarImports]),
   })
+  builtinArrayElements.set(resolution, element)
+  return resolution
 }
 
 function pgParameterArrayResolution(element: PostgresTypeScriptResolution): PostgresTypeScriptResolution {
@@ -674,17 +689,47 @@ export function resolvePostgresCodecProfile(
     resolveResultType: (type) => resolveResultAt(root, type, root),
     supportsStringLiteralRefinement: (position, type) => supportsLiteralAt(root, position, type, root),
   }
+  if (root.builtIn === 'node-postgres') {
+    builtinArrayProfiles.set(resolved, resolved.resolveResultType)
+    builtinJsonProfiles.set(resolved, {
+      result: resolved.resolveResultType,
+      scalar: resolved.resolveJsonScalarType,
+      literal: resolved.supportsStringLiteralRefinement,
+    })
+  }
   resolvedProfileCache.set(resolved, resolved)
   return resolved
 }
 
 export const defaultPostgresCodecProfile: BuiltInPostgresCodecProfile = 'conservative'
 
+/** Literal JSON primitives have no SQL scalar OID to pass to custom scalar hooks. */
+export function postgresJsonUsesBuiltinPrimitiveDecoder(profile: ResolvedPostgresCodecProfile): boolean {
+  const builtin = builtinJsonProfiles.get(profile)
+  return (
+    builtin?.result === profile.resolveResultType &&
+    builtin.scalar === profile.resolveJsonScalarType &&
+    builtin.literal === profile.supportsStringLiteralRefinement
+  )
+}
+
 export function resolveTypeScriptResultTypeForPostgresType(
   type: PostgresTypeFact,
   profile: PostgresCodecProfile | ResolvedPostgresCodecProfile = defaultPostgresCodecProfile
 ): PostgresTypeScriptResolution {
   return resolvePostgresCodecProfile(profile).resolveResultType(type)
+}
+
+/** Array refinements require the exact built-in decoder, not a profile name or matching type text. */
+export function resolveBuiltinResultArrayElement(
+  type: PostgresTypeFact,
+  profile: ResolvedPostgresCodecProfile
+): PostgresTypeScriptResolution | undefined {
+  if (builtinArrayProfiles.get(profile) !== profile.resolveResultType) {
+    return undefined
+  }
+  const resolution = nodePostgresTextResolutionByOid.get(resultDecoderType(type).pgTypeOid)
+  return resolution ? builtinArrayElements.get(resolution) : undefined
 }
 
 export function resolveTypeScriptParameterTypeForPostgresType(

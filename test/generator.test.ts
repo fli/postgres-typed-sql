@@ -139,21 +139,28 @@ join public.right_source on right_source.id = left_source.id
 test('generates nullable output only when canonical coercion proof remains incomplete', async () => {
   const output = await renderQuery(
     `create domain public.required_integer_domain as integer not null;
+create type public.coercion_source as enum ('value');
+create function public.nullable_coercion(public.coercion_source) returns integer
+language sql immutable strict as 'select null::integer';
+create cast (public.coercion_source as integer) with function public.nullable_coercion(public.coercion_source);
 create table public.coercion_outputs (
   required_integer integer not null,
-  nullable_integer integer
+  nullable_integer integer,
+  required_source public.coercion_source not null
 );
 `,
     `select
   required_integer::bigint as exact_cast,
-  required_integer::numeric as opaque_cast,
+  required_integer::numeric as numeric_cast,
   nullable_integer::numeric as nullable_cast,
+  required_source::integer as opaque_cast,
   nullable_integer::public.required_integer_domain as required_domain
 from public.coercion_outputs
 `
   )
   assert.match(output, /readonly exact_cast: PgInt8String\n/u)
-  assert.match(output, /readonly opaque_cast: PgNumericString \| null\n/u)
+  assert.match(output, /readonly numeric_cast: PgNumericString\n/u)
+  assert.match(output, /readonly opaque_cast: number \| null\n/u)
   assert.match(output, /readonly nullable_cast: PgNumericString \| null\n/u)
   assert.match(output, /readonly required_domain: number\n/u)
 })
@@ -958,7 +965,7 @@ where event_id = :event_id
   assert.match(audit, /readonly details_json: AuditEventJ12_details_jsonJson/u)
   assert.match(audit, /readonly score: number/u)
   assert.match(audit, /readonly status: "queued" \| "complete"/u)
-  assert.match(audit, /readonly whole_event: DbJsonSelected/u)
+  assert.match(audit, /readonly whole_event: AuditEventJ12_details_jsonJsonJ11_whole_event/u)
   assert.doesNotMatch(audit, /AuditScore|AuditScoreSpan/u)
 
   const catalog = await readFile(join(root, 'postgres-typed-sql.types.ts'), 'utf8')
@@ -1941,7 +1948,7 @@ test('generates build-object contracts only from proven complete argument lists'
   await writeFile(queryFile, "select jsonb_build_object('answer', null::text) as payload\n")
   await generateTypedSql(config)
   output = await readFile(outputFile, 'utf8')
-  assert.match(output, /interface QueryJ7_payloadJson \{[\s\S]*readonly answer: string \| null/u)
+  assert.match(output, /interface QueryJ7_payloadJson \{[\s\S]*readonly answer: null/u)
   assert.match(output, /readonly payload: QueryJ7_payloadJson\n/u)
   assert.doesNotMatch(output, /readonly payload: QueryJ7_payloadJson \| null/u)
 
@@ -2083,12 +2090,13 @@ from (values (1)) source(n)
   assert.match(output, /readonly displayName: 'Reader'/u)
   assert.match(output, /readonly recentPosts: readonly/u)
   assert.match(output, /readonly postId: number/u)
-  assert.match(output, /readonly publishedAt: string \| null/u)
-  assert.match(output, /readonly webhookPayload: DbJsonSelected/u)
+  assert.match(output, /readonly publishedAt: null/u)
+  assert.match(output, /readonly webhookPayload: QueryJ15_account_detailsJsonJ15_webhook_payload/u)
+  assert.match(output, /readonly eventType: 'account.created'/u)
   assert.match(output, /name: 'account_id',[\s\S]*?propertyName: 'accountId'/u)
   assert.match(
     output,
-    /jsonMapping: \{"fields":\[\{"name":"display_name","propertyName":"displayName"\},\{"mapping":\{"arrayElement":\{"fields":\[\{"name":"post_id","propertyName":"postId"\},\{"name":"published_at","propertyName":"publishedAt"\}\]\}\},"name":"recent_posts","propertyName":"recentPosts"\},\{"name":"webhook_payload","propertyName":"webhookPayload"\}\]\}/u
+    /jsonMapping: \{"fields":\[\{"name":"display_name","propertyName":"displayName"\},\{"mapping":\{"arrayElement":\{"fields":\[\{"name":"post_id","propertyName":"postId"\},\{"name":"published_at","propertyName":"publishedAt"\}\]\}\},"name":"recent_posts","propertyName":"recentPosts"\},\{"mapping":\{"fields":\[\{"name":"event_type","propertyName":"eventType"\}\]\},"name":"webhook_payload","propertyName":"webhookPayload"\}\]\}/u
   )
 })
 
@@ -2317,18 +2325,23 @@ as $$ select 'null'::jsonb $$;
   assert.doesNotMatch(output, /interface QueryJ7_payloadJson/u)
 })
 
-test('falls back to opaque JSON when COALESCE branches have different shapes', async () => {
+test('preserves structured JSON unions when COALESCE branches have different shapes', async () => {
   const output = await renderQuery(
     'create table public.json_values (value integer);\n',
     `select coalesce(
-  jsonb_agg(jsonb_build_object('a', value)) filter (where false),
+  jsonb_agg(jsonb_build_object('a', value)),
   jsonb_build_object('b', 2)
 ) as payload
 from public.json_values
 `
   )
-  assert.match(output, /readonly payload: DbJsonSelected/u)
-  assert.doesNotMatch(output, /interface QueryJ7_payloadJson/u)
+  assert.match(
+    output,
+    /readonly payload: readonly \(QueryJ7_payloadJsonJ12_alternative1J7_element\)\[\] \| QueryJ7_payloadJsonJ12_alternative2\n/u
+  )
+  assert.match(output, /readonly a: number \| null\n/u)
+  assert.match(output, /readonly b: number\n/u)
+  assert.doesNotMatch(output, /DbJsonSelected/u)
 })
 
 test('resolves column type assertions by PostgreSQL OID instead of display spelling', async () => {

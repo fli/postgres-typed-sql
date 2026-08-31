@@ -78,6 +78,8 @@ static void append_optional_name_field(StringInfo out, const char *name, const c
 static bool query_contains_volatile_functions(const Query *query);
 static bool volatile_function_walker(Node *node, void *context);
 static bool query_contains_row_marks(const Query *query);
+static const WindowClause *window_clause_for_function(
+  const WindowFunc *function, const PtsQueryScope *scope);
 static bool executor_support_dependency_invokes_volatile(
   Oid function_oid, const List *args, bool target_entries,
   Oid result_type, int32 result_typmod);
@@ -290,8 +292,16 @@ expr_tag_name(const Node *node)
       return "FuncExpr";
     case T_OpExpr:
       return "OpExpr";
+    case T_DistinctExpr:
+      return "DistinctExpr";
+    case T_NullIfExpr:
+      return "NullIfExpr";
     case T_Aggref:
       return "Aggref";
+    case T_WindowFunc:
+      return "WindowFunc";
+    case T_MinMaxExpr:
+      return "MinMaxExpr";
     case T_NullTest:
       return "NullTest";
     case T_BooleanTest:
@@ -382,7 +392,7 @@ function_cast_nonnull_for_nonnull_argument(const FuncExpr *function)
   }
 
   /*
-   * PostgreSQL's package-owned integer cast implementations return a
+   * PostgreSQL's package-owned integer/numeric/float cast implementations return a
    * converted Datum or raise on overflow.  Keep this deliberately narrow
    * and keyed by pg_proc identity plus the parsed source/result types.
    */
@@ -412,6 +422,102 @@ function_cast_nonnull_for_nonnull_argument(const FuncExpr *function)
       expected_source_type = INT2OID;
       expected_result_type = INT8OID;
       break;
+    case F_INT2_FLOAT4:
+      expected_source_type = FLOAT4OID;
+      expected_result_type = INT2OID;
+      break;
+    case F_INT2_FLOAT8:
+      expected_source_type = FLOAT8OID;
+      expected_result_type = INT2OID;
+      break;
+    case F_INT2_NUMERIC:
+      expected_source_type = NUMERICOID;
+      expected_result_type = INT2OID;
+      break;
+    case F_INT4_FLOAT4:
+      expected_source_type = FLOAT4OID;
+      expected_result_type = INT4OID;
+      break;
+    case F_INT4_FLOAT8:
+      expected_source_type = FLOAT8OID;
+      expected_result_type = INT4OID;
+      break;
+    case F_INT4_NUMERIC:
+      expected_source_type = NUMERICOID;
+      expected_result_type = INT4OID;
+      break;
+    case F_INT8_FLOAT4:
+      expected_source_type = FLOAT4OID;
+      expected_result_type = INT8OID;
+      break;
+    case F_INT8_FLOAT8:
+      expected_source_type = FLOAT8OID;
+      expected_result_type = INT8OID;
+      break;
+    case F_INT8_NUMERIC:
+      expected_source_type = NUMERICOID;
+      expected_result_type = INT8OID;
+      break;
+    case F_FLOAT4_INT2:
+      expected_source_type = INT2OID;
+      expected_result_type = FLOAT4OID;
+      break;
+    case F_FLOAT4_INT4:
+      expected_source_type = INT4OID;
+      expected_result_type = FLOAT4OID;
+      break;
+    case F_FLOAT4_INT8:
+      expected_source_type = INT8OID;
+      expected_result_type = FLOAT4OID;
+      break;
+    case F_FLOAT4_FLOAT8:
+      expected_source_type = FLOAT8OID;
+      expected_result_type = FLOAT4OID;
+      break;
+    case F_FLOAT4_NUMERIC:
+      expected_source_type = NUMERICOID;
+      expected_result_type = FLOAT4OID;
+      break;
+    case F_FLOAT8_INT2:
+      expected_source_type = INT2OID;
+      expected_result_type = FLOAT8OID;
+      break;
+    case F_FLOAT8_INT4:
+      expected_source_type = INT4OID;
+      expected_result_type = FLOAT8OID;
+      break;
+    case F_FLOAT8_INT8:
+      expected_source_type = INT8OID;
+      expected_result_type = FLOAT8OID;
+      break;
+    case F_FLOAT8_FLOAT4:
+      expected_source_type = FLOAT4OID;
+      expected_result_type = FLOAT8OID;
+      break;
+    case F_FLOAT8_NUMERIC:
+      expected_source_type = NUMERICOID;
+      expected_result_type = FLOAT8OID;
+      break;
+    case F_NUMERIC_INT2:
+      expected_source_type = INT2OID;
+      expected_result_type = NUMERICOID;
+      break;
+    case F_NUMERIC_INT4:
+      expected_source_type = INT4OID;
+      expected_result_type = NUMERICOID;
+      break;
+    case F_NUMERIC_INT8:
+      expected_source_type = INT8OID;
+      expected_result_type = NUMERICOID;
+      break;
+    case F_NUMERIC_FLOAT4:
+      expected_source_type = FLOAT4OID;
+      expected_result_type = NUMERICOID;
+      break;
+    case F_NUMERIC_FLOAT8:
+      expected_source_type = FLOAT8OID;
+      expected_result_type = NUMERICOID;
+      break;
     default:
       return false;
   }
@@ -419,6 +525,304 @@ function_cast_nonnull_for_nonnull_argument(const FuncExpr *function)
   source_type = exprType((const Node *) linitial(function->args));
   return source_type == expected_source_type &&
          function->funcresulttype == expected_result_type;
+}
+
+static bool
+function_nonnull_for_nonnull_arguments(Oid function_oid)
+{
+  /*
+   * These exact PostgreSQL implementations return a Datum or raise on
+   * non-NULL inputs.  Strictness alone never establishes this direction:
+   * both user functions and built-ins such as range lower() can return NULL.
+   * Keep casts separate so an explicit cast retains its existing contract.
+   */
+  switch (function_oid)
+  {
+    case F_INT2PL:
+    case F_INT4PL:
+    case F_INT8PL:
+    case F_INT2MI:
+    case F_INT4MI:
+    case F_INT8MI:
+    case F_INT2MUL:
+    case F_INT4MUL:
+    case F_INT8MUL:
+    case F_INT2DIV:
+    case F_INT4DIV:
+    case F_INT8DIV:
+    case F_INT2MOD:
+    case F_INT4MOD:
+    case F_INT8MOD:
+    case F_INT2UM:
+    case F_INT4UM:
+    case F_INT8UM:
+    case F_INT2UP:
+    case F_INT4UP:
+    case F_INT8UP:
+    case F_INT2ABS:
+    case F_INT4ABS:
+    case F_INT8ABS:
+    case F_INT2EQ:
+    case F_INT4EQ:
+    case F_INT8EQ:
+    case F_INT2NE:
+    case F_INT4NE:
+    case F_INT8NE:
+    case F_INT2LT:
+    case F_INT4LT:
+    case F_INT8LT:
+    case F_INT2LE:
+    case F_INT4LE:
+    case F_INT8LE:
+    case F_INT2GT:
+    case F_INT4GT:
+    case F_INT8GT:
+    case F_INT2GE:
+    case F_INT4GE:
+    case F_INT8GE:
+    case F_BOOLEQ:
+    case F_BOOLNE:
+    case F_TEXTEQ:
+    case F_TEXTNE:
+    case F_TEXTLEN:
+    case F_LENGTH_TEXT:
+    case F_CHAR_LENGTH_TEXT:
+    case F_OCTET_LENGTH_TEXT:
+    case F_TEXTCAT:
+    case F_LOWER_TEXT:
+    case F_UPPER_TEXT:
+    case F_LTRIM_TEXT:
+    case F_RTRIM_TEXT:
+    case F_BTRIM_TEXT:
+    case F_LTRIM_TEXT_TEXT:
+    case F_RTRIM_TEXT_TEXT:
+    case F_BTRIM_TEXT_TEXT:
+    case F_INT24PL:
+    case F_INT24MI:
+    case F_INT24MUL:
+    case F_INT24DIV:
+    case F_INT24EQ:
+    case F_INT24NE:
+    case F_INT24LT:
+    case F_INT24LE:
+    case F_INT24GT:
+    case F_INT24GE:
+    case F_INT42PL:
+    case F_INT42MI:
+    case F_INT42MUL:
+    case F_INT42DIV:
+    case F_INT42EQ:
+    case F_INT42NE:
+    case F_INT42LT:
+    case F_INT42LE:
+    case F_INT42GT:
+    case F_INT42GE:
+    case F_INT28PL:
+    case F_INT28MI:
+    case F_INT28MUL:
+    case F_INT28DIV:
+    case F_INT28EQ:
+    case F_INT28NE:
+    case F_INT28LT:
+    case F_INT28LE:
+    case F_INT28GT:
+    case F_INT28GE:
+    case F_INT82PL:
+    case F_INT82MI:
+    case F_INT82MUL:
+    case F_INT82DIV:
+    case F_INT82EQ:
+    case F_INT82NE:
+    case F_INT82LT:
+    case F_INT82LE:
+    case F_INT82GT:
+    case F_INT82GE:
+    case F_INT48PL:
+    case F_INT48MI:
+    case F_INT48MUL:
+    case F_INT48DIV:
+    case F_INT48EQ:
+    case F_INT48NE:
+    case F_INT48LT:
+    case F_INT48LE:
+    case F_INT48GT:
+    case F_INT48GE:
+    case F_INT84PL:
+    case F_INT84MI:
+    case F_INT84MUL:
+    case F_INT84DIV:
+    case F_INT84EQ:
+    case F_INT84NE:
+    case F_INT84LT:
+    case F_INT84LE:
+    case F_INT84GT:
+    case F_INT84GE:
+    case F_FLOAT4PL:
+    case F_FLOAT4MI:
+    case F_FLOAT4MUL:
+    case F_FLOAT4DIV:
+    case F_FLOAT4EQ:
+    case F_FLOAT4NE:
+    case F_FLOAT4LT:
+    case F_FLOAT4LE:
+    case F_FLOAT4GT:
+    case F_FLOAT4GE:
+    case F_FLOAT8PL:
+    case F_FLOAT8MI:
+    case F_FLOAT8MUL:
+    case F_FLOAT8DIV:
+    case F_FLOAT8EQ:
+    case F_FLOAT8NE:
+    case F_FLOAT8LT:
+    case F_FLOAT8LE:
+    case F_FLOAT8GT:
+    case F_FLOAT8GE:
+    case F_FLOAT48PL:
+    case F_FLOAT48MI:
+    case F_FLOAT48MUL:
+    case F_FLOAT48DIV:
+    case F_FLOAT48EQ:
+    case F_FLOAT48NE:
+    case F_FLOAT48LT:
+    case F_FLOAT48LE:
+    case F_FLOAT48GT:
+    case F_FLOAT48GE:
+    case F_FLOAT84PL:
+    case F_FLOAT84MI:
+    case F_FLOAT84MUL:
+    case F_FLOAT84DIV:
+    case F_FLOAT84EQ:
+    case F_FLOAT84NE:
+    case F_FLOAT84LT:
+    case F_FLOAT84LE:
+    case F_FLOAT84GT:
+    case F_FLOAT84GE:
+    case F_NUMERIC_ADD:
+    case F_NUMERIC_SUB:
+    case F_NUMERIC_MUL:
+    case F_NUMERIC_DIV:
+    case F_NUMERIC_MOD:
+    case F_NUMERIC_UMINUS:
+    case F_NUMERIC_UPLUS:
+    case F_NUMERIC_ABS:
+    case F_NUMERIC_EQ:
+    case F_NUMERIC_NE:
+    case F_NUMERIC_LT:
+    case F_NUMERIC_LE:
+    case F_NUMERIC_GT:
+    case F_NUMERIC_GE:
+    case F_FLOAT4UM:
+    case F_FLOAT8UM:
+    case F_FLOAT4UP:
+    case F_FLOAT8UP:
+    case F_FLOAT4ABS:
+    case F_FLOAT8ABS:
+    case F_TEXT_LT:
+    case F_TEXT_LE:
+    case F_TEXT_GT:
+    case F_TEXT_GE:
+      return true;
+    default:
+      return false;
+  }
+}
+
+static bool
+function_always_nonnull_without_arguments(const FuncExpr *function)
+{
+  if (function->funcretset || function->args != NIL)
+  {
+    return false;
+  }
+  switch (function->funcid)
+  {
+    case F_NOW:
+    case F_RANDOM_:
+    case F_GEN_RANDOM_UUID:
+      return true;
+    default:
+      return false;
+  }
+}
+
+static bool
+window_frame_includes_current_row(const WindowFunc *function,
+                                  const PtsQueryScope *scope)
+{
+  const WindowClause *window = window_clause_for_function(function, scope);
+  int options;
+
+  if (window == NULL)
+  {
+    return false;
+  }
+  options = window->frameOptions;
+  return (options & FRAMEOPTION_EXCLUSION) == 0 &&
+         (options & (FRAMEOPTION_START_UNBOUNDED_PRECEDING |
+                     FRAMEOPTION_START_CURRENT_ROW)) != 0 &&
+         (options & (FRAMEOPTION_END_UNBOUNDED_FOLLOWING |
+                     FRAMEOPTION_END_CURRENT_ROW)) != 0;
+}
+
+static void
+append_function_behavior_fields(StringInfo out, Oid function_oid)
+{
+  append_bool_field(out, "isStrict",
+                    OidIsValid(function_oid) && func_strict(function_oid));
+  append_bool_field(out, "isImmutable",
+                    OidIsValid(function_oid) &&
+                    func_volatile(function_oid) == PROVOLATILE_IMMUTABLE);
+}
+
+static bool
+text_equality_is_exact(Oid function_oid, Oid collation_oid)
+{
+  return function_oid == F_TEXTEQ &&
+         (!OidIsValid(collation_oid) ||
+          get_collation_isdeterministic(collation_oid));
+}
+
+static bool
+text_inequality_is_exact(Oid function_oid, Oid collation_oid)
+{
+  return function_oid == F_TEXTNE &&
+         (!OidIsValid(collation_oid) ||
+          get_collation_isdeterministic(collation_oid));
+}
+
+static const char *
+sql_value_function_name(SQLValueFunctionOp operation)
+{
+  switch (operation)
+  {
+    case SVFOP_CURRENT_DATE:
+      return "CURRENT_DATE";
+    case SVFOP_CURRENT_TIME:
+    case SVFOP_CURRENT_TIME_N:
+      return "CURRENT_TIME";
+    case SVFOP_CURRENT_TIMESTAMP:
+    case SVFOP_CURRENT_TIMESTAMP_N:
+      return "CURRENT_TIMESTAMP";
+    case SVFOP_LOCALTIME:
+    case SVFOP_LOCALTIME_N:
+      return "LOCALTIME";
+    case SVFOP_LOCALTIMESTAMP:
+    case SVFOP_LOCALTIMESTAMP_N:
+      return "LOCALTIMESTAMP";
+    case SVFOP_CURRENT_ROLE:
+      return "CURRENT_ROLE";
+    case SVFOP_CURRENT_USER:
+      return "CURRENT_USER";
+    case SVFOP_USER:
+      return "USER";
+    case SVFOP_SESSION_USER:
+      return "SESSION_USER";
+    case SVFOP_CURRENT_CATALOG:
+      return "CURRENT_CATALOG";
+    case SVFOP_CURRENT_SCHEMA:
+      return "CURRENT_SCHEMA";
+  }
+  return "UNRECOGNIZED";
 }
 
 static bool
@@ -636,7 +1040,11 @@ node_has_expr_type(const Node *node)
     case T_Param:
     case T_FuncExpr:
     case T_OpExpr:
+    case T_DistinctExpr:
+    case T_NullIfExpr:
     case T_Aggref:
+    case T_WindowFunc:
+    case T_MinMaxExpr:
     case T_NullTest:
     case T_BooleanTest:
     case T_CoalesceExpr:
@@ -798,6 +1206,10 @@ append_expr_specific_fields(StringInfo out, const PtsQueryScope *scope, const No
       append_bool_field(out, "constIsNull", constant->constisnull);
       if (!constant->constisnull)
       {
+        if (constant->consttype == BOOLOID)
+        {
+          append_bool_field(out, "constBoolean", DatumGetBool(constant->constvalue));
+        }
         if (constant->consttype == INT2OID)
         {
           appendStringInfo(out, ",\"constInteger\":\"%d\"", DatumGetInt16(constant->constvalue));
@@ -821,10 +1233,49 @@ append_expr_specific_fields(StringInfo out, const PtsQueryScope *scope, const No
           appendStringInfoString(out, ",\"constString\":");
           append_json_string(out, DatumGetCString(constant->constvalue));
         }
+        else if (constant->consttype == TEXTARRAYOID)
+        {
+          ArrayType *array = DatumGetArrayTypeP(constant->constvalue);
+
+          if (ARR_NDIM(array) <= 1 && ArrayGetNItems(ARR_NDIM(array), ARR_DIMS(array)) <= 256)
+          {
+            Datum *elements;
+            bool *nulls;
+            int count;
+            int index;
+
+            deconstruct_array(array, TEXTOID, -1, false, TYPALIGN_INT,
+                              &elements, &nulls, &count);
+            appendStringInfoString(out, ",\"constTextArray\":[");
+            for (index = 0; index < count; index++)
+            {
+              if (index > 0)
+                appendStringInfoChar(out, ',');
+              if (nulls[index])
+                appendStringInfoString(out, "null");
+              else
+              {
+                char *value = TextDatumGetCString(elements[index]);
+
+                append_json_string(out, value);
+                pfree(value);
+              }
+            }
+            appendStringInfoChar(out, ']');
+            if (elements != NULL)
+              pfree(elements);
+            if (nulls != NULL)
+              pfree(nulls);
+          }
+          if ((Pointer) array != DatumGetPointer(constant->constvalue))
+            pfree(array);
+        }
         if (constant->consttype == JSONOID)
         {
           char *json = TextDatumGetCString(constant->constvalue);
 
+          appendStringInfoString(out, ",\"constJson\":");
+          append_json_string(out, json);
           if (json_text_is_empty_array(json))
           {
             append_bool_field(out, "constEmptyJsonArray", true);
@@ -834,7 +1285,11 @@ append_expr_specific_fields(StringInfo out, const PtsQueryScope *scope, const No
         else if (constant->consttype == JSONBOID)
         {
           Jsonb *json = DatumGetJsonbP(constant->constvalue);
+          char *serialized = JsonbToCString(NULL, &json->root, VARSIZE(json));
 
+          appendStringInfoString(out, ",\"constJson\":");
+          append_json_string(out, serialized);
+          pfree(serialized);
           if (JB_ROOT_IS_ARRAY(json) && !JB_ROOT_IS_SCALAR(json) &&
               JB_ROOT_COUNT(json) == 0)
           {
@@ -855,6 +1310,10 @@ append_expr_specific_fields(StringInfo out, const PtsQueryScope *scope, const No
       append_optional_name_field(out, "funcname", OidIsValid(func->funcid) ? get_func_name(func->funcid) : NULL);
       append_bool_field(out, "funcVariadic", func->funcvariadic);
       append_bool_field(out, "returnsSet", func->funcretset);
+      append_bool_field(out, "alwaysNonNull",
+                        function_always_nonnull_without_arguments(func));
+      append_oid_field(out, "inputCollationOid", func->inputcollid);
+      append_function_behavior_fields(out, func->funcid);
       appendStringInfoString(out, ",\"coercionForm\":");
       append_json_string(out, coercion_form_name(func->funcformat));
       if (is_cast)
@@ -866,17 +1325,35 @@ append_expr_specific_fields(StringInfo out, const PtsQueryScope *scope, const No
           out, "nonNullInputProducesNonNull",
           function_cast_nonnull_for_nonnull_argument(func));
       }
+      else
+      {
+        append_bool_field(out, "nonNullInputProducesNonNull",
+                          !func->funcretset &&
+                          function_nonnull_for_nonnull_arguments(func->funcid));
+      }
       break;
     }
     case T_OpExpr:
+    case T_DistinctExpr:
+    case T_NullIfExpr:
     {
       const OpExpr *op = (const OpExpr *) expr;
+      Oid function_oid = OidIsValid(op->opfuncid)
+                           ? op->opfuncid : get_opcode(op->opno);
       append_oid_field(out, "opno", op->opno);
       append_optional_name_field(out, "opname", OidIsValid(op->opno) ? get_opname(op->opno) : NULL);
-      append_oid_field(out, "opfuncid", op->opfuncid);
-      append_optional_name_field(out, "opfuncname", OidIsValid(op->opfuncid) ? get_func_name(op->opfuncid) : NULL);
+      append_oid_field(out, "opfuncid", function_oid);
+      append_optional_name_field(out, "opfuncname", OidIsValid(function_oid) ? get_func_name(function_oid) : NULL);
       append_oid_field(out, "inputCollationOid", op->inputcollid);
       append_bool_field(out, "returnsSet", op->opretset);
+      append_function_behavior_fields(out, function_oid);
+      append_bool_field(out, "nonNullInputProducesNonNull",
+                        !op->opretset &&
+                        function_nonnull_for_nonnull_arguments(function_oid));
+      append_bool_field(out, "textEqualityIsExact",
+                        text_equality_is_exact(function_oid, op->inputcollid));
+      append_bool_field(out, "textInequalityIsExact",
+                        text_inequality_is_exact(function_oid, op->inputcollid));
       break;
     }
     case T_Aggref:
@@ -884,6 +1361,29 @@ append_expr_specific_fields(StringInfo out, const PtsQueryScope *scope, const No
       const Aggref *agg = (const Aggref *) expr;
       append_oid_field(out, "aggfnoid", agg->aggfnoid);
       append_optional_name_field(out, "aggname", OidIsValid(agg->aggfnoid) ? get_func_name(agg->aggfnoid) : NULL);
+      append_oid_field(out, "inputCollationOid", agg->inputcollid);
+      append_list_count_field(out, "aggOrderCount", agg->aggorder);
+      append_list_count_field(out, "aggDistinctCount", agg->aggdistinct);
+      append_bool_field(out, "aggstar", agg->aggstar);
+      appendStringInfo(out, ",\"agglevelsup\":%u", agg->agglevelsup);
+      break;
+    }
+    case T_WindowFunc:
+    {
+      const WindowFunc *function = (const WindowFunc *) expr;
+      append_oid_field(out, "winfnoid", function->winfnoid);
+      append_optional_name_field(out, "winname", get_func_name(function->winfnoid));
+      append_bool_field(out, "winagg", function->winagg);
+      append_bool_field(out, "windowFrameIncludesCurrentRow",
+                        window_frame_includes_current_row(function, scope));
+      appendStringInfo(out, ",\"winref\":%u", function->winref);
+      break;
+    }
+    case T_SQLValueFunction:
+    {
+      const SQLValueFunction *function = (const SQLValueFunction *) expr;
+      appendStringInfoString(out, ",\"sqlValueFunction\":");
+      append_json_string(out, sql_value_function_name(function->op));
       break;
     }
     default:
@@ -935,6 +1435,8 @@ append_expr_node(StringInfo out, const PtsQueryScope *scope, const Node *expr, i
       break;
     }
     case T_OpExpr:
+    case T_DistinctExpr:
+    case T_NullIfExpr:
     {
       const OpExpr *op = (const OpExpr *) expr;
       append_expr_list(out, scope, "args", op->args, depth);
@@ -943,11 +1445,20 @@ append_expr_node(StringInfo out, const PtsQueryScope *scope, const Node *expr, i
     case T_ScalarArrayOpExpr:
     {
       const ScalarArrayOpExpr *op = (const ScalarArrayOpExpr *) expr;
+      Oid function_oid = OidIsValid(op->opfuncid)
+                           ? op->opfuncid : get_opcode(op->opno);
       append_oid_field(out, "opno", op->opno);
       append_optional_name_field(out, "opname", OidIsValid(op->opno) ? get_opname(op->opno) : NULL);
-      append_oid_field(out, "opfuncid", op->opfuncid);
-      append_optional_name_field(out, "opfuncname", OidIsValid(op->opfuncid) ? get_func_name(op->opfuncid) : NULL);
+      append_oid_field(out, "opfuncid", function_oid);
+      append_optional_name_field(out, "opfuncname", OidIsValid(function_oid) ? get_func_name(function_oid) : NULL);
       append_bool_field(out, "useOr", op->useOr);
+      append_oid_field(out, "inputCollationOid", op->inputcollid);
+      append_bool_field(out, "returnsSet", false);
+      append_function_behavior_fields(out, function_oid);
+      append_bool_field(out, "textEqualityIsExact",
+                        text_equality_is_exact(function_oid, op->inputcollid));
+      append_bool_field(out, "textInequalityIsExact",
+                        text_inequality_is_exact(function_oid, op->inputcollid));
       append_expr_list(out, scope, "args", op->args, depth);
       break;
     }
@@ -963,6 +1474,24 @@ append_expr_node(StringInfo out, const PtsQueryScope *scope, const Node *expr, i
     {
       const Aggref *agg = (const Aggref *) expr;
       append_target_expr_list(out, scope, "args", agg->args, depth);
+      appendStringInfoString(out, ",\"aggfilter\":");
+      append_expr_node(out, scope, (const Node *) agg->aggfilter, depth - 1);
+      break;
+    }
+    case T_WindowFunc:
+    {
+      const WindowFunc *function = (const WindowFunc *) expr;
+      append_expr_list(out, scope, "args", function->args, depth);
+      appendStringInfoString(out, ",\"aggfilter\":");
+      append_expr_node(out, scope, (const Node *) function->aggfilter, depth - 1);
+      break;
+    }
+    case T_MinMaxExpr:
+    {
+      const MinMaxExpr *minmax = (const MinMaxExpr *) expr;
+      appendStringInfoString(out, ",\"minMaxOp\":");
+      append_json_string(out, minmax->op == IS_GREATEST ? "GREATEST" : "LEAST");
+      append_expr_list(out, scope, "args", minmax->args, depth);
       break;
     }
     case T_CoalesceExpr:
@@ -3774,6 +4303,29 @@ query_contains_row_marks(const Query *query)
 }
 
 static void
+append_sort_group_expressions(StringInfo out, const PtsQueryScope *scope,
+                              const char *name, const List *clauses, int depth)
+{
+  ListCell *cell;
+  bool first = true;
+
+  appendStringInfo(out, ",\"%s\":[", name);
+  foreach(cell, clauses)
+  {
+    SortGroupClause *clause = lfirst_node(SortGroupClause, cell);
+    Node *expression = get_sortgroupclause_expr(clause, scope->query->targetList);
+
+    if (!first)
+    {
+      appendStringInfoChar(out, ',');
+    }
+    first = false;
+    append_expr_node(out, scope, expression, depth);
+  }
+  appendStringInfoChar(out, ']');
+}
+
+static void
 append_query_summary(StringInfo out, const Query *query,
                      const PtsQueryScope *parent_scope, int depth,
                      bool protocol_output,
@@ -3806,6 +4358,9 @@ append_query_summary(StringInfo out, const Query *query,
   append_list_count_field(out, "groupClauseCount", query->groupClause);
   append_list_count_field(out, "groupingSetsCount", query->groupingSets);
   append_list_count_field(out, "distinctClauseCount", query->distinctClause);
+  append_bool_field(out, "hasDistinctOn", query->hasDistinctOn);
+  append_sort_group_expressions(out, scope, "groupExpressions", query->groupClause, depth);
+  append_sort_group_expressions(out, scope, "distinctExpressions", query->distinctClause, depth);
   append_bool_field(out, "hasHavingQual", query->havingQual != NULL);
   append_bool_field(out, "hasLimitOffset", query->limitOffset != NULL);
   append_bool_field(out, "hasLimitCount", query->limitCount != NULL);
@@ -3815,6 +4370,10 @@ append_query_summary(StringInfo out, const Query *query,
   append_set_operation(out, query->setOperations);
   appendStringInfoString(out, ",\"limitCount\":");
   append_expr_node(out, scope, query->limitCount, depth);
+  appendStringInfoString(out, ",\"limitOffset\":");
+  append_expr_node(out, scope, query->limitOffset, depth);
+  appendStringInfoString(out, ",\"havingQual\":");
+  append_expr_node(out, scope, query->havingQual, depth);
   appendStringInfoChar(out, ',');
   append_target_list(out, scope);
   append_returning_list(out, scope);
@@ -3901,7 +4460,7 @@ postgres_typed_sql_analyze(PG_FUNCTION_ARGS)
   usage_null_admission_analysis = pts_create_null_admission_analysis();
 
   initStringInfo(&out);
-  appendStringInfoString(&out, "{\"schemaVersion\":10,\"postgresVersionNum\":");
+  appendStringInfoString(&out, "{\"schemaVersion\":12,\"postgresVersionNum\":");
   appendStringInfo(&out, "%d", PG_VERSION_NUM);
   appendStringInfoString(&out, ",\"rawStatementCount\":");
   appendStringInfo(&out, "%d", list_length(raw_trees));

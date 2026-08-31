@@ -55,6 +55,11 @@ export interface TypedSqlPostgresIrParam extends PostgresTypeFact {
 export type TypedSqlPostgresIrParamNullAdmission = 'accepts' | 'rejects' | 'unknown'
 
 export interface TypedSqlPostgresIrColumn extends PostgresTypeFact {
+  /** Present only when the SQL expression proves a flat array result. */
+  readonly arrayShape?: {
+    readonly dimensions: 1
+    readonly elementNullability: TypedSqlPostgresIrResultNullability
+  }
   readonly checkConstraintType?: TypedSqlPostgresIrCheckConstraintTypeExpression
   /** The immediate analyzed expression source, not ultimate column lineage. */
   readonly expressionSource: TypedSqlPostgresIrColumnExpressionSource
@@ -91,6 +96,8 @@ export type TypedSqlPostgresIrJsonShape =
   | {
       readonly kind: 'array'
       readonly element: TypedSqlPostgresIrJsonShape
+      /** Exact positions when constructed from a complete static argument list. */
+      readonly elements?: readonly TypedSqlPostgresIrJsonShape[]
       readonly nullability: TypedSqlPostgresIrResultNullability
     }
   | {
@@ -101,6 +108,22 @@ export type TypedSqlPostgresIrJsonShape =
   | {
       readonly kind: 'opaque'
       readonly nullability: TypedSqlPostgresIrResultNullability
+    }
+  | {
+      /** JSON null is a value, independent of SQL nullability. */
+      readonly kind: 'null'
+      readonly nullability: TypedSqlPostgresIrResultNullability
+    }
+  | {
+      /** No SQL value is present; COALESCE can skip this alternative. */
+      readonly kind: 'sqlNull'
+      readonly nullability: TypedSqlPostgresIrResultNullability
+    }
+  | {
+      /** A decoded JSON primitive, with no invented source SQL scalar type. */
+      readonly kind: 'jsonScalar'
+      readonly nullability: TypedSqlPostgresIrResultNullability
+      readonly value: boolean | number | string
     }
   | {
       readonly alternatives: readonly TypedSqlPostgresIrJsonShape[]
@@ -214,6 +237,7 @@ function jsonShapeKey(shape: TypedSqlPostgresIrJsonShape): string {
     case 'array':
       return JSON.stringify({
         element: jsonShapeKey(shape.element),
+        elements: shape.elements?.map(jsonShapeKey),
         kind: shape.kind,
         nullability: shape.nullability.kind,
       })
@@ -225,8 +249,12 @@ function jsonShapeKey(shape: TypedSqlPostgresIrJsonShape): string {
         kind: shape.kind,
         nullability: shape.nullability.kind,
       })
+    case 'null':
+    case 'sqlNull':
     case 'opaque':
       return JSON.stringify({ kind: shape.kind, nullability: shape.nullability.kind })
+    case 'jsonScalar':
+      return JSON.stringify({ kind: shape.kind, nullability: shape.nullability.kind, value: shape.value })
     case 'scalar':
       return JSON.stringify({
         checkConstraintType: shape.checkConstraintType ? checkConstraintTypeKey(shape.checkConstraintType) : undefined,
@@ -282,9 +310,9 @@ export function joinJsonShapes(
   const alternatives = uniqueJsonShapes(
     candidates.flatMap((candidate) =>
       candidate
-        ? flattenJsonShapeAlternatives(candidate).map((shape) =>
-            jsonShapeWithNullability(shape, { basis: 'json_alternative', kind: 'nonNull' })
-          )
+        ? flattenJsonShapeAlternatives(candidate)
+            .filter((shape) => shape.kind !== 'sqlNull')
+            .map((shape) => jsonShapeWithNullability(shape, { basis: 'json_alternative', kind: 'nonNull' }))
         : []
     )
   )
@@ -297,7 +325,9 @@ export function joinJsonShapes(
     return jsonShapeWithNullability(onlyAlternative, nullability)
   }
   return alternatives.length === 0
-    ? jsonShapeWithNullability(allNullFallback, nullability)
+    ? candidates.length > 0 && candidates.every((candidate) => !candidate || candidate.kind === 'sqlNull')
+      ? { kind: 'sqlNull', nullability }
+      : jsonShapeWithNullability(allNullFallback, nullability)
     : { alternatives, kind: 'union', nullability }
 }
 

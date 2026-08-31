@@ -161,3 +161,32 @@ test('does not collapse equal JSON literals whose PostgreSQL types have differen
   assert.equal(joined.kind, 'union')
   assert.equal(joined.kind === 'union' ? joined.alternatives.length : 0, 2)
 })
+
+test('preserves explicit JSON null alternatives independently of SQL null and positional arrays', () => {
+  const jsonNull: TypedSqlPostgresIrJsonShape = { kind: 'null', nullability: nonNull }
+  const sqlNull: TypedSqlPostgresIrJsonShape = { kind: 'sqlNull', nullability: nullable }
+  const literal = stringLiteral('ready')
+  const joined = joinJsonShapes([jsonNull, sqlNull, literal], literal)
+  assert.equal(joined.kind, 'union')
+  assert.equal(joined.nullability.kind, 'nullable')
+  if (joined.kind === 'union')
+    assert.deepEqual(
+      joined.alternatives.map((shape) => shape.kind),
+      ['null', 'stringLiteral']
+    )
+  assert.equal(joinJsonShapes([sqlNull, null], literal).kind, 'sqlNull')
+  const left: TypedSqlPostgresIrJsonShape = {
+    kind: 'array',
+    element: literal,
+    elements: [literal],
+    nullability: nonNull,
+  }
+  const right: TypedSqlPostgresIrJsonShape = { ...left, elements: [literal, literal] }
+  const arrays = unionJsonShapes(left, right)
+  assert.equal(arrays.kind, 'union')
+  if (arrays.kind === 'union')
+    assert.deepEqual(
+      arrays.alternatives.map((shape) => (shape.kind === 'array' ? shape.elements?.length : null)),
+      [1, 2]
+    )
+})

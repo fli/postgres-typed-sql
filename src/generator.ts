@@ -22,8 +22,10 @@ import type { PostgresQueryable } from './database.js'
 import { createAnalysisDatabase } from './engine.js'
 import {
   postgresJsonSupportsStringLiteralRefinement,
+  postgresJsonUsesBuiltinPrimitiveDecoder,
   postgresParameterSupportsStringLiteralRefinement,
   postgresResultSupportsStringLiteralRefinement,
+  resolveBuiltinResultArrayElement,
   resolveTypeScriptJsonScalarTypeForPostgresType,
   resolveTypeScriptParameterTypeForPostgresType,
   resolveTypeScriptResultTypeForPostgresType,
@@ -102,6 +104,7 @@ interface ResolvedSqlField {
   readonly pgTypeSchema: string
   readonly propertyName: string
   readonly tsType: string
+  readonly typeIncludesNull?: boolean
 }
 
 interface ResolvedSqlColumn extends ResolvedSqlField {
@@ -164,7 +167,7 @@ function collectTypeResolutionDependencies(
 
 function tsTypeForCheckConstraintType(type: TypedSqlPostgresIrCheckConstraintTypeExpression, nested = false): string {
   if (type.kind === 'literalUnion') {
-    const rendered = type.labels.map(quoteString).join(' | ')
+    const rendered = type.labels.length > 0 ? type.labels.map(quoteString).join(' | ') : 'never'
     return nested ? `(${rendered})` : rendered
   }
 
@@ -386,7 +389,7 @@ function compileTypedSql(config: TypedSqlConfig, parameterNaming: PostgresTypedS
 }
 
 interface GeneratedJsonTypeDeclaration {
-  readonly fields: readonly Pick<ResolvedSqlField, 'nullable' | 'propertyName' | 'tsType'>[]
+  readonly fields: readonly Pick<ResolvedSqlField, 'nullable' | 'propertyName' | 'tsType' | 'typeIncludesNull'>[]
   readonly name: string
 }
 
@@ -483,6 +486,9 @@ function applyOpaqueJsonBarriersToAlternatives(
       case 'union':
         return { ...shape, alternatives: shape.alternatives.map(rewrite) }
       case 'opaque':
+      case 'null':
+      case 'sqlNull':
+      case 'jsonScalar':
       case 'scalar':
       case 'stringLiteral':
         return shape
@@ -492,8 +498,20 @@ function applyOpaqueJsonBarriersToAlternatives(
   return shapes.map(rewrite)
 }
 
-function applyOpaqueJsonBarriers(shape: TypedSqlPostgresIrJsonShape): TypedSqlPostgresIrJsonShape {
-  return applyOpaqueJsonBarriersToAlternatives([shape])[0] ?? shape
+function applyOpaqueJsonBarriers(
+  shape: TypedSqlPostgresIrJsonShape,
+  codecProfile: ResolvedPostgresCodecProfile
+): TypedSqlPostgresIrJsonShape {
+  const protectLiteral = (value: TypedSqlPostgresIrJsonShape): TypedSqlPostgresIrJsonShape => {
+    if (value.kind === 'null' || value.kind === 'jsonScalar') return { kind: 'opaque', nullability: value.nullability }
+    if (value.kind === 'array') return { ...value, element: protectLiteral(value.element) }
+    if (value.kind === 'object')
+      return { ...value, fields: value.fields.map((field) => ({ ...field, shape: protectLiteral(field.shape) })) }
+    if (value.kind === 'union') return { ...value, alternatives: value.alternatives.map(protectLiteral) }
+    return value
+  }
+  const protectedShape = postgresJsonUsesBuiltinPrimitiveDecoder(codecProfile) ? shape : protectLiteral(shape)
+  return applyOpaqueJsonBarriersToAlternatives([protectedShape])[0] ?? protectedShape
 }
 
 function jsonMappingForAlternatives(
@@ -606,12 +624,13 @@ function tsTypeForJsonShape(
   function render(shape: TypedSqlPostgresIrJsonShape, name: string): string {
     switch (shape.kind) {
       case 'array':
-        return `readonly (${render(shape.element, `${name}${encodedTypeNameSegment('element')}`)}${resultNullabilityAllowsNull(shape.element.nullability) ? ' | null' : ''})[]`
+        return `readonly (${render(shape.element, `${name}${encodedTypeNameSegment('element')}`)}${resultNullabilityAllowsNull(shape.element.nullability) && !jsonShapeIncludesNull(shape.element, codecProfile) ? ' | null' : ''})[]`
       case 'object':
         reserveGeneratedTypeBinding(usedNames, name, `JSON object ${name}`, sourceFile)
         declarations.push({
           fields: shape.fields.map((field) => ({
-            nullable: resultNullabilityAllowsNull(field.shape.nullability),
+            nullable:
+              resultNullabilityAllowsNull(field.shape.nullability) && !jsonShapeIncludesNull(field.shape, codecProfile),
             propertyName: propertyNameForNaming(field.name, naming),
             tsType: render(field.shape, `${name}${encodedTypeNameSegment(field.name)}`),
           })),
@@ -619,6 +638,17 @@ function tsTypeForJsonShape(
         })
         return name
       case 'opaque':
+        collectTypeResolutionDependencies(dependencies, codecProfile.opaqueJsonType)
+        return codecProfile.opaqueJsonType.type
+      case 'sqlNull':
+        return 'null'
+      case 'null':
+      case 'jsonScalar':
+        if (postgresJsonUsesBuiltinPrimitiveDecoder(codecProfile)) {
+          if (shape.kind === 'null') return 'null'
+          if (typeof shape.value === 'string') return quoteString(shape.value)
+          return typeof shape.value === 'number' && !Number.isFinite(shape.value) ? 'number' : String(shape.value)
+        }
         collectTypeResolutionDependencies(dependencies, codecProfile.opaqueJsonType)
         return codecProfile.opaqueJsonType.type
       case 'union':
@@ -642,6 +672,18 @@ function tsTypeForJsonShape(
   return render(shape, suggestedName)
 }
 
+function jsonShapeIncludesNull(
+  shape: TypedSqlPostgresIrJsonShape,
+  codecProfile: ResolvedPostgresCodecProfile
+): boolean {
+  return (
+    shape.kind === 'sqlNull' ||
+    (shape.kind === 'null' && postgresJsonUsesBuiltinPrimitiveDecoder(codecProfile)) ||
+    (shape.kind === 'union' &&
+      shape.alternatives.some((alternative) => jsonShapeIncludesNull(alternative, codecProfile)))
+  )
+}
+
 function renderImports(config: ResolvedTypedSql, generatorConfig: ResolvedPostgresTypedSqlConfig): string {
   const lines: string[] = []
   if (config.scalarTypeImports.length > 0) {
@@ -663,7 +705,7 @@ function renderInterface(name: string, fields: GeneratedJsonTypeDeclaration['fie
     `export interface ${name} {`,
     ...fields.map(
       (field) =>
-        `  readonly ${quotePropertyName(field.propertyName)}: ${field.tsType}${field.nullable ? ' | null' : ''}`
+        `  readonly ${quotePropertyName(field.propertyName)}: ${field.tsType}${field.nullable && !field.typeIncludesNull ? ' | null' : ''}`
     ),
     '}',
   ].join('\n')
@@ -823,7 +865,9 @@ async function resolveTypedSqlWithAnalyzer(
       const name = column.name ?? `column_${columnIndex + 1}`
       const propertyName = propertyNameForNaming(name, generatorConfig.naming.resultColumns)
       const suggestedJsonTypeName = `${pascalCaseIdentifier(config.name)}${encodedTypeNameSegment(name)}Json`
-      const safeJsonShape = column.jsonShape ? applyOpaqueJsonBarriers(column.jsonShape) : undefined
+      const safeJsonShape = column.jsonShape
+        ? applyOpaqueJsonBarriers(column.jsonShape, generatorConfig.codecProfile)
+        : undefined
       if (safeJsonShape) {
         validateJsonShapeNames(
           safeJsonShape,
@@ -854,7 +898,13 @@ async function resolveTypedSqlWithAnalyzer(
           generatorConfig.naming.structuredJsonFields
         )
       } else {
-        if (
+        const arrayElement = column.arrayShape
+          ? resolveBuiltinResultArrayElement(column, generatorConfig.codecProfile)
+          : undefined
+        if (arrayElement && column.arrayShape) {
+          collectTypeResolutionDependencies(typeDependencies, arrayElement)
+          tsType = `readonly (${arrayElement.type}${resultNullabilityAllowsNull(column.arrayShape.elementNullability) ? ' | null' : ''})[]`
+        } else if (
           column.checkConstraintType &&
           postgresResultSupportsStringLiteralRefinement(column, generatorConfig.codecProfile)
         ) {
@@ -867,6 +917,7 @@ async function resolveTypedSqlWithAnalyzer(
       }
       return {
         expressionSource: column.expressionSource,
+        ...(jsonShape ? { typeIncludesNull: jsonShapeIncludesNull(jsonShape, generatorConfig.codecProfile) } : {}),
         ...(jsonMapping ? { jsonMapping } : {}),
         name,
         nullable: resultNullabilityAllowsNull(column.nullability),

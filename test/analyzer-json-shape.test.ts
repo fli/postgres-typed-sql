@@ -186,7 +186,8 @@ testWithDatabase(
     assert.equal(nullableElement?.kind, 'array')
     if (nullableElement?.kind === 'array') {
       assert.equal(nullableElement.nullability.kind, 'nonNull')
-      assert.equal(nullableElement.element.nullability.kind, 'nullable')
+      assert.equal(nullableElement.element.kind, 'null')
+      assert.equal(nullableElement.element.nullability.kind, 'nonNull')
     }
 
     const heterogeneous = column('heterogeneousJsonArray').jsonShape
@@ -212,8 +213,8 @@ testWithDatabase(
     assert.equal(ordinarySqlArray?.kind, 'array')
     if (ordinarySqlArray?.kind === 'array') {
       assert.equal(ordinarySqlArray.nullability.kind, 'nonNull')
-      assert.equal(ordinarySqlArray.element.kind, 'scalar')
-      assert.equal(ordinarySqlArray.element.nullability.kind, 'nullable')
+      assert.equal(ordinarySqlArray.element.kind, 'null')
+      assert.equal(ordinarySqlArray.element.nullability.kind, 'nonNull')
     }
 
     const literalVariadic = column('literalVariadicArray').jsonShape
@@ -329,15 +330,17 @@ testWithDatabase('infers CASE JSON unions with scoped branch facts and exact str
     config(
       'nullOnlyCaseArm',
       `select jsonb_build_object(
-          'state', case when true then 'playable' else null::text end
-        ) as payload`
+          'state', case when $1::boolean then 'playable' else null::text end
+        ) as payload`,
+      ['playable']
     ),
     config(
       'fieldOrderEquivalentCase',
-      `select case when true
+      `select case when $1::boolean
           then jsonb_build_object('a', 'left', 'b', 'right')
           else jsonb_build_object('b', 'right', 'a', 'left')
-        end as payload`
+        end as payload`,
+      ['firstOrder']
     ),
     config('nonStringConstants', "select jsonb_build_object('one', 1, 'flag', true) as payload"),
     config(
@@ -458,7 +461,7 @@ testWithDatabase('infers CASE JSON unions with scoped branch facts and exact str
   )
 
   const nullableToJson = shape('nullableToJson')
-  assert.equal(nullableToJson?.kind, 'opaque')
+  assert.equal(nullableToJson?.kind, 'scalar')
   assert.equal(nullableToJson?.nullability.kind, 'nullable')
 
   for (const query of result.queries) {
@@ -490,4 +493,196 @@ testWithDatabase('infers CASE JSON unions with scoped branch facts and exact str
     ).rows,
     [{ payload: null }]
   )
+})
+
+testWithDatabase('composes reachable COALESCE JSON shapes without treating JSON null as SQL NULL', async (database) => {
+  const result = await buildTypedSqlPostgresIrFromCompiledConfigs(database, [
+    config(
+      'coalescedObjects',
+      `select coalesce(
+          (select jsonb_build_object('state', 'ready') from public.accounts limit 1),
+          jsonb_build_object('state', 'missing')
+        ) as payload`
+    ),
+    config(
+      'unreachableOpaqueFallback',
+      `select coalesce(null::jsonb, jsonb_build_object('state', 'ready'), $1::jsonb) as payload`,
+      ['ignored']
+    ),
+    config('literalJsonNull', `select coalesce('null'::jsonb, jsonb_build_object('state', 'missing')) as payload`),
+    config(
+      'projectedJsonNull',
+      `select coalesce(jsonb_build_object('value', null::text) -> 'value',
+          jsonb_build_object('state', 'missing')) as payload`
+    ),
+    config(
+      'sqlNullArrayFallback',
+      `select coalesce(null::jsonb, jsonb_agg(jsonb_build_object('id', id)), '[]'::jsonb) as payload
+         from public.accounts`
+    ),
+  ])
+  const shape = (name: string) => result.queries.find((query) => query.name === name)?.resultColumns[0]?.jsonShape
+  const coalesced = shape('coalescedObjects')
+  assert.equal(coalesced?.kind, 'union')
+  assert.equal(coalesced?.nullability.kind, 'nonNull')
+  if (coalesced?.kind === 'union') {
+    assert.equal(coalesced.alternatives.length, 2)
+    assert.ok(coalesced.alternatives.every((alternative) => alternative.kind === 'object'))
+  }
+  assert.equal(shape('unreachableOpaqueFallback')?.kind, 'object')
+  assert.equal(shape('literalJsonNull')?.kind, 'null')
+  assert.equal(shape('projectedJsonNull')?.kind, 'null')
+  assert.equal(shape('projectedJsonNull')?.nullability.kind, 'nonNull')
+  assert.equal(shape('sqlNullArrayFallback')?.kind, 'array')
+  assert.equal(shape('sqlNullArrayFallback')?.nullability.kind, 'nonNull')
+  for (const sql of [
+    `select coalesce('null'::jsonb, jsonb_build_object('state', 'missing')) as payload`,
+    `select coalesce(jsonb_build_object('value', null::text) -> 'value',
+        jsonb_build_object('state', 'missing')) as payload`,
+  ]) {
+    assert.deepEqual((await database.query(sql)).rows, [{ payload: null }])
+  }
+})
+
+testWithDatabase('infers JSON scalar and array conversions and physical base-row attributes', async (database) => {
+  await database.query('create table public.json_rows(id integer not null, removed text, display_name text)')
+  await database.query('alter table public.json_rows drop column removed')
+  await database.query(`insert into public.json_rows values (1, null)`)
+  const result = await buildTypedSqlPostgresIrFromCompiledConfigs(database, [
+    config('convertedScalar', `select to_jsonb('ready'::text) as payload`),
+    config('convertedArray', `select to_jsonb(array[jsonb_build_object('id', 1)]) as payload`),
+    config('convertedNestedArray', `select to_jsonb(array[array[1, null::integer]]) as payload`),
+    config('baseRow', `select to_jsonb(source) as payload from public.json_rows source(alias_id, alias_name)`),
+    config(
+      'outerBaseRow',
+      `select to_jsonb(source) as payload
+         from (values(1)) seed(id) left join public.json_rows source on source.id = seed.id`
+    ),
+  ])
+  const shape = (name: string) => result.queries.find((query) => query.name === name)?.resultColumns[0]?.jsonShape
+  const scalar = shape('convertedScalar')
+  assert.equal(scalar?.kind, 'stringLiteral')
+  assert.equal(scalar?.kind === 'stringLiteral' ? scalar.value : undefined, 'ready')
+  const array = shape('convertedArray')
+  assert.equal(array?.kind, 'array')
+  assert.equal(array?.kind === 'array' ? array.element.kind : undefined, 'object')
+  const nestedArray = shape('convertedNestedArray')
+  assert.equal(nestedArray?.kind, 'array')
+  if (nestedArray?.kind === 'array') {
+    assert.equal(nestedArray.element.kind, 'array')
+    if (nestedArray.element.kind === 'array') {
+      const element = nestedArray.element.element
+      assert.equal(element.kind, 'union')
+      assert.equal(element.nullability.kind, 'nonNull')
+      if (element.kind === 'union') {
+        assert.deepEqual(
+          element.alternatives.map((alternative) => alternative.kind),
+          ['scalar', 'null']
+        )
+      }
+    }
+  }
+  assert.deepEqual((await database.query('select to_jsonb(array[array[1, null::integer]]) as payload')).rows, [
+    { payload: [[1, null]] },
+  ])
+  for (const name of ['baseRow', 'outerBaseRow']) {
+    const row = shape(name)
+    assert.equal(row?.kind, 'object')
+    if (row?.kind === 'object') {
+      assert.deepEqual(
+        row.fields.map((field) => field.name),
+        ['id', 'display_name']
+      )
+      assert.equal(row.fields[0]?.shape.nullability.kind, 'nonNull')
+      assert.equal(row.fields[1]?.shape.nullability.kind, 'nullable')
+    }
+  }
+  assert.equal(shape('outerBaseRow')?.nullability.kind, 'nullable')
+  assert.deepEqual(
+    (await database.query('select to_jsonb(source) as payload from public.json_rows source(alias_id, alias_name)'))
+      .rows,
+    [{ payload: { id: 1, display_name: null } }]
+  )
+})
+
+testWithDatabase(
+  'projects known JSON object fields and concatenates objects using builtin operator identities',
+  async (database) => {
+    await database.query(`create function public.jsonb_object_field(jsonb, text) returns jsonb
+      language sql immutable as $$ select jsonb_build_object('shadow', $2) $$`)
+    await database.query(`create operator public.-> (
+      leftarg = jsonb, rightarg = text, function = public.jsonb_object_field
+    )`)
+    const result = await buildTypedSqlPostgresIrFromCompiledConfigs(database, [
+      config('jsonProjection', `select jsonb_build_object('state', 'ready') -> 'state' as payload`),
+      config('textProjection', `select to_jsonb(jsonb_build_object('state', 'ready') ->> 'state') as payload`),
+      config(
+        'duplicateKeys',
+        `select (jsonb_build_object('state', 'old', 'left', 1)
+          || jsonb_build_object('state', 'ready', 'right', 2)) as payload`
+      ),
+      config('missingKey', `select jsonb_build_object('state', 'ready') -> 'missing' as payload`),
+      config('opaqueSource', `select $1::jsonb -> 'state' as payload`, ['source']),
+      config('dynamicKey', `select jsonb_build_object('state', 'ready') -> $1::text as payload`, ['key']),
+      config('opaqueConcat', `select jsonb_build_object('state', 'ready') || $1::jsonb as payload`, ['source']),
+      config('arrayConcat', `select jsonb_build_array(1) || jsonb_build_object('state', 'ready') as payload`),
+      config('shadowedOperator', `select jsonb_build_object('state', 'ready') operator(public.->) 'state' as payload`),
+      config(
+        'nullableTextProjection',
+        `select to_jsonb(jsonb_build_object('value', display_name) ->> 'value') as payload from public.accounts`
+      ),
+    ])
+    const column = (name: string) => result.queries.find((query) => query.name === name)?.resultColumns[0]
+    for (const name of ['jsonProjection', 'textProjection']) {
+      const shape = column(name)?.jsonShape
+      assert.equal(shape?.kind, 'stringLiteral')
+      assert.equal(shape?.kind === 'stringLiteral' ? shape.value : undefined, 'ready')
+      assert.equal(column(name)?.nullability.kind, 'nonNull')
+    }
+    const combined = column('duplicateKeys')?.jsonShape
+    assert.equal(combined?.kind, 'object')
+    if (combined?.kind === 'object') {
+      assert.deepEqual(
+        combined.fields.map((field) => field.name),
+        ['state', 'left', 'right']
+      )
+      const state = combined.fields[0]?.shape
+      assert.equal(state?.kind === 'stringLiteral' ? state.value : undefined, 'ready')
+    }
+    for (const name of ['opaqueSource', 'dynamicKey', 'opaqueConcat', 'arrayConcat', 'shadowedOperator']) {
+      assert.equal(column(name)?.jsonShape?.kind, 'opaque', name)
+    }
+    assert.equal(column('missingKey')?.jsonShape?.kind, 'sqlNull')
+    assert.equal(column('missingKey')?.nullability.kind, 'nullable')
+    assert.equal(column('nullableTextProjection')?.nullability.kind, 'nullable')
+    assert.deepEqual(
+      (
+        await database.query(`select jsonb_build_object('state', 'old', 'left', 1)
+        || jsonb_build_object('state', 'ready', 'right', 2) as payload`)
+      ).rows,
+      [{ payload: { state: 'ready', left: 1, right: 2 } }]
+    )
+  }
+)
+
+testWithDatabase('narrows JSON aggregate elements inside FILTER and strict aggregation only', async (database) => {
+  const result = await buildTypedSqlPostgresIrFromCompiledConfigs(database, [
+    config('unfiltered', 'select jsonb_agg(display_name) as payload from public.accounts'),
+    config(
+      'filtered',
+      'select jsonb_agg(display_name) filter (where display_name is not null) as payload from public.accounts'
+    ),
+    config('strict', 'select jsonb_agg_strict(display_name) as payload from public.accounts'),
+    config(
+      'unrelatedFilter',
+      'select jsonb_agg(display_name) filter (where email is not null) as payload from public.accounts'
+    ),
+  ])
+  for (const query of result.queries) {
+    const shape = query.resultColumns[0]?.jsonShape
+    assert.equal(shape?.kind, 'array')
+    if (shape?.kind === 'array') {
+      assert.equal(shape.element.nullability.kind, ['filtered', 'strict'].includes(query.name) ? 'nonNull' : 'nullable')
+    }
+  }
 })
