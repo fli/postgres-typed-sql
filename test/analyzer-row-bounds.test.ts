@@ -1,22 +1,12 @@
 import assert from 'node:assert/strict'
-import { resolve } from 'node:path'
-import test from 'node:test'
 
-import {
-  buildTypedSqlPostgresIrFromCompiledConfigs,
-  type TypedSqlPostgresIrCompiledConfig,
-} from '../src/analyzer-ir.js'
-import { createAnalysisDatabase } from '../src/engine.js'
+import { buildTypedSqlPostgresIrFromCompiledConfigs } from '../src/analyzer-ir.js'
 
-const schemaFile = resolve(import.meta.dirname, 'fixtures/schema.sql')
+import { analysisConfig as config, testWithDatabase } from './analyzer-test-support.js'
 
-function config(name: string, sql: string, parameterNames: readonly string[]): TypedSqlPostgresIrCompiledConfig {
-  return { name, parameterNames, sourceFile: `queries/${name}.typed.sql`, sql }
-}
-
-test('propagates at-most-one cardinality through inner joins on primary and unique keys', async () => {
-  const database = await createAnalysisDatabase({ schemaFiles: [schemaFile] })
-  try {
+testWithDatabase(
+  'propagates at-most-one cardinality through inner joins on primary and unique keys',
+  async (database) => {
     for (const sql of [
       'create table public.trainers (id bigint primary key)',
       'create table public.currencies (id bigint primary key)',
@@ -82,14 +72,12 @@ test('propagates at-most-one cardinality through inner joins on primary and uniq
       assert.equal(query.rowBounds.min, 0, query.name)
       assert.match(query.rowBounds.proof, /^unique_join_closure\(/u, query.name)
     }
-  } finally {
-    await database.close()
   }
-})
+)
 
-test('fails closed when a join source is not uniquely determined or the join form is unsupported', async () => {
-  const database = await createAnalysisDatabase({ schemaFiles: [schemaFile] })
-  try {
+testWithDatabase(
+  'fails closed when a join source is not uniquely determined or the join form is unsupported',
+  async (database) => {
     for (const sql of [
       'create table public.bound_trainers (id bigint primary key)',
       'create table public.bound_currencies (id bigint primary key)',
@@ -147,7 +135,5 @@ test('fails closed when a join source is not uniquely determined or the join for
       assert.equal(query.rowBounds.min, 0, query.name)
       assert.equal(query.rowBounds.proof, 'unbounded', query.name)
     }
-  } finally {
-    await database.close()
   }
-})
+)

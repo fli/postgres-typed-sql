@@ -122,27 +122,15 @@ parameter_usage_null_admission_walker(Node *node, void *walker_context)
       break;
     }
     case T_FuncExpr:
-    {
-      const FuncExpr *function = (const FuncExpr *) node;
-      PtsNullEvaluation evaluation = pts_check_parameter_null_evaluation(
-        node, context->param_id, context->node_analysis);
-
-      if (!func_strict(function->funcid) ||
-          evaluation.proof != PTS_NULL_PROOF_NULL ||
-          !evaluation.evaluation_safe)
-      {
-        mark_parameter_usage(context, PTS_NULL_UNKNOWN);
-      }
-      break;
-    }
     case T_OpExpr:
     {
-      const OpExpr *operation = (const OpExpr *) node;
       PtsNullEvaluation evaluation = pts_check_parameter_null_evaluation(
         node, context->param_id, context->node_analysis);
+      bool strict = IsA(node, FuncExpr)
+                      ? func_strict(((const FuncExpr *) node)->funcid)
+                      : op_strict(((const OpExpr *) node)->opno);
 
-      if (!op_strict(operation->opno) ||
-          evaluation.proof != PTS_NULL_PROOF_NULL ||
+      if (!strict || evaluation.proof != PTS_NULL_PROOF_NULL ||
           !evaluation.evaluation_safe)
       {
         mark_parameter_usage(context, PTS_NULL_UNKNOWN);

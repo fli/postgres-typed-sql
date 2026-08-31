@@ -14,7 +14,13 @@ import {
   renderTypeScriptLineCommentValue,
 } from '../src/typescript-names.js'
 
-import { copyFixture, createMinimalFixture, generateTypedSql } from './generator-test-support.js'
+import {
+  copyFixture,
+  createMinimalFixture,
+  generateTypedSql,
+  generateFixture,
+  renderQuery,
+} from './generator-test-support.js'
 
 test('camel-cases only conventional generated property names', () => {
   assert.equal(camelCasePropertyName('account_id'), 'accountId')
@@ -27,7 +33,7 @@ test('camel-cases only conventional generated property names', () => {
 })
 
 test('camel-cases parameter properties by default while preserving raw SQL metadata', async () => {
-  const root = await createMinimalFixture(
+  const output = await renderQuery(
     'select 1;\n',
     `select
   :platform_slug::text is not distinct from :platform_slug::text
@@ -40,14 +46,6 @@ test('camel-cases parameter properties by default while preserving raw SQL metad
   as matches
 `
   )
-  await generateTypedSql({
-    include: ['queries'],
-    rootDir: root,
-    codecProfile: 'node-postgres',
-    schema: 'schema.sql',
-  })
-
-  const output = await readFile(join(root, 'queries/query.typed-sql.ts'), 'utf8')
   assert.match(output, /readonly platformSlug: string\n/u)
   assert.match(output, /readonly alreadyCamel: string/u)
   assert.match(output, /readonly URL: string/u)
@@ -64,18 +62,11 @@ test('camel-cases parameter properties by default while preserving raw SQL metad
 })
 
 test('supports explicit parameter-property preservation', async () => {
-  const root = await createMinimalFixture('select 1;\n', 'select :platform_slug::text as value\n')
-  await generateTypedSql({
-    include: ['queries'],
+  const output = await renderQuery('select 1;\n', 'select :platform_slug::text as value\n', {
     naming: {
       parameterProperties: 'preserve',
     },
-    rootDir: root,
-    codecProfile: 'node-postgres',
-    schema: 'schema.sql',
   })
-
-  const output = await readFile(join(root, 'queries/query.typed-sql.ts'), 'utf8')
   assert.match(output, /readonly platform_slug: string\n/u)
   assert.match(output, /name: 'platform_slug',[\s\S]*?nullable: false/u)
   assert.match(output, /parameterNames: \['platform_slug'\]/u)
@@ -88,15 +79,7 @@ test('rejects parameter properties that collide after camel-case transformation'
     'select :foo_bar::text is not distinct from :fooBar::text as matches\n'
   )
 
-  await assert.rejects(
-    generateTypedSql({
-      include: ['queries'],
-      rootDir: root,
-      codecProfile: 'node-postgres',
-      schema: 'schema.sql',
-    }),
-    /duplicate parameter property name "fooBar" at positions 1 and 2/u
-  )
+  await assert.rejects(generateFixture(root), /duplicate parameter property name "fooBar" at positions 1 and 2/u)
 })
 
 test('escapes every ECMAScript line terminator in generated line-comment values', () => {
@@ -105,13 +88,7 @@ test('escapes every ECMAScript line terminator in generated line-comment values'
 
 test('generates PostgreSQL-derived types, nullability, and cardinality', async () => {
   const root = await copyFixture()
-  const result = await generateTypedSql({
-    extensions: ['pgcrypto'],
-    include: ['queries'],
-    rootDir: root,
-    codecProfile: 'node-postgres',
-    schema: 'schema.sql',
-  })
+  const result = await generateFixture(root, { extensions: ['pgcrypto'] })
 
   assert.equal(result.statementCount, 4)
   const account = await readFile(join(root, 'queries/findAccountByEmail.typed-sql.ts'), 'utf8')
@@ -132,7 +109,7 @@ test('generates PostgreSQL-derived types, nullability, and cardinality', async (
 })
 
 test('generates only immediate expressionSource runtime metadata', async () => {
-  const root = await createMinimalFixture(
+  const output = await renderQuery(
     `create table public.left_source (id integer not null, label text);
 create table public.right_source (id integer not null, label text);
 `,
@@ -146,15 +123,6 @@ join (select id from public.right_source) derived on derived.id = left_source.id
 join public.right_source on right_source.id = left_source.id
 `
   )
-
-  await generateTypedSql({
-    codecProfile: 'node-postgres',
-    include: ['queries'],
-    rootDir: root,
-    schema: 'schema.sql',
-  })
-
-  const output = await readFile(join(root, 'queries/query.typed-sql.ts'), 'utf8')
   assert.match(
     output,
     /expressionSource: \{"attname":"id","kind":"tableColumn","relname":"left_source","varattno":1,"varlevelsup":0,"varno":1,"varnullingrels":\[\]\}/u
@@ -169,7 +137,7 @@ join public.right_source on right_source.id = left_source.id
 })
 
 test('generates nullable output only when canonical coercion proof remains incomplete', async () => {
-  const root = await createMinimalFixture(
+  const output = await renderQuery(
     `create domain public.required_integer_domain as integer not null;
 create table public.coercion_outputs (
   required_integer integer not null,
@@ -184,14 +152,6 @@ create table public.coercion_outputs (
 from public.coercion_outputs
 `
   )
-  await generateTypedSql({
-    codecProfile: 'node-postgres',
-    include: ['queries'],
-    rootDir: root,
-    schema: 'schema.sql',
-  })
-
-  const output = await readFile(join(root, 'queries/query.typed-sql.ts'), 'utf8')
   assert.match(output, /readonly exact_cast: PgInt8String\n/u)
   assert.match(output, /readonly opaque_cast: PgNumericString \| null\n/u)
   assert.match(output, /readonly nullable_cast: PgNumericString \| null\n/u)
@@ -254,12 +214,7 @@ create table public.items (id integer primary key, state public.item_state not n
     },
   })
 
-  await generateTypedSql({
-    codecProfile,
-    include: ['queries'],
-    rootDir: root,
-    schema: 'schema.sql',
-  })
+  await generateFixture(root, { codecProfile })
 
   const output = await readFile(join(root, 'queries/query.typed-sql.ts'), 'utf8')
   assert.match(output, /\/\/ Codec profile: application-codecs/u)
@@ -290,12 +245,7 @@ test('deduplicates Record when generated empty objects and codec types use the s
     },
   })
 
-  await generateTypedSql({
-    codecProfile,
-    include: ['queries'],
-    rootDir: root,
-    schema: 'schema.sql',
-  })
+  await generateFixture(root, { codecProfile })
 
   const output = await readFile(join(root, 'queries/query.typed-sql.ts'), 'utf8')
   assert.match(output, /export type QueryParams = Record<string, never>/u)
@@ -334,20 +284,12 @@ test('requires explicit caller null permission even when PostgreSQL proves NULL 
 })
 
 test('preserves PostgreSQL array slices through named-parameter compilation and analysis', async () => {
-  const root = await createMinimalFixture(
+  const output = await renderQuery(
     'select 1;\n',
     `select numbers[1:upper_bound] as sliced
 from (values (array[10, 20, 30], 2)) as bounds(numbers, upper_bound)
 `
   )
-  await generateTypedSql({
-    include: ['queries'],
-    rootDir: root,
-    codecProfile: 'node-postgres',
-    schema: 'schema.sql',
-  })
-
-  const output = await readFile(join(root, 'queries/query.typed-sql.ts'), 'utf8')
   assert.match(output, /parameterNames: \[\]/u)
   assert.match(output, /numbers\[1:upper_bound\]/u)
 })
@@ -356,15 +298,7 @@ test('generates and executes named parameters inside CASE array subscripts', asy
   const sql = `select numbers[case when :use_first then 1 else 2 end] as picked
 from (values (array[10, 20])) as input(numbers)
 `
-  const root = await createMinimalFixture('select 1;\n', sql)
-  await generateTypedSql({
-    include: ['queries'],
-    rootDir: root,
-    codecProfile: 'node-postgres',
-    schema: 'schema.sql',
-  })
-
-  const output = await readFile(join(root, 'queries/query.typed-sql.ts'), 'utf8')
+  const output = await renderQuery('select 1;\n', sql)
   assert.match(output, /parameterNames: \['useFirst'\]/u)
   assert.match(output, /numbers\[case when \$1 then 1 else 2 end\]/u)
 
@@ -381,21 +315,13 @@ from (values (array[10, 20])) as input(numbers)
 })
 
 test('requires serialized strings for PostgreSQL arrays whose element delimiter is not a comma', async () => {
-  const root = await createMinimalFixture(
+  const output = await renderQuery(
     'create domain public.int_list as integer[];\n',
     `select
   cardinality(:boxes::box[]) as box_count,
   cardinality(:lists::public.int_list[]) as list_count
 `
   )
-  await generateTypedSql({
-    include: ['queries'],
-    rootDir: root,
-    codecProfile: 'node-postgres',
-    schema: 'schema.sql',
-  })
-
-  const output = await readFile(join(root, 'queries/query.typed-sql.ts'), 'utf8')
   assert.match(output, /readonly boxes: string/u)
   assert.doesNotMatch(output, /readonly boxes: PgArray/u)
   assert.match(output, /readonly lists: PgArrayParameter<string> \| string/u)
@@ -403,19 +329,11 @@ test('requires serialized strings for PostgreSQL arrays whose element delimiter 
 })
 
 test('imports every scalar dependency used by bytea array parameters', async () => {
-  const root = await createMinimalFixture(
+  const output = await renderQuery(
     'select 1;\n',
     `select :payloads::bytea[] as payloads
 `
   )
-  await generateTypedSql({
-    include: ['queries'],
-    rootDir: root,
-    codecProfile: 'node-postgres',
-    schema: 'schema.sql',
-  })
-
-  const output = await readFile(join(root, 'queries/query.typed-sql.ts'), 'utf8')
   assert.match(
     output,
     /import type \{ PgArray, PgArrayParameter, PgByteaHexString \} from 'postgres-typed-sql\/scalars'/u
@@ -467,15 +385,7 @@ test('surfaces native PostgreSQL diagnostics for invalid SQL', async () => {
   const root = await copyFixture()
   await writeFile(join(root, 'queries/invalid.typed.sql'), 'select missing_column from public.accounts\n')
 
-  await assert.rejects(
-    generateTypedSql({
-      include: ['queries'],
-      rootDir: root,
-      codecProfile: 'node-postgres',
-      schema: 'schema.sql',
-    }),
-    /column "missing_column" does not exist/u
-  )
+  await assert.rejects(generateFixture(root), /column "missing_column" does not exist/u)
 })
 
 test('configuration failure releases the in-process generation guard', async () => {
@@ -498,12 +408,7 @@ test('rejects unresolved parameter types instead of generating a phantom Unknown
   await writeFile(join(root, 'queries/unresolvedParameter.typed.sql'), 'select pg_typeof(:value)\n')
 
   await assert.rejects(
-    generateTypedSql({
-      include: ['queries'],
-      rootDir: root,
-      codecProfile: 'node-postgres',
-      schema: 'schema.sql',
-    }),
+    generateFixture(root),
     /could not determine data type of parameter \$1[\s\S]*Compiled parameter map: \$1 = :value/u
   )
   await assert.rejects(
@@ -520,12 +425,7 @@ test('does not allow directives to downgrade PostgreSQL write access', async () 
   )
 
   await assert.rejects(
-    generateTypedSql({
-      include: ['queries'],
-      rootDir: root,
-      codecProfile: 'node-postgres',
-      schema: 'schema.sql',
-    }),
+    generateFixture(root),
     /@access read requires analyzer-proved read-only execution; PostgreSQL analysis found direct DELETE DML/u
   )
 })
@@ -716,15 +616,7 @@ order by value
 `
   )
 
-  await assert.rejects(
-    generateTypedSql({
-      include: ['queries'],
-      rootDir: root,
-      codecProfile: 'node-postgres',
-      schema: 'schema.sql',
-    }),
-    /execution-reachable volatile path that prevents a read-only proof/u
-  )
+  await assert.rejects(generateFixture(root), /execution-reachable volatile path that prevents a read-only proof/u)
 })
 
 test('preserves non-code parameter text and limits directives to the header', async () => {
@@ -746,12 +638,7 @@ where account.email = :email
 `
   )
 
-  const result = await generateTypedSql({
-    include: ['queries'],
-    rootDir: root,
-    codecProfile: 'node-postgres',
-    schema: 'schema.sql',
-  })
+  const result = await generateFixture(root)
 
   assert.equal(result.statementCount, 5)
   const output = await readFile(join(root, 'queries/lexicalContexts.typed-sql.ts'), 'utf8')
@@ -802,12 +689,7 @@ where account.id = :account_id
 `
   )
 
-  const result = await generateTypedSql({
-    include: ['queries'],
-    rootDir: root,
-    codecProfile: 'node-postgres',
-    schema: 'schema.sql',
-  })
+  const result = await generateFixture(root)
 
   assert.equal(result.statementCount, 5)
   const output = await readFile(join(root, 'queries/mixedParameterInference.typed-sql.ts'), 'utf8')
@@ -819,19 +701,7 @@ where account.id = :account_id
 })
 
 test('emits authored temporal casts in the exact runtime SQL', async () => {
-  const root = await createMinimalFixture(
-    'select 1;\n',
-    'select :later::timestamptz - :earlier::timestamptz as elapsed\n'
-  )
-
-  await generateTypedSql({
-    include: ['queries'],
-    rootDir: root,
-    codecProfile: 'node-postgres',
-    schema: 'schema.sql',
-  })
-
-  const output = await readFile(join(root, 'queries/query.typed-sql.ts'), 'utf8')
+  const output = await renderQuery('select 1;\n', 'select :later::timestamptz - :earlier::timestamptz as elapsed\n')
   assert.match(output, /readonly later: Date \| number \| string/u)
   assert.match(output, /readonly earlier: Date \| number \| string/u)
   assert.match(output, /text: 'select \$1::timestamptz - \$2::timestamptz as elapsed'/u)
@@ -934,12 +804,7 @@ select :value
 `
   )
 
-  const result = await generateTypedSql({
-    include: ['queries'],
-    rootDir: root,
-    codecProfile: 'node-postgres',
-    schema: 'schema.sql',
-  })
+  const result = await generateFixture(root)
 
   assert.equal(result.statementCount, 12)
 
@@ -1046,14 +911,10 @@ where event_id = :event_id
 `
   )
 
-  const result = await generateTypedSql({
-    include: ['queries'],
+  const result = await generateFixture(root, {
     naming: {
       parameterProperties: 'preserve',
     },
-    rootDir: root,
-    codecProfile: 'node-postgres',
-    schema: 'schema.sql',
   })
 
   assert.equal(result.statementCount, 6)
@@ -1155,15 +1016,7 @@ test('rejects duplicate, reserved, and colliding generated names before emission
   for (const invalid of invalidSources) {
     const root = await createMinimalFixture('select 1;\n', 'select 1\n')
     await writeFile(join(root, 'queries', invalid.file), invalid.sql)
-    await assert.rejects(
-      generateTypedSql({
-        include: ['queries'],
-        rootDir: root,
-        codecProfile: 'node-postgres',
-        schema: 'schema.sql',
-      }),
-      invalid.error
-    )
+    await assert.rejects(generateFixture(root), invalid.error)
   }
 
   for (const scalarImport of ['createTypedSqlStatement', 'query']) {
@@ -1178,12 +1031,7 @@ test('rejects duplicate, reserved, and colliding generated names before emission
       },
     })
     await assert.rejects(
-      generateTypedSql({
-        codecProfile,
-        include: ['queries'],
-        rootDir: root,
-        schema: 'schema.sql',
-      }),
+      generateFixture(root, { codecProfile }),
       new RegExp(
         `generated TypeScript binding ${scalarImport} for postgres-typed-sql scalar type import collides with ${
           scalarImport === 'createTypedSqlStatement' ? 'generated runtime import' : 'exported statement constant'
@@ -1204,12 +1052,7 @@ create type public.a_status as enum ('public');
 create type a.status as enum ('schema');
 `
   )
-  await generateTypedSql({
-    include: ['queries'],
-    rootDir: root,
-    codecProfile: 'node-postgres',
-    schema: 'schema.sql',
-  })
+  await generateFixture(root)
   const injectiveCatalog = await readFile(join(root, 'postgres-typed-sql.types.ts'), 'utf8')
   assert.match(injectiveCatalog, /export type AStatus = "public"/u)
   assert.match(injectiveCatalog, /export type A_Status = "schema"/u)
@@ -1227,12 +1070,7 @@ create type public.collision_params as enum ('one');
     join(importCollisionRoot, 'queries/collision.typed.sql'),
     "select 'one'::public.collision_params as value\n"
   )
-  await generateTypedSql({
-    include: ['queries'],
-    rootDir: importCollisionRoot,
-    codecProfile: 'node-postgres',
-    schema: 'schema.sql',
-  })
+  await generateFixture(importCollisionRoot)
   assert.match(
     await readFile(join(importCollisionRoot, 'queries/collision.typed-sql.ts'), 'utf8'),
     /readonly value: "one"/u
@@ -1243,12 +1081,7 @@ create type public.collision_params as enum ('one');
   const dateCatalogSchema = await readFile(dateCatalogSchemaPath, 'utf8')
   await writeFile(dateCatalogSchemaPath, `${dateCatalogSchema}\ncreate type public.date as enum ('today');\n`)
   await assert.rejects(
-    generateTypedSql({
-      include: ['queries'],
-      rootDir: dateCatalogCollisionRoot,
-      codecProfile: 'node-postgres',
-      schema: 'schema.sql',
-    }),
+    generateFixture(dateCatalogCollisionRoot),
     /generated TypeScript binding Date for enum public\.date collides with ambient TypeScript type/u
   )
 
@@ -1263,34 +1096,22 @@ create table public.bytea_probe (payload bytea);
 `
   )
   await assert.rejects(
-    generateTypedSql({
-      include: ['queries'],
-      rootDir: byteaCatalogCollisionRoot,
-      codecProfile: 'node-postgres',
-      schema: 'schema.sql',
-    }),
+    generateFixture(byteaCatalogCollisionRoot),
     /generated TypeScript binding Uint8Array for enum public\.uint8_array collides with ambient TypeScript type/u
   )
 
-  const dateStatementCollisionRoot = await createMinimalFixture(
+  const dateStatement = await renderQuery(
     `create type public.date as enum ('today');
 create table public.readings (kind public.date not null);
 `,
     'select kind, now()::timestamp with time zone as measured_at from public.readings\n'
   )
-  await generateTypedSql({
-    include: ['queries'],
-    rootDir: dateStatementCollisionRoot,
-    codecProfile: 'node-postgres',
-    schema: 'schema.sql',
-  })
-  const dateStatement = await readFile(join(dateStatementCollisionRoot, 'queries/query.typed-sql.ts'), 'utf8')
   assert.match(dateStatement, /readonly kind: "today"/u)
   assert.match(dateStatement, /readonly measured_at: Date \| number/u)
 })
 
 test('reserves only TypeScript utility, ambient, and scalar bindings used by each generated file', async () => {
-  const unusedCollisionRoot = await createMinimalFixture(
+  const unusedCollisionOutput = await renderQuery(
     `create type public.pg_int8_string as enum ('scalar');
 create type public.record as enum ('utility');
 create type public.date as enum ('ambient_date');
@@ -1302,13 +1123,6 @@ create type public.uint8_array as enum ('ambient_bytes');
   :bytes_kind::public.uint8_array as bytes_kind
 `
   )
-  await generateTypedSql({
-    include: ['queries'],
-    rootDir: unusedCollisionRoot,
-    codecProfile: 'node-postgres',
-    schema: 'schema.sql',
-  })
-  const unusedCollisionOutput = await readFile(join(unusedCollisionRoot, 'queries/query.typed-sql.ts'), 'utf8')
   assert.doesNotMatch(unusedCollisionOutput, /import type/u)
   assert.match(unusedCollisionOutput, /readonly utility_kind: "utility" \| null/u)
   assert.match(unusedCollisionOutput, /readonly date_kind: "ambient_date" \| null/u)
@@ -1346,12 +1160,7 @@ create type public.uint8_array as enum ('ambient_bytes');
 
   for (const collision of cases) {
     const root = await createMinimalFixture(collision.schema, collision.sql)
-    await generateTypedSql({
-      include: ['queries'],
-      rootDir: root,
-      codecProfile: 'node-postgres',
-      schema: 'schema.sql',
-    })
+    await generateFixture(root)
   }
 
   const catalogScalarCollisionRoot = await createMinimalFixture(
@@ -1361,12 +1170,7 @@ create table public.binding_values (id bigint not null);
     'select 1 as value\n'
   )
   await assert.rejects(
-    generateTypedSql({
-      include: ['queries'],
-      rootDir: catalogScalarCollisionRoot,
-      codecProfile: 'node-postgres',
-      schema: 'schema.sql',
-    }),
+    generateFixture(catalogScalarCollisionRoot),
     /generated TypeScript binding PgInt8String for enum public\.pg_int8_string collides with postgres-typed-sql scalar type import/u
   )
 })
@@ -1401,15 +1205,11 @@ create table public.empty_table ();
 `,
     'select id, "display-name", state from public."order-items"\n'
   )
-  await generateTypedSql({
-    include: ['queries'],
+  await generateFixture(root, {
     imports: {
       runtime: "package'quoted/typed-sql",
       scalars: "package'quoted/pg-scalars",
     },
-    rootDir: root,
-    codecProfile: 'node-postgres',
-    schema: 'schema.sql',
     typesOutput: "types'o.ts",
   })
 
@@ -1442,12 +1242,7 @@ create table public.review_rows (
     'select direct_value, domain_value from public.review_rows\n'
   )
 
-  await generateTypedSql({
-    include: ['queries'],
-    rootDir: root,
-    codecProfile: 'node-postgres',
-    schema: 'schema.sql',
-  })
+  await generateFixture(root)
 
   const catalog = await readFile(join(root, 'postgres-typed-sql.types.ts'), 'utf8')
   assert.match(catalog, /readonly direct_value: "a" \| "b"/u)
@@ -1456,7 +1251,7 @@ create table public.review_rows (
 })
 
 test('uses authoritative JSON-cast facts and refuses nullable overrides of proven rejecting targets', async () => {
-  const jsonCastRoot = await createMinimalFixture(
+  const jsonCastOutput = await renderQuery(
     `create type public.json_mood as enum ('sad', 'ok');
 create function public.json_mood_to_json(public.json_mood)
 returns json
@@ -1469,13 +1264,6 @@ as assignment;
     `select jsonb_build_object('value', 'ok'::public.json_mood) as payload
 `
   )
-  await generateTypedSql({
-    include: ['queries'],
-    rootDir: jsonCastRoot,
-    codecProfile: 'node-postgres',
-    schema: 'schema.sql',
-  })
-  const jsonCastOutput = await readFile(join(jsonCastRoot, 'queries/query.typed-sql.ts'), 'utf8')
   assert.match(jsonCastOutput, /readonly value: DbJsonSelected/u)
   assert.match(jsonCastOutput, /import type \{ DbJsonSelected \}/u)
   assert.doesNotMatch(jsonCastOutput, /readonly value: JsonMood/u)
@@ -1487,12 +1275,7 @@ insert into public.required_values(value) values (:value)
 `
   )
   await assert.rejects(
-    generateTypedSql({
-      include: ['queries'],
-      rootDir: rejectingOverrideRoot,
-      codecProfile: 'node-postgres',
-      schema: 'schema.sql',
-    }),
+    generateFixture(rejectingOverrideRoot),
     /@nullable value cannot be satisfied because PostgreSQL proves that one of its uses rejects NULL/u
   )
 })
@@ -1898,12 +1681,7 @@ test('does not apply textual CHECK aliases to transformed driver or JSON represe
 from public.char_values
 `
   )
-  await generateTypedSql({
-    include: ['queries'],
-    rootDir: root,
-    codecProfile: 'node-postgres',
-    schema: 'schema.sql',
-  })
+  await generateFixture(root)
 
   const output = await readFile(join(root, 'queries/query.typed-sql.ts'), 'utf8')
   assert.match(output, /readonly value: string \| null/u)
@@ -1957,7 +1735,7 @@ from public.checked_text_values
 })
 
 test('renders nullable and union JSON aggregate element types with array precedence', async () => {
-  const root = await createMinimalFixture(
+  const output = await renderQuery(
     'create table public.json_values (value text);\n',
     `select
   jsonb_agg(value) as text_values,
@@ -1969,14 +1747,6 @@ test('renders nullable and union JSON aggregate element types with array precede
 from public.json_values
 `
   )
-  await generateTypedSql({
-    include: ['queries'],
-    rootDir: root,
-    codecProfile: 'node-postgres',
-    schema: 'schema.sql',
-  })
-
-  const output = await readFile(join(root, 'queries/query.typed-sql.ts'), 'utf8')
   assert.match(output, /readonly text_values: readonly \(string \| null\)\[\] \| null/u)
   assert.match(output, /readonly numeric_values: readonly \(number \| string\)\[\] \| null/u)
   assert.match(output, /readonly object_values: readonly \(QueryJ13_object_valuesJsonJ7_element\)\[\]/u)
@@ -2115,7 +1885,7 @@ cross join lateral (
 })
 
 test('renders every inferable JSON object alternative from set-operation outputs', async () => {
-  const root = await createMinimalFixture(
+  const output = await renderQuery(
     'select 1;\n',
     `select payload
 from (
@@ -2125,14 +1895,6 @@ from (
 ) source
 `
   )
-  await generateTypedSql({
-    include: ['queries'],
-    rootDir: root,
-    codecProfile: 'node-postgres',
-    schema: 'schema.sql',
-  })
-
-  const output = await readFile(join(root, 'queries/query.typed-sql.ts'), 'utf8')
   assert.match(output, /interface QueryJ7_payloadJsonJ12_alternative1 \{[\s\S]*readonly a: number/u)
   assert.match(output, /interface QueryJ7_payloadJsonJ12_alternative2 \{[\s\S]*readonly b: 'two'/u)
   assert.match(output, /readonly payload: QueryJ7_payloadJsonJ12_alternative1 \| QueryJ7_payloadJsonJ12_alternative2/u)
@@ -2276,19 +2038,11 @@ select value from walk
 })
 
 test('encodes arbitrary JSON result and field names only in generated type bindings', async () => {
-  const root = await createMinimalFixture(
+  const output = await renderQuery(
     'select 1;\n',
     `select jsonb_build_object('outer-key', jsonb_build_object('inner key', 1, '', 2)) as "payload-data"
 `
   )
-  await generateTypedSql({
-    include: ['queries'],
-    rootDir: root,
-    codecProfile: 'node-postgres',
-    schema: 'schema.sql',
-  })
-
-  const output = await readFile(join(root, 'queries/query.typed-sql.ts'), 'utf8')
   assert.match(output, /readonly "payload-data": QueryJ15_payload\$2d\$dataJson/u)
   assert.match(output, /readonly "outer-key": QueryJ15_payload\$2d\$dataJsonJ12_outer\$2d\$key/u)
   assert.match(output, /readonly "inner key": number/u)
@@ -2296,25 +2050,17 @@ test('encodes arbitrary JSON result and field names only in generated type bindi
 })
 
 test('models the last value for duplicate PostgreSQL JSON object keys', async () => {
-  const root = await createMinimalFixture(
+  const output = await renderQuery(
     'select 1;\n',
     `select json_build_object('value', 1, 'value', 'last'::text) as payload
 `
   )
-  await generateTypedSql({
-    include: ['queries'],
-    rootDir: root,
-    codecProfile: 'node-postgres',
-    schema: 'schema.sql',
-  })
-
-  const output = await readFile(join(root, 'queries/query.typed-sql.ts'), 'utf8')
   assert.match(output, /readonly value: 'last'/u)
   assert.doesNotMatch(output, /readonly value: number/u)
 })
 
 test('maps configured result and structured JSON names to camel case', async () => {
-  const root = await createMinimalFixture(
+  const output = await renderQuery(
     'select 1;\n',
     `select
   1 as account_id,
@@ -2324,20 +2070,14 @@ test('maps configured result and structured JSON names to camel case', async () 
     'webhook_payload', '{"event_type":"account.created"}'::jsonb
   ) as account_details
 from (values (1)) source(n)
-`
+`,
+    {
+      naming: {
+        resultColumns: 'camelCase',
+        structuredJsonFields: 'camelCase',
+      },
+    }
   )
-  await generateTypedSql({
-    include: ['queries'],
-    naming: {
-      resultColumns: 'camelCase',
-      structuredJsonFields: 'camelCase',
-    },
-    rootDir: root,
-    codecProfile: 'node-postgres',
-    schema: 'schema.sql',
-  })
-
-  const output = await readFile(join(root, 'queries/query.typed-sql.ts'), 'utf8')
   assert.match(output, /readonly accountId: number/u)
   assert.match(output, /readonly accountDetails: QueryJ15_account_detailsJson/u)
   assert.match(output, /readonly displayName: 'Reader'/u)
@@ -2353,7 +2093,7 @@ from (values (1)) source(n)
 })
 
 test('maps JSON array-from and object-from derived row shapes to camel case', async () => {
-  const root = await createMinimalFixture(
+  const output = await renderQuery(
     'select 1;\n',
     `select
   coalesce(
@@ -2371,20 +2111,14 @@ test('maps JSON array-from and object-from derived row shapes to camel case', as
       select 2 as account_id, 'Writer'::text as display_name
     ) nested_row
   ) as account_row
-`
+`,
+    {
+      naming: {
+        resultColumns: 'camelCase',
+        structuredJsonFields: 'camelCase',
+      },
+    }
   )
-  await generateTypedSql({
-    include: ['queries'],
-    naming: {
-      resultColumns: 'camelCase',
-      structuredJsonFields: 'camelCase',
-    },
-    rootDir: root,
-    codecProfile: 'node-postgres',
-    schema: 'schema.sql',
-  })
-
-  const output = await readFile(join(root, 'queries/query.typed-sql.ts'), 'utf8')
   assert.match(output, /readonly accountRows: readonly \(QueryJ12_account_rowsJsonJ7_element\)\[\]/u)
   assert.match(output, /readonly accountRow: QueryJ11_account_rowJson\n/u)
   assert.match(output, /readonly accountId: number/u)
@@ -2397,7 +2131,7 @@ test('maps JSON array-from and object-from derived row shapes to camel case', as
 })
 
 test('uses exposed aliases and folds whole-row set operations for structured JSON naming', async () => {
-  const root = await createMinimalFixture(
+  const output = await renderQuery(
     'select 1;\n',
     `select
   to_jsonb(aliased_row) as aliased_payload,
@@ -2408,17 +2142,9 @@ cross join (
   union all
   select jsonb_build_object('right_key', 2) as details
 ) union_row
-`
+`,
+    { naming: { structuredJsonFields: 'camelCase' } }
   )
-  await generateTypedSql({
-    include: ['queries'],
-    naming: { structuredJsonFields: 'camelCase' },
-    rootDir: root,
-    codecProfile: 'node-postgres',
-    schema: 'schema.sql',
-  })
-
-  const output = await readFile(join(root, 'queries/query.typed-sql.ts'), 'utf8')
   assert.match(output, /readonly userId: number/u)
   assert.doesNotMatch(output, /readonly accountId: number/u)
   assert.match(output, /readonly leftKey: number/u)
@@ -2429,7 +2155,7 @@ cross join (
 })
 
 test('maps ARRAY sublink elements while preserving opaque union paths', async () => {
-  const root = await createMinimalFixture(
+  const output = await renderQuery(
     'create table public.json_values (payload jsonb not null);\n',
     `select to_jsonb(array(select jsonb_build_object('item_id', 1))) as items
 union all
@@ -2440,17 +2166,9 @@ select jsonb_build_object(
 union all
 select jsonb_build_object('payload_data', payload)
 from public.json_values
-`
+`,
+    { naming: { structuredJsonFields: 'camelCase' } }
   )
-  await generateTypedSql({
-    include: ['queries'],
-    naming: { structuredJsonFields: 'camelCase' },
-    rootDir: root,
-    codecProfile: 'node-postgres',
-    schema: 'schema.sql',
-  })
-
-  const output = await readFile(join(root, 'queries/query.typed-sql.ts'), 'utf8')
   assert.match(output, /readonly itemId: number/u)
   assert.match(output, /readonly payloadData: DbJsonSelected/u)
   assert.doesNotMatch(output, /readonly fooBar: number/u)
@@ -2460,7 +2178,7 @@ from public.json_values
 })
 
 test('treats composite JSON alternatives as opaque traversal barriers', async () => {
-  const root = await createMinimalFixture(
+  const output = await renderQuery(
     'create type public.opaque_payload as (inner_key integer);\n',
     `select jsonb_build_object(
   'payload_data',
@@ -2471,17 +2189,9 @@ select jsonb_build_object(
   'payload_data',
   row(2)::public.opaque_payload
 ) as payload
-`
+`,
+    { naming: { structuredJsonFields: 'camelCase' } }
   )
-  await generateTypedSql({
-    include: ['queries'],
-    naming: { structuredJsonFields: 'camelCase' },
-    rootDir: root,
-    codecProfile: 'node-postgres',
-    schema: 'schema.sql',
-  })
-
-  const output = await readFile(join(root, 'queries/query.typed-sql.ts'), 'utf8')
   assert.match(output, /readonly payloadData: DbJsonSelected/u)
   assert.doesNotMatch(output, /readonly innerKey: number/u)
   assert.match(output, /"name":"payload_data","propertyName":"payloadData"/u)
@@ -2489,7 +2199,7 @@ select jsonb_build_object(
 })
 
 test('keeps nested mappings when the other JSON alternative is primitive', async () => {
-  const root = await createMinimalFixture(
+  const output = await renderQuery(
     'select 1;\n',
     `select jsonb_build_object(
   'payload_data',
@@ -2497,17 +2207,9 @@ test('keeps nested mappings when the other JSON alternative is primitive', async
 ) as payload
 union all
 select jsonb_build_object('payload_data', 2) as payload
-`
+`,
+    { naming: { structuredJsonFields: 'camelCase' } }
   )
-  await generateTypedSql({
-    include: ['queries'],
-    naming: { structuredJsonFields: 'camelCase' },
-    rootDir: root,
-    codecProfile: 'node-postgres',
-    schema: 'schema.sql',
-  })
-
-  const output = await readFile(join(root, 'queries/query.typed-sql.ts'), 'utf8')
   assert.match(output, /readonly payloadData:/u)
   assert.match(output, /readonly innerKey: number/u)
   assert.match(output, /"name":"payload_data","propertyName":"payloadData"/u)
@@ -2517,14 +2219,10 @@ select jsonb_build_object('payload_data', 2) as payload
 test('rejects configured output naming collisions at every modeled object level', async () => {
   const topLevelRoot = await createMinimalFixture('select 1;\n', 'select 1 as foo_bar, 2 as "fooBar"\n')
   await assert.rejects(
-    generateTypedSql({
-      include: ['queries'],
+    generateFixture(topLevelRoot, {
       naming: {
         resultColumns: 'camelCase',
       },
-      rootDir: topLevelRoot,
-      codecProfile: 'node-postgres',
-      schema: 'schema.sql',
     }),
     /duplicate result column name "fooBar"/u
   )
@@ -2535,21 +2233,17 @@ test('rejects configured output naming collisions at every modeled object level'
 `
   )
   await assert.rejects(
-    generateTypedSql({
-      include: ['queries'],
+    generateFixture(nestedRoot, {
       naming: {
         structuredJsonFields: 'camelCase',
       },
-      rootDir: nestedRoot,
-      codecProfile: 'node-postgres',
-      schema: 'schema.sql',
     }),
     /duplicate JSON field in result column "payload" name "fooBar"/u
   )
 })
 
 test('merges camel-case runtime mappings across structured JSON unions', async () => {
-  const root = await createMinimalFixture(
+  const output = await renderQuery(
     'select 1;\n',
     `select payload
 from (
@@ -2557,19 +2251,13 @@ from (
   union all
   select jsonb_build_object('outer_right', 'two'::text)
 ) alternatives
-`
+`,
+    {
+      naming: {
+        structuredJsonFields: 'camelCase',
+      },
+    }
   )
-  await generateTypedSql({
-    include: ['queries'],
-    naming: {
-      structuredJsonFields: 'camelCase',
-    },
-    rootDir: root,
-    codecProfile: 'node-postgres',
-    schema: 'schema.sql',
-  })
-
-  const output = await readFile(join(root, 'queries/query.typed-sql.ts'), 'utf8')
   assert.match(output, /readonly outerLeft: number/u)
   assert.match(output, /readonly outerRight: 'two'/u)
   assert.match(
@@ -2598,7 +2286,7 @@ test('requires structural JSON decoding when configured JSON field naming is use
 })
 
 test('uses collision-free JSON binding paths for arrays and nested keys', async () => {
-  const root = await createMinimalFixture(
+  const output = await renderQuery(
     'select 1;\n',
     `select jsonb_build_object(
   'item', jsonb_build_object('x', 1),
@@ -2609,14 +2297,6 @@ test('uses collision-free JSON binding paths for arrays and nested keys', async 
 from (values (1)) source(n)
 `
   )
-  await generateTypedSql({
-    include: ['queries'],
-    rootDir: root,
-    codecProfile: 'node-postgres',
-    schema: 'schema.sql',
-  })
-
-  const output = await readFile(join(root, 'queries/query.typed-sql.ts'), 'utf8')
   assert.match(output, /readonly item:/u)
   assert.match(output, /readonly items: readonly/u)
   assert.match(output, /readonly left: number/u)
@@ -2624,7 +2304,7 @@ from (values (1)) source(n)
 })
 
 test('does not infer builtin JSON semantics from user-defined function names', async () => {
-  const root = await createMinimalFixture(
+  const output = await renderQuery(
     `create function public.jsonb_build_object(text, integer)
 returns jsonb
 language sql immutable
@@ -2633,20 +2313,12 @@ as $$ select 'null'::jsonb $$;
     `select public.jsonb_build_object('key', 1) as payload
 `
   )
-  await generateTypedSql({
-    include: ['queries'],
-    rootDir: root,
-    codecProfile: 'node-postgres',
-    schema: 'schema.sql',
-  })
-
-  const output = await readFile(join(root, 'queries/query.typed-sql.ts'), 'utf8')
   assert.match(output, /readonly payload: DbJsonSelected \| null/u)
   assert.doesNotMatch(output, /interface QueryJ7_payloadJson/u)
 })
 
 test('falls back to opaque JSON when COALESCE branches have different shapes', async () => {
-  const root = await createMinimalFixture(
+  const output = await renderQuery(
     'create table public.json_values (value integer);\n',
     `select coalesce(
   jsonb_agg(jsonb_build_object('a', value)) filter (where false),
@@ -2655,33 +2327,17 @@ test('falls back to opaque JSON when COALESCE branches have different shapes', a
 from public.json_values
 `
   )
-  await generateTypedSql({
-    include: ['queries'],
-    rootDir: root,
-    codecProfile: 'node-postgres',
-    schema: 'schema.sql',
-  })
-
-  const output = await readFile(join(root, 'queries/query.typed-sql.ts'), 'utf8')
   assert.match(output, /readonly payload: DbJsonSelected/u)
   assert.doesNotMatch(output, /interface QueryJ7_payloadJson/u)
 })
 
 test('resolves column type assertions by PostgreSQL OID instead of display spelling', async () => {
-  const root = await createMinimalFixture(
+  const output = await renderQuery(
     "create type public.asserted_status as enum ('active');\n",
     `-- @column status public.asserted_status
 select 'active'::public.asserted_status as status
 `
   )
-
-  await generateTypedSql({
-    include: ['queries'],
-    rootDir: root,
-    codecProfile: 'node-postgres',
-    schema: 'schema.sql',
-  })
-  const output = await readFile(join(root, 'queries/query.typed-sql.ts'), 'utf8')
   assert.match(output, /readonly status: "active"/u)
 })
 
@@ -2693,12 +2349,7 @@ test('rejects nullable column assertions because PostgreSQL determines result nu
   )
 
   await assert.rejects(
-    generateTypedSql({
-      include: ['queries'],
-      rootDir: root,
-      codecProfile: 'node-postgres',
-      schema: 'schema.sql',
-    }),
+    generateFixture(root),
     /queries\/invalidColumnNullability\.typed\.sql:1: @column does not support \?; PostgreSQL determines result nullability/u
   )
 })

@@ -1,10 +1,6 @@
 import assert from 'node:assert/strict'
-import { resolve } from 'node:path'
-import test from 'node:test'
 
-import { createAnalysisDatabase, type AnalysisDatabase } from '../src/engine.js'
-
-const schemaFile = resolve(import.meta.dirname, 'fixtures/schema.sql')
+import { analyzeNative, testWithDatabase } from './analyzer-test-support.js'
 
 type DmlAdmission = {
   readonly paramId: number
@@ -26,28 +22,7 @@ interface DmlAnalysis {
   }[]
 }
 
-async function analyze(database: AnalysisDatabase, sql: string): Promise<DmlAnalysis> {
-  let delimiter = '$native_analyzer_sql$'
-  while (sql.includes(delimiter)) {
-    delimiter = `${delimiter.slice(0, -1)}_$`
-  }
-  await database.query('select 1')
-  const result = await database.query<{ readonly analysis: string }>(
-    `select pg_temp.postgres_typed_sql_analyze(${delimiter}${sql}${delimiter}) as analysis`
-  )
-  const payload = result.rows[0]?.analysis
-  assert.ok(typeof payload === 'string')
-  return JSON.parse(payload) as DmlAnalysis
-}
-
-async function withDatabase(run: (database: AnalysisDatabase) => Promise<void>): Promise<void> {
-  const database = await createAnalysisDatabase({ schemaFiles: [schemaFile] })
-  try {
-    await run(database)
-  } finally {
-    await database.close()
-  }
-}
+const analyze = analyzeNative<DmlAnalysis>
 
 function queryFacts(analysis: DmlAnalysis) {
   const query = analysis.statements[0]?.queries[0]
@@ -55,8 +30,9 @@ function queryFacts(analysis: DmlAnalysis) {
   return query
 }
 
-test('executable indexes make NULL admission incomplete without erasing assignment identity', async () => {
-  await withDatabase(async (database) => {
+testWithDatabase(
+  'executable indexes make NULL admission incomplete without erasing assignment identity',
+  async (database) => {
     await database.query('create table public.index_enforcement_probe (value integer)')
     await database.query(`create function public.index_enforcement_key(value integer)
       returns integer language plpgsql immutable as $$
@@ -79,11 +55,12 @@ test('executable indexes make NULL admission incomplete without erasing assignme
     )
     assert.deepEqual(facts.dmlParameterNullAdmissions, [{ admission: 'unknown', basis: 'unresolved', paramId: 1 }])
     await assert.rejects(database.query(sql, [null]), /null index key/u)
-  })
-})
+  }
+)
 
-test('partial and exclusion indexes are conservative without erasing assignment identity', async () => {
-  await withDatabase(async (database) => {
+testWithDatabase(
+  'partial and exclusion indexes are conservative without erasing assignment identity',
+  async (database) => {
     await database.query('create table public.partial_index_probe (value integer)')
     await database.query(`create function public.partial_index_predicate(value integer)
       returns boolean language plpgsql immutable as $$
@@ -125,81 +102,78 @@ test('partial and exclusion indexes are conservative without erasing assignment 
       { admission: 'unknown', basis: 'unresolved', paramId: 1 },
     ])
     await database.query(exclusionSql, [null])
-  })
-})
+  }
+)
 
-test('incomplete enforcement preserves structural identity and definite rejection', async () => {
-  await withDatabase(async (database) => {
-    await database.query(`create table public.nnd_required_probe (
+testWithDatabase('incomplete enforcement preserves structural identity and definite rejection', async (database) => {
+  await database.query(`create table public.nnd_required_probe (
       value integer not null unique nulls not distinct
     )`)
-    const nndSql = 'insert into public.nnd_required_probe(value) values ($1::integer)'
-    const nndFacts = queryFacts(await analyze(database, nndSql))
+  const nndSql = 'insert into public.nnd_required_probe(value) values ($1::integer)'
+  const nndFacts = queryFacts(await analyze(database, nndSql))
 
-    assert.deepEqual(
-      nndFacts.dmlDirectAssignments.map(({ paramId }) => paramId),
-      [1]
-    )
-    assert.deepEqual(nndFacts.dmlParameterNullAdmissions, [
-      { admission: 'rejects', basis: 'direct_target_null_admission', paramId: 1 },
-    ])
+  assert.deepEqual(
+    nndFacts.dmlDirectAssignments.map(({ paramId }) => paramId),
+    [1]
+  )
+  assert.deepEqual(nndFacts.dmlParameterNullAdmissions, [
+    { admission: 'rejects', basis: 'direct_target_null_admission', paramId: 1 },
+  ])
 
-    await database.query('create table public.rls_identity_probe (value integer)')
-    await database.query('alter table public.rls_identity_probe enable row level security')
-    await database.query(`create policy require_value on public.rls_identity_probe
+  await database.query('create table public.rls_identity_probe (value integer)')
+  await database.query('alter table public.rls_identity_probe enable row level security')
+  await database.query(`create policy require_value on public.rls_identity_probe
       for insert with check (value is not null)`)
-    const rlsFacts = queryFacts(
-      await analyze(database, 'insert into public.rls_identity_probe(value) values ($1::integer)')
-    )
+  const rlsFacts = queryFacts(
+    await analyze(database, 'insert into public.rls_identity_probe(value) values ($1::integer)')
+  )
 
-    assert.deepEqual(
-      rlsFacts.dmlDirectAssignments.map(({ paramId }) => paramId),
-      [1]
-    )
-    assert.deepEqual(rlsFacts.dmlParameterNullAdmissions, [{ admission: 'unknown', basis: 'unresolved', paramId: 1 }])
-  })
+  assert.deepEqual(
+    rlsFacts.dmlDirectAssignments.map(({ paramId }) => paramId),
+    [1]
+  )
+  assert.deepEqual(rlsFacts.dmlParameterNullAdmissions, [{ admission: 'unknown', basis: 'unresolved', paramId: 1 }])
 })
 
-test('constant and leaf-partition checks participate in target NULL admission', async () => {
-  await withDatabase(async (database) => {
-    await database.query('create table public.constant_check_probe (value integer check (false))')
-    const constantSql = 'insert into public.constant_check_probe(value) values ($1::integer)'
-    const constantFacts = queryFacts(await analyze(database, constantSql))
+testWithDatabase('constant and leaf-partition checks participate in target NULL admission', async (database) => {
+  await database.query('create table public.constant_check_probe (value integer check (false))')
+  const constantSql = 'insert into public.constant_check_probe(value) values ($1::integer)'
+  const constantFacts = queryFacts(await analyze(database, constantSql))
 
-    assert.deepEqual(constantFacts.dmlParameterNullAdmissions, [
-      { admission: 'rejects', basis: 'direct_target_null_admission', paramId: 1 },
-    ])
-    await assert.rejects(database.query(constantSql, [null]), /constant_check_probe_check/u)
+  assert.deepEqual(constantFacts.dmlParameterNullAdmissions, [
+    { admission: 'rejects', basis: 'direct_target_null_admission', paramId: 1 },
+  ])
+  await assert.rejects(database.query(constantSql, [null]), /constant_check_probe_check/u)
 
-    const unreachableSql = `update public.constant_check_probe
+  const unreachableSql = `update public.constant_check_probe
       set value = $1::integer where $1::integer is not null`
-    const unreachableFacts = queryFacts(await analyze(database, unreachableSql))
-    assert.deepEqual(unreachableFacts.dmlParameterNullAdmissions, [
-      { admission: 'accepts', basis: 'action_unreachable_when_null', paramId: 1 },
-    ])
-    await database.query(unreachableSql, [null])
+  const unreachableFacts = queryFacts(await analyze(database, unreachableSql))
+  assert.deepEqual(unreachableFacts.dmlParameterNullAdmissions, [
+    { admission: 'accepts', basis: 'action_unreachable_when_null', paramId: 1 },
+  ])
+  await database.query(unreachableSql, [null])
 
-    await database.query(`create table public.partition_check_probe (
+  await database.query(`create table public.partition_check_probe (
       bucket integer,
       value integer
     ) partition by list (bucket)`)
-    await database.query(`create table public.partition_check_probe_one
+  await database.query(`create table public.partition_check_probe_one
       partition of public.partition_check_probe for values in (1)`)
-    const leafSql = `insert into public.partition_check_probe_one(bucket, value)
+  const leafSql = `insert into public.partition_check_probe_one(bucket, value)
       values ($1::integer, 1)`
-    const leafFacts = queryFacts(await analyze(database, leafSql))
+  const leafFacts = queryFacts(await analyze(database, leafSql))
 
-    assert.deepEqual(
-      leafFacts.dmlDirectAssignments.map(({ paramId }) => paramId),
-      [1]
-    )
-    assert.deepEqual(leafFacts.dmlParameterNullAdmissions, [{ admission: 'unknown', basis: 'unresolved', paramId: 1 }])
-    await assert.rejects(database.query(leafSql, [null]), /partition constraint/u)
-  })
+  assert.deepEqual(
+    leafFacts.dmlDirectAssignments.map(({ paramId }) => paramId),
+    [1]
+  )
+  assert.deepEqual(leafFacts.dmlParameterNullAdmissions, [{ admission: 'unknown', basis: 'unresolved', paramId: 1 }])
+  await assert.rejects(database.query(leafSql, [null]), /partition constraint/u)
 })
 
-test('statement triggers block action-unreachable proofs while row enforcement does not erase safe old rows', async () => {
-  await withDatabase(async (database) => {
+testWithDatabase(
+  'statement triggers block action-unreachable proofs while row enforcement does not erase safe old rows',
+  async (database) => {
     await database.query('create table public.statement_trigger_probe (value integer)')
     await database.query('insert into public.statement_trigger_probe(value) values (1)')
     await database.query(`create function public.raise_statement_trigger()
@@ -236,31 +210,29 @@ test('statement triggers block action-unreachable proofs while row enforcement d
       { admission: 'accepts', basis: 'row_values_preserved_when_null', paramId: 1 },
     ])
     await database.query(preservedSql, [null])
-  })
-})
+  }
+)
 
-test('enforced unvalidated foreign keys block old-row preservation', async () => {
-  await withDatabase(async (database) => {
-    await database.query('create table public.fk_parent_probe (id integer primary key)')
-    await database.query(`create table public.fk_child_probe (
+testWithDatabase('enforced unvalidated foreign keys block old-row preservation', async (database) => {
+  await database.query('create table public.fk_parent_probe (id integer primary key)')
+  await database.query(`create table public.fk_child_probe (
       id integer primary key,
       parent_id integer
     )`)
-    await database.query('begin')
-    await database.query('insert into public.fk_child_probe(id, parent_id) values (1, 99)')
-    await database.query(`alter table public.fk_child_probe
+  await database.query('begin')
+  await database.query('insert into public.fk_child_probe(id, parent_id) values (1, 99)')
+  await database.query(`alter table public.fk_child_probe
       add constraint fk_child_parent foreign key (parent_id)
       references public.fk_parent_probe(id) not valid`)
-    const sql = `update public.fk_child_probe
+  const sql = `update public.fk_child_probe
       set parent_id = coalesce($1::integer, parent_id)
       where id = 1`
-    const facts = queryFacts(await analyze(database, sql))
+  const facts = queryFacts(await analyze(database, sql))
 
-    assert.equal(
-      facts.dmlParameterNullAdmissions.some(({ admission, paramId }) => admission === 'accepts' && paramId === 1),
-      false
-    )
-    await assert.rejects(database.query(sql, [null]), /fk_child_parent/u)
-    await database.query('rollback')
-  })
+  assert.equal(
+    facts.dmlParameterNullAdmissions.some(({ admission, paramId }) => admission === 'accepts' && paramId === 1),
+    false
+  )
+  await assert.rejects(database.query(sql, [null]), /fk_child_parent/u)
+  await database.query('rollback')
 })

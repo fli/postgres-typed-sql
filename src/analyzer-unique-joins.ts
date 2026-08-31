@@ -43,7 +43,7 @@ function isParamOrConst(expr: PgAnalyzerExpr | null | undefined): boolean {
   return unwrapped?.tag === 'Param' || unwrapped?.tag === 'Const'
 }
 
-function constraintsFromQual(
+export function collectUniqueConstraints(
   expr: PgAnalyzerExpr | null | undefined,
   sources: readonly UniqueJoinSource[],
   output: UniqueJoinConstraint[] = []
@@ -53,7 +53,7 @@ function constraintsFromQual(
   }
   if (expr.tag === 'BoolExpr' && expr.boolOp === 'AND') {
     for (const child of analyzerExprChildren(expr)) {
-      constraintsFromQual(child, sources, output)
+      collectUniqueConstraints(child, sources, output)
     }
     return output
   }
@@ -162,12 +162,12 @@ export function collectUniqueJoinProofInput(query: PgAnalyzerQuery): UniqueJoinP
     return null
   }
   return {
-    constraints: quals.flatMap((qual) => constraintsFromQual(qual, sources)),
+    constraints: quals.flatMap((qual) => collectUniqueConstraints(qual, sources)),
     sources,
   }
 }
 
-function equalityOperatorKey(opfamilyOid: number, operatorOid: number): string {
+export function uniqueEqualityOperatorKey(opfamilyOid: number, operatorOid: number): string {
   return `${opfamilyOid}:${operatorOid}`
 }
 
@@ -193,7 +193,7 @@ export function inferUniqueJoinClosure(
               constraint.targetAttnum === attnum &&
               constraint.inputCollationOid === candidate.collationOids[keyIndex] &&
               (constraint.determinantVarno === null || determined.has(constraint.determinantVarno)) &&
-              equalityOperators.has(equalityOperatorKey(candidate.opfamilyOids[keyIndex] ?? 0, constraint.opno))
+              equalityOperators.has(uniqueEqualityOperatorKey(candidate.opfamilyOids[keyIndex] ?? 0, constraint.opno))
           )
         )
       )

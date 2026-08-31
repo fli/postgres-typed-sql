@@ -1,4 +1,4 @@
-import { cp, mkdir, mkdtemp, writeFile } from 'node:fs/promises'
+import { cp, mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -15,6 +15,24 @@ export function generateTypedSql(
   config: Omit<PostgresTypedSqlConfig, 'imports'> & { imports?: PostgresTypedSqlConfig['imports'] }
 ) {
   return generateTypedSqlBase({ ...config, imports: config.imports ?? testImports })
+}
+
+type FixtureOptions = Omit<Partial<PostgresTypedSqlConfig>, 'rootDir'>
+
+export function generateFixture(rootDir: string, options: FixtureOptions = {}) {
+  return generateTypedSql({
+    codecProfile: 'node-postgres',
+    include: ['queries'],
+    rootDir,
+    schema: 'schema.sql',
+    ...options,
+  })
+}
+
+export async function renderQuery(schema: string, sql: string, options: FixtureOptions = {}): Promise<string> {
+  const root = await createMinimalFixture(schema, sql)
+  await generateFixture(root, options)
+  return readFile(join(root, 'queries/query.typed-sql.ts'), 'utf8')
 }
 
 export async function copyFixture(): Promise<string> {

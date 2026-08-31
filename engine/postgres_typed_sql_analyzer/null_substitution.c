@@ -32,11 +32,22 @@ static PtsSubstitutedValue null_substitution_value(
 static bool null_substitution_evaluation_safe(
   const Node *expr, const PtsNullSubstitutionContext *context);
 
-static bool
-safe_strict_function(Oid function_oid)
+static const List *
+safe_strict_call_arguments(const Node *expr)
 {
-  return OidIsValid(function_oid) && func_strict(function_oid) &&
-         func_volatile(function_oid) != PROVOLATILE_VOLATILE;
+  bool is_function = IsA(expr, FuncExpr);
+  Oid function_oid = is_function
+                       ? ((const FuncExpr *) expr)->funcid
+                       : ((const OpExpr *) expr)->opfuncid;
+  bool returns_set = is_function
+                       ? ((const FuncExpr *) expr)->funcretset
+                       : ((const OpExpr *) expr)->opretset;
+
+  if (returns_set || !OidIsValid(function_oid) || !func_strict(function_oid) ||
+      func_volatile(function_oid) == PROVOLATILE_VOLATILE)
+    return NIL;
+  return is_function ? ((const FuncExpr *) expr)->args
+                     : ((const OpExpr *) expr)->args;
 }
 
 static PtsSubstitutedValue
@@ -117,32 +128,11 @@ null_substitution_evaluation_safe(
         (const Node *) case_expr->defresult, context);
     }
     case T_FuncExpr:
-    {
-      const FuncExpr *function = (const FuncExpr *) expr;
-      bool saw_null = false;
-
-      if (function->funcretset || !safe_strict_function(function->funcid))
-        return false;
-      foreach(cell, function->args)
-      {
-        const Node *argument = (const Node *) lfirst(cell);
-
-        if (!null_substitution_evaluation_safe(argument, context))
-          return false;
-        saw_null = saw_null ||
-                   null_substitution_value(argument, context) ==
-                     PTS_SUBSTITUTED_NULL;
-      }
-      return saw_null;
-    }
     case T_OpExpr:
     {
-      const OpExpr *operation = (const OpExpr *) expr;
       bool saw_null = false;
 
-      if (operation->opretset || !safe_strict_function(operation->opfuncid))
-        return false;
-      foreach(cell, operation->args)
+      foreach(cell, safe_strict_call_arguments(expr))
       {
         const Node *argument = (const Node *) lfirst(cell);
 
@@ -318,38 +308,13 @@ null_substitution_value(const Node *expr,
       return null_substitution_value(
         (const Node *) ((const CollateExpr *) expr)->arg, context);
     case T_FuncExpr:
-    {
-      const FuncExpr *function = (const FuncExpr *) expr;
-      ListCell *cell;
-      bool all_arguments_safe = true;
-      bool saw_null = false;
-
-      if (function->funcretset || !safe_strict_function(function->funcid))
-        return PTS_SUBSTITUTED_UNKNOWN;
-      foreach(cell, function->args)
-      {
-        const Node *argument = (const Node *) lfirst(cell);
-
-        all_arguments_safe = all_arguments_safe &&
-                             null_substitution_evaluation_safe(argument,
-                                                                   context);
-        saw_null = saw_null ||
-                   null_substitution_value(argument, context) ==
-                     PTS_SUBSTITUTED_NULL;
-      }
-      return all_arguments_safe && saw_null
-               ? PTS_SUBSTITUTED_NULL : PTS_SUBSTITUTED_UNKNOWN;
-    }
     case T_OpExpr:
     {
-      const OpExpr *operation = (const OpExpr *) expr;
       ListCell *cell;
       bool all_arguments_safe = true;
       bool saw_null = false;
 
-      if (operation->opretset || !safe_strict_function(operation->opfuncid))
-        return PTS_SUBSTITUTED_UNKNOWN;
-      foreach(cell, operation->args)
+      foreach(cell, safe_strict_call_arguments(expr))
       {
         const Node *argument = (const Node *) lfirst(cell);
 

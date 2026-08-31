@@ -392,49 +392,21 @@ check_null_evaluation_for_subject_uncached(const Node *expr,
         evaluation_safe, depends_on_subject);
     }
     case T_FuncExpr:
-    {
-      const FuncExpr *function = (const FuncExpr *) expr;
-      ListCell *cell;
-      bool all_arguments_safe = true;
-      bool saw_safely_null_argument = false;
-      bool depends_on_subject = false;
-
-      foreach(cell, function->args)
-      {
-        PtsNullEvaluation argument = check_null_evaluation_for_subject(
-          (const Node *) lfirst(cell), subject);
-
-        all_arguments_safe = all_arguments_safe && argument.evaluation_safe;
-        depends_on_subject = depends_on_subject ||
-                             argument.depends_on_subject;
-        saw_safely_null_argument = saw_safely_null_argument ||
-                                   (argument.evaluation_safe &&
-                                    argument.proof == PTS_NULL_PROOF_NULL);
-      }
-      if (!func_strict(function->funcid))
-      {
-        return pts_make_null_evaluation(PTS_NULL_PROOF_UNKNOWN,
-                                    all_arguments_safe &&
-                                      function_evaluation_safe(function->funcid),
-                                    depends_on_subject);
-      }
-      return all_arguments_safe && saw_safely_null_argument
-               ? pts_make_null_evaluation(PTS_NULL_PROOF_NULL, true,
-                                      depends_on_subject)
-               : pts_make_null_evaluation(PTS_NULL_PROOF_UNKNOWN,
-                                      all_arguments_safe &&
-                                        function_evaluation_safe(function->funcid),
-                                      depends_on_subject);
-    }
     case T_OpExpr:
     {
-      const OpExpr *operation = (const OpExpr *) expr;
+      bool is_function = IsA(expr, FuncExpr);
+      const List *args = is_function
+                           ? ((const FuncExpr *) expr)->args
+                           : ((const OpExpr *) expr)->args;
+      Oid callable_oid = is_function
+                           ? ((const FuncExpr *) expr)->funcid
+                           : ((const OpExpr *) expr)->opno;
       ListCell *cell;
       bool all_arguments_safe = true;
       bool saw_safely_null_argument = false;
       bool depends_on_subject = false;
 
-      foreach(cell, operation->args)
+      foreach(cell, args)
       {
         PtsNullEvaluation argument = check_null_evaluation_for_subject(
           (const Node *) lfirst(cell), subject);
@@ -446,20 +418,18 @@ check_null_evaluation_for_subject_uncached(const Node *expr,
                                    (argument.evaluation_safe &&
                                     argument.proof == PTS_NULL_PROOF_NULL);
       }
-      if (!op_strict(operation->opno))
+      if ((is_function ? func_strict(callable_oid) : op_strict(callable_oid)) &&
+          all_arguments_safe && saw_safely_null_argument)
       {
-        return pts_make_null_evaluation(PTS_NULL_PROOF_UNKNOWN,
-                                    all_arguments_safe &&
-                                      operator_evaluation_safe(operation->opno),
-                                    depends_on_subject);
+        return pts_make_null_evaluation(PTS_NULL_PROOF_NULL, true,
+                                        depends_on_subject);
       }
-      return all_arguments_safe && saw_safely_null_argument
-               ? pts_make_null_evaluation(PTS_NULL_PROOF_NULL, true,
-                                      depends_on_subject)
-               : pts_make_null_evaluation(PTS_NULL_PROOF_UNKNOWN,
-                                      all_arguments_safe &&
-                                        operator_evaluation_safe(operation->opno),
-                                      depends_on_subject);
+      return pts_make_null_evaluation(
+        PTS_NULL_PROOF_UNKNOWN,
+        all_arguments_safe &&
+          (is_function ? function_evaluation_safe(callable_oid)
+                       : operator_evaluation_safe(callable_oid)),
+        depends_on_subject);
     }
     case T_ArrayExpr:
     {

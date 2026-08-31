@@ -33,17 +33,6 @@ interface LoadCheckConstraintLiteralUnionFactsOptions {
   readonly schemas?: readonly string[]
 }
 
-interface MutableCheckConstraintLiteralUnionFact {
-  attname: string
-  attnum: number
-  constraintNames: string[]
-  labels: string[]
-  relid: number
-  relname: string
-  schema: string
-  typeName: string
-}
-
 const defaultSchemas = ['public']
 
 export function checkConstraintLiteralUnionTypeName(row: {
@@ -252,25 +241,13 @@ function parseLiteralUnionConstraintExpression(expression: string, attname: stri
   return parseDirectLiteralUnion(stripped, attname) ?? parseOrLiteralUnion(stripped, attname)
 }
 
-function uniqueLabels(labels: readonly string[]): readonly string[] {
-  const seen = new Set<string>()
-  const unique: string[] = []
-  for (const label of labels) {
-    if (!seen.has(label)) {
-      seen.add(label)
-      unique.push(label)
-    }
-  }
-  return unique
-}
-
 function intersectLabels(left: readonly string[], right: readonly string[]): readonly string[] {
   const rightLabels = new Set(right)
   return left.filter((label) => rightLabels.has(label))
 }
 
 function mergeFact(
-  facts: Map<string, MutableCheckConstraintLiteralUnionFact>,
+  facts: Map<string, CheckConstraintLiteralUnionFact>,
   row: CheckConstraintCatalogRow,
   labels: readonly string[]
 ): void {
@@ -281,7 +258,7 @@ function mergeFact(
       attname: row.attname,
       attnum: row.attnum,
       constraintNames: [row.constraint_name],
-      labels: [...uniqueLabels(labels)],
+      labels: [...new Set(labels)],
       relid: row.relid,
       relname: row.relname,
       schema: row.schema,
@@ -290,8 +267,11 @@ function mergeFact(
     return
   }
 
-  existing.constraintNames.push(row.constraint_name)
-  existing.labels = [...intersectLabels(existing.labels, uniqueLabels(labels))]
+  facts.set(key, {
+    ...existing,
+    constraintNames: [...existing.constraintNames, row.constraint_name],
+    labels: intersectLabels(existing.labels, labels),
+  })
 }
 
 export async function loadCheckConstraintLiteralUnionFacts(
@@ -345,7 +325,7 @@ export async function loadCheckConstraintLiteralUnionFacts(
     params
   )
 
-  const facts = new Map<string, MutableCheckConstraintLiteralUnionFact>()
+  const facts = new Map<string, CheckConstraintLiteralUnionFact>()
   for (const row of result.rows) {
     if (!row.collation_is_deterministic || !row.operators_are_builtin) {
       continue
@@ -360,13 +340,7 @@ export async function loadCheckConstraintLiteralUnionFacts(
   return [...facts.values()]
     .filter((fact) => fact.labels.length > 0)
     .map((fact) => ({
-      attname: fact.attname,
-      attnum: fact.attnum,
+      ...fact,
       constraintNames: fact.constraintNames.toSorted(),
-      labels: fact.labels,
-      relid: fact.relid,
-      relname: fact.relname,
-      schema: fact.schema,
-      typeName: fact.typeName,
     }))
 }

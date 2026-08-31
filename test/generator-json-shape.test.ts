@@ -5,10 +5,10 @@ import test from 'node:test'
 
 import { definePostgresCodecProfile, postgresTypeScriptType } from '../src/index.js'
 
-import { createMinimalFixture, generateTypedSql } from './generator-test-support.js'
+import { createMinimalFixture, generateTypedSql, generateFixture, renderQuery } from './generator-test-support.js'
 
 test('renders a CASE-authored JSON state machine as a precise discriminated union', async () => {
-  const root = await createMinimalFixture(
+  const output = await renderQuery(
     `create table public.playback_values (
   publication_public_id text,
   manifest_object_key text
@@ -33,14 +33,6 @@ left join lateral (
 ) playback on true
 `
   )
-  await generateTypedSql({
-    include: ['queries'],
-    rootDir: root,
-    codecProfile: 'node-postgres',
-    schema: 'schema.sql',
-  })
-
-  const output = await readFile(join(root, 'queries/query.typed-sql.ts'), 'utf8')
   assert.match(output, /interface QueryJ8_playbackJsonJ12_alternative1 \{[\s\S]*readonly state: 'playable'/u)
   assert.match(output, /readonly publicationPublicId: string\n/u)
   assert.match(output, /readonly manifestType: 'hls'\n/u)
@@ -56,7 +48,7 @@ left join lateral (
 })
 
 test('renders VALUES JSON unions while keeping function RTE outputs explicitly nullable', async () => {
-  const root = await createMinimalFixture(
+  const output = await renderQuery(
     'select 1;\n',
     `select source.payload, generated.value
 from (
@@ -67,14 +59,6 @@ from (
 cross join generate_series(1, 2) generated(value)
 `
   )
-  await generateTypedSql({
-    include: ['queries'],
-    rootDir: root,
-    codecProfile: 'node-postgres',
-    schema: 'schema.sql',
-  })
-
-  const output = await readFile(join(root, 'queries/query.typed-sql.ts'), 'utf8')
   assert.match(output, /readonly left: 'left-value'/u)
   assert.match(output, /readonly right: 'right-value'/u)
   assert.match(output, /readonly payload: QueryJ7_payloadJsonJ12_alternative1 \| QueryJ7_payloadJsonJ12_alternative2/u)
@@ -226,12 +210,7 @@ test('uses the codec JSON scalar type when exact string-literal refinement is di
     },
   })
 
-  await generateTypedSql({
-    codecProfile,
-    include: ['queries'],
-    rootDir: root,
-    schema: 'schema.sql',
-  })
+  await generateFixture(root, { codecProfile })
 
   const output = await readFile(join(root, 'queries/query.typed-sql.ts'), 'utf8')
   assert.match(output, /import type \{ DecodedJsonText \} from 'postgres-typed-sql\/scalars'/u)
