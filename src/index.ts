@@ -33,3 +33,7 @@ export type {
   ResolvedPostgresCodecProfile,
 } from './postgres-codecs.js'
 export type { PostgresTypeFact, PostgresTypeKind } from './postgres-types.js'
+
+export type { StatementFactsConfig } from './config.js'
+export type { StatementFactsManifest, StatementFactsInput, StatementFactsStatement } from './statement-facts.js'
+export { statementFactsSchemaVersion, statementFactsSha256 } from './statement-facts.js'

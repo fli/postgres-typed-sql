@@ -1,3 +1,10 @@
+import {
+  snapshotStatementFactsInputs,
+  buildStatementFacts,
+  statementFactsSha256,
+  type StatementFactsManifest,
+  type StatementFactsAnalysis,
+} from './statement-facts.js'
 import { randomUUID } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import { lstat, mkdir, readFile, readdir, realpath, rename, rm, writeFile } from 'node:fs/promises'
@@ -64,11 +71,13 @@ const ignoredDiscoveryDirectories = new Set([
 ])
 
 interface NullableParameterDeclaration {
+  readonly legacy?: boolean
   readonly line: number
   readonly name: string
 }
 
 interface SqlParameter {
+  readonly legacyNullableRequest?: boolean
   readonly name: string
   readonly nullableRequestLine?: number
   readonly propertyName: string
@@ -87,6 +96,7 @@ interface TypedSqlConfig {
   readonly outputPath: string
   readonly sourceFile: string
   readonly sourcePath: string
+  readonly sourceSha256: string
   readonly sql: string
 }
 
@@ -114,6 +124,7 @@ type TypedSqlCommand = 'delete' | 'insert' | 'merge' | 'select' | 'unknown' | 'u
 type TypedSqlAccess = 'read' | 'write'
 
 interface ResolvedTypedSql {
+  readonly statementFacts: StatementFactsAnalysis
   readonly access: TypedSqlAccess
   readonly cardinality: TypedSqlCardinality
   readonly columns: readonly ResolvedSqlColumn[]
@@ -126,6 +137,7 @@ interface ResolvedTypedSql {
   readonly scalarTypeImports: readonly string[]
   readonly sourceFile: string
   readonly sourcePath: string
+  readonly sourceSha256: string
   readonly sql: string
 }
 
@@ -271,14 +283,17 @@ async function readTypedSqlConfigs(generatorConfig: ResolvedPostgresTypedSqlConf
     const sourceFile = relativePath(generatorConfig, sourcePath)
     const text = readFileSync(sourcePath, 'utf8')
     const parsedSource = parseTypedSqlSource(text, sourceFile)
-    const name = basename(sourceFile, typedSqlSourceSuffix)
-    assertTypeScriptBindingIdentifier(name, `${sourceFile}: typed SQL filename`)
+    let name = basename(sourceFile, typedSqlSourceSuffix).replace(/-([A-Za-z0-9])/gu, (_match, next: string) =>
+      next.toUpperCase()
+    )
     let access: TypedSqlAccess | undefined
     const nullableParameters: NullableParameterDeclaration[] = []
     const columns: SqlColumn[] = []
     let firstAccessLocation: string | undefined
+    let firstNameLocation: string | undefined
     const firstColumnDirectiveByName = new Map<string, string>()
     const firstNullableDirectiveByName = new Map<string, string>()
+    const firstParameterDirectiveByName = new Map<string, string>()
 
     for (const directive of parsedSource.directives) {
       const location = `${sourceFile}:${directive.line}`
@@ -286,6 +301,18 @@ async function readTypedSqlConfigs(generatorConfig: ResolvedPostgresTypedSqlConf
       const bodyParts = /^(\S+)(?:\s+([\s\S]*))?$/u.exec(directive.body)
       const identifier = bodyParts?.[1]
       const rawPgType = bodyParts?.[2]?.trim()
+      if (kind === 'name') {
+        if (!identifier || rawPgType) {
+          throw new Error(`${location}: @name requires exactly one identifier.`)
+        }
+        if (firstNameLocation) {
+          throw new Error(`${location}: duplicate @name; first declared at ${firstNameLocation}.`)
+        }
+        assertTypeScriptBindingIdentifier(identifier, `${location}: @name`)
+        firstNameLocation = location
+        name = identifier
+        continue
+      }
       if (kind === 'access') {
         if ((identifier !== 'read' && identifier !== 'write') || rawPgType) {
           throw new Error(`${location}: @access requires exactly read or write.`)
@@ -299,7 +326,7 @@ async function readTypedSqlConfigs(generatorConfig: ResolvedPostgresTypedSqlConf
         continue
       }
 
-      if (kind !== 'nullable' && kind !== 'column') {
+      if (kind !== 'nullable' && kind !== 'param' && kind !== 'column') {
         throw new Error(`${location}: unsupported typed SQL directive @${kind}.`)
       }
 
@@ -309,23 +336,32 @@ async function readTypedSqlConfigs(generatorConfig: ResolvedPostgresTypedSqlConf
       if (kind === 'nullable' && (rawPgType || !/^[A-Za-z_][A-Za-z0-9_]*$/u.test(identifier))) {
         throw new Error(`${location}: @nullable requires exactly one named-parameter identifier.`)
       }
+      if (kind === 'param' && !/^[A-Za-z_][A-Za-z0-9_]*$/u.test(identifier)) {
+        throw new Error(`${location}: @param requires a named-parameter identifier.`)
+      }
       if (kind === 'column' && rawPgType?.endsWith('?')) {
         throw new Error(`${location}: @column does not support ?; PostgreSQL determines result nullability.`)
       }
 
-      const firstDirectiveByName = kind === 'nullable' ? firstNullableDirectiveByName : firstColumnDirectiveByName
+      const firstDirectiveByName =
+        kind === 'nullable'
+          ? firstNullableDirectiveByName
+          : kind === 'param'
+            ? firstParameterDirectiveByName
+            : firstColumnDirectiveByName
       const firstLocation = firstDirectiveByName.get(identifier)
       if (firstLocation) {
         throw new Error(`${location}: duplicate @${kind} ${identifier}; first declared at ${firstLocation}.`)
       }
       firstDirectiveByName.set(identifier, location)
 
-      if (kind === 'nullable') {
+      if (kind === 'nullable' || (kind === 'param' && rawPgType?.endsWith('?'))) {
         nullableParameters.push({
+          legacy: kind === 'param',
           line: directive.line,
           name: identifier,
         })
-      } else {
+      } else if (kind === 'column') {
         columns.push({
           name: identifier,
           pgType: rawPgType,
@@ -333,6 +369,7 @@ async function readTypedSqlConfigs(generatorConfig: ResolvedPostgresTypedSqlConf
       }
     }
 
+    assertTypeScriptBindingIdentifier(name, `${sourceFile}: typed SQL filename`)
     configs.push({
       access,
       columns,
@@ -341,6 +378,7 @@ async function readTypedSqlConfigs(generatorConfig: ResolvedPostgresTypedSqlConf
       outputPath: generatedOutputPath(sourcePath),
       sourceFile,
       sourcePath,
+      sourceSha256: statementFactsSha256(text),
       sql: parsedSource.sql,
     })
   }
@@ -356,6 +394,7 @@ function compileTypedSql(config: TypedSqlConfig, parameterNaming: PostgresTypedS
     return {
       name,
       ...(nullable ? { nullableRequestLine: nullable.line } : {}),
+      ...(nullable?.legacy ? { legacyNullableRequest: true } : {}),
       propertyName: propertyNameForNaming(name, parameterNaming),
     }
   })
@@ -381,6 +420,7 @@ function compileTypedSql(config: TypedSqlConfig, parameterNaming: PostgresTypedS
     parameters,
     sourceFile: config.sourceFile,
     sourcePath: config.sourcePath,
+    sourceSha256: config.sourceSha256,
     sql: compiled.sql,
   }
 }
@@ -900,7 +940,12 @@ async function resolveTypedSqlWithAnalyzer(
             }
           : resolveTypeScriptParameterTypeForPostgresType(analyzed, generatorConfig.codecProfile)
       collectTypeResolutionDependencies(typeDependencies, resolution)
-      if (parameter.nullableRequestLine !== undefined && analyzed.nullAdmission !== 'accepts') {
+      // Legacy @param declares caller nullability; @nullable requires a PostgreSQL proof.
+      if (
+        parameter.nullableRequestLine !== undefined &&
+        !parameter.legacyNullableRequest &&
+        analyzed.nullAdmission !== 'accepts'
+      ) {
         const reason =
           analyzed.nullAdmission === 'rejects'
             ? 'PostgreSQL proves that one of its uses rejects NULL'
@@ -951,6 +996,15 @@ async function resolveTypedSqlWithAnalyzer(
     }
 
     resolvedQueries.push({
+      statementFacts: {
+        analyzerSchemaVersion: ir.analyzerSchemaVersion,
+        postgresVersionNum: ir.postgresVersionNum,
+        command: ir.command,
+        access: config.access ?? inferredAccess,
+        accessEvidence: ir.accessEvidence,
+        rowBounds: ir.rowBounds,
+        resultColumns: ir.resultColumns,
+      },
       columns,
       access: config.access ?? inferredAccess,
       cardinality: typedSqlCardinalityFromRowBounds(ir.rowBounds),
@@ -963,6 +1017,7 @@ async function resolveTypedSqlWithAnalyzer(
       scalarTypeImports: [...typeDependencies.scalar].toSorted(),
       sourceFile: config.sourceFile,
       sourcePath: config.sourcePath,
+      sourceSha256: config.sourceSha256,
       sql: config.sql,
     })
   }
@@ -1224,6 +1279,7 @@ async function commitGeneratedOutputs(
 }
 
 export interface GenerateTypedSqlResult {
+  readonly statementFacts?: StatementFactsManifest
   readonly generatedFiles: readonly string[]
   readonly removedFiles: number
   readonly statementCount: number
@@ -1241,6 +1297,7 @@ export async function generateTypedSql(config: PostgresTypedSqlConfig): Promise<
     const resolvedConfig = resolveConfig(config)
     const rawConfigs = await readTypedSqlConfigs(resolvedConfig)
     const configs = rawConfigs.map((config) => compileTypedSql(config, resolvedConfig.naming.parameterProperties))
+    const factsInputs = await snapshotStatementFactsInputs(resolvedConfig, configs)
     database = await createAnalysisDatabase({
       extensions: resolvedConfig.extensions,
       schemaFiles: resolvedConfig.schemaFiles,
@@ -1249,8 +1306,17 @@ export async function generateTypedSql(config: PostgresTypedSqlConfig): Promise<
     const resolvedConfigs = await resolveTypedSqlWithAnalyzer(configs, database, resolvedConfig)
 
     const staleFiles = await findStaleGeneratedFiles(resolvedConfigs, resolvedConfig)
+    const statementFacts = await buildStatementFacts(resolvedConfig, resolvedConfigs, factsInputs)
     await commitGeneratedOutputs(
       [
+        ...(statementFacts && resolvedConfig.statementFacts
+          ? [
+              {
+                contents: JSON.stringify(statementFacts, null, 2) + '\n',
+                outputPath: resolvedConfig.statementFacts.output,
+              },
+            ]
+          : []),
         { contents: catalogContents, outputPath: resolvedConfig.typesOutput },
         ...resolvedConfigs.map((entry) => ({
           contents: renderTypedSql(entry, resolvedConfig),
@@ -1263,6 +1329,7 @@ export async function generateTypedSql(config: PostgresTypedSqlConfig): Promise<
       generatedFiles: resolvedConfigs.map((entry) => entry.outputPath),
       removedFiles: staleFiles.length,
       statementCount: configs.length,
+      statementFacts,
     }
   } finally {
     try {

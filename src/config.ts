@@ -26,7 +26,15 @@ export interface PostgresTypedSqlImportsConfig {
   readonly scalars: string
 }
 
+export interface StatementFactsConfig {
+  /** JSON manifest committed with generated modules. */
+  readonly output: string
+  /** Config source, imported codec/config modules, and dependency lockfiles inside rootDir. */
+  readonly configurationFiles: readonly string[]
+}
+
 export interface PostgresTypedSqlConfig {
+  readonly statementFacts?: StatementFactsConfig
   /** Driver codec behavior used for generated parameter, result, and JSON types. Defaults to conservative. */
   readonly codecProfile?: PostgresCodecProfile
   /** Directories recursively searched for *.typed.sql files. Defaults to rootDir. */
@@ -52,6 +60,7 @@ export interface ResolvedPostgresTypedSqlNamingConfig {
 }
 
 export interface ResolvedPostgresTypedSqlConfig {
+  readonly statementFacts?: StatementFactsConfig
   readonly codecProfile: ResolvedPostgresCodecProfile
   readonly extensions: readonly SupportedExtension[]
   readonly imports: PostgresTypedSqlImportsConfig
@@ -106,7 +115,26 @@ export function resolveConfig(config: PostgresTypedSqlConfig): ResolvedPostgresT
     throw new Error(`Unsupported structured-JSON field naming ${JSON.stringify(structuredJsonFields)}.`)
   }
 
+  let statementFacts: StatementFactsConfig | undefined
+  if (config.statementFacts !== undefined) {
+    const facts = config.statementFacts
+    if (
+      !facts ||
+      typeof facts.output !== 'string' ||
+      !facts.output.trim() ||
+      !Array.isArray(facts.configurationFiles) ||
+      facts.configurationFiles.length === 0 ||
+      facts.configurationFiles.some((path: unknown) => typeof path !== 'string' || !path.trim())
+    ) {
+      throw new Error('statementFacts requires output and nonempty configurationFiles.')
+    }
+    statementFacts = {
+      output: fromRoot(rootDir, facts.output),
+      configurationFiles: facts.configurationFiles.map((path) => fromRoot(rootDir, path)),
+    }
+  }
   return {
+    statementFacts,
     codecProfile,
     extensions: config.extensions ?? [],
     imports: {

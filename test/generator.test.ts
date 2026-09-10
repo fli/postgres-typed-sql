@@ -653,7 +653,7 @@ where account.email = :email
   assert.doesNotMatch(output, /Unknown/u)
 })
 
-test('rejects removed and duplicate singular header directives', async () => {
+test('rejects duplicate singular header directives', async () => {
   const root = await createMinimalFixture(
     'select 1;\n',
     `-- @name firstName
@@ -663,7 +663,7 @@ select 1
   )
   await assert.rejects(
     generateTypedSql({ include: ['queries'], rootDir: root, schema: 'schema.sql' }),
-    /unsupported typed SQL directive @name/u
+    /duplicate @name/u
   )
 
   await writeFile(
@@ -986,8 +986,8 @@ test('rejects duplicate, reserved, and colliding generated names before emission
       sql: 'select 1 as duplicate, 2 as duplicate\n',
     },
     {
-      error: /typed SQL filename: "find-account" is not a legal non-reserved TypeScript binding/u,
-      file: 'find-account.typed.sql',
+      error: /typed SQL filename: "find.account" is not a legal non-reserved TypeScript binding/u,
+      file: 'find.account.typed.sql',
       sql: 'select 1\n',
     },
     {
@@ -1007,9 +1007,9 @@ test('rejects duplicate, reserved, and colliding generated names before emission
       sql: '-- @nullable value\n-- @nullable value\nselect :value::text\n',
     },
     {
-      error: /unsupported typed SQL directive @param/u,
-      file: 'removedParam.typed.sql',
-      sql: '-- @param value text\nselect :value::text\n',
+      error: /duplicate @param value/u,
+      file: 'duplicateParam.typed.sql',
+      sql: '-- @param value text\n-- @param value text\nselect :value::text\n',
     },
   ] as const
 
@@ -2352,4 +2352,22 @@ test('rejects nullable column assertions because PostgreSQL determines result nu
     generateFixture(root),
     /queries\/invalidColumnNullability\.typed\.sql:1: @column does not support \?; PostgreSQL determines result nullability/u
   )
+})
+
+test('uses camel-case statement names for kebab-case files and supports explicit names', async () => {
+  const root = await createMinimalFixture('select 1;\n', 'select 1;\n')
+  await writeFile(join(root, 'queries/find-account.typed.sql'), 'select 1 as id;\n')
+  await writeFile(join(root, 'queries/explicit-name.typed.sql'), '-- @name legacyStatement\nselect 1 as id;\n')
+  await generateFixture(root)
+  assert.match(await readFile(join(root, 'queries/find-account.typed-sql.ts'), 'utf8'), /export const findAccount =/u)
+  assert.match(
+    await readFile(join(root, 'queries/explicit-name.typed-sql.ts'), 'utf8'),
+    /export const legacyStatement =/u
+  )
+})
+
+test('reads legacy parameter nullability without overriding PostgreSQL-inferred types', async () => {
+  const output = await renderQuery('select 1;\n', '-- @param value bigint?\nselect :value::text as value\n')
+  assert.match(output, /readonly value: string \| null/u)
+  assert.doesNotMatch(output, /readonly value: PgInt8String/u)
 })
