@@ -1487,6 +1487,14 @@ function accessEvidence(queries: readonly PgAnalyzerQuery[]): TypedSqlPostgresIr
   }
 
   for (const query of queries) {
+    for (const flag of ['hasModifyingCTE', 'hasRowMarks', 'hasVolatileFunctions'] as const) {
+      if (typeof query[flag] !== 'boolean') {
+        throw new Error(`analyzer returned a query without required access fact ${flag}.`)
+      }
+    }
+    if (!['SELECT', 'INSERT', 'UPDATE', 'DELETE', 'MERGE', 'UTILITY'].includes(query.commandType)) {
+      throw new Error(`analyzer returned an unsupported access command ${query.commandType}.`)
+    }
     if (isDataModifyingCommand(query.commandType)) {
       add({
         command: query.commandType,
@@ -1504,6 +1512,8 @@ function accessEvidence(queries: readonly PgAnalyzerQuery[]): TypedSqlPostgresIr
     }
     if (query.commandType === 'UTILITY' && query.utilityKind === 'CALL') {
       add({ kind: 'procedureCall' })
+    } else if (query.commandType === 'UTILITY') {
+      throw new Error(`analyzer returned an unsupported rewritten utility ${query.utilityKind ?? 'UNKNOWN'}.`)
     }
   }
 

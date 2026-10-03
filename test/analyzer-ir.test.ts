@@ -59,6 +59,30 @@ function firstEnvelopeQuery(analysis: MutableEnvelopeObject): MutableEnvelopeObj
 }
 
 testWithDatabase(
+  'rejects incomplete or unknown native access facts instead of proving read-only execution',
+  async (database) => {
+    for (const flag of ['hasModifyingCTE', 'hasRowMarks', 'hasVolatileFunctions']) {
+      for (const value of [undefined, null, 'false']) {
+        const corrupted = corruptAnalyzerEnvelope(database, (analysis) => {
+          firstEnvelopeQuery(analysis)[flag] = value
+        })
+        await assert.rejects(
+          buildTypedSqlPostgresIrFromCompiledConfigs(corrupted, [config('missingAccess', 'select 1 as value')]),
+          /without required access fact/u
+        )
+      }
+    }
+    const unknownCommand = corruptAnalyzerEnvelope(database, (analysis) => {
+      firstEnvelopeQuery(analysis).commandType = 'FUTURE_COMMAND'
+    })
+    await assert.rejects(
+      buildTypedSqlPostgresIrFromCompiledConfigs(unknownCommand, [config('unknownCommand', 'select 1 as value')]),
+      /unsupported access command/u
+    )
+  }
+)
+
+testWithDatabase(
   'aggregates probe-gated analyzer rejections in config order without loading shared catalog facts',
   async (database) => {
     const analyzerInvocations: string[] = []

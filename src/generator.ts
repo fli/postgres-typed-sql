@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import { lstat, mkdir, readFile, readdir, realpath, rename, rm, writeFile } from 'node:fs/promises'
 import { basename, dirname, join, relative } from 'node:path'
@@ -19,7 +19,14 @@ import { buildCatalogTypes } from './catalog-generator.js'
 import type { PostgresTypedSqlPropertyNaming, ResolvedPostgresTypedSqlConfig } from './config.js'
 import { resolveConfig, type PostgresTypedSqlConfig } from './config.js'
 import type { PostgresQueryable } from './database.js'
-import { createAnalysisDatabase } from './engine.js'
+import { createAnalysisDatabase, type AnalysisDatabase } from './engine.js'
+import {
+  generationAnalysisVersion,
+  type TypedSqlAccessConcern,
+  type TypedSqlAccessEvidence,
+  type TypedSqlAnalysisInput,
+  type TypedSqlGenerationAnalysis,
+} from './generation-analysis.js'
 import {
   postgresJsonSupportsStringLiteralRefinement,
   postgresJsonUsesBuiltinPrimitiveDecoder,
@@ -89,6 +96,7 @@ interface TypedSqlConfig {
   readonly outputPath: string
   readonly sourceFile: string
   readonly sourcePath: string
+  readonly sourceSha256: string
   readonly sql: string
 }
 
@@ -118,6 +126,7 @@ type TypedSqlAccess = 'read' | 'write'
 
 interface ResolvedTypedSql {
   readonly access: TypedSqlAccess
+  readonly accessEvidence: TypedSqlAccessEvidence
   readonly cardinality: TypedSqlCardinality
   readonly columns: readonly ResolvedSqlColumn[]
   readonly command: TypedSqlCommand
@@ -147,6 +156,35 @@ function quoteString(value: string): string {
     .replaceAll('\u2029', '\\u2029')
 
   return value.includes("'") ? `"${escaped.replaceAll('"', '\\"')}"` : `'${escaped.replaceAll("'", "\\'")}'`
+}
+
+function sha256(value: string | Uint8Array): string {
+  return createHash('sha256').update(value).digest('hex')
+}
+
+// Explicit projection keeps the public contract independent of the private IR.
+function publicAccessEvidence(evidence: TypedSqlPostgresIrAccessEvidence): TypedSqlAccessEvidence {
+  if (evidence.kind === 'provenReadOnly') return { concerns: [] }
+  if (evidence.kind !== 'notProvenReadOnly' || evidence.reasons.length === 0) {
+    throw new Error('Cannot publish unsupported access evidence.')
+  }
+  const reasons = evidence.reasons.map((reason): TypedSqlAccessConcern => {
+    switch (reason.kind) {
+      case 'definiteDml':
+        if (!['DELETE', 'INSERT', 'MERGE', 'UPDATE'].includes(reason.command)) {
+          throw new Error('Cannot publish unsupported DML evidence.')
+        }
+        return { kind: 'definiteDml', command: reason.command }
+      case 'dataModifyingCte':
+      case 'rowLock':
+      case 'volatileExecution':
+      case 'procedureCall':
+        return { kind: reason.kind }
+      default:
+        throw new Error('Cannot publish unsupported access concern.')
+    }
+  })
+  return { concerns: reasons }
 }
 
 function relativePath(config: ResolvedPostgresTypedSqlConfig, filePath: string): string {
@@ -272,7 +310,8 @@ async function readTypedSqlConfigs(generatorConfig: ResolvedPostgresTypedSqlConf
 
   for (const sourcePath of sourcePaths) {
     const sourceFile = relativePath(generatorConfig, sourcePath)
-    const text = readFileSync(sourcePath, 'utf8')
+    const bytes = readFileSync(sourcePath)
+    const text = bytes.toString('utf8')
     const parsedSource = parseTypedSqlSource(text, sourceFile)
     const name = basename(sourceFile, typedSqlSourceSuffix)
     assertTypeScriptBindingIdentifier(name, `${sourceFile}: typed SQL filename`)
@@ -344,6 +383,7 @@ async function readTypedSqlConfigs(generatorConfig: ResolvedPostgresTypedSqlConf
       outputPath: generatedOutputPath(sourcePath),
       sourceFile,
       sourcePath,
+      sourceSha256: sha256(bytes),
       sql: parsedSource.sql,
     })
   }
@@ -384,6 +424,7 @@ function compileTypedSql(config: TypedSqlConfig, parameterNaming: PostgresTypedS
     parameters,
     sourceFile: config.sourceFile,
     sourcePath: config.sourcePath,
+    sourceSha256: config.sourceSha256,
     sql: compiled.sql,
   }
 }
@@ -830,7 +871,7 @@ async function assertColumnAssertions(
 
 async function resolveTypedSqlWithAnalyzer(
   configs: readonly CompiledTypedSql[],
-  client: PostgresQueryable,
+  client: AnalysisDatabase,
   generatorConfig: ResolvedPostgresTypedSqlConfig
 ): Promise<ResolvedTypedSql[]> {
   const result = await buildTypedSqlPostgresIrFromCompiledConfigs(
@@ -844,10 +885,19 @@ async function resolveTypedSqlWithAnalyzer(
   )
 
   const resolvedQueries: ResolvedTypedSql[] = []
+  if (result.queries.length !== configs.length) {
+    throw new Error('PostgreSQL analyzer returned an incomplete statement result.')
+  }
   for (const [index, ir] of result.queries.entries()) {
     const config = configs[index]
     if (!config) {
       throw new Error(`PostgreSQL analyzer returned an unexpected extra query ${ir.name}.`)
+    }
+    if (ir.name !== config.name || ir.sourceFile !== config.sourceFile) {
+      throw new Error('PostgreSQL analyzer returned a mismatched statement identity.')
+    }
+    if (ir.postgresVersionNum !== client.postgresVersionNum) {
+      throw new Error('PostgreSQL analyzer version disagrees with the analysis engine.')
     }
 
     const generatedDeclarations: GeneratedJsonTypeDeclaration[] = []
@@ -1004,6 +1054,7 @@ async function resolveTypedSqlWithAnalyzer(
     resolvedQueries.push({
       columns,
       access: config.access ?? inferredAccess,
+      accessEvidence: publicAccessEvidence(ir.accessEvidence),
       cardinality: typedSqlCardinalityFromRowBounds(ir.rowBounds),
       command: typedSqlCommandFromPostgres(ir.command),
       generatedTypeDeclarations: generatedDeclarations.map(({ name, fields }) => renderInterface(name, fields)),
@@ -1278,9 +1329,31 @@ export interface GenerateTypedSqlResult {
   readonly generatedFiles: readonly string[]
   readonly removedFiles: number
   readonly statementCount: number
+  /** Present only when requested through the second argument. */
+  readonly analysis?: TypedSqlGenerationAnalysis
 }
 
-export async function generateTypedSql(config: PostgresTypedSqlConfig): Promise<GenerateTypedSqlResult> {
+export interface GenerateTypedSqlOptions {
+  /** Return complete semantic facts and input provenance after outputs commit successfully. */
+  readonly analysis?: boolean
+}
+
+export interface GenerateTypedSqlAnalysisResult extends GenerateTypedSqlResult {
+  readonly analysis: TypedSqlGenerationAnalysis
+}
+
+export function generateTypedSql(
+  config: PostgresTypedSqlConfig,
+  options: GenerateTypedSqlOptions & { readonly analysis: true }
+): Promise<GenerateTypedSqlAnalysisResult>
+export function generateTypedSql(
+  config: PostgresTypedSqlConfig,
+  options?: GenerateTypedSqlOptions
+): Promise<GenerateTypedSqlResult>
+export async function generateTypedSql(
+  config: PostgresTypedSqlConfig,
+  options: GenerateTypedSqlOptions = {}
+): Promise<GenerateTypedSqlResult> {
   if (generationInProgress) {
     throw new Error('Concurrent generation in one process is not supported.')
   }
@@ -1289,31 +1362,88 @@ export async function generateTypedSql(config: PostgresTypedSqlConfig): Promise<
   let database: Awaited<ReturnType<typeof createAnalysisDatabase>> | undefined
 
   try {
+    const collectAnalysis = options.analysis === true
     const resolvedConfig = resolveConfig(config)
+    // Do not retain caller-owned arrays across asynchronous work.
+    const include = [...resolvedConfig.include]
+    const extensions = [...resolvedConfig.extensions]
+    const inputs: TypedSqlAnalysisInput[] = []
     const rawConfigs = await readTypedSqlConfigs(resolvedConfig)
     const configs = rawConfigs.map((config) => compileTypedSql(config, resolvedConfig.naming.parameterProperties))
     database = await createAnalysisDatabase({
-      extensions: resolvedConfig.extensions,
+      extensions,
       schemaFiles: resolvedConfig.schemaFiles,
+      ...(collectAnalysis
+        ? {
+            readSchemaFile: async (path: string) => {
+              const bytes = await readFile(path)
+              inputs.push({ path, role: 'schema', sha256: sha256(bytes) })
+              return bytes.toString('utf8')
+            },
+          }
+        : {}),
     })
     const catalogContents = await buildCatalogTypes(database, resolvedConfig)
     const resolvedConfigs = await resolveTypedSqlWithAnalyzer(configs, database, resolvedConfig)
 
     const staleFiles = await findStaleGeneratedFiles(resolvedConfigs, resolvedConfig)
-    await commitGeneratedOutputs(
-      [
-        { contents: catalogContents, outputPath: resolvedConfig.typesOutput },
-        ...resolvedConfigs.map((entry) => ({
-          contents: renderTypedSql(entry, resolvedConfig),
-          outputPath: entry.outputPath,
+    const outputs = [
+      { contents: catalogContents, outputPath: resolvedConfig.typesOutput },
+      ...resolvedConfigs.map((entry) => ({
+        contents: renderTypedSql(entry, resolvedConfig),
+        outputPath: entry.outputPath,
+      })),
+    ]
+    let analysis: TypedSqlGenerationAnalysis | undefined
+    if (collectAnalysis) {
+      inputs.push(
+        ...rawConfigs.map((entry) => ({ path: entry.sourcePath, role: 'sql' as const, sha256: entry.sourceSha256 }))
+      )
+      const inputIdentities = new Set(await Promise.all(inputs.map((entry) => filesystemPathIdentity(entry.path))))
+      for (const path of [...outputs.map((entry) => entry.outputPath), ...staleFiles]) {
+        if (inputIdentities.has(await filesystemPathIdentity(path))) {
+          throw new Error(`Generated output ${path} overlaps an analysis input.`)
+        }
+      }
+      // Detect ordinary concurrent edits before committing. The hashes still describe
+      // the consumed bytes if files change after this check; consumers must revalidate.
+      for (const input of inputs) {
+        if (sha256(await readFile(input.path)) !== input.sha256) {
+          throw new Error(`Analysis input changed during generation: ${input.path}`)
+        }
+      }
+      const discovered = (await findTypedSqlFiles(resolvedConfig, [typedSqlSourceSuffix])).toSorted()
+      if (JSON.stringify(discovered) !== JSON.stringify(rawConfigs.map((entry) => entry.sourcePath).toSorted())) {
+        throw new Error('SQL inventory changed during generation.')
+      }
+      const producer = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8')) as {
+        version: string
+      }
+      analysis = {
+        version: generationAnalysisVersion,
+        producer: { name: 'postgres-typed-sql', version: producer.version },
+        postgresVersionNum: database.postgresVersionNum,
+        rootDir: resolvedConfig.rootDir,
+        include,
+        extensions,
+        inputs,
+        statements: resolvedConfigs.map((entry) => ({
+          source: entry.sourcePath,
+          module: entry.outputPath,
+          export: entry.name,
+          sql: entry.sql,
+          sqlSha256: sha256(entry.sql),
+          access: entry.access,
+          accessEvidence: entry.accessEvidence,
         })),
-      ],
-      staleFiles
-    )
+      }
+    }
+    await commitGeneratedOutputs(outputs, staleFiles)
     return {
       generatedFiles: resolvedConfigs.map((entry) => entry.outputPath),
       removedFiles: staleFiles.length,
       statementCount: configs.length,
+      ...(analysis ? { analysis } : {}),
     }
   } finally {
     try {

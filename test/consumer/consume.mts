@@ -4,6 +4,34 @@ import { insertWidget } from './insertWidget.typed-sql.js'
 import type { NodePostgresTypedSqlClient } from 'postgres-typed-sql/adapters/node-postgres'
 import type { TypedSqlColumnMetadata } from 'postgres-typed-sql/runtime'
 import type { PgArray, PgArrayParameter } from 'postgres-typed-sql/scalars'
+import {
+  generateTypedSql,
+  generationAnalysisVersion,
+  type GenerateTypedSqlAnalysisResult,
+  type PostgresTypedSqlConfig,
+  type TypedSqlAccessConcern,
+  type TypedSqlGenerationAnalysis,
+} from 'postgres-typed-sql'
+
+declare const generatorConfig: PostgresTypedSqlConfig
+const analysisResult: GenerateTypedSqlAnalysisResult = await generateTypedSql(generatorConfig, { analysis: true })
+const analysis: TypedSqlGenerationAnalysis = analysisResult.analysis
+const analysisVersion: 1 = generationAnalysisVersion
+for (const statement of analysis.statements) {
+  for (const concern of statement.accessEvidence.concerns) {
+    const publicConcern: TypedSqlAccessConcern = concern
+    if (concern.kind === 'definiteDml') {
+      const command: 'DELETE' | 'INSERT' | 'MERGE' | 'UPDATE' = concern.command
+      void command
+    }
+    void publicConcern
+  }
+}
+const optionalResult = await generateTypedSql(generatorConfig)
+// @ts-expect-error Analysis must be requested or checked before it is consumed.
+const requiredAnalysis: TypedSqlGenerationAnalysis = optionalResult.analysis
+void requiredAnalysis
+void analysisVersion
 
 declare const client: NodePostgresTypedSqlClient
 

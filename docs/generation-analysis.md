@@ -1,0 +1,117 @@
+# Generation analysis for external tools
+
+`generateTypedSql(config, { analysis: true })` returns `result.analysis`, a JSON-serializable report for the **entire successful generation**. The ordinary call retains its existing result and generated runtime code. All analysis types and `generationAnalysisVersion` are exported from `postgres-typed-sql`; no private analyzer imports are necessary.
+
+This contract is available starting in `0.1.0-beta.17`. Earlier packages do not contain it. Version 1 describes the public analysis contract independently of the package version and private analyzer schema.
+
+```ts
+import { generateTypedSql, generationAnalysisVersion } from 'postgres-typed-sql'
+
+const result = await generateTypedSql(config, { analysis: true })
+if (result.analysis.version !== generationAnalysisVersion) throw new Error('Unsupported analysis')
+for (const statement of result.analysis.statements) {
+  console.log(statement.module, statement.export, statement.access, statement.accessEvidence)
+}
+```
+
+TypeScript knows `analysis` is required for the literal `{ analysis: true }` overload. With a boolean option, check the optional result before using it. This is a programmatic generator option, not a configuration-file option or a CLI manifest flag.
+
+## Version 1 contract
+
+| Field                | Guarantee                                                                                                                                                                                                      |
+| -------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `version`            | `1`. Versions govern both report shape and the meanings/guarantees of its facts.                                                                                                                               |
+| `producer`           | Package name and actual installed package version, for producer acceptance and diagnostics.                                                                                                                    |
+| `postgresVersionNum` | The verified embedded PostgreSQL engine version, currently `180003`.                                                                                                                                           |
+| `rootDir`, `include` | Resolved absolute generation root and include paths.                                                                                                                                                           |
+| `extensions`         | Ordered extension configuration actually supplied to schema construction.                                                                                                                                      |
+| `inputs`             | Ordered schema inputs, then the complete discovered SQL-source inventory. Each entry has an absolute `path`, `role` (`schema` or `sql`), and lowercase SHA-256 of the original file bytes read for generation. |
+| `statements`         | Exactly one entry for every generated statement; unchanged outputs are included. An empty inventory yields an empty array, with schema provenance still present.                                               |
+
+Every statement contains absolute `source` and `module` paths, the exact exported identifier in `export`, the compiled `sql`, `sqlSha256`, emitted `access`, and `accessEvidence`. The hash is SHA-256 over the UTF-8 encoding of `sql`, which is exactly the SQL sent to analysis and emitted as `statement.text`. Bind facts by **module plus export**, then verify exact SQL and access agreement against the consumer's parsed generated statement. A basename or export alone is insufficient: two directories can contain the same query filename. The source must belong to the hashed SQL inventory. Version 1 has one statement per source; reject missing, duplicate, or unmatched sources and identities.
+
+Source and schema hashes describe the **bytes consumed**, including comments, directives, CRLF, and accepted schema guard lines. Named parameters and source directives are compiled before statement analysis; consequently the source hash and compiled SQL hash intentionally cover different representations. Schema execution retains its existing normalization of accepted `pg_dump` guards and line endings. SQL inputs are discovered in the generator's existing order; schema inputs preserve execution order. The same path may have both input roles, or be loaded repeatedly as an ordered schema input. Consumers can impose stricter input rules if their own manifests require them.
+
+Discovery recursively searches the configured include directories for regular `*.typed.sql` files. It ignores directories beginning with `.` and `build`, `coverage`, `dist`, `node_modules`, `out`, `playwright-report`, `reports`, and `test-results`. Directory entries that are symbolic links are not traversed. Overlapping include roots and sources are deduplicated by real path; reported paths retain the discovered spelling. Consumers must validate the current inventory with equivalent discovery rules or stricter project-specific rules that fail explicitly on a discrepancy. Paths can lie outside `rootDir` when configured that way; reject them in consumers that require a closed project boundary. Persisting relative paths or relocating a report is consumer work and must preserve identity and containment checks.
+
+## Access evidence contains positive concerns, not an effect proof
+
+`accessEvidence.concerns` is a required array of positive concerns detected in the supported PostgreSQL-analyzed and rewritten statement. It may be empty. **An empty array proves neither purity nor absence of mutation or locking.** The public API deliberately does not export the private adapter's `provenReadOnly`/`notProvenReadOnly` proof-status tags.
+
+The supported concern kinds are:
+
+| Reason                                                       | What a policy tool may conclude                                                                                                                                               |
+| ------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `definiteDml`, with `INSERT`, `UPDATE`, `DELETE`, or `MERGE` | The analyzed/rewrite result contains that direct DML command. This does not prove any rows will change.                                                                       |
+| `dataModifyingCte`                                           | The analyzed statement contains a data-modifying CTE.                                                                                                                         |
+| `rowLock`                                                    | Read-only execution cannot be proved due to locking. Ownership, target, mode, and consumption need separate analysis.                                                         |
+| `volatileExecution`                                          | A reachable volatile path prevents the read-only proof. `random()` is one counterexample to treating this reason as proof of mutation. Function-body effects are not exposed. |
+| `procedureCall`                                              | An opaque no-result `CALL` prevents the read-only proof. It does not establish the procedure's effects.                                                                       |
+
+Concerns are not an exhaustive effect inventory. A consumer may use the two DML concerns to supplement its own mutation analysis; it must separately handle functions, procedures, locking, and other policy semantics. The classifier relies on PostgreSQL's declared volatility attributes. A `STABLE` wrapper can call a mutating `VOLATILE` function while exposing no concerns in the outer analyzed query. This is a documented [PostgreSQL limitation of volatility declarations](https://www.postgresql.org/docs/18/xfunc-volatility.html), and the integration test executes such a wrapper to verify the counterexample. Do not infer no mutation from read routing, no DML concerns, or an empty concern array.
+
+`access` describes the actual generated routing choice under the existing generator's classifier. `@access write` can make a statement with no detected concerns use write routing. `@access read` cannot suppress a detected concern: generation rejects it. Nonempty concerns require emitted write access in version 1. Unsupported statement forms fail generation rather than receiving fabricated evidence; currently utilities other than supported no-result `CALL` fail. Function bodies are outside this report's semantic coverage even when PostgreSQL accepts the statement. Consumers must reject unknown concern kinds and unsupported report versions. They must not silently drop new concerns or treat unexamined effects as safe.
+
+## Lifecycle and provenance ownership
+
+There are no per-statement callbacks, partial success results, or analysis reports on rejection. Resolution, analysis, rendering, and output preflight precede installation. The report is returned after the existing output commit and database shutdown succeed. If analysis, input validation, staging, installation, or shutdown fails, the promise rejects; never authorize proofs from a caught partial result. Existing commit rollback behavior applies. A shutdown failure may occur after outputs have been installed, and filesystem observers can see a multi-file commit in progress; the operation is not a cross-process filesystem transaction.
+
+When analysis is requested, generation rechecks consumed input hashes and SQL inventory before installation and rejects detected changes. It also rejects output or stale-output deletion paths that overlap consumed inputs, including real-path aliases. These checks catch ordinary concurrent edits and preserve existing outputs on preflight failures. They do not lock the filesystem. Inputs can change during/after the final check or between consumer reads, and an edit followed by a restore is not an atomic snapshot of the whole project. The report's hashes still refer to the bytes actually consumed, rather than late rereads accidentally presented as provenance. For a proof over a coherent project state, use immutable inputs or an appropriately locked/content-addressed workspace; consumers must still revalidate persisted reports against the project snapshot they analyze.
+
+| Owner                           | Required guarantees                                                                                                                                                                                                                                                                              |
+| ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Generator                       | Evidence derives from the exact compiled SQL emitted at the stated module/export; hashes bind the actual SQL/schema reads; supported analysis succeeds for all discovered statements; no report is returned before successful generation; engine compatibility is checked internally.            |
+| Consumer generator wrapper      | Capture configuration/dependency/lockfile provenance before loading/evaluating configuration, control any environment or external inputs that affect it, check it remains valid, and persist the complete report with those dependencies. Hashing configuration only after generation is unsafe. |
+| Consumer proof session          | Validate report/producer/engine compatibility, every input hash, current complete SQL inventory, unique module/export/source association, and complete generated-statement coverage with exact SQL/access agreement; keep incremental dependency and content-event tracking sound.               |
+| Consumer native policy analysis | Prove mutation effects, function/procedure handling, lock ownership/consumption, keyset structure, and application policies.                                                                                                                                                                     |
+
+The generator does not know which configuration modules, package metadata, environment variables, or dependency files produced a programmatically passed object. It cannot attest to arbitrary configuration callbacks. A wrapper that loads files from a changing workspace or hashes cached modules after loading them has not bound configuration evaluation to those hashes. Capture dependencies in a fresh process against a controlled snapshot before module loading; revalidate afterwards. File hashes alone cannot make nondeterministic configuration, concurrent updates, or a drifted deployment schema sound.
+
+The returned objects have readonly TypeScript interfaces; they are not signed or tamper-resistant. Trust the generation process and manifest storage. A consumer must validate untrusted JSON and fail closed before attaching any facts. Ordinary validation failure rejects a proof, even when generation outputs are otherwise usable.
+
+## Compatibility policy
+
+The public version is independent of native analyzer schema numbers, PostgreSQL parse trees, IR shapes, and package release numbering. Internal reorganizations and private schema changes can retain version 1 when these guarantees hold. A changed meaning, new reason that existing consumers must understand, removed guarantee, or incompatible shape needs a new public version. Version 1 is a complete contract, so it has no optional capability list and no partially supported statements.
+
+Producer version is not a replacement for the semantic version. Consumers should explicitly decide which package releases and PostgreSQL versions/majors they have reviewed; rejecting an unreviewed release remains a valid policy. Never accept arbitrary future producers solely because their version sorts after beta.16. Minor internal improvements can change facts while preserving their meaning. A consumer can approve new producer versions without learning private analyzer schema versions.
+
+## Migrating a policy consumer from beta.15.1
+
+The reference consumer is read-only during upstream development. Its current native `statement_facts.rs` consumes DML reasons, compiled SQL/access identity, input hashes, and inventory. It validates row bounds, result columns, and private analyzer versions without using those fields to decide proofs. Its own SQL and schema-function analysis supplies additional mutation, locking, and keyset facts.
+
+The minimum adaptation is:
+
+1. Remove the old `statementFacts` configuration option. Replace the CLI invocation in the consumer's `typed-sql` package script with a fresh-process programmatic wrapper that requests `{ analysis: true }`, applies the same project-root override, and persists the returned report inside a **consumer-owned** manifest, alongside configuration hashes captured before configuration evaluation. Keep the current formatting step: formatting generated modules does not invalidate SQL/access identity. Keep the current configuration, package, lockfile, and workspace dependency coverage, including the new wrapper's source and dependencies in the controlled snapshot. Do not recompute SQL/schema hashes for manifest construction: use the report's consumed-byte hashes. The wrapper owns manifest-output overlap checks against all inputs, and must prevent generator outputs from overwriting its configuration dependencies as well.
+2. Keep the consumer manifest's own schema/version check, bumping its version when replacing the existing flat manifest with a new envelope. Add checks for `generation.version === 1`, producer name, an explicitly supported package release, and reviewed `postgresVersionNum`. Replace the private `analyzerSchemaVersion === 10` requirement. Internal schema compatibility is upstream's responsibility.
+3. Use `generation.inputs` (`path` instead of the old root-relative path) and `generation.include` for current hash/inventory checks. Convert to root-relative paths during persistence if retaining the current Rust path loader. Validate containment before conversion; do not strip a leading `../` or normalize an unsafe path into acceptance. Preserve schema order and extension/configuration provenance.
+4. Use `generation.statements` (`source`, `module`, `export`, `sqlSha256`, `access`, `accessEvidence`). Replace the old access-evidence tag/reasons validation with required `concerns` array validation, allowing an empty array and validating every nonempty entry against the supported kinds/commands. Preserve unique identities, source coverage, generated SQL/access agreement, and complete coverage of the parsed generated statements. Check the report's `sql` against the parsed text or its independently computed hash. Remove the unused row-bound/result-column validations; do not insert dummy fields. Runtime row bounds and expression metadata remain available on generated statements if a future policy actually needs them.
+5. Preserve the existing mutation OR from `definiteDml`/`dataModifyingCte` in `accessEvidence.concerns`, and the independent schema function, locking, and keyset analysis. Run function-effect analysis for **all statements**, including emitted `access: 'read'`; remove the existing write-access gate on schema-function mutation detection. Keep unresolved function/procedure effects unknown, and block policies requiring their absence until separately proved. Preserve manifest fingerprinting and dependency tracking of all inputs/generated modules for incremental sessions. Fix any pre-existing coverage gap for generated modules outside the old suffix/include fallback, including `.mts` files: a report is accepted only if every relevant parsed statement and every report entry associates exactly once.
+
+The inspected reference consumer's `sql_functions.rs` is a **positive mutation detector**: parse failures, unqualified function names, mixed overloads, and dynamic SQL can return false without proving no mutation. Preserve those positive checks, but a policy that needs absence of mutation/locking must carry an unknown state or reject an opaque path until independent analysis resolves it. Do not convert uncertainty into `mutation: true` either: a policy that requires a definite write would then accept `random()` or a no-op procedure. The fixtures include both `random()` and an actually mutating SQL function with identical `volatileExecution` concerns, plus an actually mutating `STABLE` wrapper with empty concerns and emitted read access. A migration that equates missing DML concerns with no mutation is unsound, even if it preserves every hash and inventory check. The upstream report supplies positive evidence; it cannot repair consumer rules that discard uncertainty.
+
+The old `statementFactsSchemaVersion`/`statementFactsSha256` imports become the consumer manifest's version plus `generationAnalysisVersion` and Node's `createHash('sha256')`. Update producer compatibility fixtures to a reviewed release carrying this API, rather than the previous beta.15.1 pin; retain the existing stale-input, formatting-only, inventory-addition, SQL-divergence, incompatible-producer, destination-overlap, and relocated-module cases.
+
+A wrapper can persist this simple envelope (after its configuration snapshot checks and final input/inventory validation):
+
+```ts
+const { analysis } = await generateTypedSql(config, { analysis: true })
+const manifest = {
+  schemaVersion: 1, // A fresh consumer schema; bump the old consumer version when migrating.
+  generation: analysis,
+  configurationInputs, // Captured before importing config, not after this call.
+}
+// Serialize to a staged file and atomically replace the consumer manifest.
+// On failure, retain the previous manifest; its freshness checks reject stale outputs.
+```
+
+The repository's [isolated consumer example](../test/policy-consumer-example.ts) demonstrates freshness, inventory, compatibility, association, and coverage checks without private analyzer imports. [Integration tests](../test/generation-analysis.test.ts) use real generation and independently evaluate emitted modules, then reject missing/duplicate/swapped identities, divergent SQL/access, unknown semantics, stale inputs, and inventory additions. The example assumes shape-validated JSON and caller-supplied complete inventory/parsed-statement sets; production consumers must retain their own parser, path containment, JSON-shape validation, configuration loader, and incremental-session guarantees. Packed-package smoke and TypeScript consumers verify the public entry point with lifecycle scripts disabled.
+
+## Boundary assessment
+
+Restoring the full beta.15.1 manifest would couple this package to consumer-specific configuration files, relative-path policy, persistence, and native compatibility checks, while encouraging reliance on unused fields. A standalone SQL analyzer would require another schema-construction and compilation lifecycle and would not automatically bind analysis to generation. A per-statement callback could publish early facts for a run that later fails, omits a statement, or cannot install outputs. A raw tree/IR export would make internal evolution part of the public contract.
+
+The optional completed report keeps the semantic boundary useful for policy checks, routing audits, and build provenance while remaining independent of private representations. The initial hypothesis of caller-only provenance was insufficient: late hashes could certify different bytes from those analyzed. Capturing SQL/schema hashes at their reads is the necessary upstream support. Further caller attestations remain unavoidable for arbitrary configuration evaluation and live project state. This API does not by itself make those broader proofs sound.
+
+Implementation review also found that the private adapter treated absent native access flags as false. It now rejects missing/malformed modifying-CTE, row-lock, and volatile-execution flags, unknown commands, and unsupported rewritten utilities. The generator checks analyzer result count, source/name association, and PostgreSQL version agreement before rendering. A throwing option getter releases the generation guard through the normal error cleanup. These checks prevent incomplete internal results and lifecycle errors from undermining the public boundary.
+
+The second semantic review rejected exporting the internal read-only proof-status tags. PostgreSQL volatility declarations are not a transitive function-body effect proof; exposing those tags would encourage false negative-effect proofs. The final positive-concern interface is smaller, keeps the runtime's existing routing behavior intact, and states precisely what upstream can guarantee. Sound consumer policies require the independent effect analysis described above; a manifest-shape rewrite alone cannot provide that guarantee.
