@@ -12,7 +12,9 @@ if ! docker image inspect "$builder_image" >/dev/null 2>&1; then
     # still includes its builder recipe. Rebuild that same toolchain locally.
     builder_dockerfile=$(mktemp)
     trap 'rm -f "$builder_dockerfile"' EXIT
-    cp "$source_dir/postgres-pglite/pglite/builder/Dockerfile" "$builder_dockerfile"
+    # Unlimited make jobs in the upstream recipe can exhaust hosted-runner memory.
+    sed -E 's/ -j([[:space:]]|$)/ -j2\1/g' \
+      "$source_dir/postgres-pglite/pglite/builder/Dockerfile" > "$builder_dockerfile"
     patch -F 0 "$builder_dockerfile" "$project_root/patches/pglite-builder-downloads.patch"
     docker build --file "$builder_dockerfile" --tag "$builder_image" "$source_dir/postgres-pglite/pglite/builder"
     rm -f "$builder_dockerfile"
