@@ -10,7 +10,13 @@ if ! docker image inspect "$builder_image" >/dev/null 2>&1; then
   if ! docker pull "$builder_image"; then
     # The upstream registry can stop serving an image while the pinned source
     # still includes its builder recipe. Rebuild that same toolchain locally.
-    docker build --tag "$builder_image" "$source_dir/postgres-pglite/pglite/builder"
+    builder_dockerfile=$(mktemp)
+    trap 'rm -f "$builder_dockerfile"' EXIT
+    cp "$source_dir/postgres-pglite/pglite/builder/Dockerfile" "$builder_dockerfile"
+    patch -F 0 "$builder_dockerfile" "$project_root/patches/pglite-builder-downloads.patch"
+    docker build --file "$builder_dockerfile" --tag "$builder_image" "$source_dir/postgres-pglite/pglite/builder"
+    rm -f "$builder_dockerfile"
+    trap - EXIT
   fi
 fi
 rm -f "$source_dir/.postgres-typed-sql-build-identity"
