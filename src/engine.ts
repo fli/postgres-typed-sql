@@ -31,10 +31,13 @@ export type SupportedExtension = (typeof supportedExtensions)[number]
 
 export interface CreateAnalysisDatabaseOptions {
   readonly extensions?: readonly SupportedExtension[]
+  /** Internal hook to capture the same bytes used to construct the analysis schema. */
+  readonly readSchemaFile?: (path: string) => Promise<string>
   readonly schemaFiles: readonly string[]
 }
 
 export interface AnalysisDatabase extends PostgresQueryable {
+  readonly postgresVersionNum: number
   close(): Promise<void>
 }
 
@@ -105,7 +108,9 @@ export async function createAnalysisDatabase(options: CreateAnalysisDatabaseOpti
     }
 
     for (const schemaFile of options.schemaFiles) {
-      const contents = await readFile(schemaFile, 'utf8')
+      const contents = options.readSchemaFile
+        ? await options.readSchemaFile(schemaFile)
+        : await readFile(schemaFile, 'utf8')
       await pg.exec(executableSchema(contents, schemaFile))
       await pg.exec('reset all')
     }
@@ -120,6 +125,7 @@ export async function createAnalysisDatabase(options: CreateAnalysisDatabaseOpti
 
     await bindTypedSqlPostgresAnalyzer(pg)
     return {
+      postgresVersionNum: serverVersion,
       close: () => pg.close(),
       query: (text, params) => pg.query(text, params),
     }

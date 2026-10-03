@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.0-beta.17
+
+- Added an optional `generateTypedSql(config, { analysis: true })` report with versioned positive access concerns, exact emitted statement identities and SQL, and hashes of the SQL/schema bytes consumed by generation. Empty concerns do not prove absence of mutation/locking or function effects. Analysis requests reject detected input/inventory changes and output/input overlaps before committing. The report is complete and returned only after successful generation; consumers own manifest persistence, configuration provenance, freshness validation, and independent effect proofs.
+- Reject missing/malformed native access facts and unknown access commands instead of interpreting missing flags as a read-only proof. Generation also checks statement identity, completeness, and agreement with the verified PostgreSQL engine version before emitting results.
+- Engine builds can reconstruct the builder image from the pinned upstream Dockerfile when its published Docker image cannot be pulled.
+
 ## 0.1.0-beta.16
 
 - Added predicate narrowing for strict comparisons, supported inner-join conditions, boolean tests, CASE fallthrough,

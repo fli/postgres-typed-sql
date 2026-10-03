@@ -3,6 +3,7 @@ import { resolve } from 'node:path'
 
 const projectRoot = resolve(import.meta.dirname, '..')
 const target = resolve(projectRoot, 'dist-test/src/vendor')
+await cp(resolve(projectRoot, 'package.json'), resolve(projectRoot, 'dist-test/package.json'))
 await rm(target, { force: true, recursive: true })
 await mkdir(resolve(target, '..'), { recursive: true })
 await cp(resolve(projectRoot, 'dist/vendor'), target, { recursive: true })

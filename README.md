@@ -324,10 +324,23 @@ const result = await generateTypedSql({
   rootDir: process.cwd(),
   schema: ['./db/base.sql', './db/functions.sql'],
   include: ['./src'],
+  imports: { runtime: 'postgres-typed-sql/runtime', scalars: 'postgres-typed-sql/scalars' },
 })
 ```
 
 Generation is intentionally single-flight within one Node.js process because each run owns an isolated PostgreSQL instance.
+
+Policy analyzers and other build tools can request a complete, versioned analysis report:
+
+```ts
+const result = await generateTypedSql(config, { analysis: true })
+for (const statement of result.analysis.statements) {
+  // Exact emitted module/export identity and compiled SQL, with access evidence.
+  console.log(statement.module, statement.export, statement.sqlSha256, statement.accessEvidence)
+}
+```
+
+The optional report binds facts to the SQL and schema bytes consumed by generation. It is returned only after successful output installation and does not add analysis machinery to the runtime entry point. Persisted reports require consumer-owned freshness, inventory, configuration, and compatibility checks. See [the analysis contract and beta.15.1 migration guide](./docs/generation-analysis.md) for guarantees, limitations, and an isolated policy-tool integration example.
 
 ## Security
 
