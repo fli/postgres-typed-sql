@@ -19,6 +19,7 @@
 #include "catalog/pg_type_d.h"
 #include "commands/trigger.h"
 #include "fmgr.h"
+#include "miscadmin.h"
 #include "nodes/bitmapset.h"
 #include "nodes/execnodes.h"
 #include "nodes/nodeFuncs.h"
@@ -4334,8 +4335,13 @@ append_query_summary(StringInfo out, const Query *query,
   /* Query ownership is complete. Bound expression detail within each query,
    * rather than spending its budget on enclosing view/CTE/query levels. */
   const int depth = 10;
-  PtsQueryScope *scope = pts_make_query_scope(query, parent_scope);
-  bool has_volatile_functions = bind_io_invokes_volatile ||
+  PtsQueryScope *scope;
+  bool has_volatile_functions;
+
+  check_stack_depth();
+  CHECK_FOR_INTERRUPTS();
+  scope = pts_make_query_scope(query, parent_scope);
+  has_volatile_functions = bind_io_invokes_volatile ||
                                 query_contains_volatile_functions(query) ||
                                 (protocol_output &&
                                  query_result_io_invokes_volatile(query));

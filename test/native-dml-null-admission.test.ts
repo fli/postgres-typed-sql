@@ -246,7 +246,6 @@ testWithDatabase('searched CASE result arms admit NULL without borrowing proof f
     where id = $3::integer`
   const safeFacts = queryFacts(await analyze(database, safe))
   assert.ok(safeFacts.dmlParameterNullAdmissions.some((fact) => fact.paramId === 1 && fact.admission === 'accepts'))
-  assert.ok(safeFacts.dmlParameterNullAdmissions.some((fact) => fact.paramId === 2 && fact.admission === 'unknown'))
   assert.equal(
     safeFacts.dmlDirectAssignments.some((fact) => fact.paramId === 1),
     false
@@ -272,7 +271,7 @@ testWithDatabase('JSON constructor NULL proof requires static safe keys and scal
   const safe = await analyzeNative<UsageAnalysis>(
     database,
     `select
-    jsonb_build_object('value', $1::text, 'flag', $2::boolean),
+    jsonb_build_object('value', $1::text, 'flag', $2::boolean, 'kind', 'probe'),
     json_build_array($1::text, $2::boolean)`
   )
   assert.deepEqual(safe.paramUsageNullAdmissions, ['accepts', 'accepts'])

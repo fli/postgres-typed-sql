@@ -213,6 +213,8 @@ json_constructor_evaluation_safe(const FuncExpr *function,
         return false;
     }
     else if (evaluation.proof != PTS_NULL_PROOF_NULL &&
+             !(IsA(argument, Const) &&
+               ((const Const *) argument)->consttype == UNKNOWNOID) &&
              !json_scalar_conversion_safe(exprType(argument)))
       return false;
     index++;

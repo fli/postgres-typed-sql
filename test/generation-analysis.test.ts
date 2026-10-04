@@ -411,7 +411,7 @@ test('smart CASE and safe expression proofs satisfy strict nullable without a bi
   )
   await writeFile(
     join(root, 'queries/safeJson.typed.sql'),
-    "-- @nullable message\nselect jsonb_build_object('message', :message::text, 'flag', :flag::boolean) as value"
+    "-- @nullable message\nselect jsonb_build_object('message', :message::text, 'flag', :flag::boolean, 'kind', 'message') as value"
   )
   const result = await generateTypedSql(configFor(root), { analysis: true })
   for (const entry of result.analysis.statements) {
