@@ -144,8 +144,8 @@ check_null_evaluation_for_subject(const Node *expr,
   return evaluation;
 }
 
-/* Audited scalar conversions used by PostgreSQL's JSON constructors. Do not
- * admit containers, custom casts/output functions, or textual JSON parsing. */
+/* Audited conversions used by PostgreSQL's JSON constructors. Do not admit
+ * SQL containers, custom casts/output functions, or textual JSON parsing. */
 static bool
 json_scalar_conversion_safe(Oid type_oid)
 {
@@ -165,6 +165,7 @@ json_scalar_conversion_safe(Oid type_oid)
     case DATEOID:
     case TIMESTAMPOID:
     case TIMESTAMPTZOID:
+    case JSONBOID:
       return true;
     default:
       return false;

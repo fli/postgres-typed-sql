@@ -264,6 +264,10 @@ parameter_usage_null_admission_walker(Node *node, void *walker_context)
       {
         mark_parameter_usage(context, PTS_NULL_UNKNOWN);
       }
+      else
+      {
+        mark_parameter_usage(context, PTS_NULL_ADMITS);
+      }
       if (case_expr->arg != NULL)
       {
         break;

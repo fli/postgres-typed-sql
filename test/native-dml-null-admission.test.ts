@@ -272,7 +272,8 @@ testWithDatabase('JSON constructor NULL proof requires static safe keys and scal
     database,
     `select
     jsonb_build_object('value', $1::text, 'flag', $2::boolean, 'kind', 'probe'),
-    json_build_array($1::text, $2::boolean)`
+    json_build_array($1::text, $2::boolean),
+    jsonb_build_object('nested', jsonb_build_object('value', $1::text))`
   )
   assert.deepEqual(safe.paramUsageNullAdmissions, ['accepts', 'accepts'])
   const keySql = 'select jsonb_build_object($1::text, 1)'
