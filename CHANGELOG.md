@@ -6,6 +6,7 @@
 - Serialize complete nested query ownership and restart bounded expression detail for each query, so deeply expanded views retain their subquery and set-operation bodies.
 - Support hyphenated SQL filenames with camelCase statement exports and one validated `@name` export override, without changing generated module paths.
 - Prove searched-CASE NULL evaluation and nullable result-arm assignments, keeping condition parameters and unsafe evaluation conservative. Safe expression admission no longer requires NULL-valued output.
+- Audit reachable CASE conditions as well as result uses. Conditions with unmodeled scalar subqueries remain unknown, correcting earlier acceptance based only on a safe result arm.
 - Prove NULL-safe JSON builders with constant textual keys and audited scalar conversions; dynamic keys and custom/unsafe conversion remain conservative.
 - Keep strict `@nullable` proof requests and add explicit `@bindNull` for caller-owned NULL binding contracts. Type inference and compiled SQL remain PostgreSQL-owned.
 - **Breaking for analysis consumers:** public generation-analysis version 2 adds required ordered parameter identities, NULL binding contracts, and independent admission evidence.

@@ -263,6 +263,16 @@ testWithDatabase('searched CASE result arms admit NULL without borrowing proof f
   const unsafeFacts = queryFacts(await analyze(database, unsafeCondition))
   assert.ok(unsafeFacts.dmlParameterNullAdmissions.some((fact) => fact.paramId === 1 && fact.admission === 'unknown'))
   await assert.rejects(database.query(unsafeCondition, [null]), /case_admission_probe_value_check/u)
+
+  await database.query("insert into public.case_admission_probe values (2, 'second', 1)")
+  const unsafeSubquery = `select case when (select message from public.case_admission_probe) is null
+    then 'public' else coalesce($1::text, 'admin') end`
+  const subqueryFacts = await analyzeNative<{ readonly paramUsageNullAdmissions: readonly string[] }>(
+    database,
+    unsafeSubquery
+  )
+  assert.deepEqual(subqueryFacts.paramUsageNullAdmissions, ['unknown'])
+  await assert.rejects(database.query(unsafeSubquery, [null]), /more than one row returned by a subquery/u)
 })
 
 testWithDatabase('JSON constructor NULL proof requires static safe keys and scalar conversions', async (database) => {
