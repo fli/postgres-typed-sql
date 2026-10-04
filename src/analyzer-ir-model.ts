@@ -334,7 +334,13 @@ export function joinJsonShapes(
   }
   return alternatives.length === 0
     ? candidates.length > 0 && candidates.every((candidate) => !candidate || candidate.kind === 'sqlNull')
-      ? { ...allNullFallback, kind: 'sqlNull', nullability }
+      ? {
+          kind: 'sqlNull',
+          ...(allNullFallback.kind === 'sqlNull' && allNullFallback.sqlType
+            ? { sqlType: allNullFallback.sqlType }
+            : {}),
+          nullability,
+        }
       : jsonShapeWithNullability(allNullFallback, nullability)
     : { alternatives, kind: 'union', nullability }
 }

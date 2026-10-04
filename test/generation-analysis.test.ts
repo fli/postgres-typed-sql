@@ -33,9 +33,7 @@ const configFor = (rootDir: string): PostgresTypedSqlConfig => ({
   imports: { runtime: 'postgres-typed-sql/runtime', scalars: 'postgres-typed-sql/scalars' },
 })
 
-async function emittedStatement(
-  entry: TypedSqlStatementAnalysis
-): Promise<{
+async function emittedStatement(entry: TypedSqlStatementAnalysis): Promise<{
   text: string
   access: string
   parameterNames: readonly string[]
@@ -44,7 +42,7 @@ async function emittedStatement(
   const javascript = ts.transpileModule(await readFile(entry.module, 'utf8'), {
     compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2023 },
   }).outputText
-  const exports: Record<string, { text: string; access: string }> = {}
+  const exports: Record<string, Awaited<ReturnType<typeof emittedStatement>>> = {}
   runInNewContext(javascript, {
     exports,
     require: (specifier: string) => {
