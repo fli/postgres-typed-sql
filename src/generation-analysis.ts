@@ -1,7 +1,7 @@
 import type { SupportedExtension } from './engine.js'
 
 /** Version of both the report shape and its semantic guarantees. */
-export const generationAnalysisVersion = 1 as const
+export const generationAnalysisVersion = 2 as const
 
 /** Positive evidence from the PostgreSQL access classifier; only the DML concerns prove DML. */
 export type TypedSqlAccessConcern =
@@ -24,6 +24,18 @@ export interface TypedSqlAnalysisInput {
   readonly sha256: string
 }
 
+/** Input policy and PostgreSQL admission evidence are independent contracts. */
+export interface TypedSqlParameterAnalysis {
+  /** Raw named-parameter token, in positional binding order. */
+  readonly name: string
+  /** Emitted parameter-object property name. */
+  readonly propertyName: string
+  /** Non-null by default, a strict @nullable proof, or a caller-owned @bindNull permission. */
+  readonly nullBinding: 'nonNull' | 'provedNullable' | 'callerNullable'
+  /** Every modeled use admits NULL, a use rejects NULL, or acceptance is unresolved. */
+  readonly nullAdmission: 'accepts' | 'rejects' | 'unknown'
+}
+
 export interface TypedSqlStatementAnalysis {
   readonly source: string
   /** Absolute generated module path. Together with export, identifies the emitted statement. */
@@ -37,6 +49,8 @@ export interface TypedSqlStatementAnalysis {
   readonly access: 'read' | 'write'
   /** Independent of access overrides. Does not establish absence of mutation. */
   readonly accessEvidence: TypedSqlAccessEvidence
+  /** Complete ordered input contracts and independent NULL admission evidence. */
+  readonly parameters: readonly TypedSqlParameterAnalysis[]
 }
 
 /** Complete report for one successful generation; never a partial stream of facts. */

@@ -19,6 +19,7 @@
 #include "catalog/pg_type_d.h"
 #include "commands/trigger.h"
 #include "fmgr.h"
+#include "miscadmin.h"
 #include "nodes/bitmapset.h"
 #include "nodes/execnodes.h"
 #include "nodes/nodeFuncs.h"
@@ -61,7 +62,7 @@ PG_FUNCTION_INFO_V1(postgres_typed_sql_analyze);
 
 static void append_expr_node(StringInfo out, const PtsQueryScope *scope, const Node *expr, int depth);
 static void append_query_summary(StringInfo out, const Query *query,
-                                 const PtsQueryScope *parent_scope, int depth,
+                                 const PtsQueryScope *parent_scope,
                                  bool protocol_output,
                                  bool bind_io_invokes_volatile);
 static void append_from_node(StringInfo out, const PtsQueryScope *scope, const Node *node, int depth);
@@ -1641,7 +1642,7 @@ append_expr_node(StringInfo out, const PtsQueryScope *scope, const Node *expr, i
       {
         appendStringInfoString(out, ",\"subquery\":");
         append_query_summary(out, (const Query *) sublink->subselect, scope,
-                             depth - 1, false, false);
+                             false, false);
       }
       else
       {
@@ -1657,7 +1658,7 @@ append_expr_node(StringInfo out, const PtsQueryScope *scope, const Node *expr, i
 }
 
 static void
-append_cte_list(StringInfo out, const PtsQueryScope *scope, int depth)
+append_cte_list(StringInfo out, const PtsQueryScope *scope)
 {
   const Query *query = scope->query;
   ListCell *cell;
@@ -1686,7 +1687,7 @@ append_cte_list(StringInfo out, const PtsQueryScope *scope, int depth)
       appendStringInfoString(out, ",\"commandType\":");
       append_json_string(out, command_type_name(cte_query->commandType));
       appendStringInfoString(out, ",\"query\":");
-      append_query_summary(out, cte_query, scope, depth - 1, false, false);
+      append_query_summary(out, cte_query, scope, false, false);
     }
     appendStringInfoChar(out, '}');
   }
@@ -1867,10 +1868,10 @@ append_rtable(StringInfo out, const PtsQueryScope *scope, int depth)
     }
     append_oid_field(out, "relid", rte->relid);
     append_optional_name_field(out, "relname", OidIsValid(rte->relid) ? get_rel_name(rte->relid) : NULL);
-    if (rte->rtekind == RTE_SUBQUERY && rte->subquery != NULL && depth > 0)
+    if (rte->rtekind == RTE_SUBQUERY && rte->subquery != NULL)
     {
       appendStringInfoString(out, ",\"subquery\":");
-      append_query_summary(out, rte->subquery, scope, depth - 1, false, false);
+      append_query_summary(out, rte->subquery, scope, false, false);
     }
     appendStringInfoChar(out, '}');
     index++;
@@ -4327,12 +4328,20 @@ append_sort_group_expressions(StringInfo out, const PtsQueryScope *scope,
 
 static void
 append_query_summary(StringInfo out, const Query *query,
-                     const PtsQueryScope *parent_scope, int depth,
+                     const PtsQueryScope *parent_scope,
                      bool protocol_output,
                      bool bind_io_invokes_volatile)
 {
-  PtsQueryScope *scope = pts_make_query_scope(query, parent_scope);
-  bool has_volatile_functions = bind_io_invokes_volatile ||
+  /* Query ownership is complete. Bound expression detail within each query,
+   * rather than spending its budget on enclosing view/CTE/query levels. */
+  const int depth = 10;
+  PtsQueryScope *scope;
+  bool has_volatile_functions;
+
+  check_stack_depth();
+  CHECK_FOR_INTERRUPTS();
+  scope = pts_make_query_scope(query, parent_scope);
+  has_volatile_functions = bind_io_invokes_volatile ||
                                 query_contains_volatile_functions(query) ||
                                 (protocol_output &&
                                  query_result_io_invokes_volatile(query));
@@ -4378,7 +4387,7 @@ append_query_summary(StringInfo out, const Query *query,
   append_target_list(out, scope);
   append_returning_list(out, scope);
   pts_append_dml_analysis(out, query);
-  append_cte_list(out, scope, depth);
+  append_cte_list(out, scope);
   append_rtable(out, scope, depth);
   appendStringInfoString(out, ",\"fromTree\":");
   append_from_node(out, scope, (const Node *) query->jointree, depth);
@@ -4517,7 +4526,7 @@ postgres_typed_sql_analyze(PG_FUNCTION_ARGS)
       }
       first_query = false;
 
-      append_query_summary(&out, query, NULL, 10, true,
+      append_query_summary(&out, query, NULL, true,
                            bind_io_invokes_volatile);
     }
 

@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.1.0-beta.18
+
+- Preserve query ownership through row-bound, correlated subquery, CTE, grouping, and set-operation analysis; malformed owner references still fail.
+- Serialize complete nested query ownership and restart bounded expression detail for each query, so deeply expanded views retain their subquery and set-operation bodies.
+- Support hyphenated SQL filenames with camelCase statement exports and one validated `@name` export override, without changing generated module paths.
+- Prove searched-CASE NULL evaluation and nullable result-arm assignments, keeping condition parameters and unsafe evaluation conservative. Safe expression admission no longer requires NULL-valued output.
+- Audit reachable CASE conditions as well as result uses. Conditions with unmodeled scalar subqueries remain unknown, correcting earlier acceptance based only on a safe result arm.
+- Prove NULL-safe JSON builders with constant textual keys and audited scalar conversions; dynamic keys and custom/unsafe conversion remain conservative.
+- Keep strict `@nullable` proof requests and add explicit `@bindNull` for caller-owned NULL binding contracts. Type inference and compiled SQL remain PostgreSQL-owned.
+- **Breaking for analysis consumers:** public generation-analysis version 2 adds required ordered parameter identities, NULL binding contracts, and independent admission evidence.
+- Retain authored SQL scalar identity for typed NULL values embedded in JSON under custom codecs; unknown decoded JSON literals remain opaque.
+- Canonicalize rendered JSON unions by absorbing known literals into exact emitted primitives, preserving custom scalar aliases and distinct literal-only unions.
+
 ## 0.1.0-beta.17
 
 - Added an optional `generateTypedSql(config, { analysis: true })` report with versioned positive access concerns, exact emitted statement identities and SQL, and hashes of the SQL/schema bytes consumed by generation. Empty concerns do not prove absence of mutation/locking or function effects. Analysis requests reject detected input/inventory changes and output/input overlaps before committing. The report is complete and returned only after successful generation; consumers own manifest persistence, configuration provenance, freshness validation, and independent effect proofs.

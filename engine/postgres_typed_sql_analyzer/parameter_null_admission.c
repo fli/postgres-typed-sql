@@ -126,12 +126,9 @@ parameter_usage_null_admission_walker(Node *node, void *walker_context)
     {
       PtsNullEvaluation evaluation = pts_check_parameter_null_evaluation(
         node, context->param_id, context->node_analysis);
-      bool strict = IsA(node, FuncExpr)
-                      ? func_strict(((const FuncExpr *) node)->funcid)
-                      : op_strict(((const OpExpr *) node)->opno);
-
-      if (!strict || evaluation.proof != PTS_NULL_PROOF_NULL ||
-          !evaluation.evaluation_safe)
+      /* Admission requires safe evaluation, not NULL-valued output. A
+       * leakproof callable can safely evaluate a non-NULL CASE/COALESCE arm. */
+      if (!evaluation.evaluation_safe)
       {
         mark_parameter_usage(context, PTS_NULL_UNKNOWN);
       }
@@ -256,6 +253,43 @@ parameter_usage_null_admission_walker(Node *node, void *walker_context)
       }
       break;
     }
+    case T_CaseExpr:
+    {
+      const CaseExpr *case_expr = (const CaseExpr *) node;
+      ListCell *cell;
+      PtsNullEvaluation evaluation = pts_check_parameter_null_evaluation(
+        node, context->param_id, context->node_analysis);
+
+      if (!evaluation.evaluation_safe)
+      {
+        mark_parameter_usage(context, PTS_NULL_UNKNOWN);
+      }
+      else
+      {
+        mark_parameter_usage(context, PTS_NULL_ADMITS);
+      }
+      if (case_expr->arg != NULL)
+      {
+        break;
+      }
+      foreach(cell, case_expr->args)
+      {
+        const CaseWhen *when = lfirst_node(CaseWhen, cell);
+        PtsNullEvaluation condition = pts_check_parameter_null_evaluation(
+          (const Node *) when->expr, context->param_id, context->node_analysis);
+
+        if (parameter_usage_null_admission_walker((Node *) when->expr, context))
+          return true;
+        if (condition.proof != PTS_NULL_PROOF_FALSE &&
+            condition.proof != PTS_NULL_PROOF_NULL &&
+            parameter_usage_null_admission_walker((Node *) when->result, context))
+          return true;
+        if (condition.proof == PTS_NULL_PROOF_TRUE)
+          return false;
+      }
+      return parameter_usage_null_admission_walker((Node *) case_expr->defresult,
+                                                    context);
+    }
     case T_Query:
     case T_List:
     case T_TargetEntry:
@@ -264,7 +298,6 @@ parameter_usage_null_admission_walker(Node *node, void *walker_context)
     case T_FieldSelect:
     case T_RelabelType:
     case T_CollateExpr:
-    case T_CaseExpr:
     case T_ArrayExpr:
     case T_RowExpr:
     case T_CoalesceExpr:

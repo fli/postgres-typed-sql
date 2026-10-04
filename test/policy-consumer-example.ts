@@ -16,6 +16,8 @@ interface ParsedStatement {
   readonly export: string
   readonly text: string
   readonly access: string
+  readonly parameterNames: readonly string[]
+  readonly parameters: readonly { readonly name: string; readonly nullable: boolean }[]
 }
 
 const hash = (bytes: string | Uint8Array) => createHash('sha256').update(bytes).digest('hex')
@@ -31,7 +33,7 @@ export async function validatePolicyManifest(
   const report = manifest.generation
   if (
     manifest.schemaVersion !== 1 ||
-    report.version !== 1 ||
+    report.version !== 2 ||
     report.producer.name !== 'postgres-typed-sql' ||
     !supportedProducers.includes(report.producer.version) ||
     Math.floor(report.postgresVersionNum / 10000) !== 18
@@ -77,6 +79,24 @@ export async function validatePolicyManifest(
       throw new Error('Invalid statement source')
     coveredSources.add(entry.source)
     byIdentity.delete(identity(entry))
+    if (
+      !Array.isArray(entry.parameters) ||
+      entry.parameters.length !== parsed.parameters.length ||
+      entry.parameters.length !== parsed.parameterNames.length ||
+      new Set(entry.parameters.map((parameter) => parameter.name)).size !== entry.parameters.length ||
+      new Set(entry.parameters.map((parameter) => parameter.propertyName)).size !== entry.parameters.length ||
+      entry.parameters.some(
+        (parameter, index) =>
+          parameter.name !== parsed.parameters[index]?.name ||
+          parameter.propertyName !== parsed.parameterNames[index] ||
+          !['nonNull', 'provedNullable', 'callerNullable'].includes(parameter.nullBinding) ||
+          !['accepts', 'rejects', 'unknown'].includes(parameter.nullAdmission) ||
+          (parameter.nullBinding === 'provedNullable' && parameter.nullAdmission !== 'accepts') ||
+          parsed.parameters[index]?.nullable !== (parameter.nullBinding !== 'nonNull')
+      )
+    ) {
+      throw new Error('Invalid parameter contracts')
+    }
     const { concerns } = entry.accessEvidence
     if (!['read', 'write'].includes(entry.access) || !Array.isArray(concerns)) {
       throw new Error('Invalid access evidence')

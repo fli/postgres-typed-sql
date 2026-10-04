@@ -5,6 +5,7 @@
 #include "nodes/nodeFuncs.h"
 #include "nodes/primnodes.h"
 #include "utils/hsearch.h"
+#include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
 
 #include "array_shape.h"
@@ -141,6 +142,85 @@ check_null_evaluation_for_subject(const Node *expr,
   entry->null_evaluation = evaluation;
   entry->proof_known = true;
   return evaluation;
+}
+
+/* Audited conversions used by PostgreSQL's JSON constructors. Do not admit
+ * SQL containers, custom casts/output functions, or textual JSON parsing. */
+static bool
+json_scalar_conversion_safe(Oid type_oid)
+{
+  switch (type_oid)
+  {
+    case BOOLOID:
+    case INT2OID:
+    case INT4OID:
+    case INT8OID:
+    case FLOAT4OID:
+    case FLOAT8OID:
+    case NUMERICOID:
+    case TEXTOID:
+    case VARCHAROID:
+    case BPCHAROID:
+    case UUIDOID:
+    case DATEOID:
+    case TIMESTAMPOID:
+    case TIMESTAMPTZOID:
+    case JSONBOID:
+      return true;
+    default:
+      return false;
+  }
+}
+
+static bool
+json_constructor_evaluation_safe(const FuncExpr *function,
+                                  const NullProofSubject *subject)
+{
+  bool object;
+  ListCell *cell;
+  int index = 0;
+
+  switch (function->funcid)
+  {
+    case F_JSON_BUILD_OBJECT_ANY:
+    case F_JSONB_BUILD_OBJECT_ANY:
+      object = true;
+      break;
+    case F_JSON_BUILD_ARRAY_ANY:
+    case F_JSONB_BUILD_ARRAY_ANY:
+      object = false;
+      break;
+    default:
+      return false;
+  }
+  if (function->funcvariadic ||
+      (object && list_length(function->args) % 2 != 0))
+    return false;
+  foreach(cell, function->args)
+  {
+    const Node *argument = (const Node *) lfirst(cell);
+    PtsNullEvaluation evaluation = check_null_evaluation_for_subject(argument,
+                                                                    subject);
+    if (!evaluation.evaluation_safe)
+      return false;
+    if (object && index % 2 == 0)
+    {
+      /* Constant textual keys exclude NULL keys and arbitrary key I/O. */
+      if (!IsA(argument, Const) || ((const Const *) argument)->constisnull ||
+          (((const Const *) argument)->consttype != TEXTOID &&
+           ((const Const *) argument)->consttype != UNKNOWNOID &&
+           ((const Const *) argument)->consttype != VARCHAROID &&
+           ((const Const *) argument)->consttype != BPCHAROID))
+        return false;
+    }
+    else if (evaluation.proof != PTS_NULL_PROOF_NULL &&
+             !(IsA(argument, Const) &&
+               ((const Const *) argument)->consttype == UNKNOWNOID) &&
+             !json_scalar_conversion_safe(exprType(argument)))
+      return false;
+    index++;
+  }
+  return true;
 }
 
 static PtsNullEvaluation
@@ -355,6 +435,60 @@ check_null_evaluation_for_subject_uncached(const Node *expr,
         boolean->boolop == AND_EXPR ? PTS_NULL_PROOF_TRUE : PTS_NULL_PROOF_FALSE,
         evaluation_safe, depends_on_subject);
     }
+    case T_CaseExpr:
+    {
+      const CaseExpr *case_expr = (const CaseExpr *) expr;
+      ListCell *cell;
+      bool has_result = false;
+      bool evaluation_safe = true;
+      bool depends_on_subject = false;
+      bool include_default = true;
+      PtsNullProof proof = PTS_NULL_PROOF_UNKNOWN;
+
+      /* Simple CASE needs CaseTestExpr substitution; leave it unresolved. */
+      if (case_expr->arg != NULL)
+      {
+        return pts_make_null_evaluation(PTS_NULL_PROOF_UNKNOWN, false, true);
+      }
+      foreach(cell, case_expr->args)
+      {
+        const CaseWhen *when = lfirst_node(CaseWhen, cell);
+        PtsNullEvaluation condition = check_null_evaluation_for_subject(
+          (const Node *) when->expr, subject);
+        PtsNullEvaluation result;
+
+        evaluation_safe = evaluation_safe && condition.evaluation_safe;
+        depends_on_subject = depends_on_subject || condition.depends_on_subject;
+        if (condition.proof == PTS_NULL_PROOF_FALSE ||
+            condition.proof == PTS_NULL_PROOF_NULL)
+        {
+          continue;
+        }
+        result = check_null_evaluation_for_subject((const Node *) when->result,
+                                                    subject);
+        evaluation_safe = evaluation_safe && result.evaluation_safe;
+        depends_on_subject = depends_on_subject || result.depends_on_subject;
+        proof = !has_result ? result.proof : proof == result.proof
+                                               ? proof : PTS_NULL_PROOF_UNKNOWN;
+        has_result = true;
+        if (condition.proof == PTS_NULL_PROOF_TRUE)
+        {
+          include_default = false;
+          break;
+        }
+      }
+      if (include_default)
+      {
+        PtsNullEvaluation result = check_null_evaluation_for_subject(
+          (const Node *) case_expr->defresult, subject);
+
+        evaluation_safe = evaluation_safe && result.evaluation_safe;
+        depends_on_subject = depends_on_subject || result.depends_on_subject;
+        proof = !has_result ? result.proof : proof == result.proof
+                                               ? proof : PTS_NULL_PROOF_UNKNOWN;
+      }
+      return pts_make_null_evaluation(proof, evaluation_safe, depends_on_subject);
+    }
     case T_CoalesceExpr:
     {
       const CoalesceExpr *coalesce = (const CoalesceExpr *) expr;
@@ -422,6 +556,12 @@ check_null_evaluation_for_subject_uncached(const Node *expr,
           all_arguments_safe && saw_safely_null_argument)
       {
         return pts_make_null_evaluation(PTS_NULL_PROOF_NULL, true,
+                                        depends_on_subject);
+      }
+      if (is_function && json_constructor_evaluation_safe(
+                            (const FuncExpr *) expr, subject))
+      {
+        return pts_make_null_evaluation(PTS_NULL_PROOF_NONNULL, true,
                                         depends_on_subject);
       }
       return pts_make_null_evaluation(

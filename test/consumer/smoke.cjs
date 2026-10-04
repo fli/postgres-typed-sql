@@ -14,7 +14,7 @@ const nodePostgresAdapter = require('postgres-typed-sql/adapters/node-postgres')
 const scalars = require('postgres-typed-sql/scalars')
 
 assert.equal(typeof packageApi.generateTypedSql, 'function')
-assert.equal(packageApi.generationAnalysisVersion, 1)
+assert.equal(packageApi.generationAnalysisVersion, 2)
 assert.equal('generationAnalysisVersion' in runtime, false)
 assert.equal(typeof runtime.createTypedSqlStatement, 'function')
 assert.equal(typeof nodePostgresAdapter.executeTypedSql, 'function')

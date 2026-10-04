@@ -236,3 +236,71 @@ testWithDatabase('enforced unvalidated foreign keys block old-row preservation',
   await assert.rejects(database.query(sql, [null]), /fk_child_parent/u)
   await database.query('rollback')
 })
+
+testWithDatabase('searched CASE result arms admit NULL without borrowing proof for conditions', async (database) => {
+  await database.query(`create table public.case_admission_probe (
+    id integer primary key, message text, value integer check(value > 0)
+  )`)
+  await database.query("insert into public.case_admission_probe values (1, 'before', 1)")
+  const safe = `update public.case_admission_probe
+    set message = case when $2::boolean then $1::text else message end
+    where id = $3::integer`
+  const safeFacts = queryFacts(await analyze(database, safe))
+  assert.ok(safeFacts.dmlParameterNullAdmissions.some((fact) => fact.paramId === 1 && fact.admission === 'accepts'))
+  assert.equal(
+    safeFacts.dmlDirectAssignments.some((fact) => fact.paramId === 1),
+    false
+  )
+  await database.query(safe, [null, false, 1])
+  assert.deepEqual((await database.query('select message from public.case_admission_probe')).rows, [
+    { message: 'before' },
+  ])
+  await database.query(safe, [null, true, 1])
+  assert.deepEqual((await database.query('select message from public.case_admission_probe')).rows, [{ message: null }])
+
+  const unsafeCondition = `update public.case_admission_probe
+    set value = case when $1::integer is null then -1 else $1::integer end`
+  const unsafeFacts = queryFacts(await analyze(database, unsafeCondition))
+  assert.ok(unsafeFacts.dmlParameterNullAdmissions.some((fact) => fact.paramId === 1 && fact.admission === 'unknown'))
+  await assert.rejects(database.query(unsafeCondition, [null]), /case_admission_probe_value_check/u)
+
+  await database.query("insert into public.case_admission_probe values (2, 'second', 1)")
+  const unsafeSubquery = `select case when (select message from public.case_admission_probe) is null
+    then 'public' else coalesce($1::text, 'admin') end`
+  const subqueryFacts = await analyzeNative<{ readonly paramUsageNullAdmissions: readonly string[] }>(
+    database,
+    unsafeSubquery
+  )
+  assert.deepEqual(subqueryFacts.paramUsageNullAdmissions, ['unknown'])
+  await assert.rejects(database.query(unsafeSubquery, [null]), /more than one row returned by a subquery/u)
+})
+
+testWithDatabase('JSON constructor NULL proof requires static safe keys and scalar conversions', async (database) => {
+  interface UsageAnalysis {
+    readonly paramUsageNullAdmissions: readonly string[]
+  }
+  const safe = await analyzeNative<UsageAnalysis>(
+    database,
+    `select
+    jsonb_build_object('value', $1::text, 'flag', $2::boolean, 'kind', 'probe'),
+    json_build_array($1::text, $2::boolean),
+    jsonb_build_object('nested', jsonb_build_object('value', $1::text))`
+  )
+  assert.deepEqual(safe.paramUsageNullAdmissions, ['accepts', 'accepts'])
+  const keySql = 'select jsonb_build_object($1::text, 1)'
+  assert.deepEqual((await analyzeNative<UsageAnalysis>(database, keySql)).paramUsageNullAdmissions, ['unknown'])
+  await assert.rejects(database.query(keySql, [null]), /key must not be null/u)
+  const dangerousSql = `select jsonb_build_object('value', $1::text, 'danger', 1 / $2::integer)`
+  assert.equal((await analyzeNative<UsageAnalysis>(database, dangerousSql)).paramUsageNullAdmissions[0], 'unknown')
+  await assert.rejects(database.query(dangerousSql, [null, 0]), /division by zero/u)
+
+  await database.query("create type public.json_effect_enum as enum ('bad')")
+  await database.query(`create function public.json_effect_cast(public.json_effect_enum) returns json
+      language plpgsql immutable as $$begin raise exception 'custom JSON conversion'; end$$`)
+  await database.query(
+    'create cast (public.json_effect_enum as json) with function public.json_effect_cast(public.json_effect_enum)'
+  )
+  const customSql = `select jsonb_build_object('value', coalesce($1::public.json_effect_enum, 'bad'::public.json_effect_enum))`
+  assert.equal((await analyzeNative<UsageAnalysis>(database, customSql)).paramUsageNullAdmissions[0], 'unknown')
+  await assert.rejects(database.query(customSql, [null]), /custom JSON conversion/u)
+})

@@ -660,7 +660,7 @@ where account.email = :email
   assert.doesNotMatch(output, /Unknown/u)
 })
 
-test('rejects removed and duplicate singular header directives', async () => {
+test('rejects duplicate singular header directives', async () => {
   const root = await createMinimalFixture(
     'select 1;\n',
     `-- @name firstName
@@ -670,7 +670,7 @@ select 1
   )
   await assert.rejects(
     generateTypedSql({ include: ['queries'], rootDir: root, schema: 'schema.sql' }),
-    /unsupported typed SQL directive @name/u
+    /duplicate @name; first declared/u
   )
 
   await writeFile(
@@ -993,8 +993,8 @@ test('rejects duplicate, reserved, and colliding generated names before emission
       sql: 'select 1 as duplicate, 2 as duplicate\n',
     },
     {
-      error: /typed SQL filename: "find-account" is not a legal non-reserved TypeScript binding/u,
-      file: 'find-account.typed.sql',
+      error: /typed SQL filename: "find.account" is not a legal non-reserved TypeScript binding/u,
+      file: 'find.account.typed.sql',
       sql: 'select 1\n',
     },
     {
@@ -2365,4 +2365,22 @@ test('rejects nullable column assertions because PostgreSQL determines result nu
     generateFixture(root),
     /queries\/invalidColumnNullability\.typed\.sql:1: @column does not support \?; PostgreSQL determines result nullability/u
   )
+})
+
+test('normalizes hyphenated filenames and preserves explicit per-module export overrides', async () => {
+  const root = await createMinimalFixture('select 1;', 'select 1 as value')
+  await writeFile(join(root, 'queries/find-account-by-email.typed.sql'), 'select 2 as value')
+  await writeFile(join(root, 'queries/load-course.typed.sql'), '-- @name fetchCourse\nselect 3 as value')
+  await writeFile(join(root, 'queries/class.typed.sql'), '-- @name classQuery\nselect 4 as value')
+  await generateFixture(root)
+  assert.match(
+    await readFile(join(root, 'queries/find-account-by-email.typed-sql.ts'), 'utf8'),
+    /export const findAccountByEmail =/u
+  )
+  assert.match(await readFile(join(root, 'queries/load-course.typed-sql.ts'), 'utf8'), /export const fetchCourse =/u)
+  assert.match(await readFile(join(root, 'queries/class.typed-sql.ts'), 'utf8'), /export const classQuery =/u)
+  for (const declaration of ['class', 'bad-name', 'first second', '']) {
+    await writeFile(join(root, 'queries/load-course.typed.sql'), `-- @name ${declaration}\nselect 3 as value`)
+    await assert.rejects(generateFixture(root), /@name.*(?:binding|requires)/u)
+  }
 })

@@ -112,11 +112,14 @@ export type TypedSqlPostgresIrJsonShape =
   | {
       /** JSON null is a value, independent of SQL nullability. */
       readonly kind: 'null'
+      /** Authored SQL scalar identity when NULL was embedded by a JSON constructor. */
+      readonly sqlType?: PostgresTypeFact
       readonly nullability: TypedSqlPostgresIrResultNullability
     }
   | {
       /** No SQL value is present; COALESCE can skip this alternative. */
       readonly kind: 'sqlNull'
+      readonly sqlType?: PostgresTypeFact
       readonly nullability: TypedSqlPostgresIrResultNullability
     }
   | {
@@ -251,6 +254,11 @@ function jsonShapeKey(shape: TypedSqlPostgresIrJsonShape): string {
       })
     case 'null':
     case 'sqlNull':
+      return JSON.stringify({
+        kind: shape.kind,
+        nullability: shape.nullability.kind,
+        sqlTypeOid: shape.sqlType?.pgTypeOid,
+      })
     case 'opaque':
       return JSON.stringify({ kind: shape.kind, nullability: shape.nullability.kind })
     case 'jsonScalar':
@@ -326,7 +334,13 @@ export function joinJsonShapes(
   }
   return alternatives.length === 0
     ? candidates.length > 0 && candidates.every((candidate) => !candidate || candidate.kind === 'sqlNull')
-      ? { kind: 'sqlNull', nullability }
+      ? {
+          kind: 'sqlNull',
+          ...(allNullFallback.kind === 'sqlNull' && allNullFallback.sqlType
+            ? { sqlType: allNullFallback.sqlType }
+            : {}),
+          nullability,
+        }
       : jsonShapeWithNullability(allNullFallback, nullability)
     : { alternatives, kind: 'union', nullability }
 }

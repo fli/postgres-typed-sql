@@ -71,17 +71,15 @@ from public.accounts
 where email = :email
 ```
 
-Each file contains exactly one PostgreSQL statement. The filename basename is used verbatim as the generated
-statement export and runtime display name, so it must be a supported non-reserved TypeScript binding identifier:
-an ASCII letter, `_`, or `$`, followed by ASCII letters, digits, `_`, or `$`. Lower camel case is recommended but
-not required. Filenames are validated rather than normalized: `findAccountByEmail.typed.sql` exports
-`findAccountByEmail`, while `find-account-by-email.typed.sql` is rejected.
+Each file contains exactly one PostgreSQL statement. The filename basename determines the generated statement export and runtime display name. A hyphen followed by an ASCII letter or digit is converted to an uppercase character: `find-account-by-email.typed.sql` exports `findAccountByEmail`. Existing camelCase, underscores, and dollar signs retain their spelling. Use one `-- @name fetchAccount` header declaration when the export must differ from the filename. The resulting name must be a supported non-reserved TypeScript binding identifier: an ASCII letter, `_`, or `$`, followed by ASCII letters, digits, `_`, or `$`. Module paths always follow the source filename. Names are scoped to each generated module, so different directories may share an export name.
 
 Named parameter tokens retain their exact spelling for SQL compilation, `@nullable` directives, diagnostics, and runtime metadata. Generated parameter-object properties are application-facing and use conservative camel case by default, so `:platform_slug` is supplied as `{ platformSlug }`. Repeated uses of one raw token still share one positional placeholder and one public property. Set `naming.parameterProperties` to `'preserve'` only when callers deliberately use the raw token spelling.
 
 PostgreSQL infers parameter types from the authored SQL. When an expression does not provide enough context—such as an otherwise ambiguous operator—write an ordinary PostgreSQL cast at that use, for example `:cutoff::timestamptz`. The generator does not maintain a parallel annotation type system and does not inject casts into the SQL. It analyzes the exact compiled `$1`, `$2`, … text that the runtime executes, without supplying out-of-band parameter OIDs.
 
 Parameters are non-null to callers by default, independently of whether PostgreSQL can evaluate the statement with SQL `NULL`. Use `-- @nullable name` to request top-level SQL `NULL`. This changes only the caller contract; it does not provide a PostgreSQL type. Generation accepts the request only when PostgreSQL analysis proves that every use admits `NULL`; proven rejection or incomplete evidence is an error.
+
+Prefer `@nullable` when a NULL contract can be proved. The analyzer models guarded writes, searched CASE result arms, and safe expressions; a NULL result does not have to flow directly into every use. For a caller-owned contract that allows NULL only under conditions outside that proof, use `-- @bindNull name`. This permits top-level NULL in the generated input and binding metadata without claiming database acceptance. The caller owns valid argument combinations and execution errors. It does not turn unknown or rejected admission into acceptance. Neither declaration supplies a PostgreSQL type, and a parameter may have only one NULL declaration. The public generation-analysis report distinguishes `provedNullable`, `callerNullable`, and `nonNull` contracts from the independent admission result.
 
 The built-in node-postgres adapter sends only the generated SQL text and values; it does not add Parse-message parameter type OIDs. A custom adapter conforms to generated parameter typing only when it preserves that property. Supplying out-of-band type hints can make runtime preparation resolve SQL differently from the SQL-only analysis contract.
 

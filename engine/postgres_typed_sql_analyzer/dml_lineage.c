@@ -9,6 +9,7 @@
 #include "utils/syscache.h"
 #include "dml_lineage.h"
 #include "null_admission.h"
+#include "null_evaluation.h"
 #include "query_scope.h"
 
 typedef struct DmlParameterTargetKey
@@ -682,6 +683,48 @@ append_direct_parameter_targets(DmlLineageContext *context, const PtsQueryScope 
                                             &walker_context);
           }
         }
+      }
+      else if (unwrapped != NULL && IsA(unwrapped, CaseExpr))
+      {
+        const CaseExpr *case_expr = (const CaseExpr *) unwrapped;
+        ListCell *cell;
+        bool include_default = true;
+        UnknownLineageWalkerContext condition_context = {
+          context, &work, item->scope
+        };
+
+        /* Conditions change which value is written: they cannot inherit a
+         * nullable target's admission. Result arms can, without claiming a
+         * direct assignment or unconditional rejection. */
+        enqueue_unknown_lineage_walker((Node *) case_expr->arg,
+                                        &condition_context);
+        foreach(cell, case_expr->args)
+        {
+          const CaseWhen *when = lfirst_node(CaseWhen, cell);
+          PtsNullEvaluation condition = pts_check_parameter_null_evaluation(
+            (const Node *) when->expr, 0, NULL);
+
+          if (condition.evaluation_safe &&
+              (condition.proof == PTS_NULL_PROOF_FALSE ||
+               condition.proof == PTS_NULL_PROOF_NULL))
+            continue;
+
+          enqueue_unknown_lineage_walker((Node *) when->expr,
+                                          &condition_context);
+          enqueue_lineage_work(context, &work, LINEAGE_WORK_EXPR, item->scope,
+                               (const Node *) when->result, 0, item_admission,
+                               false, item->null_propagating, false);
+          if (condition.evaluation_safe && condition.proof == PTS_NULL_PROOF_TRUE)
+          {
+            include_default = false;
+            break;
+          }
+        }
+        if (include_default)
+          enqueue_lineage_work(context, &work, LINEAGE_WORK_EXPR, item->scope,
+                               (const Node *) case_expr->defresult, 0,
+                               item_admission, false, item->null_propagating,
+                               false);
       }
       else if (unwrapped != NULL)
       {

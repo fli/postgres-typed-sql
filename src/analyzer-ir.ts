@@ -864,13 +864,10 @@ function compareUniqueIndexCatalogRows(left: UniqueIndexCatalogRow, right: Uniqu
   return left.indexrelid - right.indexrelid
 }
 
-function uniqueClosureRelation(
-  catalog: CatalogFacts,
-  query: PgAnalyzerQuery,
-  varno: number
-): UniqueJoinClosureRelation {
+function uniqueClosureRelation(catalog: CatalogFacts, scope: QueryScope, varno: number): UniqueJoinClosureRelation {
+  const { query } = scope
   return {
-    indexes: sourceLookupKeys(catalog, query, varno).flatMap((key) => {
+    indexes: sourceLookupKeys(catalog, query, varno, [], scope.parent).flatMap((key) => {
       if (
         key.columns.some(
           (column) =>
@@ -901,7 +898,8 @@ function hasSimpleProjection(query: PgAnalyzerQuery): boolean {
   )
 }
 
-function uniqueIndexRowBounds(catalog: CatalogFacts, query: PgAnalyzerQuery): TypedSqlPostgresIrRowBounds | null {
+function uniqueIndexRowBounds(catalog: CatalogFacts, scope: QueryScope): TypedSqlPostgresIrRowBounds | null {
+  const { query } = scope
   if (query.commandType !== 'SELECT' && query.commandType !== 'UPDATE' && query.commandType !== 'DELETE') {
     return null
   }
@@ -921,9 +919,8 @@ function uniqueIndexRowBounds(catalog: CatalogFacts, query: PgAnalyzerQuery): Ty
     return null
   }
 
-  const scope = queryScope(query, null, catalog)
   const constraints = equalityConstraintsFromQual(query.whereQual, scope)
-  const uniqueIndex = sourceLookupKeys(catalog, query, varno).find((index) =>
+  const uniqueIndex = sourceLookupKeys(catalog, query, varno, [], scope.parent).find((index) =>
     uniqueIndexIsConstrained(catalog, scope, index, constraints)
   )
   if (!uniqueIndex) {
@@ -939,9 +936,10 @@ function uniqueIndexRowBounds(catalog: CatalogFacts, query: PgAnalyzerQuery): Ty
 
 function uniqueJoinRowBounds(
   catalog: CatalogFacts,
-  query: PgAnalyzerQuery,
+  scope: QueryScope,
   seen: readonly PgAnalyzerQuery[]
 ): TypedSqlPostgresIrRowBounds | null {
+  const { query } = scope
   if (
     query.commandType !== 'SELECT' ||
     (query.hasAggs === true && (query.groupClauseCount ?? 0) === 0) ||
@@ -953,7 +951,7 @@ function uniqueJoinRowBounds(
     return null
   }
   const input = collectUniqueJoinProofInput(query)
-  const relations = (input?.sources ?? []).map((relation) => uniqueClosureRelation(catalog, query, relation.varno))
+  const relations = (input?.sources ?? []).map((relation) => uniqueClosureRelation(catalog, scope, relation.varno))
   const proofs = input ? inferUniqueJoinClosure(relations, input.constraints, catalog.uniqueEqualityOperators) : null
 
   if (proofs) {
@@ -965,20 +963,16 @@ function uniqueJoinRowBounds(
 
   const sources: JoinRowBoundSource[] = (query.rtable ?? []).map((rte, index) => {
     let bounds: TypedSqlPostgresIrRowBounds = { max: null, min: 0, proof: 'unbounded' }
-    if (rte.kind === 'SUBQUERY' && rte.subquery) {
-      bounds = inferRowBounds(catalog, rte.subquery, seen)
-    } else if (rte.kind === 'CTE' && (rte.cteLevelSup ?? 0) === 0 && rte.cteSelfReference !== true) {
-      const cte = cteByName(query, rte.cteName)
-      if (cte?.query && cte.recursive !== true) {
-        bounds = inferRowBounds(catalog, cte.query, seen)
-      }
+    const source = rowBoundSource(scope, rte)
+    if (source) {
+      bounds = inferRowBounds(catalog, source.scope, seen)
     } else if (rte.kind === 'VALUES' && rte.valuesLists) {
       const count = rte.valuesLists.length
       bounds = { max: count, min: count, proof: `values_${count}_rows` }
     }
     return {
       bounds,
-      indexes: uniqueClosureRelation(catalog, query, index + 1).indexes,
+      indexes: uniqueClosureRelation(catalog, scope, index + 1).indexes,
       lateral: rte.lateral === true,
       relid: rte.kind === 'RELATION' ? (rte.relid ?? null) : null,
       varno: index + 1,
@@ -1039,9 +1033,10 @@ function finiteQualAlternatives(
 
 function finiteKeyAlternativeRowBounds(
   catalog: CatalogFacts,
-  query: PgAnalyzerQuery,
+  scope: QueryScope,
   seen: readonly PgAnalyzerQuery[]
 ): TypedSqlPostgresIrRowBounds | null {
+  const { query } = scope
   if (
     !query.whereQual ||
     query.hasTargetSRFs ||
@@ -1056,7 +1051,6 @@ function finiteKeyAlternativeRowBounds(
     (alternatives.length === 1 && alternatives[0]?.length === 1 && alternatives[0]?.[0] === query.whereQual)
   )
     return null
-  const scope = queryScope(query, null, catalog)
   const seenAlternatives = new Set<string>()
   let max = 0
   for (const clauses of alternatives) {
@@ -1069,7 +1063,9 @@ function finiteKeyAlternativeRowBounds(
     const whereQual: PgAnalyzerExpr =
       clauses.length === 1 ? (clauses[0] as PgAnalyzerExpr) : { tag: 'BoolExpr', boolOp: 'AND', args: clauses }
     const branch = { ...query, whereQual }
-    const bounds = uniqueIndexRowBounds(catalog, branch) ?? uniqueJoinRowBounds(catalog, branch, seen)
+    const bounds =
+      uniqueIndexRowBounds(catalog, queryScope(branch, scope.parent, catalog)) ??
+      uniqueJoinRowBounds(catalog, queryScope(branch, scope.parent, catalog), seen)
     if (bounds?.max === null || bounds?.max === undefined) return null
     max += bounds.max
     if (!Number.isSafeInteger(max)) return null
@@ -1117,9 +1113,10 @@ function finiteProjectedValues(
 
 function finiteDistinctGroupingBounds(
   catalog: CatalogFacts,
-  query: PgAnalyzerQuery,
+  scope: QueryScope,
   bounds: TypedSqlPostgresIrRowBounds
 ): TypedSqlPostgresIrRowBounds {
+  const { query } = scope
   if (
     query.commandType !== 'SELECT' ||
     query.hasTargetSRFs ||
@@ -1132,7 +1129,6 @@ function finiteDistinctGroupingBounds(
     { count: query.distinctClauseCount ?? 0, expressions: query.distinctExpressions, label: 'distinct_values' },
   ]
   if (sets.every((set) => set.count === 0)) return bounds
-  const scope = queryScope(query, null, catalog)
   let result = bounds
   for (const set of sets) {
     if (set.count === 0 || set.expressions?.length !== set.count) continue
@@ -1166,34 +1162,56 @@ function finiteDistinctGroupingBounds(
 }
 
 function rowBoundSource(
-  query: PgAnalyzerQuery,
+  scope: QueryScope,
   source: PgAnalyzerRte | undefined
-): { readonly kind: 'cte' | 'subquery'; readonly query: PgAnalyzerQuery } | null {
+): { readonly kind: 'cte' | 'subquery'; readonly scope: QueryScope } | null {
   if (source?.kind === 'SUBQUERY') {
-    return source.subquery ? { kind: 'subquery', query: source.subquery } : null
+    if (!source.subquery) {
+      throw new Error('internal analyzer envelope inconsistency: SUBQUERY row source is missing its query')
+    }
+    return { kind: 'subquery', scope: queryScope(source.subquery, scope) }
   }
-  if (source?.kind === 'CTE' && (source.cteLevelSup ?? 0) === 0 && source.cteSelfReference !== true) {
-    const cte = cteByName(query, source.cteName)
-    return cte?.query && cte.recursive !== true ? { kind: 'cte', query: cte.query } : null
+  if (source?.kind === 'CTE' && source.cteSelfReference !== true) {
+    if (
+      typeof source.cteName !== 'string' ||
+      !Number.isInteger(source.cteLevelSup) ||
+      (source.cteLevelSup as number) < 0
+    ) {
+      throw new Error('internal analyzer envelope inconsistency: CTE row source has malformed owner identity')
+    }
+    const owner = queryScopeAtLevel(scope, source.cteLevelSup as number)
+    if (!owner) {
+      throw new Error(
+        `internal analyzer envelope inconsistency: CTE ${JSON.stringify(source.cteName)} owner level ${source.cteLevelSup as number} has no query scope`
+      )
+    }
+    const cte = cteByName(owner.query, source.cteName)
+    if (!cte?.query) {
+      throw new Error(
+        `internal analyzer envelope inconsistency: CTE ${JSON.stringify(source.cteName)} is absent from its exact owner query`
+      )
+    }
+    return cte.recursive === true ? null : { kind: 'cte', scope: queryScope(cte.query, owner) }
   }
   return null
 }
 
 function projectionSourceRowBounds(
   catalog: CatalogFacts,
-  query: PgAnalyzerQuery,
+  scope: QueryScope,
   seen: readonly PgAnalyzerQuery[]
 ): TypedSqlPostgresIrRowBounds | null {
+  const { query } = scope
   if (query.commandType !== 'SELECT' || !hasSimpleProjection(query) || query.hasHavingQual === true) {
     return null
   }
 
-  const source = rowBoundSource(query, query.rtable?.length === 1 ? query.rtable[0] : undefined)
+  const source = rowBoundSource(scope, query.rtable?.length === 1 ? query.rtable[0] : undefined)
   if (!source) {
     return null
   }
 
-  const sourceBounds = inferRowBounds(catalog, source.query, seen)
+  const sourceBounds = inferRowBounds(catalog, source.scope, seen)
   return {
     max: sourceBounds.max,
     min: query.whereQual ? 0 : (query.distinctClauseCount ?? 0) > 0 ? Math.min(sourceBounds.min, 1) : sourceBounds.min,
@@ -1225,9 +1243,10 @@ function exactValuesRowBounds(query: PgAnalyzerQuery): TypedSqlPostgresIrRowBoun
 
 function groupedSourceRowBounds(
   catalog: CatalogFacts,
-  query: PgAnalyzerQuery,
+  scope: QueryScope,
   seen: readonly PgAnalyzerQuery[]
 ): TypedSqlPostgresIrRowBounds | null {
+  const { query } = scope
   if (
     query.commandType !== 'SELECT' ||
     (query.groupClauseCount ?? 0) === 0 ||
@@ -1245,12 +1264,12 @@ function groupedSourceRowBounds(
     const min = query.whereQual || query.hasHavingQual === true || count === 0 ? 0 : 1
     return { max: count, min, proof: `values_grouping_${count}_rows${query.whereQual ? '+qual_can_filter' : ''}` }
   }
-  const sourceQuery = rowBoundSource(query, source)
+  const sourceQuery = rowBoundSource(scope, source)
   if (!sourceQuery) {
     return null
   }
 
-  const sourceBounds = inferRowBounds(catalog, sourceQuery.query, seen)
+  const sourceBounds = inferRowBounds(catalog, sourceQuery.scope, seen)
   return {
     max: sourceBounds.max,
     min: query.whereQual || query.hasHavingQual === true || sourceBounds.min === 0 ? 0 : 1,
@@ -1268,10 +1287,11 @@ function addBound(left: number | null, right: number | null): number | null {
 
 function setOperationRowBounds(
   catalog: CatalogFacts,
-  query: PgAnalyzerQuery,
+  scope: QueryScope,
   operation: PgAnalyzerSetOperation,
   seen: readonly PgAnalyzerQuery[]
 ): TypedSqlPostgresIrRowBounds {
+  const { query } = scope
   if (operation.kind === 'leaf') {
     const leafQuery = query.rtable?.[operation.rtindex - 1]?.subquery
     if (!leafQuery) {
@@ -1279,11 +1299,11 @@ function setOperationRowBounds(
         `internal analyzer envelope inconsistency: set-operation leaf RTE ${operation.rtindex} is missing its query`
       )
     }
-    return inferRowBounds(catalog, leafQuery, seen)
+    return inferRowBounds(catalog, queryScope(leafQuery, scope), seen)
   }
 
-  const left = setOperationRowBounds(catalog, query, operation.left, seen)
-  const right = setOperationRowBounds(catalog, query, operation.right, seen)
+  const left = setOperationRowBounds(catalog, scope, operation.left, seen)
+  const right = setOperationRowBounds(catalog, scope, operation.right, seen)
   switch (operation.operation) {
     case 'UNION':
       return {
@@ -1312,9 +1332,10 @@ function setOperationRowBounds(
 
 function inferBaseRowBounds(
   catalog: CatalogFacts,
-  query: PgAnalyzerQuery,
+  scope: QueryScope,
   seen: readonly PgAnalyzerQuery[]
 ): TypedSqlPostgresIrRowBounds {
+  const { query } = scope
   if (resultTargets(query).length === 0 && query.commandType !== 'SELECT') {
     return { max: 0, min: 0, proof: 'no_result_columns' }
   }
@@ -1328,7 +1349,7 @@ function inferBaseRowBounds(
   // A global aggregate produces its implicit group even when WHERE removes
   // every input row. Grouping sets can also contain an empty grouping set.
   const contradictionQuery = globalAggregate || hasGroupingSets ? { ...query, whereQual: null, fromTree: null } : query
-  if (scopeHasContradiction(queryScope(contradictionQuery, null, catalog))) {
+  if (scopeHasContradiction(queryScope(contradictionQuery, scope.parent, catalog))) {
     return { max: 0, min: 0, proof: 'contradictory_qual' }
   }
 
@@ -1336,7 +1357,7 @@ function inferBaseRowBounds(
     return { max: null, min: 0, proof: 'target_srf' }
   }
   if (query.setOperation) {
-    return setOperationRowBounds(catalog, query, query.setOperation, seen)
+    return setOperationRowBounds(catalog, scope, query.setOperation, seen)
   }
   if (query.hasSetOperations === true) {
     throw new Error('internal analyzer envelope inconsistency: query has set operations without a set-operation tree')
@@ -1347,21 +1368,21 @@ function inferBaseRowBounds(
     return valuesBounds
   }
 
-  const uniqueBounds = uniqueIndexRowBounds(catalog, query)
+  const uniqueBounds = uniqueIndexRowBounds(catalog, scope)
   if (uniqueBounds) {
     return uniqueBounds
   }
-  const uniqueJoinBounds = uniqueJoinRowBounds(catalog, query, seen)
+  const uniqueJoinBounds = uniqueJoinRowBounds(catalog, scope, seen)
   if (uniqueJoinBounds) {
     return uniqueJoinBounds
   }
-  const finiteKeyBounds = finiteKeyAlternativeRowBounds(catalog, query, seen)
+  const finiteKeyBounds = finiteKeyAlternativeRowBounds(catalog, scope, seen)
   if (finiteKeyBounds) return finiteKeyBounds
-  const projectionBounds = projectionSourceRowBounds(catalog, query, seen)
+  const projectionBounds = projectionSourceRowBounds(catalog, scope, seen)
   if (projectionBounds) {
     return projectionBounds
   }
-  const groupedBounds = groupedSourceRowBounds(catalog, query, seen)
+  const groupedBounds = groupedSourceRowBounds(catalog, scope, seen)
   if (groupedBounds) {
     return groupedBounds
   }
@@ -1389,9 +1410,10 @@ function inferBaseRowBounds(
 
 function inferRowBounds(
   catalog: CatalogFacts,
-  query: PgAnalyzerQuery,
+  scope: QueryScope,
   seen: readonly PgAnalyzerQuery[] = []
 ): TypedSqlPostgresIrRowBounds {
+  const { query } = scope
   if (seen.includes(query)) {
     throw new Error('internal analyzer envelope inconsistency: cyclic query row-bound ownership')
   }
@@ -1399,7 +1421,7 @@ function inferRowBounds(
   return applyLimitBounds(
     catalog,
     query,
-    finiteDistinctGroupingBounds(catalog, query, inferBaseRowBounds(catalog, query, nestedSeen))
+    finiteDistinctGroupingBounds(catalog, scope, inferBaseRowBounds(catalog, scope, nestedSeen))
   )
 }
 
@@ -2638,7 +2660,7 @@ function scalarSubqueryNullability(
 
   const subqueryScope = queryScope(subquery, scope)
   const output = queryOutputNullability(catalog, subqueryScope, 0, seen)
-  const bounds = inferRowBounds(catalog, subquery)
+  const bounds = inferRowBounds(catalog, subqueryScope)
   if (bounds.max === 0) {
     return { evidence: 'scalar_sublink_empty_query', kind: 'nullable' }
   }
@@ -2682,7 +2704,7 @@ function aggregateNullability(
   }
   const ordinaryGroup = (scope.query.groupClauseCount ?? 0) > 0 && scope.query.groupingSetsCount === 0
   const inputPresent =
-    (aggregateFilterIsUnrestricted(expr) && (ordinaryGroup || aggregateSourceIsNonempty(catalog, scope.query))) ||
+    (aggregateFilterIsUnrestricted(expr) && (ordinaryGroup || aggregateSourceIsNonempty(catalog, scope))) ||
     havingProvesAggregateInput(scope, expr, false)
   if (aggregateIncludesNullInputs(catalog, expr.aggfnoid)) {
     return inputPresent
@@ -2738,7 +2760,8 @@ function aggregateFilterIsUnrestricted(expr: PgAnalyzerExpr): boolean {
   return expr.aggfilter === null || (filter?.tag === 'Const' && filter.constBoolean === true)
 }
 
-function aggregateSourceIsNonempty(catalog: CatalogFacts, query: PgAnalyzerQuery): boolean {
+function aggregateSourceIsNonempty(catalog: CatalogFacts, scope: QueryScope): boolean {
+  const { query } = scope
   const where = unwrapValuePreservingExpr(query.whereQual)
   if (query.whereQual && !(where?.tag === 'Const' && where.constBoolean === true)) return false
   const from = query.fromTree
@@ -2748,14 +2771,8 @@ function aggregateSourceIsNonempty(catalog: CatalogFacts, query: PgAnalyzerQuery
   if (node?.tag !== 'RangeTblRef' || node.truncated === true) return false
   const source = query.rtable?.[(node.rtindex ?? 0) - 1]
   if (source?.kind === 'VALUES') return (source.valuesLists?.length ?? 0) > 0
-  if (source?.kind === 'SUBQUERY' && source.subquery) {
-    return inferRowBounds(catalog, source.subquery, [query]).min > 0
-  }
-  if (source?.kind === 'CTE' && (source.cteLevelSup ?? 0) === 0 && source.cteSelfReference !== true) {
-    const cte = cteByName(query, source.cteName)
-    return cte?.query !== undefined && cte.recursive !== true && inferRowBounds(catalog, cte.query, [query]).min > 0
-  }
-  return false
+  const rowSource = rowBoundSource(scope, source)
+  return rowSource !== null && inferRowBounds(catalog, rowSource.scope, [query]).min > 0
 }
 
 function havingProvesAggregateInput(
@@ -3393,7 +3410,7 @@ function jsonLeafShapeForExpr(
   const typeFact = typeFactForOid(catalog, expr.typeOid, expr.typeName)
   const constantExpr = unwrapValuePreservingExpr(expr)
   if (constantExpr?.tag === 'Const' && constantExpr.constIsNull === true) {
-    return jsonSqlNullShape('sql_null_constant')
+    return jsonSqlNullShape('sql_null_constant', typeFact)
   }
   if (
     postgresJsonSupportsTextualLiteralRefinement(typeFact) &&
@@ -3444,7 +3461,11 @@ function jsonNestedShapeForExpr(
 
 function jsonNestedShape(shape: TypedSqlPostgresIrJsonShape): TypedSqlPostgresIrJsonShape {
   return shape.kind === 'sqlNull'
-    ? { kind: 'null', nullability: { basis: 'embedded_sql_null', kind: 'nonNull' } }
+    ? {
+        kind: 'null',
+        ...(shape.sqlType ? { sqlType: shape.sqlType } : {}),
+        nullability: { basis: 'embedded_sql_null', kind: 'nonNull' },
+      }
     : shape
 }
 
@@ -3456,8 +3477,8 @@ function hasCustomJsonCast(type: PostgresTypeFact): boolean {
   return type.pgCastsToJson === true || (type.pgBaseType !== undefined && hasCustomJsonCast(type.pgBaseType))
 }
 
-function jsonSqlNullShape(evidence: string): TypedSqlPostgresIrJsonShape {
-  return { kind: 'sqlNull', nullability: { evidence, kind: 'nullable' } }
+function jsonSqlNullShape(evidence: string, sqlType?: PostgresTypeFact): TypedSqlPostgresIrJsonShape {
+  return { kind: 'sqlNull', ...(sqlType ? { sqlType } : {}), nullability: { evidence, kind: 'nullable' } }
 }
 
 function jsonLiteralShape(expr: PgAnalyzerExpr): TypedSqlPostgresIrJsonShape | null {
@@ -3827,7 +3848,8 @@ function inferStructuredJsonShape(
   if (hasCustomJsonCast(typeFactForOid(catalog, expr?.typeOid, expr?.typeName))) {
     return null
   }
-  if (unwrapped.tag === 'Const' && unwrapped.constIsNull === true) return jsonSqlNullShape('sql_null_constant')
+  if (unwrapped.tag === 'Const' && unwrapped.constIsNull === true)
+    return jsonSqlNullShape('sql_null_constant', typeFactForOid(catalog, unwrapped.typeOid, unwrapped.typeName))
 
   const literal = jsonLiteralShape(unwrapped)
   if (literal) return literal
@@ -4053,6 +4075,11 @@ function inferStructuredJsonShape(
         shape = null
         break
     }
+    if (shape?.kind === 'sqlNull') {
+      // The referencing Var carries PostgreSQL's resolved output type, including
+      // set-operation coercions; leaf scalar identities are no longer authoritative.
+      shape = { ...shape, sqlType: typeFactForOid(catalog, unwrapped.typeOid, unwrapped.typeName) }
+    }
     return shape ? jsonShapeWithNullability(shape, expressionNullability(catalog, scope, unwrapped, seen)) : null
   }
 
@@ -4213,7 +4240,7 @@ function normalizeCompiledIr(catalog: CatalogFacts, analyzed: AnalyzedCompiledCo
       ...(checkConstraintType ? { checkConstraintType } : {}),
     }
   })
-  const rowBounds = inferRowBounds(catalog, query)
+  const rowBounds = inferRowBounds(catalog, rootScope)
 
   return {
     accessEvidence: accessEvidence(rewrittenQueries),

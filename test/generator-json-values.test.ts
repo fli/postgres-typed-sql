@@ -103,3 +103,75 @@ test('does not assign source scalar OIDs or builtin parser guarantees to custom 
   assert.match(output, /readonly json_null: string\n/u)
   assert.doesNotMatch(output, /interface QueryJ7_literalJson/u)
 })
+
+test('retains authored scalar identities for typed NULL embedded in JSON under custom codecs', async () => {
+  const root = await createMinimalFixture(
+    'select 1;',
+    `select jsonb_build_object(
+    'email', null::text,
+    'position', null::integer,
+    'granted_at', null::timestamptz,
+    'literal', 'null'::jsonb
+  ) as value`
+  )
+  const profile = definePostgresCodecProfile({
+    extends: 'node-postgres',
+    name: 'custom-json-null',
+    opaqueJsonType: postgresTypeScriptType('OpaqueJson'),
+    jsonScalarType({ type }, fallback) {
+      if (type.pgTypeName === 'text') return postgresTypeScriptType('EmailText')
+      if (type.pgTypeName === 'int4') return postgresTypeScriptType('PositionNumber')
+      if (type.pgTypeName === 'timestamptz') return postgresTypeScriptType('TimestampText')
+      return fallback()
+    },
+  })
+  await generateTypedSql({ include: ['queries'], rootDir: root, schema: 'schema.sql', codecProfile: profile })
+  const output = await readFile(join(root, 'queries/query.typed-sql.ts'), 'utf8')
+  assert.match(output, /readonly email: EmailText \| null/u)
+  assert.match(output, /readonly position: PositionNumber \| null/u)
+  assert.match(output, /readonly granted_at: TimestampText \| null/u)
+  assert.match(output, /readonly literal: OpaqueJson/u)
+  await generateTypedSql({ include: ['queries'], rootDir: root, schema: 'schema.sql', codecProfile: 'node-postgres' })
+  const builtinOutput = await readFile(join(root, 'queries/query.typed-sql.ts'), 'utf8')
+  assert.match(builtinOutput, /readonly email: null\n/u)
+  assert.match(builtinOutput, /readonly position: null\n/u)
+  assert.match(builtinOutput, /readonly granted_at: null\n/u)
+})
+
+test('absorbs JSON literals only into exact emitted primitives and preserves custom aliases', async () => {
+  const root = await createMinimalFixture(
+    'create table json_union_values(value text, flag boolean, amount integer);',
+    `select jsonb_build_object(
+      'text', coalesce(value, ''),
+      'literal_only', case when flag then '' else 'other' end,
+      'number', case when flag then to_jsonb(amount) else '42'::jsonb end,
+      'boolean', case when flag then to_jsonb(flag) else 'true'::jsonb end,
+      'mixed', case when flag then to_jsonb(value) else '42'::jsonb end
+    ) as payload from json_union_values`
+  )
+  const config = { include: ['queries'], rootDir: root, schema: 'schema.sql' }
+  await generateTypedSql({ ...config, codecProfile: 'node-postgres' })
+  let output = await readFile(join(root, 'queries/query.typed-sql.ts'), 'utf8')
+  assert.match(output, /readonly text: string\n/u)
+  assert.match(output, /readonly literal_only: '' \| 'other'\n/u)
+  assert.doesNotMatch(output, /readonly number: [^\n]*\b42\b/u)
+  assert.doesNotMatch(output, /readonly boolean: [^\n]*\btrue\b/u)
+  assert.match(output, /readonly mixed: string \| 42(?: \| null)?\n/u)
+
+  for (const type of ['string', 'DecodedText']) {
+    const profile = definePostgresCodecProfile({
+      extends: 'node-postgres',
+      name: 'custom-json-union',
+      jsonScalarType({ type: sqlType }, fallback) {
+        return sqlType.pgTypeName === 'text' ? postgresTypeScriptType(type) : fallback()
+      },
+      supportsStringLiteralRefinement() {
+        return true
+      },
+    })
+    await generateTypedSql({ ...config, codecProfile: profile })
+    output = await readFile(join(root, 'queries/query.typed-sql.ts'), 'utf8')
+    assert.match(output, type === 'string' ? /readonly text: string\n/u : /readonly text: DecodedText \| ''\n/u)
+    assert.match(output, /readonly literal_only: '' \| 'other'\n/u)
+  }
+})

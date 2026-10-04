@@ -26,6 +26,7 @@ import {
   type TypedSqlAccessEvidence,
   type TypedSqlAnalysisInput,
   type TypedSqlGenerationAnalysis,
+  type TypedSqlParameterAnalysis,
 } from './generation-analysis.js'
 import {
   postgresJsonSupportsStringLiteralRefinement,
@@ -73,13 +74,14 @@ const ignoredDiscoveryDirectories = new Set([
 ])
 
 interface NullableParameterDeclaration {
+  readonly kind: 'nullable' | 'bindNull'
   readonly line: number
   readonly name: string
 }
 
 interface SqlParameter {
   readonly name: string
-  readonly nullableRequestLine?: number
+  readonly nullBinding?: NullableParameterDeclaration
   readonly propertyName: string
 }
 
@@ -127,6 +129,7 @@ type TypedSqlAccess = 'read' | 'write'
 interface ResolvedTypedSql {
   readonly access: TypedSqlAccess
   readonly accessEvidence: TypedSqlAccessEvidence
+  readonly parameterAnalysis: readonly TypedSqlParameterAnalysis[]
   readonly cardinality: TypedSqlCardinality
   readonly columns: readonly ResolvedSqlColumn[]
   readonly command: TypedSqlCommand
@@ -313,11 +316,13 @@ async function readTypedSqlConfigs(generatorConfig: ResolvedPostgresTypedSqlConf
     const bytes = readFileSync(sourcePath)
     const text = bytes.toString('utf8')
     const parsedSource = parseTypedSqlSource(text, sourceFile)
-    const name = basename(sourceFile, typedSqlSourceSuffix)
-    assertTypeScriptBindingIdentifier(name, `${sourceFile}: typed SQL filename`)
+    let name = basename(sourceFile, typedSqlSourceSuffix).replace(/-([A-Za-z0-9])/gu, (_match, next: string) =>
+      next.toUpperCase()
+    )
     let access: TypedSqlAccess | undefined
     const nullableParameters: NullableParameterDeclaration[] = []
     const columns: SqlColumn[] = []
+    let firstNameLocation: string | undefined
     let firstAccessLocation: string | undefined
     const firstColumnDirectiveByName = new Map<string, string>()
     const firstNullableDirectiveByName = new Map<string, string>()
@@ -328,6 +333,19 @@ async function readTypedSqlConfigs(generatorConfig: ResolvedPostgresTypedSqlConf
       const bodyParts = /^(\S+)(?:\s+([\s\S]*))?$/u.exec(directive.body)
       const identifier = bodyParts?.[1]
       const rawPgType = bodyParts?.[2]?.trim()
+      if (kind === 'name') {
+        if (!identifier || rawPgType) {
+          throw new Error(`${location}: @name requires exactly one TypeScript binding identifier.`)
+        }
+        if (firstNameLocation) {
+          throw new Error(`${location}: duplicate @name; first declared at ${firstNameLocation}.`)
+        }
+        assertTypeScriptBindingIdentifier(identifier, `${location}: @name`)
+        firstNameLocation = location
+        name = identifier
+        continue
+      }
+
       if (kind === 'access') {
         if ((identifier !== 'read' && identifier !== 'write') || rawPgType) {
           throw new Error(`${location}: @access requires exactly read or write.`)
@@ -341,29 +359,30 @@ async function readTypedSqlConfigs(generatorConfig: ResolvedPostgresTypedSqlConf
         continue
       }
 
-      if (kind !== 'nullable' && kind !== 'column') {
+      if (kind !== 'nullable' && kind !== 'bindNull' && kind !== 'column') {
         throw new Error(`${location}: unsupported typed SQL directive @${kind}.`)
       }
 
       if (!identifier) {
         throw new Error(`${location}: @${kind} requires a name.`)
       }
-      if (kind === 'nullable' && (rawPgType || !/^[A-Za-z_][A-Za-z0-9_]*$/u.test(identifier))) {
-        throw new Error(`${location}: @nullable requires exactly one named-parameter identifier.`)
+      if (kind !== 'column' && (rawPgType || !/^[A-Za-z_][A-Za-z0-9_]*$/u.test(identifier))) {
+        throw new Error(`${location}: @${kind} requires exactly one named-parameter identifier.`)
       }
       if (kind === 'column' && rawPgType?.endsWith('?')) {
         throw new Error(`${location}: @column does not support ?; PostgreSQL determines result nullability.`)
       }
 
-      const firstDirectiveByName = kind === 'nullable' ? firstNullableDirectiveByName : firstColumnDirectiveByName
+      const firstDirectiveByName = kind !== 'column' ? firstNullableDirectiveByName : firstColumnDirectiveByName
       const firstLocation = firstDirectiveByName.get(identifier)
       if (firstLocation) {
         throw new Error(`${location}: duplicate @${kind} ${identifier}; first declared at ${firstLocation}.`)
       }
       firstDirectiveByName.set(identifier, location)
 
-      if (kind === 'nullable') {
+      if (kind !== 'column') {
         nullableParameters.push({
+          kind,
           line: directive.line,
           name: identifier,
         })
@@ -374,6 +393,8 @@ async function readTypedSqlConfigs(generatorConfig: ResolvedPostgresTypedSqlConf
         })
       }
     }
+
+    assertTypeScriptBindingIdentifier(name, `${sourceFile}: typed SQL filename`)
 
     configs.push({
       access,
@@ -398,7 +419,7 @@ function compileTypedSql(config: TypedSqlConfig, parameterNaming: PostgresTypedS
     const nullable = nullableByName.get(name)
     return {
       name,
-      ...(nullable ? { nullableRequestLine: nullable.line } : {}),
+      ...(nullable ? { nullBinding: nullable } : {}),
       propertyName: propertyNameForNaming(name, parameterNaming),
     }
   })
@@ -413,7 +434,9 @@ function compileTypedSql(config: TypedSqlConfig, parameterNaming: PostgresTypedS
   )
   if (unusedParameters.length > 0) {
     const first = unusedParameters[0] as NullableParameterDeclaration
-    throw new Error(`${config.sourceFile}:${first.line}: @nullable parameter ${first.name} is not used by the SQL.`)
+    throw new Error(
+      `${config.sourceFile}:${first.line}: @${first.kind} parameter ${first.name} is not used by the SQL.`
+    )
   }
 
   return {
@@ -544,6 +567,9 @@ function applyOpaqueJsonBarriers(
   codecProfile: ResolvedPostgresCodecProfile
 ): TypedSqlPostgresIrJsonShape {
   const protectLiteral = (value: TypedSqlPostgresIrJsonShape): TypedSqlPostgresIrJsonShape => {
+    if (value.kind === 'null' && value.sqlType) {
+      return { ...value.sqlType, kind: 'scalar', nullability: { evidence: 'embedded_sql_null', kind: 'nullable' } }
+    }
     if (value.kind === 'null' || value.kind === 'jsonScalar') return { kind: 'opaque', nullability: value.nullability }
     if (value.kind === 'array') return { ...value, element: protectLiteral(value.element) }
     if (value.kind === 'object')
@@ -652,6 +678,22 @@ function scalarTsTypeForJsonShape(
   return resolved.type
 }
 
+function jsonLiteralPrimitive(
+  shape: TypedSqlPostgresIrJsonShape,
+  rendered: string
+): 'string' | 'number' | 'boolean' | undefined {
+  if (shape.kind === 'stringLiteral' && rendered === quoteString(shape.value)) return 'string'
+  if (shape.kind === 'scalar' && shape.checkConstraintType) {
+    if (rendered === tsTypeForCheckConstraintType(shape.checkConstraintType)) return 'string'
+  }
+  if (shape.kind === 'jsonScalar') {
+    if (typeof shape.value === 'string' && rendered === quoteString(shape.value)) return 'string'
+    if (typeof shape.value === 'number' && rendered === String(shape.value)) return 'number'
+    if (typeof shape.value === 'boolean' && rendered === String(shape.value)) return 'boolean'
+  }
+  return undefined
+}
+
 function tsTypeForJsonShape(
   shape: TypedSqlPostgresIrJsonShape,
   sourceFile: string,
@@ -692,12 +734,22 @@ function tsTypeForJsonShape(
         }
         collectTypeResolutionDependencies(dependencies, codecProfile.opaqueJsonType)
         return codecProfile.opaqueJsonType.type
-      case 'union':
-        return shape.alternatives
-          .map((alternative, index) =>
-            render(alternative, `${name}${encodedTypeNameSegment(`alternative${index + 1}`)}`)
-          )
-          .join(' | ')
+      case 'union': {
+        const alternatives = shape.alternatives.map((alternative, index) => {
+          const type = render(alternative, `${name}${encodedTypeNameSegment(`alternative${index + 1}`)}`)
+          return { type, literalPrimitive: jsonLiteralPrimitive(alternative, type) }
+        })
+        const renderedTypes = new Set(alternatives.map(({ type }) => type))
+        // Codec type expressions are opaque. Only exact emitted primitives can
+        // absorb our known literals; aliases and literal-only unions retain them.
+        return [
+          ...new Set(
+            alternatives
+              .filter(({ literalPrimitive }) => !literalPrimitive || !renderedTypes.has(literalPrimitive))
+              .map(({ type }) => type)
+          ),
+        ].join(' | ')
+      }
       case 'scalar':
         return scalarTsTypeForJsonShape(shape, dependencies, codecProfile)
       case 'stringLiteral': {
@@ -985,6 +1037,7 @@ async function resolveTypedSqlWithAnalyzer(
       config.sourceFile
     )
     await assertColumnAssertions(client, config, columns)
+    const parameterAnalysis: TypedSqlParameterAnalysis[] = []
     const parameters = config.parameters.map((parameter, paramIndex): ResolvedSqlField => {
       const analyzed = ir.params[paramIndex]
       if (!analyzed) {
@@ -1001,18 +1054,29 @@ async function resolveTypedSqlWithAnalyzer(
             }
           : resolveTypeScriptParameterTypeForPostgresType(analyzed, generatorConfig.codecProfile)
       collectTypeResolutionDependencies(typeDependencies, resolution)
-      if (parameter.nullableRequestLine !== undefined && analyzed.nullAdmission !== 'accepts') {
+      if (parameter.nullBinding?.kind === 'nullable' && analyzed.nullAdmission !== 'accepts') {
         const reason =
           analyzed.nullAdmission === 'rejects'
             ? 'PostgreSQL proves that one of its uses rejects NULL'
             : 'PostgreSQL could not prove that every use accepts NULL'
         throw new Error(
-          `${config.sourceFile}:${parameter.nullableRequestLine}: @nullable ${parameter.name} cannot be satisfied because ${reason}.`
+          `${config.sourceFile}:${parameter.nullBinding?.line}: @nullable ${parameter.name} cannot be satisfied because ${reason}.`
         )
       }
+      parameterAnalysis.push({
+        name: parameter.name,
+        propertyName: parameter.propertyName,
+        nullBinding:
+          parameter.nullBinding?.kind === 'nullable'
+            ? 'provedNullable'
+            : parameter.nullBinding?.kind === 'bindNull'
+              ? 'callerNullable'
+              : 'nonNull',
+        nullAdmission: analyzed.nullAdmission,
+      })
       return {
         name: parameter.name,
-        nullable: parameter.nullableRequestLine !== undefined,
+        nullable: parameter.nullBinding !== undefined,
         pgType: analyzed.pgType,
         pgTypeName: analyzed.pgTypeName,
         pgTypeSchema: analyzed.pgTypeSchema,
@@ -1055,6 +1119,7 @@ async function resolveTypedSqlWithAnalyzer(
       columns,
       access: config.access ?? inferredAccess,
       accessEvidence: publicAccessEvidence(ir.accessEvidence),
+      parameterAnalysis,
       cardinality: typedSqlCardinalityFromRowBounds(ir.rowBounds),
       command: typedSqlCommandFromPostgres(ir.command),
       generatedTypeDeclarations: generatedDeclarations.map(({ name, fields }) => renderInterface(name, fields)),
@@ -1435,6 +1500,7 @@ export async function generateTypedSql(
           sqlSha256: sha256(entry.sql),
           access: entry.access,
           accessEvidence: entry.accessEvidence,
+          parameters: entry.parameterAnalysis,
         })),
       }
     }
