@@ -50,7 +50,7 @@ test('allows matching statement basenames in separate module directories', async
 
 test('validates typed SQL source contracts before initializing PostgreSQL analysis', async () => {
   const root = await createMinimalFixture('this is not valid SQL\n', 'select 1\n')
-  await writeFile(join(root, 'queries/find-account.typed.sql'), 'select 1\n')
+  await writeFile(join(root, 'queries/find.account.typed.sql'), 'select 1\n')
 
   await assert.rejects(
     generateTypedSql({
@@ -58,6 +58,6 @@ test('validates typed SQL source contracts before initializing PostgreSQL analys
       rootDir: root,
       schema: 'schema.sql',
     }),
-    /typed SQL filename: "find-account" is not a legal non-reserved TypeScript binding/u
+    /typed SQL filename: "find.account" is not a legal non-reserved TypeScript binding/u
   )
 })

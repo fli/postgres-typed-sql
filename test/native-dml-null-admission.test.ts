@@ -240,7 +240,8 @@ testWithDatabase('enforced unvalidated foreign keys block old-row preservation',
 testWithDatabase('searched CASE result arms admit NULL without borrowing proof for conditions', async (database) => {
   await database.query(`create table public.case_admission_probe (
     id integer primary key, message text, value integer check(value > 0)
-  ); insert into public.case_admission_probe values (1, 'before', 1)`)
+  )`)
+  await database.query("insert into public.case_admission_probe values (1, 'before', 1)")
   const safe = `update public.case_admission_probe
     set message = case when $2::boolean then $1::text else message end
     where id = $3::integer`
@@ -283,10 +284,12 @@ testWithDatabase('JSON constructor NULL proof requires static safe keys and scal
   assert.equal((await analyzeNative<UsageAnalysis>(database, dangerousSql)).paramUsageNullAdmissions[0], 'unknown')
   await assert.rejects(database.query(dangerousSql, [null, 0]), /division by zero/u)
 
-  await database.query(`create type public.json_effect_enum as enum ('bad');
-    create function public.json_effect_cast(public.json_effect_enum) returns json
-      language plpgsql immutable as $$begin raise exception 'custom JSON conversion'; end$$;
-    create cast (public.json_effect_enum as json) with function public.json_effect_cast(public.json_effect_enum)`)
+  await database.query("create type public.json_effect_enum as enum ('bad')")
+  await database.query(`create function public.json_effect_cast(public.json_effect_enum) returns json
+      language plpgsql immutable as $$begin raise exception 'custom JSON conversion'; end$$`)
+  await database.query(
+    'create cast (public.json_effect_enum as json) with function public.json_effect_cast(public.json_effect_enum)'
+  )
   const customSql = `select jsonb_build_object('value', coalesce($1::public.json_effect_enum, 'bad'::public.json_effect_enum))`
   assert.equal((await analyzeNative<UsageAnalysis>(database, customSql)).paramUsageNullAdmissions[0], 'unknown')
   await assert.rejects(database.query(customSql, [null]), /custom JSON conversion/u)
