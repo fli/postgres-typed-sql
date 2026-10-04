@@ -42,6 +42,16 @@ assert.deepEqual(insertAnalysis.accessEvidence, {
 })
 assert.equal(insertAnalysis.sqlSha256, createHash('sha256').update(insertAnalysis.sql).digest('hex'))
 assert.equal(insertAnalysis.access, 'write')
+assert.equal(insertAnalysis.parameters.find((parameter) => parameter.name === 'code').nullBinding, 'nonNull')
+assert.deepEqual(
+  insertAnalysis.parameters.find((parameter) => parameter.name === 'widget_label'),
+  {
+    name: 'widget_label',
+    propertyName: 'widgetLabel',
+    nullBinding: 'provedNullable',
+    nullAdmission: 'accepts',
+  }
+)
 
 const output = await readFile('findWidget.typed-sql.ts', 'utf8')
 assert.match(output, /cardinality: 'optional'/u)

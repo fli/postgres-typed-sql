@@ -11,13 +11,22 @@ import {
   type PostgresTypedSqlConfig,
   type TypedSqlAccessConcern,
   type TypedSqlGenerationAnalysis,
+  type TypedSqlParameterAnalysis,
 } from 'postgres-typed-sql'
 
 declare const generatorConfig: PostgresTypedSqlConfig
 const analysisResult: GenerateTypedSqlAnalysisResult = await generateTypedSql(generatorConfig, { analysis: true })
 const analysis: TypedSqlGenerationAnalysis = analysisResult.analysis
-const analysisVersion: 1 = generationAnalysisVersion
+const analysisVersion: 2 = generationAnalysisVersion
 for (const statement of analysis.statements) {
+  for (const parameter of statement.parameters) {
+    const publicParameter: TypedSqlParameterAnalysis = parameter
+    const binding: 'nonNull' | 'provedNullable' | 'callerNullable' = parameter.nullBinding
+    const admission: 'accepts' | 'rejects' | 'unknown' = parameter.nullAdmission
+    void publicParameter
+    void binding
+    void admission
+  }
   for (const concern of statement.accessEvidence.concerns) {
     const publicConcern: TypedSqlAccessConcern = concern
     if (concern.kind === 'definiteDml') {
