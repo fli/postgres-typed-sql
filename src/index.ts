@@ -15,6 +15,7 @@ export type {
   TypedSqlAccessEvidence,
   TypedSqlAnalysisInput,
   TypedSqlGenerationAnalysis,
+  TypedSqlParameterAnalysis,
   TypedSqlStatementAnalysis,
 } from './generation-analysis.js'
 export { postgresVersion, supportedExtensions } from './engine.js'

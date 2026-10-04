@@ -2186,3 +2186,87 @@ testWithDatabase(
     }
   }
 )
+
+testWithDatabase('row-bound traversal retains exact CTE and correlated subquery owners', async (database) => {
+  const statements = [
+    `with seed as (select 1 as value), projected as (
+       select value from seed where value = 1
+     ) select value from projected`,
+    `with seed(value) as (values (1), (2)), projected as (
+       select value from seed where value = 1
+       union all select value from seed where value = 2
+     ) select value from projected`,
+    `with seed as (select 1 as value), projected as (
+       with seed as (select 2 as value)
+       select nested.value from (select value from seed) nested where nested.value = 2
+     ) select value from projected`,
+    `with seed(value) as (values (1), (2))
+     select nested.value from seed outer_seed
+     cross join lateral (
+       select value from seed where value = outer_seed.value
+     ) nested(value)`,
+    `select (select value from (select outer_seed.value) nested(value) where value = 1) as value
+     from (values (1)) outer_seed(value)`,
+    `with seed as (select 1 as value)
+     select (select sum(value) from (select value from seed) nested) as value from seed`,
+  ]
+  const { queries: reports } = await buildTypedSqlPostgresIrFromCompiledConfigs(
+    database,
+    statements.map((sql, index) => config(`owned${index}`, sql))
+  )
+  for (const [index, report] of reports.entries()) {
+    const rows = (await database.query(statements[index] as string)).rows
+    assert.ok(report.rowBounds.min <= rows.length, `${index}: minimum exceeds execution`)
+    assert.ok(
+      report.rowBounds.max === null || report.rowBounds.max >= rows.length,
+      `${index}: maximum excludes execution`
+    )
+  }
+  assert.deepEqual((await database.query(statements[2] as string)).rows, [{ value: 2 }])
+})
+
+testWithDatabase('deep expanded views keep set-operation bodies and nullable output evidence', async (database) => {
+  await database.query('create view public.depth_leaf as select 1 as value union all select null::integer')
+  for (let level = 1; level <= 24; level++) {
+    await database.query(
+      `create view public.depth_${level} as select value from public.${level === 1 ? 'depth_leaf' : `depth_${level - 1}`}`
+    )
+  }
+  const sql = 'select value from public.depth_24'
+  const {
+    queries: [report],
+  } = await buildTypedSqlPostgresIrFromCompiledConfigs(database, [config('deepView', sql)])
+  assert.ok(report)
+  assert.equal(report.resultColumns[0]?.nullability.kind, 'nullable')
+  assert.deepEqual((await database.query(sql)).rows, [{ value: 1 }, { value: null }])
+  assert.ok(report.rowBounds.min <= 2)
+  assert.ok(report.rowBounds.max === null || report.rowBounds.max >= 2)
+})
+
+testWithDatabase(
+  'query ownership omissions remain envelope errors even beside truncated expressions',
+  async (database) => {
+    const corrupted = corruptAnalyzerEnvelope(database, (analysis) => {
+      const query = firstEnvelopeQuery(analysis)
+      const rte = envelopeObject(envelopeArray(query.rtable)[0])
+      delete rte.subquery
+      query.fromTree = { tag: 'FromExpr', truncated: true }
+    })
+    await assert.rejects(
+      buildTypedSqlPostgresIrFromCompiledConfigs(corrupted, [
+        config('missingBody', 'select 1 as value union all select 2'),
+      ]),
+      /set-operation leaf RTE 1 is missing its query/u
+    )
+    const invalidOwner = corruptAnalyzerEnvelope(database, (analysis) => {
+      const query = firstEnvelopeQuery(analysis)
+      envelopeObject(envelopeArray(query.rtable)[0]).cteLevelSup = 2
+    })
+    await assert.rejects(
+      buildTypedSqlPostgresIrFromCompiledConfigs(invalidOwner, [
+        config('invalidOwner', 'with seed as (select 1 as value) select value from seed'),
+      ]),
+      /owner level 2 has no query scope/u
+    )
+  }
+)

@@ -15,6 +15,15 @@ if ! docker image inspect "$builder_image" >/dev/null 2>&1; then
     # Unlimited make jobs in the upstream recipe can exhaust hosted-runner memory.
     sed -E 's/ -j([[:space:]]|$)/ -j2\1/g' \
       "$source_dir/postgres-pglite/pglite/builder/Dockerfile" > "$builder_dockerfile"
+    # This SDK release uses a separate ARM tag, rather than a multiarch image.
+    # Match the daemon's build platform so the compiler runs natively.
+    case $(docker info --format '{{.Architecture}}') in
+      arm64|aarch64)
+        sed 's/${EMSDK_VER} AS builder/${EMSDK_VER}-arm64 AS builder/' \
+          "$builder_dockerfile" > "$builder_dockerfile.arm64"
+        mv "$builder_dockerfile.arm64" "$builder_dockerfile"
+        ;;
+    esac
     patch -F 0 "$builder_dockerfile" "$project_root/patches/pglite-builder-downloads.patch"
     docker build --file "$builder_dockerfile" --tag "$builder_image" "$source_dir/postgres-pglite/pglite/builder"
     rm -f "$builder_dockerfile"

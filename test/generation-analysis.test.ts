@@ -33,7 +33,14 @@ const configFor = (rootDir: string): PostgresTypedSqlConfig => ({
   imports: { runtime: 'postgres-typed-sql/runtime', scalars: 'postgres-typed-sql/scalars' },
 })
 
-async function emittedStatement(entry: TypedSqlStatementAnalysis): Promise<{ text: string; access: string }> {
+async function emittedStatement(
+  entry: TypedSqlStatementAnalysis
+): Promise<{
+  text: string
+  access: string
+  parameterNames: readonly string[]
+  parameters: readonly { name: string; nullable: boolean }[]
+}> {
   const javascript = ts.transpileModule(await readFile(entry.module, 'utf8'), {
     compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2023 },
   }).outputText
@@ -194,6 +201,19 @@ test('isolated policy consumer rejects misassociation, incompleteness, divergenc
   await tamper((v) => {
     Object.assign(v.generation.producer, { version: 'future-unreviewed' })
   }, /Incompatible/u)
+  for (const patch of [
+    { parameters: undefined },
+    { parameters: [] },
+    { parameters: [{ name: 'id', propertyName: 'other', nullBinding: 'nonNull', nullAdmission: 'accepts' }] },
+    { parameters: [{ name: 'id', propertyName: 'id', nullBinding: 'future', nullAdmission: 'accepts' }] },
+    { parameters: [{ name: 'id', propertyName: 'id', nullBinding: 'nonNull', nullAdmission: 'future' }] },
+    { parameters: [{ name: 'id', propertyName: 'id', nullBinding: 'provedNullable', nullAdmission: 'unknown' }] },
+    { parameters: [{ name: 'id', propertyName: 'id', nullBinding: 'callerNullable', nullAdmission: 'accepts' }] },
+  ]) {
+    await tamper((v) => {
+      Object.assign(statementAt(v.generation, 0), patch)
+    }, /Invalid parameter contracts/u)
+  }
   await tamper((v) => {
     Object.assign(v.generation, { postgresVersionNum: 190000 })
   }, /Incompatible/u)
@@ -329,4 +349,81 @@ test('empty access concerns do not certify effects hidden behind declared STABLE
   } finally {
     await database.close()
   }
+})
+
+test('binding NULL permission is explicit and independent of proved or unresolved admission', async (t) => {
+  const root = await createMinimalFixture(
+    `create table required_input(value integer not null);
+    create function opaque_input(value integer) returns integer language plpgsql as $$begin return value; end$$;`,
+    '-- @bindNull input_value\ninsert into required_input(value) values (:input_value::integer)'
+  )
+  t.after(() => rm(root, { recursive: true, force: true }))
+  await writeFile(
+    join(root, 'queries/unknown.typed.sql'),
+    '-- @bindNull input_value\nselect opaque_input(:input_value::integer)'
+  )
+  await writeFile(
+    join(root, 'queries/proved.typed.sql'),
+    '-- @nullable input_value\nselect :input_value::integer as value'
+  )
+  await writeFile(join(root, 'queries/defaultInput.typed.sql'), 'select :input_value::integer as value')
+  const result = await generateTypedSql(configFor(root), { analysis: true })
+  assert.equal(result.analysis.version, 2)
+  const parameter = (name: string) => result.analysis.statements.find((entry) => entry.export === name)?.parameters[0]
+  assert.deepEqual(parameter('query'), {
+    name: 'input_value',
+    propertyName: 'inputValue',
+    nullBinding: 'callerNullable',
+    nullAdmission: 'rejects',
+  })
+  assert.equal(parameter('unknown')?.nullBinding, 'callerNullable')
+  assert.equal(parameter('unknown')?.nullAdmission, 'unknown')
+  assert.equal(parameter('proved')?.nullBinding, 'provedNullable')
+  assert.equal(parameter('proved')?.nullAdmission, 'accepts')
+  assert.equal(parameter('defaultInput')?.nullBinding, 'nonNull')
+  assert.equal(parameter('defaultInput')?.nullAdmission, 'accepts')
+  assert.match(await readFile(join(root, 'queries/query.typed-sql.ts'), 'utf8'), /readonly inputValue:.* \| null/u)
+  for (const source of [
+    '-- @bindNull input_value\n-- @nullable input_value\nselect :input_value::integer',
+    '-- @bindNull input_value\n-- @bindNull input_value\nselect :input_value::integer',
+    '-- @bindNull input_value integer?\nselect :input_value::integer',
+    '-- @bindNull missing\nselect :input_value::integer',
+  ]) {
+    await writeFile(join(root, 'queries/query.typed.sql'), source)
+    await assert.rejects(generateTypedSql(configFor(root)), /(?:duplicate @|requires exactly|is not used)/u)
+  }
+  await writeFile(
+    join(root, 'queries/query.typed.sql'),
+    '-- @nullable input_value\ninsert into required_input(value) values (:input_value::integer)'
+  )
+  await assert.rejects(generateTypedSql(configFor(root)), /@nullable input_value cannot be satisfied/u)
+})
+
+test('smart CASE and safe expression proofs satisfy strict nullable without a binding override', async (t) => {
+  const root = await createMinimalFixture(
+    'create table nullable_case(id integer primary key, message text);',
+    `-- @nullable message
+     update nullable_case set message = case when :change::boolean then :message::text else message end
+     where id = :id::integer`
+  )
+  t.after(() => rm(root, { recursive: true, force: true }))
+  await writeFile(
+    join(root, 'queries/safeCall.typed.sql'),
+    '-- @nullable value\nselect coalesce(:value::integer, 0) = 0 as is_zero'
+  )
+  await writeFile(
+    join(root, 'queries/safeJson.typed.sql'),
+    "-- @nullable message\nselect jsonb_build_object('message', :message::text, 'flag', :flag::boolean) as value"
+  )
+  const result = await generateTypedSql(configFor(root), { analysis: true })
+  for (const entry of result.analysis.statements) {
+    const nullable = entry.parameters.find((parameter) => parameter.nullBinding === 'provedNullable')
+    assert.equal(nullable?.nullAdmission, 'accepts')
+  }
+  await writeFile(
+    join(root, 'queries/query.typed.sql'),
+    `-- @nullable message
+    update nullable_case set message = case when :divisor::integer / 0 = 1 then :message::text else message end`
+  )
+  await assert.rejects(generateTypedSql(configFor(root)), /could not prove that every use accepts NULL/u)
 })

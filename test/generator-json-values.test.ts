@@ -103,3 +103,37 @@ test('does not assign source scalar OIDs or builtin parser guarantees to custom 
   assert.match(output, /readonly json_null: string\n/u)
   assert.doesNotMatch(output, /interface QueryJ7_literalJson/u)
 })
+
+test('retains authored scalar identities for typed NULL embedded in JSON under custom codecs', async () => {
+  const root = await createMinimalFixture(
+    'select 1;',
+    `select jsonb_build_object(
+    'email', null::text,
+    'position', null::integer,
+    'granted_at', null::timestamptz,
+    'literal', 'null'::jsonb
+  ) as value`
+  )
+  const profile = definePostgresCodecProfile({
+    extends: 'node-postgres',
+    name: 'custom-json-null',
+    opaqueJsonType: postgresTypeScriptType('OpaqueJson'),
+    jsonScalarType({ type }, fallback) {
+      if (type.pgTypeName === 'text') return postgresTypeScriptType('EmailText')
+      if (type.pgTypeName === 'int4') return postgresTypeScriptType('PositionNumber')
+      if (type.pgTypeName === 'timestamptz') return postgresTypeScriptType('TimestampText')
+      return fallback()
+    },
+  })
+  await generateTypedSql({ include: ['queries'], rootDir: root, schema: 'schema.sql', codecProfile: profile })
+  const output = await readFile(join(root, 'queries/query.typed-sql.ts'), 'utf8')
+  assert.match(output, /readonly email: EmailText \| null/u)
+  assert.match(output, /readonly position: PositionNumber \| null/u)
+  assert.match(output, /readonly granted_at: TimestampText \| null/u)
+  assert.match(output, /readonly literal: OpaqueJson/u)
+  await generateTypedSql({ include: ['queries'], rootDir: root, schema: 'schema.sql', codecProfile: 'node-postgres' })
+  const builtinOutput = await readFile(join(root, 'queries/query.typed-sql.ts'), 'utf8')
+  assert.match(builtinOutput, /readonly email: null\n/u)
+  assert.match(builtinOutput, /readonly position: null\n/u)
+  assert.match(builtinOutput, /readonly granted_at: null\n/u)
+})
