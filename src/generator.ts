@@ -678,6 +678,22 @@ function scalarTsTypeForJsonShape(
   return resolved.type
 }
 
+function jsonLiteralPrimitive(
+  shape: TypedSqlPostgresIrJsonShape,
+  rendered: string
+): 'string' | 'number' | 'boolean' | undefined {
+  if (shape.kind === 'stringLiteral' && rendered === quoteString(shape.value)) return 'string'
+  if (shape.kind === 'scalar' && shape.checkConstraintType) {
+    if (rendered === tsTypeForCheckConstraintType(shape.checkConstraintType)) return 'string'
+  }
+  if (shape.kind === 'jsonScalar') {
+    if (typeof shape.value === 'string' && rendered === quoteString(shape.value)) return 'string'
+    if (typeof shape.value === 'number' && rendered === String(shape.value)) return 'number'
+    if (typeof shape.value === 'boolean' && rendered === String(shape.value)) return 'boolean'
+  }
+  return undefined
+}
+
 function tsTypeForJsonShape(
   shape: TypedSqlPostgresIrJsonShape,
   sourceFile: string,
@@ -718,12 +734,22 @@ function tsTypeForJsonShape(
         }
         collectTypeResolutionDependencies(dependencies, codecProfile.opaqueJsonType)
         return codecProfile.opaqueJsonType.type
-      case 'union':
-        return shape.alternatives
-          .map((alternative, index) =>
-            render(alternative, `${name}${encodedTypeNameSegment(`alternative${index + 1}`)}`)
-          )
-          .join(' | ')
+      case 'union': {
+        const alternatives = shape.alternatives.map((alternative, index) => {
+          const type = render(alternative, `${name}${encodedTypeNameSegment(`alternative${index + 1}`)}`)
+          return { type, literalPrimitive: jsonLiteralPrimitive(alternative, type) }
+        })
+        const renderedTypes = new Set(alternatives.map(({ type }) => type))
+        // Codec type expressions are opaque. Only exact emitted primitives can
+        // absorb our known literals; aliases and literal-only unions retain them.
+        return [
+          ...new Set(
+            alternatives
+              .filter(({ literalPrimitive }) => !literalPrimitive || !renderedTypes.has(literalPrimitive))
+              .map(({ type }) => type)
+          ),
+        ].join(' | ')
+      }
       case 'scalar':
         return scalarTsTypeForJsonShape(shape, dependencies, codecProfile)
       case 'stringLiteral': {

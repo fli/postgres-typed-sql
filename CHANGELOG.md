@@ -11,6 +11,7 @@
 - Keep strict `@nullable` proof requests and add explicit `@bindNull` for caller-owned NULL binding contracts. Type inference and compiled SQL remain PostgreSQL-owned.
 - **Breaking for analysis consumers:** public generation-analysis version 2 adds required ordered parameter identities, NULL binding contracts, and independent admission evidence.
 - Retain authored SQL scalar identity for typed NULL values embedded in JSON under custom codecs; unknown decoded JSON literals remain opaque.
+- Canonicalize rendered JSON unions by absorbing known literals into exact emitted primitives, preserving custom scalar aliases and distinct literal-only unions.
 
 ## 0.1.0-beta.17
 
