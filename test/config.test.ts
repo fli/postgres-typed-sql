@@ -4,7 +4,7 @@ import test from 'node:test'
 import { resolveConfig as resolveConfigBase, type PostgresTypedSqlConfig } from '../src/config.js'
 
 const testImports = {
-  runtime: 'postgres-typed-sql/runtime',
+  runtime: 'postgres-typed-sql/adapters/node-postgres',
   scalars: 'postgres-typed-sql/scalars',
 } as const
 
@@ -24,7 +24,11 @@ test('config requires exact generated-code imports and rejects the removed packa
     /imports\.runtime must be a non-empty module specifier/u
   )
   assert.throws(
-    () => resolveConfig({ imports: { runtime: 'postgres-typed-sql/runtime', scalars: ' ' }, schema: 'schema.sql' }),
+    () =>
+      resolveConfig({
+        imports: { runtime: 'postgres-typed-sql/adapters/node-postgres', scalars: ' ' },
+        schema: 'schema.sql',
+      }),
     /imports\.scalars must be a non-empty module specifier/u
   )
   assert.throws(

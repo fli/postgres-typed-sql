@@ -3,8 +3,6 @@ import test from 'node:test'
 
 import {
   executeTypedSql,
-  executeTypedSqlCommand,
-  executeTypedSqlOptional,
   type NodePostgresTypedSqlClient,
   type NodePostgresTypedSqlQueryConfig,
 } from '../src/adapters/node-postgres.js'
@@ -32,24 +30,27 @@ type ObsoleteSourceIsAbsent = AssertTrue<IsExactly<Extract<keyof TypedSqlColumnM
 const publicMetadataTypeAssertions: [ExpressionSourceIsRequired, ObsoleteSourceIsAbsent] = [true, true]
 
 test('runtime binds named parameters in generated order', async () => {
-  const statement = createTypedSqlStatement<{ readonly email: string }, { readonly email: string }>({
-    cardinality: 'optional',
-    columns: [
-      {
-        expressionSource: { kind: 'expression', tag: 'OpExpr' },
-        name: 'email',
-        nullable: false,
-        pgType: 'text',
-        pgTypeName: 'text',
-        pgTypeSchema: 'pg_catalog',
-        propertyName: 'email',
-      },
-    ],
-    command: 'select',
-    name: 'findAccount',
-    parameterNames: ['email'],
-    text: 'select email from accounts where email = $1',
-  })
+  const statement = createTypedSqlStatement<{ readonly email: string }, { readonly email: string }, 'read', 'optional'>(
+    {
+      rowBounds: { min: 0, max: 1, proof: 'test' },
+      resultKind: 'optional',
+      columns: [
+        {
+          expressionSource: { kind: 'expression', tag: 'OpExpr' },
+          name: 'email',
+          nullable: false,
+          pgType: 'text',
+          pgTypeName: 'text',
+          pgTypeSchema: 'pg_catalog',
+          propertyName: 'email',
+        },
+      ],
+      command: 'select',
+      name: 'findAccount',
+      parameterNames: ['email'],
+      text: 'select email from accounts where email = $1',
+    }
+  )
 
   assert.deepEqual(statement.values({ email: 'reader@example.test' }), ['reader@example.test'])
   assert.deepEqual(publicMetadataTypeAssertions, [true, true])
@@ -82,7 +83,7 @@ test('runtime binds named parameters in generated order', async () => {
   const adapterDoesNotClaimDriverRows: IsExactly<DirectRow, unknown> = true
   assert.equal(adapterDoesNotClaimDriverRows, true)
 
-  const row = await executeTypedSqlOptional(
+  const row = await executeTypedSql(
     {
       async query(config: NodePostgresTypedSqlQueryConfig) {
         assert.deepEqual(config.values, ['reader@example.test'])
@@ -104,7 +105,9 @@ test('runtime binds named parameters in generated order', async () => {
 })
 
 test('runtime looks up public parameter properties independently of raw SQL metadata names', () => {
-  const statement = createTypedSqlStatement<{ readonly platformSlug: string }, Record<string, never>>({
+  const statement = createTypedSqlStatement<{ readonly platformSlug: string }, Record<string, never>, 'read', 'many'>({
+    rowBounds: { min: 0, max: null, proof: 'test' },
+    resultKind: 'many',
     name: 'findPlatform',
     parameterNames: ['platformSlug'],
     parameters: [
@@ -133,14 +136,16 @@ test('runtime looks up public parameter properties independently of raw SQL meta
 })
 
 test('node-postgres adapter reports command row counts without adding a driver client to the core runtime', async () => {
-  const statement = createTypedSqlStatement<{ readonly id: number }, Record<string, never>>({
+  const statement = createTypedSqlStatement<{ readonly id: number }, Record<string, never>, 'write', 'command'>({
+    rowBounds: { min: 0, max: 0, proof: 'test' },
+    resultKind: 'command',
     command: 'delete',
     name: 'deleteAccount',
     parameterNames: ['id'],
     text: 'delete from accounts where id = $1',
   })
 
-  const affected = await executeTypedSqlCommand(
+  const affected = await executeTypedSql(
     {
       async query(config) {
         assert.deepEqual(config, {
@@ -157,12 +162,16 @@ test('node-postgres adapter reports command row counts without adding a driver c
 })
 
 test('human statement names never become node-postgres prepared-statement names', async () => {
-  const first = createTypedSqlStatement<Record<string, never>, Record<string, never>>({
+  const first = createTypedSqlStatement<Record<string, never>, Record<string, never>, 'read', 'many'>({
+    rowBounds: { min: 0, max: null, proof: 'test' },
+    resultKind: 'many',
     name: 'findById',
     parameterNames: [],
     text: 'select 1',
   })
-  const second = createTypedSqlStatement<Record<string, never>, Record<string, never>>({
+  const second = createTypedSqlStatement<Record<string, never>, Record<string, never>, 'read', 'many'>({
+    rowBounds: { min: 0, max: null, proof: 'test' },
+    resultKind: 'many',
     name: 'findById',
     parameterNames: [],
     text: 'select 2',
@@ -187,7 +196,9 @@ test('human statement names never become node-postgres prepared-statement names'
 })
 
 test('node-postgres adapter rejects rows that do not match the requested mapping representation', async () => {
-  const positional = createTypedSqlStatement<Record<string, never>, { readonly value: number }>({
+  const positional = createTypedSqlStatement<Record<string, never>, { readonly value: number }, 'read', 'many'>({
+    rowBounds: { min: 0, max: null, proof: 'test' },
+    resultKind: 'many',
     columns: [
       {
         expressionSource: { kind: 'expression', tag: 'Const' },
@@ -216,7 +227,9 @@ test('node-postgres adapter rejects rows that do not match the requested mapping
     /expected node-postgres row 1 to use rowMode: 'array'/u
   )
 
-  const object = createTypedSqlStatement<Record<string, never>, { readonly value: number }>({
+  const object = createTypedSqlStatement<Record<string, never>, { readonly value: number }, 'read', 'many'>({
+    rowBounds: { min: 0, max: null, proof: 'test' },
+    resultKind: 'many',
     name: 'objectRows',
     parameterNames: [],
     text: 'select 1 as value',
@@ -250,7 +263,9 @@ test('runtime accepts only nonnegative safe integer row counts', () => {
 })
 
 test('runtime reads only own parameter properties, including __proto__', () => {
-  const statement = createTypedSqlStatement<{ readonly __proto__: string }, Record<string, never>>({
+  const statement = createTypedSqlStatement<{ readonly __proto__: string }, Record<string, never>, 'read', 'many'>({
+    rowBounds: { min: 0, max: null, proof: 'test' },
+    resultKind: 'many',
     name: 'prototypeParameter',
     parameterNames: ['__proto__'],
     text: 'select $1::text',
@@ -266,7 +281,9 @@ test('runtime reads only own parameter properties, including __proto__', () => {
 })
 
 test('runtime preserves an exact __proto__ output property from array rows without changing the row prototype', async () => {
-  const statement = createTypedSqlStatement<Record<string, never>, { readonly __proto__: string }>({
+  const statement = createTypedSqlStatement<Record<string, never>, { readonly __proto__: string }, 'read', 'optional'>({
+    rowBounds: { min: 0, max: 1, proof: 'test' },
+    resultKind: 'optional',
     columns: [
       {
         expressionSource: { kind: 'expression', tag: 'OpExpr' },
@@ -289,7 +306,7 @@ test('runtime preserves an exact __proto__ output property from array rows witho
   assert.equal(mapped.__proto__, 'preserved')
   assert.deepEqual(Object.keys(mapped), ['__proto__'])
 
-  const executed = await executeTypedSqlOptional(
+  const executed = await executeTypedSql(
     {
       async query(config: NodePostgresTypedSqlQueryConfig) {
         assert.equal(config.rowMode, 'array')
@@ -305,8 +322,9 @@ test('runtime preserves an exact __proto__ output property from array rows witho
 })
 
 test('runtime maps zero-column array rows to empty row objects', async () => {
-  const statement = createTypedSqlStatement<Record<string, never>, Record<string, never>>({
-    cardinality: 'many',
+  const statement = createTypedSqlStatement<Record<string, never>, Record<string, never>, 'read', 'many'>({
+    rowBounds: { min: 0, max: null, proof: 'test' },
+    resultKind: 'many',
     columns: [],
     command: 'select',
     name: 'emptyRows',
@@ -334,7 +352,9 @@ test('runtime maps zero-column array rows to empty row objects', async () => {
 })
 
 test('runtime preserves object rows when result-column metadata is omitted', async () => {
-  const statement = createTypedSqlStatement<Record<string, never>, { readonly value: number }>({
+  const statement = createTypedSqlStatement<Record<string, never>, { readonly value: number }, 'read', 'many'>({
+    rowBounds: { min: 0, max: null, proof: 'test' },
+    resultKind: 'many',
     name: 'customObjectRows',
     parameterNames: [],
     text: 'select 1 as value',
@@ -362,7 +382,7 @@ test('runtime public statement contract preserves legacy custom object-row mappi
 
   const customStatement: TypedSqlStatement<Record<string, never>, CustomRow> = {
     access: 'read',
-    cardinality: 'many',
+    resultKind: 'many',
     columns: [
       {
         expressionSource: { kind: 'expression', tag: 'Const' },
@@ -468,8 +488,12 @@ test('runtime execution applies generated nested JSON mappings to positional row
         readonly accountId: number
         readonly displayName: string
       }[]
-    }
+    },
+    'read',
+    'many'
   >({
+    rowBounds: { min: 0, max: null, proof: 'test' },
+    resultKind: 'many',
     columns: [
       {
         expressionSource: { kind: 'expression', tag: 'SubLink' },

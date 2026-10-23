@@ -42,7 +42,7 @@ import {
 } from './postgres-codecs.js'
 import { postgresJsonValueMayBeStructured } from './postgres-types.js'
 import { compileNamedParameters, parseTypedSqlSource } from './sql-source.js'
-import type { TypedSqlCardinality, TypedSqlJsonFieldMappingMetadata, TypedSqlJsonMappingMetadata } from './runtime.js'
+import type { TypedSqlResultKind, TypedSqlJsonFieldMappingMetadata, TypedSqlJsonMappingMetadata } from './runtime.js'
 import {
   assertTypeScriptBindingIdentifier,
   assertUniqueTypeScriptBindings,
@@ -130,7 +130,7 @@ interface ResolvedTypedSql {
   readonly access: TypedSqlAccess
   readonly accessEvidence: TypedSqlAccessEvidence
   readonly parameterAnalysis: readonly TypedSqlParameterAnalysis[]
-  readonly cardinality: TypedSqlCardinality
+  readonly resultKind: TypedSqlResultKind
   readonly columns: readonly ResolvedSqlColumn[]
   readonly command: TypedSqlCommand
   readonly generatedTypeDeclarations: readonly string[]
@@ -232,19 +232,6 @@ function typedSqlCommandFromPostgres(command: string): TypedSqlCommand {
     default:
       return 'unknown'
   }
-}
-
-function typedSqlCardinalityFromRowBounds(bounds: TypedSqlPostgresIrRowBounds): TypedSqlCardinality {
-  if (bounds.min === 0 && bounds.max === 0) {
-    return 'none'
-  }
-  if (bounds.min === 1 && bounds.max === 1) {
-    return 'one'
-  }
-  if (bounds.min === 0 && bounds.max === 1) {
-    return 'optional'
-  }
-  return 'many'
 }
 
 function typedSqlAccessFromEvidence(evidence: TypedSqlPostgresIrAccessEvidence): TypedSqlAccess {
@@ -784,7 +771,9 @@ function renderImports(config: ResolvedTypedSql, generatorConfig: ResolvedPostgr
       `import type { ${config.scalarTypeImports.join(', ')} } from ${quoteString(generatorConfig.imports.scalars)}`
     )
   }
-  lines.push(`import { createTypedSqlStatement } from ${quoteString(generatorConfig.imports.runtime)}`)
+  lines.push(
+    `import { createTypedSqlStatement, createTypedSqlExecutor } from ${quoteString(generatorConfig.imports.runtime)}`
+  )
 
   return lines.join('\n')
 }
@@ -844,18 +833,20 @@ export const ${config.name} = createTypedSqlStatement<
   ${paramsName},
   ${rowName},
   ${quoteString(config.access)},
-  ${quoteString(config.cardinality)}
+  ${quoteString(config.resultKind)}
 >({
   access: ${quoteString(config.access)},
   columns: ${renderMetadata(config.columns)},
   command: ${quoteString(config.command)},
-  cardinality: ${quoteString(config.cardinality)},
+  resultKind: ${quoteString(config.resultKind)},
   name: ${quoteString(config.name)},
   parameterNames: [${parameterNames}],
   parameters: ${renderMetadata(config.parameters)},
   rowBounds: { min: ${config.rowBounds.min}, max: ${config.rowBounds.max ?? 'null'}, proof: ${quoteString(config.rowBounds.proof)} },
   text: ${quoteString(config.sql)},
-})`
+})
+
+export default createTypedSqlExecutor(${config.name})`
 }
 
 function renderTypedSql(config: ResolvedTypedSql, generatorConfig: ResolvedPostgresTypedSqlConfig): string {
@@ -1093,6 +1084,7 @@ async function resolveTypedSqlWithAnalyzer(
     assertUniqueTypeScriptBindings(
       [
         { name: 'createTypedSqlStatement', source: 'generated runtime import' },
+        { name: 'createTypedSqlExecutor', source: 'generated runtime import' },
         { name: config.name, source: 'exported statement constant' },
         ...[...usedGeneratedTypeNames].map(([name, source]) => ({ name, source })),
         ...[...ambientBindings].map((name) => ({ name, source: 'ambient TypeScript type' })),
@@ -1120,7 +1112,7 @@ async function resolveTypedSqlWithAnalyzer(
       access: config.access ?? inferredAccess,
       accessEvidence: publicAccessEvidence(ir.accessEvidence),
       parameterAnalysis,
-      cardinality: typedSqlCardinalityFromRowBounds(ir.rowBounds),
+      resultKind: ir.resultKind,
       command: typedSqlCommandFromPostgres(ir.command),
       generatedTypeDeclarations: generatedDeclarations.map(({ name, fields }) => renderInterface(name, fields)),
       name: config.name,

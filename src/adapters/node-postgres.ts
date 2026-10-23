@@ -1,6 +1,11 @@
 import {
   mapTypedSqlRows,
   typedSqlRowCount,
+  validateTypedSqlResultMetadata,
+  type TypedSqlAccessKind,
+  type TypedSqlResultKind,
+  type TypedSqlExecutionResult,
+  type TypedSqlParameterArgs,
   type TypedSqlArrayRow,
   type TypedSqlParams,
   type TypedSqlQueryConfig,
@@ -43,53 +48,81 @@ function objectRows(statementName: string, rows: readonly unknown[]): TypedSqlRa
   })
 }
 
-export async function executeTypedSql<Params extends TypedSqlParams, Row>(
+export { createTypedSqlStatement } from '../runtime.js'
+export type * from '../runtime.js'
+
+export async function executeTypedSql<
+  Params extends TypedSqlParams,
+  Row,
+  Access extends TypedSqlAccessKind,
+  Kind extends TypedSqlResultKind,
+>(
   client: NodePostgresTypedSqlClient,
-  statement: TypedSqlStatement<Params, Row>,
-  params: Params
-): Promise<Row[]> {
+  statement: TypedSqlStatement<Params, Row, Access, Kind>,
+  params: NoInfer<Params>
+): Promise<TypedSqlExecutionResult<Row, Kind>> {
+  validateTypedSqlResultMetadata(statement)
+  const resultKind = statement.resultKind
+  const bounds = { ...statement.rowBounds }
   const query = statement.query(params)
-  if (statement.resultRowMapping === 'positional') {
-    const result = await client.query({
-      ...query,
-      rowMode: 'array',
-    })
-    return mapTypedSqlRows(statement, positionalRows(statement.name, result.rows))
+  const result = await client.query(
+    statement.resultRowMapping === 'positional' ? { ...query, rowMode: 'array' } : query
+  )
+  let value: Row | Row[] | number | null | undefined
+  switch (resultKind) {
+    case 'command':
+    case 'void':
+      if (result.rows.length !== 0) {
+        throw new Error(`Typed SQL statement ${statement.name} returned unexpected rows for ${resultKind}.`)
+      }
+      value = resultKind === 'command' ? typedSqlRowCount(result.rowCount) : undefined
+      break
+    case 'one':
+    case 'optional':
+    case 'many': {
+      const { min, max } = bounds
+      if (result.rows.length < min || (max !== null && result.rows.length > max)) {
+        throw new Error(
+          `Typed SQL statement ${statement.name} returned ${result.rows.length} rows; expected rowBounds [${min}, ${max ?? 'unbounded'}]. SQL may already have executed; do not retry automatically.`
+        )
+      }
+      const rows = mapTypedSqlRows(
+        statement,
+        statement.resultRowMapping === 'positional'
+          ? positionalRows(statement.name, result.rows)
+          : objectRows(statement.name, result.rows)
+      )
+      value = resultKind === 'many' ? rows : (rows[0] ?? null)
+      break
+    }
+    default: {
+      const exhaustive: never = resultKind
+      throw new Error(`Unsupported Typed SQL result kind ${String(exhaustive)}.`)
+    }
   }
-
-  const result = await client.query(query)
-  return mapTypedSqlRows(statement, objectRows(statement.name, result.rows))
+  return value as TypedSqlExecutionResult<Row, Kind>
 }
 
-export async function executeTypedSqlOptional<Params extends TypedSqlParams, Row>(
+export function createTypedSqlExecutor<
+  Params extends TypedSqlParams,
+  Row,
+  Access extends TypedSqlAccessKind,
+  Kind extends TypedSqlResultKind,
+>(
+  statement: TypedSqlStatement<Params, Row, Access, Kind>
+): (
   client: NodePostgresTypedSqlClient,
-  statement: TypedSqlStatement<Params, Row>,
-  params: Params
-): Promise<Row | null> {
-  const rows = await executeTypedSql(client, statement, params)
-  if (rows.length > 1) {
-    throw new Error(`Typed SQL statement ${statement.name} returned ${rows.length} rows; expected zero or one.`)
+  ...args: TypedSqlParameterArgs<Params>
+) => Promise<TypedSqlExecutionResult<Row, Kind>> {
+  validateTypedSqlResultMetadata(statement)
+  return (client, ...args) => {
+    const params = args[0]
+    if (params === undefined) {
+      if (statement.parameterNames.length !== 0) {
+        throw new Error(`Typed SQL statement ${statement.name} requires a parameter object.`)
+      }
+      return executeTypedSql(client, statement, {} as Params)
+    }
+    return executeTypedSql(client, statement, params)
   }
-  return rows[0] ?? null
-}
-
-export async function executeTypedSqlOne<Params extends TypedSqlParams, Row>(
-  client: NodePostgresTypedSqlClient,
-  statement: TypedSqlStatement<Params, Row>,
-  params: Params
-): Promise<Row> {
-  const row = await executeTypedSqlOptional(client, statement, params)
-  if (row === null) {
-    throw new Error(`Typed SQL statement ${statement.name} returned no rows; expected exactly one.`)
-  }
-  return row
-}
-
-export async function executeTypedSqlCommand<Params extends TypedSqlParams, Row>(
-  client: NodePostgresTypedSqlClient,
-  statement: TypedSqlStatement<Params, Row>,
-  params: Params
-): Promise<number> {
-  const result = await client.query(statement.query(params))
-  return typedSqlRowCount(result.rowCount)
 }

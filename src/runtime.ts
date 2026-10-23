@@ -1,6 +1,19 @@
 export type TypedSqlParams = object
 
-export type TypedSqlCardinality = 'many' | 'none' | 'one' | 'optional'
+export type TypedSqlResultKind = 'one' | 'optional' | 'many' | 'command' | 'void'
+
+export type TypedSqlExecutionResult<Row, Kind extends TypedSqlResultKind> = Kind extends 'one'
+  ? Row
+  : Kind extends 'optional'
+    ? Row | null
+    : Kind extends 'many'
+      ? Row[]
+      : Kind extends 'command'
+        ? number
+        : void
+
+export type TypedSqlParameterArgs<Params extends TypedSqlParams> =
+  Record<never, never> extends Params ? [params?: Params] : [params: Params]
 
 export type TypedSqlCommandKind = 'delete' | 'insert' | 'merge' | 'select' | 'unknown' | 'update'
 export type TypedSqlAccessKind = 'read' | 'write'
@@ -105,10 +118,10 @@ export interface TypedSqlStatement<
   Params extends TypedSqlParams,
   Row,
   Access extends TypedSqlAccessKind = TypedSqlAccessKind,
-  Cardinality extends TypedSqlCardinality = TypedSqlCardinality,
+  Kind extends TypedSqlResultKind = TypedSqlResultKind,
 > {
   readonly access: Access
-  readonly cardinality: Cardinality
+  readonly resultKind: Kind
   readonly columns: readonly TypedSqlColumnMetadata[]
   readonly command: TypedSqlCommandKind
   readonly name: string
@@ -127,16 +140,16 @@ export interface TypedSqlDefinition<
   Params extends TypedSqlParams,
   Row,
   Access extends TypedSqlAccessKind = TypedSqlAccessKind,
-  Cardinality extends TypedSqlCardinality = TypedSqlCardinality,
+  Kind extends TypedSqlResultKind = TypedSqlResultKind,
 > {
   readonly access?: Access
-  readonly cardinality?: Cardinality
+  readonly resultKind: Kind
   readonly columns?: readonly TypedSqlColumnMetadata[]
   readonly command?: TypedSqlCommandKind
   readonly name: string
   readonly parameterNames: readonly (keyof Params & string)[]
   readonly parameters?: readonly TypedSqlParameterMetadata[]
-  readonly rowBounds?: TypedSqlRowBounds
+  readonly rowBounds: TypedSqlRowBounds
   readonly text: string
   readonly [typedSqlStatementRow]?: Row
 }
@@ -155,48 +168,83 @@ export function typedSqlAccessForCommand(command: TypedSqlCommandKind): TypedSql
   }
 }
 
+export function validateTypedSqlResultMetadata(metadata: {
+  readonly name: string
+  readonly resultKind: TypedSqlResultKind
+  readonly command?: TypedSqlCommandKind
+  readonly columns?: readonly TypedSqlColumnMetadata[]
+  readonly rowBounds: TypedSqlRowBounds
+}): void {
+  const bounds = metadata.rowBounds
+  if (
+    (metadata.resultKind === 'command' && (metadata.command === 'select' || (metadata.columns?.length ?? 0) > 0)) ||
+    (metadata.resultKind === 'void' &&
+      ((metadata.command !== undefined && metadata.command !== 'unknown') || (metadata.columns?.length ?? 0) > 0))
+  ) {
+    throw new Error(
+      `Typed SQL statement ${metadata.name} has contradictory command/result metadata; regenerate stale statements.`
+    )
+  }
+  if (
+    !bounds ||
+    !Number.isSafeInteger(bounds.min) ||
+    bounds.min < 0 ||
+    (bounds.max !== null && (!Number.isSafeInteger(bounds.max) || bounds.max < bounds.min)) ||
+    typeof bounds.proof !== 'string' ||
+    bounds.proof.length === 0
+  ) {
+    throw new Error(`Typed SQL statement ${metadata.name} requires valid rowBounds; regenerate stale statements.`)
+  }
+  const expected =
+    bounds.min === 1 && bounds.max === 1 ? 'one' : bounds.min === 0 && bounds.max === 1 ? 'optional' : 'many'
+  if (metadata.resultKind === 'command' || metadata.resultKind === 'void') {
+    if (bounds.min === 0 && bounds.max === 0) return
+  } else if (metadata.resultKind === expected) {
+    return
+  }
+  throw new Error(
+    `Typed SQL statement ${metadata.name} has missing or mismatched resultKind; regenerate stale statements.`
+  )
+}
+
 export function createTypedSqlStatement<
   Params extends TypedSqlParams,
   Row,
   Access extends TypedSqlAccessKind = TypedSqlAccessKind,
-  Cardinality extends TypedSqlCardinality = TypedSqlCardinality,
->(
-  definition: TypedSqlDefinition<Params, Row, Access, Cardinality>
-): TypedSqlStatement<Params, Row, Access, Cardinality> {
-  return {
+  Kind extends TypedSqlResultKind = TypedSqlResultKind,
+>(definition: TypedSqlDefinition<Params, Row, Access, Kind>): TypedSqlStatement<Params, Row, Access, Kind> {
+  validateTypedSqlResultMetadata(definition)
+  const { name, text } = definition
+  const parameterNames = Object.freeze([...definition.parameterNames])
+  return Object.freeze({
     // oxlint-disable-next-line typescript-eslint/no-unsafe-type-assertion -- The generated statement declaration pins Access to this metadata value.
     access: (definition.access ?? typedSqlAccessForCommand(definition.command ?? 'unknown')) as Access,
-    // oxlint-disable-next-line typescript-eslint/no-unsafe-type-assertion -- The generated statement declaration pins Cardinality to this metadata value.
-    cardinality: (definition.cardinality ?? 'many') as Cardinality,
-    columns: definition.columns ?? [],
+    resultKind: definition.resultKind,
+    columns: Object.freeze([...(definition.columns ?? [])]),
     command: definition.command ?? 'unknown',
     name: definition.name,
-    parameterNames: definition.parameterNames,
+    parameterNames,
     parameters: definition.parameters ?? [],
     resultRowMapping: definition.columns !== undefined ? 'positional' : undefined,
-    rowBounds: definition.rowBounds ?? {
-      max: null,
-      min: 0,
-      proof: 'unspecified',
-    },
-    text: definition.text,
-    query(params) {
+    rowBounds: Object.freeze({ ...definition.rowBounds }),
+    text,
+    query(params: Params) {
       return {
-        text: definition.text,
+        text,
         values: [...this.values(params)],
       }
     },
-    values(params) {
-      return definition.parameterNames.map((parameterName) => {
+    values(params: Params) {
+      return parameterNames.map((parameterName) => {
         if (!Object.hasOwn(params, parameterName)) {
           throw new Error(
-            `Typed SQL statement ${definition.name} expected an own parameter property ${JSON.stringify(parameterName)}.`
+            `Typed SQL statement ${name} expected an own parameter property ${JSON.stringify(parameterName)}.`
           )
         }
         return params[parameterName]
       })
     },
-  }
+  })
 }
 
 export function mapTypedSqlRow<Params extends TypedSqlParams, Row>(

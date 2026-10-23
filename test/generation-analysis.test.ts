@@ -15,7 +15,7 @@ import {
   type TypedSqlStatementAnalysis,
   type TypedSqlGenerationAnalysis,
 } from '../src/index.js'
-import { createTypedSqlStatement } from '../src/runtime.js'
+import { createTypedSqlStatement, createTypedSqlExecutor } from '../src/adapters/node-postgres.js'
 import { createAnalysisDatabase } from '../src/engine.js'
 import { createMinimalFixture } from './generator-test-support.js'
 import { validatePolicyManifest, type PolicyManifest } from './policy-consumer-example.js'
@@ -30,7 +30,7 @@ const configFor = (rootDir: string): PostgresTypedSqlConfig => ({
   rootDir,
   schema: 'schema.sql',
   include: ['queries'],
-  imports: { runtime: 'postgres-typed-sql/runtime', scalars: 'postgres-typed-sql/scalars' },
+  imports: { runtime: 'postgres-typed-sql/adapters/node-postgres', scalars: 'postgres-typed-sql/scalars' },
 })
 
 async function emittedStatement(entry: TypedSqlStatementAnalysis): Promise<{
@@ -46,8 +46,8 @@ async function emittedStatement(entry: TypedSqlStatementAnalysis): Promise<{
   runInNewContext(javascript, {
     exports,
     require: (specifier: string) => {
-      assert.equal(specifier, 'postgres-typed-sql/runtime')
-      return { createTypedSqlStatement }
+      assert.equal(specifier, 'postgres-typed-sql/adapters/node-postgres')
+      return { createTypedSqlStatement, createTypedSqlExecutor }
     },
   })
   const emitted = exports[entry.export]
