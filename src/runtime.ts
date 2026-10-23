@@ -10,8 +10,13 @@ export type TypedSqlExecutionResult<Row, Kind extends TypedSqlResultKind> = {
   readonly void: void
 }[Kind]
 
-export type TypedSqlParameterArgs<Params extends TypedSqlParams> =
-  Record<never, never> extends Params ? [params?: Params] : [params: Params]
+export type TypedSqlParameterArgs<Params extends TypedSqlParams> = string extends keyof Params
+  ? [Params[keyof Params]] extends [never]
+    ? Record<string, never> extends Params
+      ? [params?: Params]
+      : [params: Params]
+    : [params: Params]
+  : [params: Params]
 
 export type TypedSqlCommandKind = 'delete' | 'insert' | 'merge' | 'select' | 'unknown' | 'update'
 export type TypedSqlAccessKind = 'read' | 'write'

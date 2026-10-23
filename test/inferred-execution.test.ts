@@ -7,7 +7,12 @@ import {
   executeTypedSql,
   type NodePostgresTypedSqlClient,
 } from '../src/adapters/node-postgres.js'
-import type { TypedSqlExecutionResult, TypedSqlResultKind, TypedSqlStatement } from '../src/runtime.js'
+import type {
+  TypedSqlExecutionResult,
+  TypedSqlResultKind,
+  TypedSqlStatement,
+  TypedSqlParameterArgs,
+} from '../src/runtime.js'
 
 const row = { value: 7 }
 const bounds = { min: 0, max: null, proof: 'test' } as const
@@ -214,3 +219,20 @@ test('a widened statement descriptor preserves the complete inferred result unio
   assert.equal(completeUnion, true)
   assert.deepEqual(result, [row])
 })
+
+test('only the canonical generated empty parameter type permits omitted arguments', () => {
+  const canonical: [] extends TypedSqlParameterArgs<Record<string, never>> ? true : false = true
+  const broad: [] extends TypedSqlParameterArgs<object> ? true : false = false
+  const untyped: [] extends TypedSqlParameterArgs<ReturnType<typeof JSON.parse>> ? true : false = false
+  const optional: [] extends TypedSqlParameterArgs<{ id?: number }> ? true : false = false
+  const union: [] extends TypedSqlParameterArgs<Record<string, never> | { id: number }> ? true : false = false
+  const nullable: [] extends TypedSqlParameterArgs<{ id: number | null }> ? true : false = false
+  assert.deepEqual([canonical, broad, untyped, optional, union, nullable], [true, false, false, false, false, false])
+})
+
+function assertParameterVariance(statement: TypedSqlStatement<{ id: number }, typeof row>) {
+  // @ts-expect-error A non-null parameter statement cannot be widened to accept SQL NULL.
+  const widened: TypedSqlStatement<{ id: number | null }, typeof row> = statement
+  void widened
+}
+void assertParameterVariance
