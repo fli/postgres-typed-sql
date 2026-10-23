@@ -152,6 +152,107 @@ test('descriptor result metadata is copied and frozen', () => {
   assert.equal(Object.isFrozen(statement.rowBounds), true)
 })
 
+test('DML without output columns rejects row results before querying', async () => {
+  let calls = 0
+  const client: NodePostgresTypedSqlClient = {
+    async query() {
+      calls++
+      return { rows: [], rowCount: 3 }
+    },
+  }
+  for (const command of ['delete', 'insert', 'update', 'merge'] as const) {
+    for (const [resultKind, rowBounds] of [
+      ['many', { min: 0, max: 0, proof: 'empty' }],
+      ['many', bounds],
+      ['one', { min: 1, max: 1, proof: 'one' }],
+      ['optional', { min: 0, max: 1, proof: 'optional' }],
+    ] as const) {
+      const invalidDefinition = { ...definition, command, columns: [], resultKind, rowBounds }
+      const invalid = { ...many, ...invalidDefinition, resultRowMapping: 'positional' as const }
+      assert.throws(
+        () => createTypedSqlStatement<Record<string, never>, typeof row>(invalidDefinition),
+        /contradictory command\/result metadata/u
+      )
+      assert.throws(() => createTypedSqlExecutor(invalid), /contradictory command\/result metadata/u)
+      await assert.rejects(executeTypedSql(client, invalid, {}), /contradictory command\/result metadata/u)
+    }
+  }
+  assert.equal(calls, 0)
+})
+
+test('output column validation preserves row protocols and empty returning results', async () => {
+  const empty: NodePostgresTypedSqlClient = {
+    async query() {
+      return { rows: [], rowCount: 0 }
+    },
+  }
+  for (const command of ['delete', 'insert', 'update', 'merge'] as const) {
+    const affected = createTypedSqlStatement<Record<string, never>, never>({
+      ...definition,
+      command,
+      columns: [],
+      resultKind: 'command',
+      rowBounds: { min: 0, max: 0, proof: 'command' },
+    })
+    assert.equal(await createTypedSqlExecutor(affected)(empty), 0)
+    const returning = createTypedSqlStatement<Record<string, never>, typeof row>({
+      ...definition,
+      command,
+      columns: [
+        {
+          name: 'value',
+          propertyName: 'value',
+          nullable: false,
+          pgType: 'int4',
+          pgTypeName: 'int4',
+          pgTypeSchema: 'pg_catalog',
+          expressionSource: { kind: 'expression', tag: 'Const' },
+        },
+      ],
+      resultKind: 'many',
+      rowBounds: { min: 0, max: 0, proof: 'empty' },
+    })
+    assert.deepEqual(await createTypedSqlExecutor(returning)(empty), [])
+    const custom = createTypedSqlStatement<Record<string, never>, typeof row>({
+      ...definition,
+      command,
+      resultKind: 'many',
+      rowBounds: bounds,
+    })
+    assert.deepEqual(
+      await createTypedSqlExecutor(custom)({
+        async query() {
+          return { rows: [row] }
+        },
+      }),
+      [row]
+    )
+  }
+  const zeroColumns = createTypedSqlStatement<Record<string, never>, Record<string, never>>({
+    ...definition,
+    command: 'select',
+    columns: [],
+    resultKind: 'many',
+    rowBounds: bounds,
+  })
+  assert.deepEqual(
+    await createTypedSqlExecutor(zeroColumns)({
+      async query() {
+        return { rows: [[]] }
+      },
+    }),
+    [{}]
+  )
+  const call = createTypedSqlStatement<Record<string, never>, never>({
+    ...definition,
+    command: 'unknown',
+    columns: [],
+    resultKind: 'void',
+    rowBounds: { min: 0, max: 0, proof: 'call' },
+  })
+  assert.equal(await createTypedSqlExecutor(call)(empty), undefined)
+})
+
 test('required nullable parameters remain required and fail before querying when omitted', async () => {
   const statement = createTypedSqlStatement<{ value: string | null }, typeof row, 'read', 'many'>({
     ...definition,

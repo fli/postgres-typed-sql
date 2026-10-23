@@ -176,10 +176,20 @@ export function validateTypedSqlResultMetadata(metadata: {
   readonly resultKind: TypedSqlResultKind
   readonly command?: TypedSqlCommandKind
   readonly columns?: readonly TypedSqlColumnMetadata[]
+  readonly resultRowMapping?: 'positional'
   readonly rowBounds: TypedSqlRowBounds
 }): void {
   const bounds = metadata.rowBounds
+  const dmlWithoutOutput =
+    (metadata.command === 'delete' ||
+      metadata.command === 'insert' ||
+      metadata.command === 'update' ||
+      metadata.command === 'merge') &&
+    metadata.columns?.length === 0 &&
+    metadata.resultRowMapping === 'positional'
   if (
+    (dmlWithoutOutput &&
+      (metadata.resultKind === 'one' || metadata.resultKind === 'optional' || metadata.resultKind === 'many')) ||
     (metadata.resultKind === 'command' && (metadata.command === 'select' || (metadata.columns?.length ?? 0) > 0)) ||
     (metadata.resultKind === 'void' &&
       ((metadata.command !== undefined && metadata.command !== 'unknown') || (metadata.columns?.length ?? 0) > 0))
@@ -216,7 +226,8 @@ export function createTypedSqlStatement<
   Access extends TypedSqlAccessKind = TypedSqlAccessKind,
   Kind extends TypedSqlResultKind = TypedSqlResultKind,
 >(definition: TypedSqlDefinition<Params, Row, Access, Kind>): TypedSqlStatement<Params, Row, Access, Kind> {
-  validateTypedSqlResultMetadata(definition)
+  const resultRowMapping = definition.columns !== undefined ? 'positional' : undefined
+  validateTypedSqlResultMetadata({ ...definition, resultRowMapping })
   const { name, text } = definition
   const parameterNames = Object.freeze([...definition.parameterNames])
   return Object.freeze({
@@ -228,7 +239,7 @@ export function createTypedSqlStatement<
     name: definition.name,
     parameterNames,
     parameters: definition.parameters ?? [],
-    resultRowMapping: definition.columns !== undefined ? 'positional' : undefined,
+    resultRowMapping,
     rowBounds: Object.freeze({ ...definition.rowBounds }),
     text,
     query(params: Params) {
