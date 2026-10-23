@@ -7,7 +7,7 @@ import {
   executeTypedSql,
   type NodePostgresTypedSqlClient,
 } from '../src/adapters/node-postgres.js'
-import type { TypedSqlExecutionResult, TypedSqlResultKind } from '../src/runtime.js'
+import type { TypedSqlExecutionResult, TypedSqlResultKind, TypedSqlStatement } from '../src/runtime.js'
 
 const row = { value: 7 }
 const bounds = { min: 0, max: null, proof: 'test' } as const
@@ -198,4 +198,19 @@ test('binding captures the SQL text and parameter names used by the descriptor',
   source.parameterNames.length = 0
   assert.equal(statement.text, 'select $1::text')
   assert.deepEqual(statement.query({ value: 'captured' }), { text: 'select $1::text', values: ['captured'] })
+})
+
+test('a widened statement descriptor preserves the complete inferred result union', async () => {
+  const statement: TypedSqlStatement<Record<string, never>, typeof row> = many
+  const client: NodePostgresTypedSqlClient = {
+    async query() {
+      return { rows: [row] }
+    },
+  }
+  const result = await executeTypedSql(client, statement, {})
+  type IsExactly<Left, Right> =
+    (<Value>() => Value extends Left ? 1 : 2) extends <Value>() => Value extends Right ? 1 : 2 ? true : false
+  const completeUnion: IsExactly<typeof result, typeof row | (typeof row)[] | number | null | void> = true
+  assert.equal(completeUnion, true)
+  assert.deepEqual(result, [row])
 })

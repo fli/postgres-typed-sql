@@ -2,15 +2,13 @@ export type TypedSqlParams = object
 
 export type TypedSqlResultKind = 'one' | 'optional' | 'many' | 'command' | 'void'
 
-export type TypedSqlExecutionResult<Row, Kind extends TypedSqlResultKind> = Kind extends 'one'
-  ? Row
-  : Kind extends 'optional'
-    ? Row | null
-    : Kind extends 'many'
-      ? Row[]
-      : Kind extends 'command'
-        ? number
-        : void
+export type TypedSqlExecutionResult<Row, Kind extends TypedSqlResultKind> = {
+  readonly one: Row
+  readonly optional: Row | null
+  readonly many: Row[]
+  readonly command: number
+  readonly void: void
+}[Kind]
 
 export type TypedSqlParameterArgs<Params extends TypedSqlParams> =
   Record<never, never> extends Params ? [params?: Params] : [params: Params]
