@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.0-beta.19
 
 - Generate a default callable alongside each named statement descriptor. Execution returns the analyzer-inferred row, nullable row, row array, affected-row count, or void result.
 - Replace `cardinality` with required `resultKind` and `rowBounds` metadata. Regenerate existing statements and use `executeTypedSql` instead of the removed `executeTypedSqlOne`, `executeTypedSqlOptional`, and `executeTypedSqlCommand` helpers.
