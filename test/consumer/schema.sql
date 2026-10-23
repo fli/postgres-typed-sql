@@ -11,3 +11,7 @@ create table public.widgets (
   metrics numeric[] not null default '{}',
   search_document tsquery not null default ''::tsquery
 );
+
+create procedure public.no_widget_output()
+language sql
+as $$ select 1 $$;

@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Generate a default callable alongside each named statement descriptor. Execution returns the analyzer-inferred row, nullable row, row array, affected-row count, or void result.
+- Replace `cardinality` with required `resultKind` and `rowBounds` metadata. Regenerate existing statements and use `executeTypedSql` instead of the removed `executeTypedSqlOne`, `executeTypedSqlOptional`, and `executeTypedSqlCommand` helpers.
+- Generated runtime imports now require both `createTypedSqlStatement` and `createTypedSqlExecutor`. Configure the node-postgres adapter module or a facade that exports both factories. Scalar codec selection remains independent.
+- Reject inconsistent metadata before execution and enforce all proved row bounds after execution. Command results reject unexpected rows and invalid affected-row counts.
+
 ## 0.1.0-beta.18
 
 - Preserve query ownership through row-bound, correlated subquery, CTE, grouping, and set-operation analysis; malformed owner references still fail.

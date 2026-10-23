@@ -3,15 +3,15 @@ import { createHash } from 'node:crypto'
 import { readFile } from 'node:fs/promises'
 
 import { generateTypedSql, generationAnalysisVersion, postgresVersion } from 'postgres-typed-sql'
-import { executeTypedSqlOptional } from 'postgres-typed-sql/adapters/node-postgres'
+import { executeTypedSql } from 'postgres-typed-sql/adapters/node-postgres'
 
 assert.equal(postgresVersion, '18.3')
-assert.equal(typeof executeTypedSqlOptional, 'function')
+assert.equal(typeof executeTypedSql, 'function')
 const result = await generateTypedSql(
   {
     include: ['.'],
     imports: {
-      runtime: 'postgres-typed-sql/runtime',
+      runtime: './runtime-facade.mjs',
       scalars: 'postgres-typed-sql/scalars',
     },
     naming: {
@@ -24,9 +24,9 @@ const result = await generateTypedSql(
   },
   { analysis: true }
 )
-assert.equal(result.statementCount, 3)
+assert.equal(result.statementCount, 6)
 assert.equal(result.analysis.version, generationAnalysisVersion)
-assert.equal(result.analysis.statements.length, 3)
+assert.equal(result.analysis.statements.length, 6)
 assert.equal(result.analysis.producer.name, 'postgres-typed-sql')
 for (const input of result.analysis.inputs) {
   assert.equal(
@@ -54,7 +54,7 @@ assert.deepEqual(
 )
 
 const output = await readFile('findWidget.typed-sql.ts', 'utf8')
-assert.match(output, /cardinality: 'optional'/u)
+assert.match(output, /resultKind: 'optional'/u)
 assert.match(output, /readonly label: string \| null/u)
 assert.match(output, /readonly state: "active" \| "archived"/u)
 assert.match(output, /readonly metrics: PgArray<number>/u)
@@ -73,13 +73,13 @@ assert.match(echoBytes, /readonly payloads: PgArray<Uint8Array> \| null/u)
 const conservativeResult = await generateTypedSql({
   include: ['.'],
   imports: {
-    runtime: 'postgres-typed-sql/runtime',
+    runtime: './runtime-facade.mjs',
     scalars: 'postgres-typed-sql/scalars',
   },
   rootDir: process.cwd(),
   schema: 'schema.sql',
 })
-assert.equal(conservativeResult.statementCount, 3)
+assert.equal(conservativeResult.statementCount, 6)
 assert.equal(Object.hasOwn(conservativeResult, 'analysis'), false)
 
 const conservativeInsert = await readFile('insertWidget.typed-sql.ts', 'utf8')
@@ -89,7 +89,7 @@ assert.match(conservativeInsert, /readonly widgetLabel: NonNullable<unknown> \| 
 await generateTypedSql({
   include: ['.'],
   imports: {
-    runtime: 'postgres-typed-sql/runtime',
+    runtime: './runtime-facade.mjs',
     scalars: 'postgres-typed-sql/scalars',
   },
   naming: {
