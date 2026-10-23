@@ -7,7 +7,7 @@ This experimental workflow requires TypeScript 7.1.0-beta and esbuild 0.25 or la
 Install the package and build tools.
 
 ```sh
-npm install postgres-typed-sql
+npm install postgres-typed-sql@beta
 npm install --save-dev typescript@7.1.0-beta esbuild
 ```
 
