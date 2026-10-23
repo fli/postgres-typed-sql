@@ -299,104 +299,116 @@ async function readTypedSqlConfigs(generatorConfig: ResolvedPostgresTypedSqlConf
   const configs: TypedSqlConfig[] = []
 
   for (const sourcePath of sourcePaths) {
-    const sourceFile = relativePath(generatorConfig, sourcePath)
     const bytes = readFileSync(sourcePath)
     const text = bytes.toString('utf8')
-    const parsedSource = parseTypedSqlSource(text, sourceFile)
-    let name = basename(sourceFile, typedSqlSourceSuffix).replace(/-([A-Za-z0-9])/gu, (_match, next: string) =>
-      next.toUpperCase()
-    )
-    let access: TypedSqlAccess | undefined
-    const nullableParameters: NullableParameterDeclaration[] = []
-    const columns: SqlColumn[] = []
-    let firstNameLocation: string | undefined
-    let firstAccessLocation: string | undefined
-    const firstColumnDirectiveByName = new Map<string, string>()
-    const firstNullableDirectiveByName = new Map<string, string>()
-
-    for (const directive of parsedSource.directives) {
-      const location = `${sourceFile}:${directive.line}`
-      const kind = directive.kind
-      const bodyParts = /^(\S+)(?:\s+([\s\S]*))?$/u.exec(directive.body)
-      const identifier = bodyParts?.[1]
-      const rawPgType = bodyParts?.[2]?.trim()
-      if (kind === 'name') {
-        if (!identifier || rawPgType) {
-          throw new Error(`${location}: @name requires exactly one TypeScript binding identifier.`)
-        }
-        if (firstNameLocation) {
-          throw new Error(`${location}: duplicate @name; first declared at ${firstNameLocation}.`)
-        }
-        assertTypeScriptBindingIdentifier(identifier, `${location}: @name`)
-        firstNameLocation = location
-        name = identifier
-        continue
-      }
-
-      if (kind === 'access') {
-        if ((identifier !== 'read' && identifier !== 'write') || rawPgType) {
-          throw new Error(`${location}: @access requires exactly read or write.`)
-        }
-
-        if (firstAccessLocation) {
-          throw new Error(`${location}: duplicate @access; first declared at ${firstAccessLocation}.`)
-        }
-        firstAccessLocation = location
-        access = identifier
-        continue
-      }
-
-      if (kind !== 'nullable' && kind !== 'bindNull' && kind !== 'column') {
-        throw new Error(`${location}: unsupported typed SQL directive @${kind}.`)
-      }
-
-      if (!identifier) {
-        throw new Error(`${location}: @${kind} requires a name.`)
-      }
-      if (kind !== 'column' && (rawPgType || !/^[A-Za-z_][A-Za-z0-9_]*$/u.test(identifier))) {
-        throw new Error(`${location}: @${kind} requires exactly one named-parameter identifier.`)
-      }
-      if (kind === 'column' && rawPgType?.endsWith('?')) {
-        throw new Error(`${location}: @column does not support ?; PostgreSQL determines result nullability.`)
-      }
-
-      const firstDirectiveByName = kind !== 'column' ? firstNullableDirectiveByName : firstColumnDirectiveByName
-      const firstLocation = firstDirectiveByName.get(identifier)
-      if (firstLocation) {
-        throw new Error(`${location}: duplicate @${kind} ${identifier}; first declared at ${firstLocation}.`)
-      }
-      firstDirectiveByName.set(identifier, location)
-
-      if (kind !== 'column') {
-        nullableParameters.push({
-          kind,
-          line: directive.line,
-          name: identifier,
-        })
-      } else {
-        columns.push({
-          name: identifier,
-          pgType: rawPgType,
-        })
-      }
-    }
-
-    assertTypeScriptBindingIdentifier(name, `${sourceFile}: typed SQL filename`)
-
     configs.push({
-      access,
-      columns,
-      name,
-      nullableParameters,
-      outputPath: generatedOutputPath(sourcePath),
-      sourceFile,
-      sourcePath,
+      ...parseTypedSqlConfig({ sourcePath, content: text, config: generatorConfig }),
       sourceSha256: sha256(bytes),
-      sql: parsedSource.sql,
     })
   }
 
   return configs
+}
+
+function parseTypedSqlConfig(input: {
+  sourcePath: string
+  content: string
+  config: ResolvedPostgresTypedSqlConfig
+}): TypedSqlConfig {
+  const { sourcePath, content: text, config: generatorConfig } = input
+  const sourceFile = relativePath(generatorConfig, sourcePath)
+  const parsedSource = parseTypedSqlSource(text, sourceFile)
+  let name = basename(sourceFile, typedSqlSourceSuffix).replace(/-([A-Za-z0-9])/gu, (_match, next: string) =>
+    next.toUpperCase()
+  )
+  let access: TypedSqlAccess | undefined
+  const nullableParameters: NullableParameterDeclaration[] = []
+  const columns: SqlColumn[] = []
+  let firstNameLocation: string | undefined
+  let firstAccessLocation: string | undefined
+  const firstColumnDirectiveByName = new Map<string, string>()
+  const firstNullableDirectiveByName = new Map<string, string>()
+
+  for (const directive of parsedSource.directives) {
+    const location = `${sourceFile}:${directive.line}`
+    const kind = directive.kind
+    const bodyParts = /^(\S+)(?:\s+([\s\S]*))?$/u.exec(directive.body)
+    const identifier = bodyParts?.[1]
+    const rawPgType = bodyParts?.[2]?.trim()
+    if (kind === 'name') {
+      if (!identifier || rawPgType) {
+        throw new Error(`${location}: @name requires exactly one TypeScript binding identifier.`)
+      }
+      if (firstNameLocation) {
+        throw new Error(`${location}: duplicate @name; first declared at ${firstNameLocation}.`)
+      }
+      assertTypeScriptBindingIdentifier(identifier, `${location}: @name`)
+      firstNameLocation = location
+      name = identifier
+      continue
+    }
+
+    if (kind === 'access') {
+      if ((identifier !== 'read' && identifier !== 'write') || rawPgType) {
+        throw new Error(`${location}: @access requires exactly read or write.`)
+      }
+
+      if (firstAccessLocation) {
+        throw new Error(`${location}: duplicate @access; first declared at ${firstAccessLocation}.`)
+      }
+      firstAccessLocation = location
+      access = identifier
+      continue
+    }
+
+    if (kind !== 'nullable' && kind !== 'bindNull' && kind !== 'column') {
+      throw new Error(`${location}: unsupported typed SQL directive @${kind}.`)
+    }
+
+    if (!identifier) {
+      throw new Error(`${location}: @${kind} requires a name.`)
+    }
+    if (kind !== 'column' && (rawPgType || !/^[A-Za-z_][A-Za-z0-9_]*$/u.test(identifier))) {
+      throw new Error(`${location}: @${kind} requires exactly one named-parameter identifier.`)
+    }
+    if (kind === 'column' && rawPgType?.endsWith('?')) {
+      throw new Error(`${location}: @column does not support ?; PostgreSQL determines result nullability.`)
+    }
+
+    const firstDirectiveByName = kind !== 'column' ? firstNullableDirectiveByName : firstColumnDirectiveByName
+    const firstLocation = firstDirectiveByName.get(identifier)
+    if (firstLocation) {
+      throw new Error(`${location}: duplicate @${kind} ${identifier}; first declared at ${firstLocation}.`)
+    }
+    firstDirectiveByName.set(identifier, location)
+
+    if (kind !== 'column') {
+      nullableParameters.push({
+        kind,
+        line: directive.line,
+        name: identifier,
+      })
+    } else {
+      columns.push({
+        name: identifier,
+        pgType: rawPgType,
+      })
+    }
+  }
+
+  assertTypeScriptBindingIdentifier(name, `${sourceFile}: typed SQL filename`)
+
+  return {
+    access,
+    columns,
+    name,
+    nullableParameters,
+    outputPath: generatedOutputPath(sourcePath),
+    sourceFile,
+    sourcePath,
+    sourceSha256: sha256(text),
+    sql: parsedSource.sql,
+  }
 }
 
 function compileTypedSql(config: TypedSqlConfig, parameterNaming: PostgresTypedSqlPropertyNaming): CompiledTypedSql {
@@ -1510,4 +1522,17 @@ export async function generateTypedSql(
       generationInProgress = false
     }
   }
+}
+
+export async function compileTypedSqlSource(input: {
+  readonly sourcePath: string
+  readonly content: string
+  readonly database: AnalysisDatabase
+  readonly config: ResolvedPostgresTypedSqlConfig
+}): Promise<string> {
+  const parsed = parseTypedSqlConfig(input)
+  const compiled = compileTypedSql(parsed, input.config.naming.parameterProperties)
+  const [statement] = await resolveTypedSqlWithAnalyzer([compiled], input.database, input.config)
+  if (!statement) throw new Error('PostgreSQL analyzer returned no statement.')
+  return renderTypedSql(statement, input.config)
 }

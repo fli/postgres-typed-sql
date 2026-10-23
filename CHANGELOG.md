@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.0-beta.20
+
+- Add experimental direct `.typed.sql` imports for bundled ESM Node applications through the TypeScript 7.1 beta content mapper and `postgres-typed-sql/esbuild` plugin. The default callable, named statement, exported types, codecs, and result mapping use the existing generator contracts.
+- Check supplied SQL buffers without generated siblings. Refresh saved schema and ESM helper inputs, report recoverable SQL diagnostics, and dispose isolated analysis processes on project shutdown.
+- Add explicit `configDependencies` for package manifests and non-module configuration inputs. See the direct-import guide for setup, refresh rules, and the supported scope.
+
 ## 0.1.0-beta.19
 
 - Generate a default callable alongside each named statement descriptor. Execution returns the analyzer-inferred row, nullable row, row array, affected-row count, or void result.
