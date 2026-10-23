@@ -1,5 +1,7 @@
 # Postgres Typed SQL
 
+For bundled Node applications, the experimental [direct SQL import workflow](docs/direct-imports.md) checks `.typed.sql` imports with TypeScript 7.1 and builds them with esbuild without a generation command.
+
 Postgres Typed SQL generates TypeScript statements from SQL by asking an embedded PostgreSQL engine to perform parse analysis and query rewriting against your real schema.
 
 The package does not approximate PostgreSQL semantics with a separate parser. It bundles PostgreSQL 18.3 through a custom PGlite build and fails when a schema requires an unsupported database feature or extension.
