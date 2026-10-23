@@ -4250,6 +4250,16 @@ function normalizeCompiledIr(catalog: CatalogFacts, analyzed: AnalyzedCompiledCo
     params,
     postgresVersionNum: analysis.postgresVersionNum,
     resultColumns,
+    resultKind:
+      query.commandType === 'UTILITY'
+        ? 'void'
+        : query.commandType !== 'SELECT' && (query.returningList ?? []).length === 0
+          ? 'command'
+          : rowBounds.min === 1 && rowBounds.max === 1
+            ? 'one'
+            : rowBounds.min === 0 && rowBounds.max === 1
+              ? 'optional'
+              : 'many',
     rowBounds,
     sourceFile: config.sourceFile,
   }

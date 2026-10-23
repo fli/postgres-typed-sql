@@ -1,0 +1,8 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "outDir": "./compiled"
+  },
+  "include": ["execute.mts", "runtime-facade.mts", "*.typed-sql.ts"]
+}

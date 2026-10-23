@@ -1,3 +1,4 @@
+import type { TypedSqlResultKind } from './runtime.js'
 import type { PostgresTypeFact } from './postgres-types.js'
 
 export interface TypedSqlPostgresIr {
@@ -8,6 +9,7 @@ export interface TypedSqlPostgresIr {
   readonly params: readonly TypedSqlPostgresIrParam[]
   readonly postgresVersionNum: number
   readonly resultColumns: readonly TypedSqlPostgresIrColumn[]
+  readonly resultKind: TypedSqlResultKind
   readonly rowBounds: TypedSqlPostgresIrRowBounds
   readonly sourceFile: string
 }

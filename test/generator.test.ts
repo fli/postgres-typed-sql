@@ -86,18 +86,18 @@ test('escapes every ECMAScript line terminator in generated line-comment values'
   assert.equal(renderTypeScriptLineCommentValue('before\r\n\u2028\u2029after'), 'before\\r\\n\\u2028\\u2029after')
 })
 
-test('generates PostgreSQL-derived types, nullability, and cardinality', async () => {
+test('generates PostgreSQL-derived types, nullability, and resultKind', async () => {
   const root = await copyFixture()
   const result = await generateFixture(root, { extensions: ['pgcrypto'] })
 
   assert.equal(result.statementCount, 4)
   const account = await readFile(join(root, 'queries/findAccountByEmail.typed-sql.ts'), 'utf8')
-  assert.match(account, /cardinality: 'optional'/u)
+  assert.match(account, /resultKind: 'optional'/u)
   assert.match(account, /readonly display_name: string \| null/u)
   assert.match(account, /readonly status: "active" \| "suspended"/u)
   assert.match(account, /readonly role: 'member' \| 'admin'/u)
   assert.doesNotMatch(account, /postgres-typed-sql\.types/u)
-  assert.match(account, /postgres-typed-sql\/runtime/u)
+  assert.match(account, /postgres-typed-sql\/adapters\/node-postgres/u)
 
   const joined = await readFile(join(root, 'queries/listAccountsWithPosts.typed-sql.ts'), 'utf8')
   assert.match(joined, /readonly title: string \| null/u)
@@ -1984,7 +1984,7 @@ as $$ begin output_value := input_value * 2; end $$;
   const output = await readFile(outputFile, 'utf8')
   assert.match(output, /export type QueryRow = Record<string, never>/u)
   assert.match(output, /access: 'write'/u)
-  assert.match(output, /cardinality: 'none'/u)
+  assert.match(output, /resultKind: 'void'/u)
   assert.match(output, /rowBounds: \{ min: 0, max: 0, proof: 'no_result_columns' \}/u)
 
   for (const [sql, error] of [

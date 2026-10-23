@@ -19,6 +19,8 @@ before=$(find node_modules -type f -exec shasum -a 256 {} \; | sort | shasum -a 
 node smoke.mjs
 node smoke.cjs
 "$project_root/node_modules/.bin/tsc" --project tsconfig.json
+"$project_root/node_modules/.bin/tsc" --project tsconfig.runtime.json
+node compiled/execute.mjs
 after=$(find node_modules -type f -exec shasum -a 256 {} \; | sort | shasum -a 256 | awk '{print $1}')
 
 if [ "$before" != "$after" ]; then

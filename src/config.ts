@@ -20,7 +20,7 @@ export interface PostgresTypedSqlNamingConfig {
 }
 
 export interface PostgresTypedSqlImportsConfig {
-  /** Exact module specifier for the generated-code runtime exporting createTypedSqlStatement. */
+  /** Exact module specifier for the generated-code runtime exporting createTypedSqlStatement and createTypedSqlExecutor. */
   readonly runtime: string
   /** Exact module specifier for PostgreSQL scalar type declarations used by generated code. */
   readonly scalars: string

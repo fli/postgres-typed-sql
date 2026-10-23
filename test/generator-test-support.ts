@@ -7,7 +7,7 @@ import { generateTypedSql as generateTypedSqlBase } from '../src/generator.js'
 
 const fixtureRoot = new URL('./fixtures/', import.meta.url)
 const testImports = {
-  runtime: 'postgres-typed-sql/runtime',
+  runtime: 'postgres-typed-sql/adapters/node-postgres',
   scalars: 'postgres-typed-sql/scalars',
 } as const
 

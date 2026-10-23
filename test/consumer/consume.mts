@@ -1,6 +1,9 @@
+import runOneWidget, { type OneWidgetRow } from './oneWidget.typed-sql.js'
+import runDeleteWidget from './deleteWidget.typed-sql.js'
+import runCallWidget from './callWidget.typed-sql.js'
 import { echoBytes } from './echoBytes.typed-sql.js'
-import { findWidget } from './findWidget.typed-sql.js'
-import { insertWidget } from './insertWidget.typed-sql.js'
+import runFindWidget, { findWidget, type FindWidgetRow } from './findWidget.typed-sql.js'
+import runInsertWidget, { insertWidget, type InsertWidgetRow } from './insertWidget.typed-sql.js'
 import type { NodePostgresTypedSqlClient } from 'postgres-typed-sql/adapters/node-postgres'
 import type { TypedSqlColumnMetadata } from 'postgres-typed-sql/runtime'
 import type { PgArray, PgArrayParameter } from 'postgres-typed-sql/scalars'
@@ -103,3 +106,32 @@ insertWidget.query({ code: null, widgetLabel: null })
 
 // @ts-expect-error SQL parameters do not accept JavaScript undefined.
 insertWidget.query({ code: 'widget-code', widgetLabel: undefined })
+
+const inferredFind = await runFindWidget(client, { code: 'widget-code', metrics: [] })
+const inferredInsert = await runInsertWidget(client, { code: 'new-widget', widgetLabel: null })
+const findType: IsExactly<typeof inferredFind, FindWidgetRow | null> = true
+const insertType: IsExactly<typeof inferredInsert, InsertWidgetRow[]> = true
+void inferredFind
+void inferredInsert
+void findType
+void insertType
+// @ts-expect-error The generated callable requires its parameter object.
+await runFindWidget(client)
+// @ts-expect-error Nullable properties remain required.
+await runInsertWidget(client, { code: 'new-widget' })
+// @ts-expect-error Callers cannot choose an execution result generic.
+await runFindWidget<string>(client, { code: 'widget-code', metrics: [] })
+
+const inferredOne = await runOneWidget(client)
+await runOneWidget(client, {})
+const inferredCommand = await runDeleteWidget(client, { code: 'removed' })
+const inferredVoid = await runCallWidget(client)
+const oneType: IsExactly<typeof inferredOne, OneWidgetRow> = true
+const commandType: IsExactly<typeof inferredCommand, number> = true
+const voidType: IsExactly<typeof inferredVoid, void> = true
+void inferredOne
+void inferredCommand
+void inferredVoid
+void oneType
+void commandType
+void voidType

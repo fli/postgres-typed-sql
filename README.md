@@ -33,7 +33,7 @@ export default defineConfig({
   schema: './db/schema.sql',
   include: ['./src'],
   imports: {
-    runtime: 'postgres-typed-sql/runtime',
+    runtime: 'postgres-typed-sql/adapters/node-postgres',
     scalars: 'postgres-typed-sql/scalars',
   },
   extensions: ['pgcrypto'],
@@ -46,7 +46,7 @@ export default defineConfig({
 })
 ```
 
-`imports` is required because generated statements have a runtime value dependency and a type-only scalar-support dependency. One generation invocation uses the same two exact module specifiers for every output; workspaces that publish different generated-code façades should use separate configurations. The configured modules are two addresses within the ABI owned by this generator version: `runtime` must export `createTypedSqlStatement`, and `scalars` must export the scalar bindings used by the selected profile. No package suffixes are inferred.
+`imports` is required because generated statements have a runtime value dependency and a type-only scalar-support dependency. One generation invocation uses the same two exact module specifiers for every output; workspaces that publish different generated-code façades should use separate configurations. The configured modules are two addresses within the ABI owned by this generator version: `runtime` must export `createTypedSqlStatement` and `createTypedSqlExecutor`, and `scalars` must export the scalar bindings used by the selected profile. No package suffixes are inferred.
 
 The generated catalog defaults to `postgres-typed-sql.types.ts` and can be relocated with `typesOutput`. Statement files do not import that artifact: enum labels and supported CHECK-constraint refinements are rendered directly into their parameter, result, and structured-JSON types. The catalog remains available as a standalone database model for application code that needs it.
 
@@ -112,10 +112,18 @@ generic is not inferred from a query configuration object, so a direct unannotat
 The core runtime is driver-neutral. It owns statement construction, named-parameter ordering, result metadata, positional/object row mapping, structured-JSON mapping, and affected-row-count normalization. Driver query options and execution live in adapters. For node-postgres:
 
 ```ts
-import { executeTypedSqlOptional } from 'postgres-typed-sql/adapters/node-postgres'
+import findAccountByEmail from './findAccountByEmail.typed-sql.js'
 
-const account = await executeTypedSqlOptional(client, findAccountByEmail, { email })
+const account = await findAccountByEmail(client, { email })
 ```
+
+Each generated module default-exports a callable that accepts the supplied client and its generated parameter object. The named statement export remains available for metadata, `query()`, and composition with `executeTypedSql(client, statement, params)`. Parameterless callables accept either `run(client)` or `run(client, {})`. A parameterized callable requires its object even when every value is nullable.
+
+The analyzer selects `resultKind` and matching `rowBounds`. Exactly one row returns `Row`, zero or one returns `Row | null`, and other row bounds return `Row[]`, including a proved empty SELECT. DML without RETURNING returns its affected-row count. A supported CALL without output returns `void`. DML with RETURNING uses the existing conservative bounds, so INSERT RETURNING can return an array even for a single VALUES tuple. There is no caller-selected result shape.
+
+When migrating from the removed `executeTypedSqlOne`, `executeTypedSqlOptional`, and `executeTypedSqlCommand` helpers, regenerate statements and review each inferred result shape. If a former One call now returns `Row | null`, keep an explicit missing-row check when the application requires a row. If a former One or Optional call now returns `Row[]`, keep the application's explicit row-count assertion before selecting a row. This includes a single-row INSERT RETURNING whose bounds remain conservative. A former Command call on DML with RETURNING now receives rows instead of an affected-row count. Improved analyzer proofs can change the inferred shape on later regeneration, so review those changes with their callers.
+
+The adapter executes once on the supplied client. It checks every proved row bound after execution, rejects unexpected rows for command and void results, and requires a nonnegative safe affected-row count for commands. A bound failure can occur after SQL has executed, so callers must not automatically retry it. Old generated statements missing result metadata must be regenerated. Custom runtime façades must export both factories from the same exact `imports.runtime` module. Codec profiles control scalar types independently of the execution adapter.
 
 The node-postgres adapter requests array rows for generated statements, maps them by result-column position, enforces `one`, `optional`, and `many` result shapes, and returns the generated row type selected by the configured codec profile. Positional mapping preserves every unique PostgreSQL result name safely, including names such as `__proto__` that object-row construction cannot represent reliably. Other drivers can consume statement `text`, `values(params)`, `columns`, and `resultRowMapping` and use the core mapping functions without importing any node-postgres contract.
 
@@ -129,7 +137,7 @@ Postgres Typed SQL uses application-facing camel-case parameter properties by de
 export default defineConfig({
   schema: './db/schema.sql',
   imports: {
-    runtime: 'postgres-typed-sql/runtime',
+    runtime: 'postgres-typed-sql/adapters/node-postgres',
     scalars: 'postgres-typed-sql/scalars',
   },
   codecProfile: 'node-postgres',
@@ -147,7 +155,7 @@ For result values, a PostgreSQL column `account_id` becomes the mapped row prope
 
 Naming is deterministic and conservative: conventional lower-snake-case identifiers are camel-cased, already camel-case names stay unchanged, and unusual names such as `URL`, `__proto__`, leading or repeated underscores, spaces, and hyphens are preserved. Generation rejects parameter, result, or modeled JSON properties that collide after transformation. Parameter collisions must be resolved by choosing distinct SQL tokens or explicitly selecting `'preserve'`; they never fall back, receive suffixes, or overwrite one another.
 
-The generated row type describes mapped execution through the node-postgres adapter's `executeTypedSql`, `executeTypedSqlOne`, and `executeTypedSqlOptional`. Direct `client.query(statement.query(params))` execution remains raw and returns driver/PostgreSQL result names because the driver constructs those object rows. Parameter-object lookup still uses the generated public property names. Generated catalog types and opaque JSON contents are unaffected.
+The generated row type describes mapped execution through the node-postgres adapter's `executeTypedSql` and generated default callable. Direct `client.query(statement.query(params))` execution remains raw and returns driver/PostgreSQL result names because the driver constructs those object rows. Parameter-object lookup still uses the generated public property names. Generated catalog types and opaque JSON contents are unaffected.
 
 Structured JSON field naming requires a codec profile with `structuredJson: true` when a query needs a nested mapping, because the runtime must know that `json` and `jsonb` values are decoded into JavaScript objects and arrays. The built-in `node-postgres` profile provides this capability.
 
@@ -291,7 +299,7 @@ Parameter type annotations are intentionally unsupported. Move type information 
 
 Prefer contextual inference from columns, function signatures, operators, `VALUES`, DML targets, and other ordinary SQL constructs. Add casts only where they express an actual SQL type boundary or resolve an ambiguity. Typemods such as `varchar(100)` are authored SQL semantics rather than parameter metadata and must be migrated deliberately; do not assume that a base-type cast preserves typemod behavior.
 
-Generated cardinality is derived from the analyzer's row bounds. At-most-one proofs include direct primary/unique-key lookups and supported inner-join chains in which every relation is determined through primary or unique keys. A `rowBounds.max` value of `null` means that analysis did not prove a finite upper bound, not that execution is known to produce multiple rows; the public contract remains conservatively `many`.
+For row-producing statements, generated `resultKind` is derived from the analyzer's row bounds. At-most-one proofs include direct primary/unique-key lookups and supported inner-join chains in which every relation is determined through primary or unique keys. A `rowBounds.max` value of `null` means that analysis did not prove a finite upper bound, not that execution is known to produce multiple rows; the public contract remains conservatively `many`.
 
 Bounds also compose through ordinary window functions, supported DISTINCT and grouping, directional LEFT joins with
 unique matches, and bounded lateral subqueries. Unique-key lookups may use supported immutable expressions over
@@ -322,7 +330,7 @@ const result = await generateTypedSql({
   rootDir: process.cwd(),
   schema: ['./db/base.sql', './db/functions.sql'],
   include: ['./src'],
-  imports: { runtime: 'postgres-typed-sql/runtime', scalars: 'postgres-typed-sql/scalars' },
+  imports: { runtime: 'postgres-typed-sql/adapters/node-postgres', scalars: 'postgres-typed-sql/scalars' },
 })
 ```
 

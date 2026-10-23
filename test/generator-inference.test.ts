@@ -4,7 +4,7 @@ import test from 'node:test'
 
 import { renderQuery } from './generator-test-support.js'
 
-test('generates precise range JSON fields and optional cardinality through a unique join chain', async () => {
+test('generates precise range JSON fields and optional resultKind through a unique join chain', async () => {
   const output = await renderQuery(
     `create table public.trainers (
   id bigint primary key,
@@ -34,7 +34,7 @@ where trainer.id = :trainer_id
   and not upper_inf(trainer.active_span)
 `
   )
-  assert.match(output, /cardinality: 'optional'/u)
+  assert.match(output, /resultKind: 'optional'/u)
   assert.match(output, /readonly lower: number\n/u)
   assert.match(output, /readonly upper: number\n/u)
   assert.doesNotMatch(output, /readonly lower: number \| null/u)
