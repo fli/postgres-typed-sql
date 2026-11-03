@@ -46,8 +46,10 @@ function corruptAnalyzerEnvelope(
       }
       const rows = structuredClone(result.rows) as unknown[]
       const firstRow = envelopeObject(rows[0])
-      const analysis = envelopeObject(firstRow.analysis)
+      assert.ok(typeof firstRow.analysis === 'string')
+      const analysis = envelopeObject(JSON.parse(firstRow.analysis))
       mutate(analysis)
+      firstRow.analysis = JSON.stringify(analysis)
       return { rows: rows as Row[] }
     },
   }
@@ -57,6 +59,66 @@ function firstEnvelopeQuery(analysis: MutableEnvelopeObject): MutableEnvelopeObj
   const statement = envelopeObject(envelopeArray(analysis.statements)[0])
   return envelopeObject(envelopeArray(statement.queries)[0])
 }
+
+testWithDatabase('decodes native JSON text to the same values as the legacy jsonb transport', async (database) => {
+  await database.query('create table public.transport_probe (id bigint, value text)')
+  const statements = [
+    `select -9223372036854775808::bigint, 9223372036854775807::bigint,
+       12345678901234567890.123456789::numeric, E'雪😀\\n\\t\\\\quote''s' as value`,
+    `with first_cte as (select 1 as id), second_cte as (select id from first_cte)
+       select id from second_cte`,
+    `with inserted as (
+       insert into public.transport_probe (id, value) values (1, E'雪\\n') returning id, value
+     ) select id, value from inserted`,
+    `update public.transport_probe set value = 'changed' where id = 1 returning id, value`,
+  ]
+
+  for (const sql of statements) {
+    await database.query('select 1')
+    const textResult = await database.query<{ readonly analysis: string }>(
+      `select pg_temp.postgres_typed_sql_analyze($transport$${sql}$transport$) as analysis`
+    )
+    await database.query('select 1')
+    const jsonbResult = await database.query<{ readonly analysis: unknown }>(
+      `select pg_temp.postgres_typed_sql_analyze($transport$${sql}$transport$)::jsonb as analysis`
+    )
+    const textAnalysis = textResult.rows[0]?.analysis
+    assert.ok(typeof textAnalysis === 'string')
+    assert.deepEqual(JSON.parse(textAnalysis), jsonbResult.rows[0]?.analysis, sql)
+  }
+})
+
+testWithDatabase('probes malformed analyzer text before continuing to later statements', async (database) => {
+  const invocations: string[] = []
+  const observedClient: PostgresQueryable = {
+    async query<Row>(text: string, params?: readonly unknown[]) {
+      if (text.includes('postgres_typed_sql_analyze')) {
+        invocations.push(text)
+        if (text.includes('$postgres_typed_sql$select 1001$postgres_typed_sql$')) {
+          return { rows: [{ analysis: '{' }] as Row[] }
+        }
+      }
+      return database.query<Row>(text, params)
+    },
+  }
+
+  await assert.rejects(
+    buildTypedSqlPostgresIrFromCompiledConfigs(observedClient, [
+      config('malformedTransport', 'select 1001'),
+      config('followingStatement', 'select 1002'),
+    ]),
+    (error: unknown) => {
+      assert.ok(error instanceof Error)
+      assert.match(error.message, /queries\/malformedTransport\.typed\.sql/u)
+      assert.ok(error.cause instanceof SyntaxError)
+      return true
+    }
+  )
+  assert.equal(invocations.length, 3)
+  assert.match(invocations[0] ?? '', /select 1001/u)
+  assert.match(invocations[1] ?? '', /\$postgres_typed_sql\$select 1\$postgres_typed_sql\$/u)
+  assert.match(invocations[2] ?? '', /select 1002/u)
+})
 
 testWithDatabase(
   'rejects incomplete or unknown native access facts instead of proving read-only execution',
@@ -788,7 +850,7 @@ testWithDatabase('composes canonical row bounds with scalar EXPR subquery output
   assert.equal(nullability('nestedSetScalar')?.kind, 'nullable')
 })
 
-testWithDatabase('throws on malformed and cyclic scalar EXPR subquery ownership', async (database) => {
+testWithDatabase('throws on malformed scalar EXPR subquery ownership', async (database) => {
   const cases: readonly {
     readonly corrupt: (analysis: MutableEnvelopeObject) => void
     readonly error: RegExp
@@ -804,15 +866,6 @@ testWithDatabase('throws on malformed and cyclic scalar EXPR subquery ownership'
       error: /EXPR SubLink query has 0 result outputs; expected exactly 1/u,
       name: 'missingScalarOutput',
     },
-    {
-      corrupt(analysis) {
-        const query = firstEnvelopeQuery(analysis)
-        const target = envelopeObject(envelopeArray(query.targetList)[0])
-        envelopeObject(target.expr).subquery = query
-      },
-      error: /cyclic nested-query ownership/u,
-      name: 'cyclicScalarQuery',
-    },
   ]
 
   for (const fixture of cases) {
@@ -822,6 +875,37 @@ testWithDatabase('throws on malformed and cyclic scalar EXPR subquery ownership'
       ]),
       fixture.error
     )
+  }
+})
+
+testWithDatabase('rejects cyclic scalar EXPR subquery ownership', async (database) => {
+  const originalParse = JSON.parse
+  const sentinel = 'cyclic analyzer envelope'
+  let cyclicAnalysis: unknown
+  const client: PostgresQueryable = {
+    async query<Row>(text: string, params?: readonly unknown[]) {
+      const result = await database.query<Row>(text, params)
+      if (!text.includes('postgres_typed_sql_analyze')) return result
+      const rows = structuredClone(result.rows) as unknown[]
+      const firstRow = envelopeObject(rows[0])
+      assert.ok(typeof firstRow.analysis === 'string')
+      const analysis = envelopeObject(originalParse(firstRow.analysis))
+      const query = firstEnvelopeQuery(analysis)
+      const target = envelopeObject(envelopeArray(query.targetList)[0])
+      envelopeObject(target.expr).subquery = query
+      cyclicAnalysis = analysis
+      firstRow.analysis = sentinel
+      return { rows: rows as Row[] }
+    },
+  }
+  JSON.parse = (text, reviver) => (text === sentinel ? cyclicAnalysis : originalParse(text, reviver))
+  try {
+    await assert.rejects(
+      buildTypedSqlPostgresIrFromCompiledConfigs(client, [config('cyclicScalarQuery', 'select (select 1) as value')]),
+      /cyclic nested-query ownership/u
+    )
+  } finally {
+    JSON.parse = originalParse
   }
 })
 

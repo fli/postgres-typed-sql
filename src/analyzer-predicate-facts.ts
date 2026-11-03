@@ -100,6 +100,24 @@ function literalFactVarKey(key: PredicateFactKey): string | null {
     : null
 }
 
+function literalAndExcludedVarFacts(
+  keys: ReadonlySet<PredicateFactKey>,
+  variable: string
+): { literals: readonly (readonly string[])[]; excluded: readonly string[] } {
+  const literalPrefix = `var_literal:${variable}:`
+  const excludedPrefix = `var_excluded:${variable}:`
+  const literals: PredicateFactKey[] = []
+  const excluded: PredicateFactKey[] = []
+  for (const key of keys) {
+    if (key.startsWith(literalPrefix)) literals.push(key)
+    if (key.startsWith(excludedPrefix)) excluded.push(key)
+  }
+  return {
+    literals: literals.map((key) => JSON.parse(key.slice(literalPrefix.length)) as readonly string[]),
+    excluded: excluded.flatMap((key) => JSON.parse(key.slice(excludedPrefix.length)) as readonly string[]),
+  }
+}
+
 function normalizePredicateKeys(keys: Set<PredicateFactKey>): ReadonlySet<PredicateFactKey> {
   const groups: Set<string>[] = []
   for (const key of keys) {
@@ -123,8 +141,8 @@ function normalizePredicateKeys(keys: Set<PredicateFactKey>): ReadonlySet<Predic
     }
   }
   for (const variable of variables) {
-    const [first, ...rest] = literalVarFacts(keys, variable)
-    const excluded = excludedVarFacts(keys, variable)
+    const { literals, excluded } = literalAndExcludedVarFacts(keys, variable)
+    const [first, ...rest] = literals
     if (first) {
       const allowed = first.filter(
         (label) => rest.every((labels) => labels.includes(label)) && !excluded.includes(label)
