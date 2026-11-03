@@ -21,9 +21,30 @@ jobs:
           cache: pnpm
       - run: pnpm install --frozen-lockfile --ignore-scripts
       - run: pnpm build:engine
+      - run: node --test scripts/package-receipt.test.mjs
       - run: pnpm test:all
+      - run: node scripts/package-receipt.mjs create artifacts/npm-pack "$GITHUB_SHA"
       - uses: actions/upload-artifact@v4
         with:
           name: npm-package
-          path: artifacts/npm-pack/*.tgz
+          path: |
+            artifacts/npm-pack/*.tgz
+            artifacts/npm-pack/receipt.json
           if-no-files-found: error
+
+  node-20-compatibility:
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20.19.0
+      - uses: actions/download-artifact@v4
+        with:
+          name: npm-package
+          path: artifacts/npm-pack
+      - run: |
+          tarball=$(node scripts/package-receipt.mjs verify artifacts/npm-pack "$GITHUB_SHA")
+          node scripts/node-compatibility-check.mjs "$tarball"

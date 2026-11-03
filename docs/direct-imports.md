@@ -94,9 +94,47 @@ await build({
 
 Run `node build.mjs`. The adapter resolves its config path from the build script process's working directory. Relative runtime and scalar facade imports resolve from each original SQL file's directory. Esbuild transpiles the query module as TypeScript.
 
-TypeScript does not emit executable SQL modules. Use the esbuild build API with this plugin for runtime output. The standalone esbuild transform API does not run plugins.
+TypeScript does not emit executable SQL modules. Use a build adapter for runtime output. The standalone esbuild transform API does not run plugins.
 
 The bundle executes query descriptors through the existing runtime. Query imports in the bundle do not load schemas, evaluate configuration, or initialize the analyzer. Application code that explicitly imports generator APIs still includes those APIs.
+
+## Bundle with Next.js or webpack
+
+Install `esbuild` alongside `postgres-typed-sql`. Configure the loader for Turbopack in `next.config.mjs`.
+
+```js
+import { createRequire } from 'node:module'
+import { resolve } from 'node:path'
+
+const require = createRequire(import.meta.url)
+const loader = require.resolve('postgres-typed-sql/turbopack-loader')
+const options = { config: resolve('postgres-typed-sql.config.mjs') }
+
+export default {
+  turbopack: {
+    rules: {
+      '*.typed.sql': { loaders: [{ loader, options }], as: '*.js' },
+    },
+  },
+}
+```
+
+For webpack, add `{ test: /\.typed\.sql$/, use: [{ loader, options }] }` to `module.rules`. The loader uses esbuild to remove TypeScript syntax from the compiled SQL module. Its config path resolves from the build process's working directory. The loader reuses an analysis session during builds and closes it after a short idle period.
+
+## Bundle with Vite or Vitest
+
+Install `esbuild` alongside `postgres-typed-sql` and add the plugin to the Vite or Vitest config.
+
+```js
+import { defineConfig } from 'vite'
+import { postgresTypedSql } from 'postgres-typed-sql/vite'
+
+export default defineConfig({
+  plugins: [postgresTypedSql({ config: './postgres-typed-sql.config.mjs' })],
+})
+```
+
+The plugin watches the configuration and schema inputs used by each query. It refreshes query modules when those inputs change and closes the session when the build or dev server closes. Its config path resolves from the process's working directory.
 
 ## Refresh inputs
 
@@ -132,10 +170,38 @@ Listed files are fingerprinted before configuration evaluation and checked aroun
 
 Use a fixed, ordered schema file list. Glob inventories, directory enumeration, late dynamic imports in callbacks, inherited environment variables, package installations, and symbolic-link targets require restarting the tooling host after changes. Clear TypeScript incremental build information when changing inputs outside the watched set. Unsaved schema or config edits are not read.
 
-Esbuild registers SQL and configuration dependencies for watching and closes the analysis process when the build context is disposed. In watch mode, SQL failures retain the dependency list so a correction can rebuild.
+The adapters register SQL and configuration dependencies for watching. SQL failures retain the dependency list so a correction can rebuild.
 
 ## Keep generation where it is still required
 
 Code that imports `postgres-typed-sql.types.ts` still needs catalog generation. The complete version-2 generation-analysis report remains part of the existing generator API.
 
 The initial direct-import workflow covers bundled ESM Node applications. It does not claim downstream library declarations, unbundled emission, or CommonJS direct SQL imports. Diagnostics currently identify the SQL file without precise ranges. SQL navigation and editor-specific behavior have not been validated.
+
+## Build-time project API
+
+Project analysis, inventory and catalog methods, and the Next.js and Vite adapters require Node.js 22.15 or later for synchronous configuration dependency tracking. The existing generator, runtime, direct compile method and esbuild adapter retain Node.js 20.19 support.
+
+`postgres-typed-sql/project` provides a session for custom build adapters and policy tools. It runs the same compiler as the mapper and esbuild plugin. The session writes no files.
+
+```ts
+import { openQueryProject } from 'postgres-typed-sql/project'
+
+const project = await openQueryProject('/absolute/path/postgres-typed-sql.config.mjs', {
+  configDependencies: ['package.json'],
+})
+try {
+  const moduleText = await project.compile(absoluteSqlPath, sqlSource)
+  const snapshot = await project.analyzeProject()
+  await project.verify(snapshot)
+  const catalogTypes = await project.catalog()
+} finally {
+  await project.close()
+}
+```
+
+`compile` and `analyze` take an absolute SQL source path and the source text. `analyze` returns the generated module text, source hash, actual statement and default executor exports, compiled SQL hash, runtime descriptor, access evidence, and ordered parameter null contracts. The buffer need not match the saved file. `compile` returns only the module text.
+
+`analyzeProject` discovers every configured SQL source on disk and returns a versioned snapshot with producer and PostgreSQL versions, project root, include roots, extension list, input hashes, and statement facts. Inputs include configuration modules and declared dependencies, ordered schema inputs, SQL files, and the bundled engine files, including extension archives and PGlite JavaScript, WebAssembly and initialization data. `sources` only inventories files and does not initialize PostgreSQL or validate the schema. Compilation and analysis initialize the schema when needed. `catalog` returns catalog TypeScript without writing it. The caller chooses whether and where to save that text.
+
+`analyzeProject` freezes the returned snapshot and its nested values. `verify` accepts only that snapshot object from the same session. It checks the captured input hashes and the current SQL inventory. A copied or deserialized report is not authenticated by this API. Verification describes the inputs observed during the check; it cannot prevent a later filesystem edit. Reopen the session after a configuration, schema, or engine input changes. Close each session, including after an error. The configuration dependency limitations in [Refresh inputs](#refresh-inputs) also apply to this API.

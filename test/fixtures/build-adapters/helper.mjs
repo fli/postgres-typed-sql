@@ -1,0 +1,1 @@
+export default { resultColumns: 'camelCase' }

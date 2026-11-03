@@ -42,6 +42,7 @@ import {
 } from './postgres-codecs.js'
 import { postgresJsonValueMayBeStructured } from './postgres-types.js'
 import { compileNamedParameters, parseTypedSqlSource } from './sql-source.js'
+import type { QueryAnalysis, QueryDescriptor } from './project-facts.js'
 import type { TypedSqlResultKind, TypedSqlJsonFieldMappingMetadata, TypedSqlJsonMappingMetadata } from './runtime.js'
 import {
   assertTypeScriptBindingIdentifier,
@@ -134,6 +135,7 @@ interface ResolvedTypedSql {
   readonly columns: readonly ResolvedSqlColumn[]
   readonly command: TypedSqlCommand
   readonly generatedTypeDeclarations: readonly string[]
+  readonly typeExports: readonly string[]
   readonly name: string
   readonly outputPath: string
   readonly parameters: readonly ResolvedSqlField[]
@@ -253,7 +255,7 @@ function accessConcernDescription(concern: TypedSqlPostgresIrAccessConcern): str
   }
 }
 
-async function findTypedSqlFiles(
+export async function findTypedSqlFiles(
   config: ResolvedPostgresTypedSqlConfig,
   suffixes: readonly string[]
 ): Promise<string[]> {
@@ -805,7 +807,9 @@ function renderInterface(name: string, fields: GeneratedJsonTypeDeclaration['fie
   ].join('\n')
 }
 
-function renderMetadata(entries: readonly (ResolvedSqlColumn | ResolvedSqlField)[]): string {
+function renderMetadata(
+  entries: readonly (QueryDescriptor['columns'][number] | QueryDescriptor['parameters'][number])[]
+): string {
   if (entries.length === 0) {
     return '[]'
   }
@@ -830,10 +834,38 @@ function renderMetadata(entries: readonly (ResolvedSqlColumn | ResolvedSqlField)
   return `[\n${objects.join(',\n')},\n  ]`
 }
 
+function queryDescriptor(config: ResolvedTypedSql): QueryDescriptor {
+  const metadata = (field: ResolvedSqlField) => ({
+    name: field.name,
+    nullable: field.nullable,
+    pgType: field.pgType,
+    pgTypeName: field.pgTypeName,
+    pgTypeSchema: field.pgTypeSchema,
+    propertyName: field.propertyName,
+  })
+  return {
+    access: config.access,
+    resultKind: config.resultKind,
+    columns: config.columns.map((column) => ({
+      expressionSource: column.expressionSource,
+      ...(column.jsonMapping ? { jsonMapping: column.jsonMapping } : {}),
+      ...metadata(column),
+    })),
+    command: config.command,
+    name: config.name,
+    parameterNames: config.parameters.map((parameter) => parameter.propertyName),
+    parameters: config.parameters.map(metadata),
+    resultRowMapping: 'positional',
+    rowBounds: { min: config.rowBounds.min, max: config.rowBounds.max, proof: config.rowBounds.proof },
+    text: config.sql,
+  }
+}
+
 function renderStatement(config: ResolvedTypedSql): string {
+  const descriptor = queryDescriptor(config)
   const paramsName = `${pascalCaseIdentifier(config.name)}Params`
   const rowName = `${pascalCaseIdentifier(config.name)}Row`
-  const parameterNames = config.parameters.map((parameter) => quoteString(parameter.propertyName)).join(', ')
+  const parameterNames = descriptor.parameterNames.map(quoteString).join(', ')
   const generatedTypeDeclarations =
     config.generatedTypeDeclarations.length > 0 ? `${config.generatedTypeDeclarations.join('\n\n')}\n\n` : ''
 
@@ -844,18 +876,18 @@ ${renderInterface(rowName, config.columns)}
 export const ${config.name} = createTypedSqlStatement<
   ${paramsName},
   ${rowName},
-  ${quoteString(config.access)},
-  ${quoteString(config.resultKind)}
+  ${quoteString(descriptor.access)},
+  ${quoteString(descriptor.resultKind)}
 >({
-  access: ${quoteString(config.access)},
-  columns: ${renderMetadata(config.columns)},
-  command: ${quoteString(config.command)},
-  resultKind: ${quoteString(config.resultKind)},
-  name: ${quoteString(config.name)},
+  access: ${quoteString(descriptor.access)},
+  columns: ${renderMetadata(descriptor.columns)},
+  command: ${quoteString(descriptor.command)},
+  resultKind: ${quoteString(descriptor.resultKind)},
+  name: ${quoteString(descriptor.name)},
   parameterNames: [${parameterNames}],
-  parameters: ${renderMetadata(config.parameters)},
-  rowBounds: { min: ${config.rowBounds.min}, max: ${config.rowBounds.max ?? 'null'}, proof: ${quoteString(config.rowBounds.proof)} },
-  text: ${quoteString(config.sql)},
+  parameters: ${renderMetadata(descriptor.parameters)},
+  rowBounds: { min: ${descriptor.rowBounds.min}, max: ${descriptor.rowBounds.max ?? 'null'}, proof: ${quoteString(descriptor.rowBounds.proof)} },
+  text: ${quoteString(descriptor.text)},
 })
 
 export default createTypedSqlExecutor(${config.name})`
@@ -1127,6 +1159,11 @@ async function resolveTypedSqlWithAnalyzer(
       resultKind: ir.resultKind,
       command: typedSqlCommandFromPostgres(ir.command),
       generatedTypeDeclarations: generatedDeclarations.map(({ name, fields }) => renderInterface(name, fields)),
+      typeExports: [
+        ...generatedDeclarations.map(({ name }) => name),
+        `${pascalCaseIdentifier(config.name)}Params`,
+        `${pascalCaseIdentifier(config.name)}Row`,
+      ],
       name: config.name,
       outputPath: config.outputPath,
       parameters,
@@ -1524,15 +1561,24 @@ export async function generateTypedSql(
   }
 }
 
-export async function compileTypedSqlSource(input: {
+export async function analyzeTypedSqlSource(input: {
   readonly sourcePath: string
   readonly content: string
   readonly database: AnalysisDatabase
   readonly config: ResolvedPostgresTypedSqlConfig
-}): Promise<string> {
+}): Promise<QueryAnalysis> {
   const parsed = parseTypedSqlConfig(input)
   const compiled = compileTypedSql(parsed, input.config.naming.parameterProperties)
   const [statement] = await resolveTypedSqlWithAnalyzer([compiled], input.database, input.config)
   if (!statement) throw new Error('PostgreSQL analyzer returned no statement.')
-  return renderTypedSql(statement, input.config)
+  return {
+    source: input.sourcePath,
+    sourceSha256: sha256(input.content),
+    exports: { statement: statement.name, executor: 'default', types: statement.typeExports },
+    sqlSha256: sha256(statement.sql),
+    descriptor: queryDescriptor(statement),
+    accessEvidence: statement.accessEvidence,
+    parameters: statement.parameterAnalysis,
+    moduleText: renderTypedSql(statement, input.config),
+  }
 }

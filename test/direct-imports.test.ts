@@ -6,6 +6,7 @@ import { mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from 'node
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
+import { ModuleKind, transpileModule } from 'typescript'
 
 import { openQueryProject, QueryProjectError } from '../src/query-project.js'
 import { generateTypedSql } from '../src/generator.js'
@@ -386,6 +387,139 @@ test('unexpected startup exits retain declared configuration watches', async () 
       return true
     })
   } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('public project snapshots expose runtime facts without outputs and reject forged or stale snapshots', async () => {
+  const { root, config, sourcePath } = await fixture()
+  const sql = 'select id, display_name from widget where id = :id'
+  await writeFile(sourcePath, sql)
+  const before = await readdir(root)
+  const project = await openQueryProject(config)
+  try {
+    const buffer = await project.analyze(sourcePath, 'select 1 as value')
+    assert.equal(buffer.source, sourcePath)
+    assert.equal(buffer.exports.executor, 'default')
+    const nullable = await project.analyze(sourcePath, '-- @bindNull id\nselect id from widget where id = :id')
+    assert.deepEqual(nullable.parameters, [
+      { name: 'id', propertyName: 'id', nullBinding: 'callerNullable', nullAdmission: 'accepts' },
+    ])
+    assert.equal(buffer.descriptor.resultKind, 'one')
+    assert.match(buffer.moduleText, /select 1 as value/u)
+    const snapshot = await project.analyzeProject()
+    assert.equal(snapshot.version, 1)
+    assert.equal(snapshot.rootDir, root)
+    assert.deepEqual(
+      snapshot.inputs.filter((input) => input.role === 'sql').map((input) => input.path),
+      [sourcePath]
+    )
+    assert.ok(snapshot.inputs.some((input) => input.path === config && input.role === 'config'))
+    assert.ok(snapshot.inputs.some((input) => input.path === join(root, 'schema.sql') && input.role === 'schema'))
+    const statement = snapshot.statements[0]
+    assert.ok(statement)
+    assert.equal(statement.exports.statement, 'findWidget')
+    assert.deepEqual(statement.exports.types, ['FindWidgetParams', 'FindWidgetRow'])
+    assert.equal(statement.descriptor.name, 'findWidget')
+    assert.equal(statement.descriptor.resultKind, 'optional')
+    assert.equal(statement.descriptor.resultRowMapping, 'positional')
+    assert.deepEqual(statement.descriptor.parameterNames, ['id'])
+    assert.equal(statement.parameters[0]?.nullBinding, 'nonNull')
+    assert.equal(statement.parameters[0]?.name, 'id')
+    assert.equal(statement.descriptor.columns[1]?.propertyName, 'displayName')
+    const runtimeUrl = new URL('../src/adapters/node-postgres.js', import.meta.url).href
+    const js = transpileModule(statement.moduleText.replace(imports.runtime, runtimeUrl), {
+      compilerOptions: { module: ModuleKind.ESNext },
+    }).outputText
+    const loaded: unknown = await import(`data:text/javascript;base64,${Buffer.from(js).toString('base64')}`)
+    assert.ok(loaded && typeof loaded === 'object')
+    const actual: unknown = Reflect.get(loaded, statement.exports.statement)
+    assert.equal(JSON.stringify(statement.descriptor), JSON.stringify(actual))
+    assert.match(await project.catalog(), /export /u)
+    assert.deepEqual(await readdir(root), before)
+    await project.verify(snapshot)
+    await assert.rejects(project.verify(structuredClone(snapshot)), /unchanged snapshot/u)
+    const pendingVerification = project.verify(snapshot)
+    assert.throws(() => Object.assign(statement.descriptor, { resultKind: 'many' }), TypeError)
+    await pendingVerification
+    await writeFile(sourcePath, 'select 2')
+    await assert.rejects(project.verify(snapshot), /SQL input changed/u)
+    await writeFile(sourcePath, sql)
+    await writeFile(join(root, 'another.typed.sql'), 'select 1')
+    await assert.rejects(project.verify(snapshot), /inventory changed/u)
+    await rm(join(root, 'another.typed.sql'))
+    await writeFile(join(root, 'helper.mjs'), "export default {resultColumns: 'preserve'}")
+    await assert.rejects(project.verify(snapshot), /input changed/u)
+  } finally {
+    await project.close()
+    await assert.rejects(project.catalog(), /closed/u)
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('source inventory does not analyze invalid saved SQL and supports unsaved buffers', async () => {
+  const { root, config, sourcePath } = await fixture()
+  await writeFile(sourcePath, 'invalid saved SQL')
+  const project = await openQueryProject(config)
+  try {
+    assert.equal(project.rootDir, root)
+    assert.deepEqual(project.include, [root])
+    assert.deepEqual(await project.sources(), [sourcePath])
+    await assert.rejects(project.analyzeProject())
+    assert.match((await project.analyze(sourcePath, 'select 1 as value')).moduleText, /resultKind: 'one'/u)
+    assert.match(
+      (await project.analyze(join(root, 'draft.typed.sql'), 'select 2 as value')).moduleText,
+      /resultKind: 'one'/u
+    )
+  } finally {
+    await project.close()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('late codec imports reject analysis even when the import rejection is caught', async () => {
+  const { root, config, sourcePath } = await fixture()
+  await writeFile(join(root, 'late.mjs'), 'export const value = 1')
+  await writeFile(
+    config,
+    `export default {schema:'schema.sql',imports:${JSON.stringify(imports)},codecProfile:{extends:'node-postgres',name:'late',resultType(){void import('./late.mjs').catch(()=>{});return {type:'number',ambientBindings:[],scalarImports:[]}}}}`
+  )
+  const project = await openQueryProject(config)
+  try {
+    await assert.rejects(project.analyze(sourcePath, 'select id from widget'), /late import/u)
+    await assert.rejects(project.analyzeProject(), /late import/u)
+    await writeFile(join(root, 'late.mjs'), 'export const value = 2')
+    await assert.rejects(project.compile(sourcePath, 'select id from widget'), /late import/u)
+  } finally {
+    await project.close()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('configuration dependencies reject CommonJS modules', async () => {
+  const { root, config } = await fixture()
+  await writeFile(join(root, 'helper.cjs'), 'module.exports = {}')
+  await writeFile(
+    config,
+    `import helper from './helper.cjs'; export default {schema:'schema.sql',imports:${JSON.stringify(imports)},naming:helper}`
+  )
+  try {
+    await assert.rejects(openQueryProject(config), /must use ESM/u)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('source inventory does not initialize the schema database', async () => {
+  const { root, config, sourcePath } = await fixture('invalid schema SQL')
+  await writeFile(sourcePath, 'select 1 as value')
+  const project = await openQueryProject(config)
+  try {
+    assert.deepEqual(await project.sources(), [sourcePath])
+    await assert.rejects(project.compile(sourcePath, 'select 1 as value'), /syntax error/u)
+    await assert.rejects(project.catalog(), /syntax error/u)
+  } finally {
+    await project.close()
     await rm(root, { recursive: true, force: true })
   }
 })
