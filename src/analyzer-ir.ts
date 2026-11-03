@@ -4376,10 +4376,11 @@ interface ValidatedAnalyzerEnvelope {
 const nativeAnalyzerProbeSql = 'select 1'
 
 async function invokeNativeAnalyzer(client: PostgresQueryable, sql: string): Promise<PgAnalyzerResult | undefined> {
-  const result = await client.query<{ readonly analysis: PgAnalyzerResult }>(
-    `select ${ANALYZER_SQL_FUNCTION}(${dollarQuotedSqlText(sql)})::jsonb as analysis`
+  const result = await client.query<{ readonly analysis: string }>(
+    `select ${ANALYZER_SQL_FUNCTION}(${dollarQuotedSqlText(sql)}) as analysis`
   )
-  return result.rows[0]?.analysis
+  const analysis = result.rows[0]?.analysis
+  return analysis === undefined ? undefined : JSON.parse(analysis)
 }
 
 function validateAnalyzerSchema(analysis: PgAnalyzerResult | undefined): asserts analysis is PgAnalyzerResult {
