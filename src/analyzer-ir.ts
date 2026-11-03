@@ -219,8 +219,21 @@ interface VarLocation {
 // qualified tuple after command-specific transformations such as UPDATE SET.
 type QueryEvaluationPhase = 'input' | 'result'
 
+interface PredicateWork {
+  readonly catalog: CatalogFacts
+  readonly expressionKeys: WeakMap<
+    PgAnalyzerQuery,
+    Record<QueryEvaluationPhase, WeakMap<PgAnalyzerExpr, string | null>>
+  >
+  readonly queryScopes: WeakMap<
+    PgAnalyzerQuery,
+    { root: QueryScope | undefined; parents: WeakMap<QueryScope, QueryScope> }
+  >
+}
+
 interface QueryScope {
   readonly catalog: CatalogFacts
+  readonly work: PredicateWork
   readonly evaluationPhase: QueryEvaluationPhase
   readonly inputPredicateFacts: PredicateFacts
   readonly predicateFacts: PredicateFacts
@@ -228,12 +241,17 @@ interface QueryScope {
   readonly query: PgAnalyzerQuery
 }
 
-function queryScope(query: PgAnalyzerQuery, parent: QueryScope | null = null, catalog = parent?.catalog): QueryScope {
-  if (!catalog) {
+function queryScope(query: PgAnalyzerQuery, parent: QueryScope | null, work = parent?.work): QueryScope {
+  if (!work) {
     throw new Error('internal analyzer inconsistency: query scope has no catalog')
   }
+  let cachedScopes = work.queryScopes.get(query)
+  const cachedScope = parent ? cachedScopes?.parents.get(parent) : cachedScopes?.root
+  if (cachedScope) return cachedScope
+
   const inputScope: QueryScope = {
-    catalog,
+    catalog: work.catalog,
+    work,
     evaluationPhase: 'input',
     inputPredicateFacts: parent?.predicateFacts ?? noPredicateFacts,
     predicateFacts: parent?.predicateFacts ?? noPredicateFacts,
@@ -250,7 +268,7 @@ function queryScope(query: PgAnalyzerQuery, parent: QueryScope | null = null, ca
     query.commandType === 'SELECT' &&
     (((query.hasAggs || query.hasHavingQual) && (query.groupClauseCount ?? 0) === 0) ||
       (query.groupingSetsCount ?? 0) > 0)
-  return scopeWithQual(
+  const result = scopeWithQual(
     {
       ...qualifiedInputScope,
       evaluationPhase: 'result',
@@ -263,6 +281,16 @@ function queryScope(query: PgAnalyzerQuery, parent: QueryScope | null = null, ca
     },
     query.havingQual
   )
+  if (!cachedScopes) {
+    cachedScopes = { root: undefined, parents: new WeakMap() }
+    work.queryScopes.set(query, cachedScopes)
+  }
+  if (parent) {
+    cachedScopes.parents.set(parent, result)
+  } else {
+    cachedScopes.root = result
+  }
+  return result
 }
 
 function aggregateInputScope(scope: QueryScope): QueryScope {
@@ -699,12 +727,13 @@ function sourceLookupKeys(
   catalog: CatalogFacts,
   query: PgAnalyzerQuery,
   varno: number,
-  seen: readonly PgAnalyzerQuery[] = [],
-  parent: QueryScope | null = null
+  seen: readonly PgAnalyzerQuery[],
+  parent: QueryScope | null,
+  work: PredicateWork
 ): readonly UniqueLookupKey[] {
   if (seen.includes(query) || seen.length >= 32) return []
   const rte = query.rtable?.[varno - 1]
-  const scope = queryScope(query, parent, catalog)
+  const scope = queryScope(query, parent, work)
   if (rte?.kind === 'RELATION' && rte.relid) {
     const relid = rte.relid
     return (catalog.uniqueIndexesByRelid.get(relid) ?? []).flatMap((index) => {
@@ -759,7 +788,7 @@ function sourceLookupKeys(
     return []
   const sourceScope = queryScope(source, sourceParent)
   const targets = resultTargets(source)
-  return sourceLookupKeys(catalog, source, 1, [...seen, query], sourceParent).flatMap((key) => {
+  return sourceLookupKeys(catalog, source, 1, [...seen, query], sourceParent, work).flatMap((key) => {
     const columns = key.columns.map((column) => {
       const identity = predicateExpressionKey(sourceScope, column.expression)
       const outputIndex = targets.findIndex(
@@ -867,7 +896,7 @@ function compareUniqueIndexCatalogRows(left: UniqueIndexCatalogRow, right: Uniqu
 function uniqueClosureRelation(catalog: CatalogFacts, scope: QueryScope, varno: number): UniqueJoinClosureRelation {
   const { query } = scope
   return {
-    indexes: sourceLookupKeys(catalog, query, varno, [], scope.parent).flatMap((key) => {
+    indexes: sourceLookupKeys(catalog, query, varno, [], scope.parent, scope.work).flatMap((key) => {
       if (
         key.columns.some(
           (column) =>
@@ -920,7 +949,7 @@ function uniqueIndexRowBounds(catalog: CatalogFacts, scope: QueryScope): TypedSq
   }
 
   const constraints = equalityConstraintsFromQual(query.whereQual, scope)
-  const uniqueIndex = sourceLookupKeys(catalog, query, varno, [], scope.parent).find((index) =>
+  const uniqueIndex = sourceLookupKeys(catalog, query, varno, [], scope.parent, scope.work).find((index) =>
     uniqueIndexIsConstrained(catalog, scope, index, constraints)
   )
   if (!uniqueIndex) {
@@ -1064,8 +1093,8 @@ function finiteKeyAlternativeRowBounds(
       clauses.length === 1 ? (clauses[0] as PgAnalyzerExpr) : { tag: 'BoolExpr', boolOp: 'AND', args: clauses }
     const branch = { ...query, whereQual }
     const bounds =
-      uniqueIndexRowBounds(catalog, queryScope(branch, scope.parent, catalog)) ??
-      uniqueJoinRowBounds(catalog, queryScope(branch, scope.parent, catalog), seen)
+      uniqueIndexRowBounds(catalog, queryScope(branch, scope.parent, scope.work)) ??
+      uniqueJoinRowBounds(catalog, queryScope(branch, scope.parent, scope.work), seen)
     if (bounds?.max === null || bounds?.max === undefined) return null
     max += bounds.max
     if (!Number.isSafeInteger(max)) return null
@@ -1349,7 +1378,7 @@ function inferBaseRowBounds(
   // A global aggregate produces its implicit group even when WHERE removes
   // every input row. Grouping sets can also contain an empty grouping set.
   const contradictionQuery = globalAggregate || hasGroupingSets ? { ...query, whereQual: null, fromTree: null } : query
-  if (scopeHasContradiction(queryScope(contradictionQuery, scope.parent, catalog))) {
+  if (scopeHasContradiction(queryScope(contradictionQuery, scope.parent, scope.work))) {
     return { max: 0, min: 0, proof: 'contradictory_qual' }
   }
 
@@ -2009,7 +2038,22 @@ function scopeProvesNull(scope: QueryScope, expr: PgAnalyzerExpr): boolean {
 // the native envelope. Unknown constants, volatile calls, and aggregate order
 // or DISTINCT semantics cannot be equated by their truncated representation.
 function predicateExpressionKey(scope: QueryScope, expr: PgAnalyzerExpr | null | undefined): string | null {
-  if (!expr || expr.truncated) return null
+  if (!expr) return null
+  let phaseKeys = scope.work.expressionKeys.get(scope.query)
+  if (!phaseKeys) {
+    phaseKeys = { input: new WeakMap(), result: new WeakMap() }
+    scope.work.expressionKeys.set(scope.query, phaseKeys)
+  }
+  const keys = phaseKeys[scope.evaluationPhase]
+  const cached = keys.get(expr)
+  if (cached !== undefined) return cached
+  const key = serializePredicateExpressionKey(scope, expr)
+  keys.set(expr, key)
+  return key
+}
+
+function serializePredicateExpressionKey(scope: QueryScope, expr: PgAnalyzerExpr): string | null {
+  if (expr.truncated) return null
   const type = expr.typeOid
   if (expr.tag === 'Var') {
     if ((expr.varlevelsup ?? 0) !== 0) return null
@@ -2844,7 +2888,7 @@ function windowFunctionNullability(
   // CASE facts describe only the current output row. Values fetched from a
   // different row may use only the query's WHERE/HAVING and correlated facts.
   const otherRowNullability = () =>
-    first ? expressionNullability(catalog, queryScope(scope.query, scope.parent, catalog), first, seen) : undefined
+    first ? expressionNullability(catalog, queryScope(scope.query, scope.parent, scope.work), first, seen) : undefined
   if (expr.winagg === false) {
     if (
       ['row_number', 'rank', 'dense_rank', 'percent_rank', 'cume_dist'].some((name) =>
@@ -4199,7 +4243,7 @@ function queryOutputSqlArrayShape(
 
 function normalizeCompiledIr(catalog: CatalogFacts, analyzed: AnalyzedCompiledConfig): TypedSqlPostgresIr {
   const { analysis, config, primaryQuery: query, rewrittenQueries } = analyzed
-  const rootScope = queryScope(query, null, catalog)
+  const rootScope = queryScope(query, null, { catalog, expressionKeys: new WeakMap(), queryScopes: new WeakMap() })
 
   const resultColumns = resultTargets(query).map((target, outputIndex): TypedSqlPostgresIrColumn => {
     const expr = target.expr
