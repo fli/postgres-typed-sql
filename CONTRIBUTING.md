@@ -34,3 +34,7 @@ pnpm test:all
 ```
 
 Changes to the C analyzer or normalized intermediate representation must include focused conformance fixtures. A release is not valid unless the packed-package consumer test succeeds with lifecycle scripts disabled.
+
+## Release
+
+Merge the version change into `main` and wait for its CI run, including the Node.js 20 compatibility job, to succeed. Dispatch `release.yml` on `main` with the exact verified commit in its `commit` input. The release rejects a different checkout revision and publishes the single package tarball from that successful main CI run after verifying its receipt, version and SHA-256. It does not rebuild the tested package.

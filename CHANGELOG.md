@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.1.0-beta.22
+
+- Expose the public query project API for compilation, fresh versioned query facts, authenticated in-memory snapshots and catalog-only output.
+- Add Next.js/Turbopack, webpack and Vite/Vitest adapters for direct SQL imports.
+- Track bundled engine inputs, including extension archives and PGlite JavaScript, alongside SQL, schema and configuration inputs. Reject changed inputs before admitting a snapshot.
+- Inventory SQL sources without initializing PostgreSQL. Compilation and analysis initialize the schema when needed.
+- Require Node.js 22.15 for the new analysis, inventory, catalog and host adapters. Existing generation, direct compilation, esbuild and runtime paths continue to support Node.js 20.19.
+- Publish the verified package artifact from successful main CI instead of rebuilding and retesting it during release.
+
 ## 0.1.0-beta.20
 
 - Add experimental direct `.typed.sql` imports for bundled ESM Node applications through the TypeScript 7.1 beta content mapper and `postgres-typed-sql/esbuild` plugin. The default callable, named statement, exported types, codecs, and result mapping use the existing generator contracts.

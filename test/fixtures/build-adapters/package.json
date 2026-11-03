@@ -1,0 +1,14 @@
+{
+  "name": "postgres-typed-sql-build-adapter-fixture",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "esbuild": "0.25.12",
+    "next": "16.4.3",
+    "postgres-typed-sql": "file:../../..",
+    "react": "19.3.1",
+    "react-dom": "19.3.1",
+    "vite": "8.3.1",
+    "vitest": "5.0.2"
+  }
+}

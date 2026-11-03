@@ -6,6 +6,14 @@ export default tseslint.config(
   eslint.configs.recommended,
   ...tseslint.configs.recommended,
   {
+    files: ['**/*.cjs'],
+    languageOptions: { globals: { module: 'readonly', setTimeout: 'readonly', clearTimeout: 'readonly' } },
+  },
+  {
+    files: ['test/fixtures/build-adapters/**/*.{js,mjs}'],
+    languageOptions: { globals: { console: 'readonly', fetch: 'readonly', Response: 'readonly' } },
+  },
+  {
     languageOptions: {
       globals: {
         process: 'readonly',
