@@ -2,11 +2,12 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import {
+  createPostgresExecutor,
   createTypedSqlExecutor,
   createTypedSqlStatement,
   executeTypedSql,
-  type NodePostgresTypedSqlClient,
-} from '../src/adapters/node-postgres.js'
+} from '../src/runtime.js'
+import type { PostgresExecutionResponse } from '../src/runtime.js'
 import type {
   TypedSqlExecutionResult,
   TypedSqlResultKind,
@@ -16,7 +17,48 @@ import type {
 
 const row = { value: 7 }
 const bounds = { min: 0, max: null, proof: 'test' } as const
-const definition = { name: 'example', parameterNames: [], text: 'select 7 as value' } as const
+const int4 = {
+  pgType: 'integer',
+  pgTypeName: 'int4',
+  pgTypeSchema: 'pg_catalog',
+  pgTypeKind: 'base',
+  pgTypeOid: 23,
+} as const
+const textType = {
+  pgType: 'text',
+  pgTypeName: 'text',
+  pgTypeSchema: 'pg_catalog',
+  pgTypeKind: 'base',
+  pgTypeOid: 25,
+} as const
+const valueColumn = {
+  name: 'value',
+  propertyName: 'value',
+  nullable: false,
+  type: int4,
+  pgType: 'integer',
+  pgTypeName: 'int4',
+  pgTypeSchema: 'pg_catalog',
+  expressionSource: { kind: 'expression', tag: 'Const' },
+} as const
+const definition = {
+  valueModel: 'postgres-lossless-v1',
+  columns: [valueColumn],
+  name: 'example',
+  parameterNames: [],
+  text: 'select 7 as value',
+} as const
+const noOutput = { ...definition, columns: [] }
+function executor(rows: PostgresExecutionResponse['rows'], rowCount?: number | null, columns = [int4]) {
+  return createPostgresExecutor(async () => ({ rows, rowCount, columnTypes: columns }))
+}
+function hasError(pattern: RegExp) {
+  return (error: unknown): boolean =>
+    error instanceof Error && (pattern.test(error.message) || hasErrorCause(error.cause, pattern))
+}
+function hasErrorCause(error: unknown, pattern: RegExp): boolean {
+  return error instanceof Error && (pattern.test(error.message) || hasErrorCause(error.cause, pattern))
+}
 const many = createTypedSqlStatement<Record<string, never>, typeof row, 'read', 'many'>({
   ...definition,
   resultKind: 'many',
@@ -33,35 +75,31 @@ const optional = createTypedSqlStatement<Record<string, never>, typeof row, 'rea
   rowBounds: { min: 0, max: 1, proof: 'test' },
 })
 const command = createTypedSqlStatement<Record<string, never>, never, 'write', 'command'>({
-  ...definition,
+  ...noOutput,
   resultKind: 'command',
   rowBounds: { min: 0, max: 0, proof: 'test' },
 })
 const noResult = createTypedSqlStatement<Record<string, never>, never, 'write', 'void'>({
-  ...definition,
+  ...noOutput,
   resultKind: 'void',
   rowBounds: { min: 0, max: 0, proof: 'test' },
 })
 
-test('execution selects inferred results and uses the supplied client exactly once', async () => {
+test('execution selects inferred results and uses the supplied executor exactly once', async () => {
   let calls = 0
-  const client: NodePostgresTypedSqlClient = {
-    async query() {
-      calls++
-      return { rows: [row], rowCount: 1 }
-    },
-  }
+  const client = createPostgresExecutor(async () => {
+    calls++
+    return { rows: [['7']], rowCount: 1, columnTypes: [int4] }
+  })
   const manyResult: (typeof row)[] = await createTypedSqlExecutor(many)(client)
   const oneResult: typeof row = await createTypedSqlExecutor(one)(client, {})
   const optionalResult: typeof row | null = await createTypedSqlExecutor(optional)(client)
   assert.deepEqual([manyResult, oneResult, optionalResult], [[row], row, row])
   assert.equal(calls, 3)
-  const empty: NodePostgresTypedSqlClient = {
-    async query() {
-      calls++
-      return { rows: [], rowCount: 2 }
-    },
-  }
+  const empty = createPostgresExecutor(async (request) => {
+    calls++
+    return { rows: [], rowCount: 2, columnTypes: request.columns.map((column) => column.type) }
+  })
   const count: number = await createTypedSqlExecutor(command)(empty)
   const nothing: void = await createTypedSqlExecutor(noResult)(empty)
   assert.equal(count, 2)
@@ -72,19 +110,15 @@ test('execution selects inferred results and uses the supplied client exactly on
 
 test('execution enforces all proved row bounds and does not retry', async () => {
   let calls = 0
-  const empty: NodePostgresTypedSqlClient = {
-    async query() {
-      calls++
-      return { rows: [] }
-    },
-  }
+  const empty = createPostgresExecutor(async () => {
+    calls++
+    return { rows: [], columnTypes: [int4], rowCount: 0 }
+  })
+  const two = createPostgresExecutor(async () => {
+    calls++
+    return { rows: [['7'], ['7']], columnTypes: [int4], rowCount: 2 }
+  })
   await assert.rejects(createTypedSqlExecutor(one)(empty), /rowBounds/u)
-  const two: NodePostgresTypedSqlClient = {
-    async query() {
-      calls++
-      return { rows: [row, row] }
-    },
-  }
   await assert.rejects(createTypedSqlExecutor(optional)(two), /rowBounds/u)
   const zero = createTypedSqlStatement<Record<string, never>, typeof row, 'read', 'many'>({
     ...definition,
@@ -104,13 +138,9 @@ test('execution enforces all proved row bounds and does not retry', async () => 
 })
 
 test('command and void reject rows and only command requires a valid count', async () => {
-  const client = (rows: readonly unknown[], rowCount?: number | null): NodePostgresTypedSqlClient => ({
-    async query() {
-      return { rows, rowCount }
-    },
-  })
-  await assert.rejects(createTypedSqlExecutor(command)(client([row], 1)), /unexpected rows/u)
-  await assert.rejects(createTypedSqlExecutor(noResult)(client([row], 1)), /unexpected rows/u)
+  const client = (rows: PostgresExecutionResponse['rows'], rowCount?: number | null) => executor(rows, rowCount, [])
+  await assert.rejects(createTypedSqlExecutor(command)(client([[]], 1)), /unexpected rows/u)
+  await assert.rejects(createTypedSqlExecutor(noResult)(client([[]], 1)), /unexpected rows/u)
   for (const count of [undefined, null, -1, 1.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1]) {
     await assert.rejects(createTypedSqlExecutor(command)(client([], count)), /row count/u)
   }
@@ -120,12 +150,10 @@ test('command and void reject rows and only command requires a valid count', asy
 
 test('stale and inconsistent metadata fail before executing SQL', async () => {
   let calls = 0
-  const client: NodePostgresTypedSqlClient = {
-    async query() {
-      calls++
-      return { rows: [] }
-    },
-  }
+  const client = createPostgresExecutor(async () => {
+    calls++
+    return { rows: [], columnTypes: [], rowCount: 0 }
+  })
   for (const invalid of [
     { ...many, resultKind: undefined },
     { ...many, rowBounds: undefined },
@@ -136,10 +164,26 @@ test('stale and inconsistent metadata fail before executing SQL', async () => {
     { ...command, rowBounds: bounds },
     { ...many, rowBounds: { min: -1, max: null, proof: 'bad' } },
     { ...many, rowBounds: { min: 2, max: 1, proof: 'bad' } },
+    { ...many, valueModel: undefined },
+    { ...many, resultRowMapping: undefined },
+    { ...many, columns: [{ ...valueColumn, type: undefined }] },
   ]) {
     // @ts-expect-error Stale JavaScript descriptors deliberately violate the current ABI.
-    await assert.rejects(executeTypedSql(client, invalid, {}), /regenerate stale statements/u)
+    await assert.rejects(executeTypedSql(client, invalid, {}), hasError(/regenerate/u))
   }
+  assert.equal(calls, 0)
+})
+
+test('execution rejects an unverified legacy client before calling it', async () => {
+  let calls = 0
+  const legacyClient = {
+    async query() {
+      calls++
+      return { rows: [] }
+    },
+  }
+  // @ts-expect-error Driver clients must be wrapped in a verified transport adapter.
+  await assert.rejects(executeTypedSql(legacyClient, many, {}), hasError(/verified postgres-lossless-v1 executor/u))
   assert.equal(calls, 0)
 })
 
@@ -154,12 +198,10 @@ test('descriptor result metadata is copied and frozen', () => {
 
 test('DML without output columns rejects row results before querying', async () => {
   let calls = 0
-  const client: NodePostgresTypedSqlClient = {
-    async query() {
-      calls++
-      return { rows: [], rowCount: 3 }
-    },
-  }
+  const client = createPostgresExecutor(async () => {
+    calls++
+    return { rows: [], columnTypes: [], rowCount: 3 }
+  })
   for (const command of ['delete', 'insert', 'update', 'merge'] as const) {
     for (const [resultKind, rowBounds] of [
       ['many', { min: 0, max: 0, proof: 'empty' }],
@@ -167,30 +209,28 @@ test('DML without output columns rejects row results before querying', async () 
       ['one', { min: 1, max: 1, proof: 'one' }],
       ['optional', { min: 0, max: 1, proof: 'optional' }],
     ] as const) {
-      const invalidDefinition = { ...definition, command, columns: [], resultKind, rowBounds }
+      const invalidDefinition = { ...noOutput, command, resultKind, rowBounds }
       const invalid = { ...many, ...invalidDefinition, resultRowMapping: 'positional' as const }
       assert.throws(
         () => createTypedSqlStatement<Record<string, never>, typeof row>(invalidDefinition),
         /contradictory command\/result metadata/u
       )
-      assert.throws(() => createTypedSqlExecutor(invalid), /contradictory command\/result metadata/u)
-      await assert.rejects(executeTypedSql(client, invalid, {}), /contradictory command\/result metadata/u)
+      await assert.rejects(executeTypedSql(client, invalid, {}), hasError(/contradictory command\/result metadata/u))
     }
   }
   assert.equal(calls, 0)
 })
 
-test('output column validation preserves row protocols and empty returning results', async () => {
-  const empty: NodePostgresTypedSqlClient = {
-    async query() {
-      return { rows: [], rowCount: 0 }
-    },
-  }
+test('output column validation preserves empty returning and zero-column results', async () => {
+  const empty = createPostgresExecutor(async (request) => ({
+    rows: [],
+    rowCount: 0,
+    columnTypes: request.columns.map((column) => column.type),
+  }))
   for (const command of ['delete', 'insert', 'update', 'merge'] as const) {
     const affected = createTypedSqlStatement<Record<string, never>, never>({
-      ...definition,
+      ...noOutput,
       command,
-      columns: [],
       resultKind: 'command',
       rowBounds: { min: 0, max: 0, proof: 'command' },
     })
@@ -198,55 +238,21 @@ test('output column validation preserves row protocols and empty returning resul
     const returning = createTypedSqlStatement<Record<string, never>, typeof row>({
       ...definition,
       command,
-      columns: [
-        {
-          name: 'value',
-          propertyName: 'value',
-          nullable: false,
-          pgType: 'int4',
-          pgTypeName: 'int4',
-          pgTypeSchema: 'pg_catalog',
-          expressionSource: { kind: 'expression', tag: 'Const' },
-        },
-      ],
       resultKind: 'many',
       rowBounds: { min: 0, max: 0, proof: 'empty' },
     })
     assert.deepEqual(await createTypedSqlExecutor(returning)(empty), [])
-    const custom = createTypedSqlStatement<Record<string, never>, typeof row>({
-      ...definition,
-      command,
-      resultKind: 'many',
-      rowBounds: bounds,
-    })
-    assert.deepEqual(
-      await createTypedSqlExecutor(custom)({
-        async query() {
-          return { rows: [row] }
-        },
-      }),
-      [row]
-    )
   }
   const zeroColumns = createTypedSqlStatement<Record<string, never>, Record<string, never>>({
-    ...definition,
+    ...noOutput,
     command: 'select',
-    columns: [],
     resultKind: 'many',
     rowBounds: bounds,
   })
-  assert.deepEqual(
-    await createTypedSqlExecutor(zeroColumns)({
-      async query() {
-        return { rows: [[]] }
-      },
-    }),
-    [{}]
-  )
+  assert.deepEqual(await createTypedSqlExecutor(zeroColumns)(executor([[]], 1, [])), [{}])
   const call = createTypedSqlStatement<Record<string, never>, never>({
-    ...definition,
+    ...noOutput,
     command: 'unknown',
-    columns: [],
     resultKind: 'void',
     rowBounds: { min: 0, max: 0, proof: 'call' },
   })
@@ -256,32 +262,35 @@ test('output column validation preserves row protocols and empty returning resul
 test('required nullable parameters remain required and fail before querying when omitted', async () => {
   const statement = createTypedSqlStatement<{ value: string | null }, typeof row, 'read', 'many'>({
     ...definition,
-    parameterNames: ['value'] satisfies 'value'[],
+    parameterNames: ['value'],
+    parameters: [
+      {
+        name: 'value',
+        propertyName: 'value',
+        nullable: true,
+        type: textType,
+        pgType: 'text',
+        pgTypeName: 'text',
+        pgTypeSchema: 'pg_catalog',
+      },
+    ],
     resultKind: 'many',
     rowBounds: bounds,
   })
   const run = createTypedSqlExecutor(statement)
   let calls = 0
-  const client: NodePostgresTypedSqlClient = {
-    async query(config) {
-      calls++
-      assert.deepEqual(config.values, [null])
-      return { rows: [] }
-    },
-  }
+  const client = createPostgresExecutor(async (request) => {
+    calls++
+    assert.deepEqual(request.values, [null])
+    return { rows: [], columnTypes: [int4], rowCount: 0 }
+  })
   await run(client, { value: null })
-  assert.throws(() => {
-    // @ts-expect-error Nullable does not permit omitting the parameter object.
-    void run(client)
-  }, /requires a parameter object/u)
-  await assert.rejects(async () => {
-    // @ts-expect-error Nullable does not permit omitting its required property.
-    await run(client, {})
-  }, /expected an own parameter property/u)
-  await assert.rejects(async () => {
-    // @ts-expect-error The shared executor cannot widen the inferred parameter contract.
-    await executeTypedSql(client, statement, {})
-  }, /expected an own parameter property/u)
+  // @ts-expect-error Nullable does not permit omitting the parameter object.
+  await assert.rejects(run(client), hasError(/expected an own parameter property/u))
+  // @ts-expect-error Nullable does not permit omitting its required property.
+  await assert.rejects(run(client, {}), hasError(/expected an own parameter property/u))
+  // @ts-expect-error The shared executor cannot widen the inferred parameter contract.
+  await assert.rejects(executeTypedSql(client, statement, {}), hasError(/expected an own parameter property/u))
   assert.equal(calls, 1)
 })
 
@@ -308,11 +317,7 @@ test('binding captures the SQL text and parameter names used by the descriptor',
 
 test('a widened statement descriptor preserves the complete inferred result union', async () => {
   const statement: TypedSqlStatement<Record<string, never>, typeof row> = many
-  const client: NodePostgresTypedSqlClient = {
-    async query() {
-      return { rows: [row] }
-    },
-  }
+  const client = executor([['7']], 1)
   const result = await executeTypedSql(client, statement, {})
   type IsExactly<Left, Right> =
     (<Value>() => Value extends Left ? 1 : 2) extends <Value>() => Value extends Right ? 1 : 2 ? true : false

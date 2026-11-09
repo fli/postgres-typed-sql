@@ -4,7 +4,6 @@ import { join } from 'node:path'
 import test from 'node:test'
 
 import { PGlite } from '../src/vendor/pglite/index.js'
-import { definePostgresCodecProfile, postgresResultTypesByOid, postgresTypeScriptType } from '../src/index.js'
 import {
   assertTypeScriptBindingIdentifier,
   camelCasePropertyName,
@@ -97,11 +96,11 @@ test('generates PostgreSQL-derived types, nullability, and resultKind', async ()
   assert.match(account, /readonly status: "active" \| "suspended"/u)
   assert.match(account, /readonly role: 'member' \| 'admin'/u)
   assert.doesNotMatch(account, /postgres-typed-sql\.types/u)
-  assert.match(account, /postgres-typed-sql\/adapters\/node-postgres/u)
+  assert.match(account, /postgres-typed-sql\/runtime/u)
 
   const joined = await readFile(join(root, 'queries/listAccountsWithPosts.typed-sql.ts'), 'utf8')
   assert.match(joined, /readonly title: string \| null/u)
-  assert.match(joined, /readonly published_at: Date \| number \| null/u)
+  assert.match(joined, /readonly published_at: PgTimestampTz \| null/u)
 
   const catalog = await readFile(join(root, 'postgres-typed-sql.types.ts'), 'utf8')
   assert.match(catalog, /export type AccountStatus = "active" \| "suspended"/u)
@@ -158,105 +157,35 @@ create table public.coercion_outputs (
 from public.coercion_outputs
 `
   )
-  assert.match(output, /readonly exact_cast: PgInt8String\n/u)
-  assert.match(output, /readonly numeric_cast: PgNumericString\n/u)
+  assert.match(output, /readonly exact_cast: bigint\n/u)
+  assert.match(output, /readonly numeric_cast: PgDecimal\n/u)
   assert.match(output, /readonly opaque_cast: number \| null\n/u)
-  assert.match(output, /readonly nullable_cast: PgNumericString \| null\n/u)
+  assert.match(output, /readonly nullable_cast: PgDecimal \| null\n/u)
   assert.match(output, /readonly required_domain: number\n/u)
 })
 
-test('defaults to conservative unknown driver scalar values', async () => {
+test('uses the fixed lossless value model by default', async () => {
   const root = await copyFixture()
-  await generateTypedSql({
-    include: ['queries'],
-    rootDir: root,
-    schema: 'schema.sql',
-  })
-
+  await generateTypedSql({ include: ['queries'], rootDir: root, schema: 'schema.sql' })
   const account = await readFile(join(root, 'queries/findAccountByEmail.typed-sql.ts'), 'utf8')
-  assert.match(account, /export interface FindAccountByEmailParams \{[\s\S]*readonly email: NonNullable<unknown>/u)
-  assert.match(account, /export interface FindAccountByEmailRow \{[\s\S]*readonly email: unknown/u)
-  assert.match(account, /readonly display_name: unknown \| null/u)
-  assert.match(account, /readonly status: unknown/u)
-  assert.doesNotMatch(account, /import type \{ AccountStatus/u)
-
-  const catalog = await readFile(join(root, 'postgres-typed-sql.types.ts'), 'utf8')
-  assert.match(catalog, /readonly id: unknown/u)
-  assert.match(catalog, /readonly status: unknown/u)
-})
-
-test('applies custom codec hooks to parameters, results, structured JSON, catalog types, and artifact metadata', async () => {
-  const root = await createMinimalFixture(
-    `create type public.item_state as enum ('active', 'archived');
-create table public.items (id integer primary key, state public.item_state not null);
-`,
-    `select
-  :value::integer as direct_value,
-  jsonb_build_object('nested_value', :value::integer) as payload,
-  'active'::public.item_state as state
-`
-  )
-  const codecProfile = definePostgresCodecProfile({
-    extends: 'node-postgres',
-    name: 'application-codecs',
-    opaqueJsonType: postgresTypeScriptType('ApplicationJson', { scalarImports: ['ApplicationJson'] }),
-    parameterType({ type }, fallback) {
-      return type.pgTypeOid === 23
-        ? postgresTypeScriptType('ApplicationIntInput', { scalarImports: ['ApplicationIntInput'] })
-        : fallback()
-    },
-    resultType: (() => {
-      const byOid = postgresResultTypesByOid({
-        23: postgresTypeScriptType('ApplicationInt', { scalarImports: ['ApplicationInt'] }),
-      })
-      return (context, fallback) =>
-        context.declaredType.pgTypeSchema === 'public' && context.declaredType.pgTypeName === 'item_state'
-          ? postgresTypeScriptType('ApplicationItemState', { scalarImports: ['ApplicationItemState'] })
-          : byOid(context, fallback)
-    })(),
-    jsonScalarType({ type }, fallback) {
-      return type.pgTypeOid === 23
-        ? postgresTypeScriptType('ApplicationJsonInt', { scalarImports: ['ApplicationJsonInt'] })
-        : fallback()
-    },
-  })
-
-  await generateFixture(root, { codecProfile })
-
-  const output = await readFile(join(root, 'queries/query.typed-sql.ts'), 'utf8')
-  assert.match(output, /\/\/ Codec profile: application-codecs/u)
-  assert.match(output, /readonly value: ApplicationIntInput/u)
-  assert.match(output, /readonly direct_value: ApplicationInt \| null/u)
-  assert.match(output, /readonly nested_value: ApplicationJsonInt \| null/u)
-  assert.match(output, /readonly state: ApplicationItemState/u)
+  assert.match(account, /readonly email: string/u)
+  assert.match(account, /readonly display_name: string \| null/u)
+  assert.match(account, /readonly status: "active" \| "suspended"/u)
+  assert.match(account, /Value model: postgres-lossless-v1/u)
+  assert.match(account, /postgres-typed-sql\/runtime/u)
   assert.match(
-    output,
-    /import type \{ ApplicationInt, ApplicationIntInput, ApplicationItemState, ApplicationJsonInt \} from 'postgres-typed-sql\/scalars'/u
+    account,
+    /type: \{"pgType":"text","pgTypeKind":"base","pgTypeName":"text","pgTypeOid":0,"pgTypeSchema":"pg_catalog"\}/u
   )
-
   const catalog = await readFile(join(root, 'postgres-typed-sql.types.ts'), 'utf8')
-  assert.match(catalog, /\/\/ Codec profile: application-codecs/u)
-  assert.match(catalog, /readonly id: ApplicationInt/u)
-  assert.match(catalog, /readonly state: ApplicationItemState/u)
+  assert.match(catalog, /readonly id: bigint/u)
+  assert.match(catalog, /readonly status: AccountStatus/u)
 })
 
-test('deduplicates Record when generated empty objects and codec types use the same ambient dependency', async () => {
-  const root = await createMinimalFixture('select 1;\n', 'select 1::integer as value\n')
-  const codecProfile = definePostgresCodecProfile({
-    extends: 'node-postgres',
-    name: 'ambient-record-result',
-    resultType({ decoderType }, fallback) {
-      return decoderType.pgTypeOid === 23
-        ? postgresTypeScriptType('Record<string, unknown>', { ambientBindings: ['Record'] })
-        : fallback()
-    },
-  })
-
-  await generateFixture(root, { codecProfile })
-
-  const output = await readFile(join(root, 'queries/query.typed-sql.ts'), 'utf8')
-  assert.match(output, /export type QueryParams = Record<string, never>/u)
-  assert.match(output, /readonly value: Record<string, unknown>/u)
+test('rejects removed codec profiles with a migration message', async () => {
+  const root = await createMinimalFixture('select 1;\n', 'select 1\n')
+  const config = { include: ['queries'], rootDir: root, schema: 'schema.sql', codecProfile: 'node-postgres' }
+  await assert.rejects(generateTypedSql(config), /codecProfile is no longer supported/u)
 })
 
 test('requires explicit caller null permission even when PostgreSQL proves NULL is accepted', async () => {
@@ -264,7 +193,6 @@ test('requires explicit caller null permission even when PostgreSQL proves NULL 
   const config = {
     include: ['queries'],
     rootDir: root,
-    codecProfile: 'node-postgres' as const,
     schema: 'schema.sql',
   }
   const queryFile = join(root, 'queries/query.typed.sql')
@@ -321,7 +249,7 @@ from (values (array[10, 20])) as input(numbers)
   }
 })
 
-test('requires serialized strings for PostgreSQL arrays whose element delimiter is not a comma', async () => {
+test('uses structured inputs for arrays with custom delimiters and domain elements', async () => {
   const output = await renderQuery(
     'create domain public.int_list as integer[];\n',
     `select
@@ -329,10 +257,9 @@ test('requires serialized strings for PostgreSQL arrays whose element delimiter 
   cardinality(:lists::public.int_list[]) as list_count
 `
   )
-  assert.match(output, /readonly boxes: string/u)
-  assert.doesNotMatch(output, /readonly boxes: PgArray/u)
-  assert.match(output, /readonly lists: PgArrayParameter<string> \| string/u)
-  assert.doesNotMatch(output, /readonly lists: PgArrayParameter<PgArray/u)
+  assert.match(output, /readonly boxes: PgArrayInput<string \| PgRawValue \| null>/u)
+  assert.match(output, /readonly lists: PgArrayInput<PgArrayInput<number \| null> \| null>/u)
+  assert.match(output, /"pgArrayDelimiter":";"/u)
 })
 
 test('imports every scalar dependency used by bytea array parameters', async () => {
@@ -341,15 +268,9 @@ test('imports every scalar dependency used by bytea array parameters', async () 
     `select :payloads::bytea[] as payloads
 `
   )
-  assert.match(
-    output,
-    /import type \{ PgArray, PgArrayParameter, PgByteaHexString \} from 'postgres-typed-sql\/scalars'/u
-  )
-  assert.match(
-    output,
-    /export interface QueryParams \{[\s\S]*readonly payloads: PgArrayParameter<PgByteaHexString> \| string/u
-  )
-  assert.match(output, /export interface QueryRow \{[\s\S]*readonly payloads: PgArray<Uint8Array> \| null/u)
+  assert.match(output, /import type \{ PgArray, PgArrayInput \} from 'postgres-typed-sql\/values'/u)
+  assert.match(output, /export interface QueryParams \{[\s\S]*readonly payloads: PgArrayInput<Uint8Array \| null>/u)
+  assert.match(output, /export interface QueryRow \{[\s\S]*readonly payloads: PgArray<Uint8Array \| null> \| null/u)
 })
 
 test('keeps array elements and JSON contents independent from explicit top-level SQL NULL permission', async () => {
@@ -357,7 +278,6 @@ test('keeps array elements and JSON contents independent from explicit top-level
   const config = {
     include: ['queries'],
     rootDir: root,
-    codecProfile: 'node-postgres' as const,
     schema: 'schema.sql',
   }
   const queryFile = join(root, 'queries/query.typed.sql')
@@ -365,25 +285,25 @@ test('keeps array elements and JSON contents independent from explicit top-level
 
   await generateTypedSql(config)
   let output = await readFile(outputFile, 'utf8')
-  assert.match(output, /readonly values: PgArrayParameter<bigint \| number \| string> \| string\n/u)
+  assert.match(output, /readonly values: PgArrayInput<number \| null>\n/u)
   assert.match(output, /name: 'values',[\s\S]*?nullable: false/u)
 
   await writeFile(queryFile, '-- @nullable values\nselect :values::integer[] as values\n')
   await generateTypedSql(config)
   output = await readFile(outputFile, 'utf8')
-  assert.match(output, /readonly values: PgArrayParameter<bigint \| number \| string> \| string \| null/u)
+  assert.match(output, /readonly values: PgArrayInput<number \| null> \| null/u)
   assert.match(output, /name: 'values',[\s\S]*?nullable: true/u)
 
   await writeFile(queryFile, 'select :payload::jsonb as payload\n')
   await generateTypedSql(config)
   output = await readFile(outputFile, 'utf8')
-  assert.match(output, /readonly payload: DbJsonParameter\n/u)
+  assert.match(output, /readonly payload: PgJsonParameter\n/u)
   assert.match(output, /name: 'payload',[\s\S]*?nullable: false/u)
 
   await writeFile(queryFile, '-- @nullable payload\nselect :payload::jsonb as payload\n')
   await generateTypedSql(config)
   output = await readFile(outputFile, 'utf8')
-  assert.match(output, /readonly payload: DbJsonParameter \| null/u)
+  assert.match(output, /readonly payload: PgJsonParameter \| null/u)
   assert.match(output, /name: 'payload',[\s\S]*?nullable: true/u)
   assert.doesNotMatch(output, /nullAdmission/u)
 })
@@ -453,7 +373,6 @@ set value = nextval('public.access_sequence')
   const config = {
     include: ['queries'],
     rootDir: root,
-    codecProfile: 'node-postgres' as const,
     schema: 'schema.sql',
   }
 
@@ -503,7 +422,6 @@ select 1 as value limit nextval('public.event_sequence')
   const config = {
     include: ['queries'],
     rootDir: root,
-    codecProfile: 'node-postgres' as const,
     schema: 'schema.sql',
   }
   await assert.rejects(generateTypedSql(config), /execution-reachable volatile path that prevents a read-only proof/u)
@@ -650,7 +568,7 @@ where account.email = :email
   assert.equal(result.statementCount, 5)
   const output = await readFile(join(root, 'queries/lexicalContexts.typed-sql.ts'), 'utf8')
   assert.match(output, /parameterNames: \['cutoff', 'email'\]/u)
-  assert.match(output, /readonly cutoff: Date \| number \| string \| null/u)
+  assert.match(output, /readonly cutoff: PgTimestampTzInput \| null/u)
   assert.match(output, /name: 'cutoff',[\s\S]*?nullable: true/u)
   assert.match(output, /':not_a_parameter'/u)
   assert.match(output, /\$\$:also_not\$\$/u)
@@ -702,15 +620,15 @@ where account.id = :account_id
   const output = await readFile(join(root, 'queries/mixedParameterInference.typed-sql.ts'), 'utf8')
   assert.match(output, /parameterNames: \['label', 'accountId'\]/u)
   assert.match(output, /readonly label: string/u)
-  assert.match(output, /readonly accountId: bigint \| number \| string/u)
+  assert.match(output, /readonly accountId: PgInt8Input/u)
   assert.match(output, /name: 'label',[\s\S]*?pgType: 'text'/u)
   assert.match(output, /name: 'account_id',[\s\S]*?pgType: 'bigint'/u)
 })
 
 test('emits authored temporal casts in the exact runtime SQL', async () => {
   const output = await renderQuery('select 1;\n', 'select :later::timestamptz - :earlier::timestamptz as elapsed\n')
-  assert.match(output, /readonly later: Date \| number \| string/u)
-  assert.match(output, /readonly earlier: Date \| number \| string/u)
+  assert.match(output, /readonly later: PgTimestampTzInput/u)
+  assert.match(output, /readonly earlier: PgTimestampTzInput/u)
   assert.match(output, /text: 'select \$1::timestamptz - \$2::timestamptz as elapsed'/u)
   assert.match(output, /parameterNames: \['later', 'earlier'\]/u)
 })
@@ -848,8 +766,8 @@ select :value
   assert.doesNotMatch(nullExtendedInput, /OuterJoinInputs__Value/u)
 
   const unsafeInsertSelect = await readFile(join(root, 'queries/unsafeInsertSelect.typed-sql.ts'), 'utf8')
-  assert.match(unsafeInsertSelect, /readonly value: bigint \| number \| string\n/u)
-  assert.doesNotMatch(unsafeInsertSelect, /readonly value: bigint \| number \| string \| null/u)
+  assert.match(unsafeInsertSelect, /readonly value: number\n/u)
+  assert.doesNotMatch(unsafeInsertSelect, /readonly value: number \| null/u)
 })
 
 test('preserves exact parameter, result, JSON, relation, and schema-qualified type names', async () => {
@@ -933,36 +851,38 @@ where event_id = :event_id
   assert.match(exact, /readonly user_id: string/u)
   assert.match(exact, /readonly userId: string/u)
   assert.match(exact, /readonly json_value: string/u)
-  assert.match(exact, /readonly payload_json: ExactNamesJ12_payload_jsonJson/u)
+  assert.match(exact, /readonly payload_json: PgJson<ExactNamesJ12_payload_jsonJson>/u)
   assert.match(exact, /readonly snake_key: string/u)
   assert.match(exact, /readonly URL: string/u)
   assert.match(exact, /readonly n: number/u)
-  assert.match(exact, /readonly big: number/u)
-  assert.match(exact, /readonly ratio: number/u)
-  assert.match(exact, /readonly numbers: DbJsonSelected/u)
-  assert.match(exact, /readonly json_numbers: PgArrayParameter<bigint \| number \| string> \| string/u)
-  assert.match(exact, /readonly json_values: PgArrayParameter<DbJsonParameter> \| string/u)
-  assert.match(exact, /readonly json_values: PgArray<DbJsonSelected> \| null/u)
+  assert.match(exact, /readonly big: bigint/u)
+  assert.match(exact, /readonly ratio: PgDecimal/u)
+  assert.match(exact, /jsonPlan: .*"name":"big".*"pgType":"bigint"/u)
+  assert.doesNotMatch(exact, /jsonMapping:/u)
+  assert.match(exact, /readonly numbers: PgJsonValue/u)
+  assert.match(exact, /readonly json_numbers: PgArrayInput<PgDecimalInput \| null>/u)
+  assert.match(exact, /readonly json_values: PgArrayInput<PgJsonParameter \| null>/u)
+  assert.match(exact, /readonly json_values: PgArray<PgJson \| null> \| null/u)
   assert.match(exact, /readonly __proto__: string/u)
   assert.match(exact, /name: '__proto__',[\s\S]*?propertyName: '__proto__'/u)
-  assert.match(exact, /import type \{ DbJsonParameter, DbJsonSelected, PgArray, PgArrayParameter \}/u)
+  assert.match(exact, /import type \{[^}]*PgJsonParameter[^}]*\} from 'postgres-typed-sql\/values'/u)
   assert.doesNotMatch(exact, /import type \{ URL \}/u)
 
   const audit = await readFile(join(root, 'queries/auditEvent.typed-sql.ts'), 'utf8')
   assert.doesNotMatch(audit, /Audit_AccountStatus/u)
   assert.match(audit, /readonly event_record: string/u)
-  assert.match(audit, /readonly event_id: PgInt8String/u)
+  assert.match(audit, /readonly event_id: bigint/u)
   assert.match(audit, /readonly event_status: "queued" \| "complete"/u)
-  assert.match(audit, /readonly event_statuses: string/u)
-  assert.match(audit, /readonly numeric_values: PgArray<number>/u)
-  assert.match(audit, /readonly occurred_at: Date \| number/u)
+  assert.match(audit, /readonly event_statuses: PgArray<"queued" \| "complete" \| null>/u)
+  assert.match(audit, /readonly numeric_values: PgArray<PgDecimal \| null>/u)
+  assert.match(audit, /readonly occurred_at: PgTimestampTz/u)
   assert.match(audit, /readonly score: number/u)
-  assert.match(audit, /readonly score_list: PgArray<number>/u)
-  assert.match(audit, /readonly score_history: string/u)
-  assert.match(audit, /readonly score_span: string/u)
-  assert.match(audit, /readonly search_document: string/u)
-  assert.match(audit, /readonly whole_event: string/u)
-  assert.match(audit, /readonly details_json: AuditEventJ12_details_jsonJson/u)
+  assert.match(audit, /readonly score_list: PgArray<number \| null>/u)
+  assert.match(audit, /readonly score_history: PgArray<number \| null>/u)
+  assert.match(audit, /readonly score_span: PgRawValue/u)
+  assert.match(audit, /readonly search_document: PgRawValue/u)
+  assert.match(audit, /readonly whole_event: PgRawValue/u)
+  assert.match(audit, /readonly details_json: PgJson<AuditEventJ12_details_jsonJson>/u)
   assert.match(audit, /readonly score: number/u)
   assert.match(audit, /readonly status: "queued" \| "complete"/u)
   assert.match(audit, /readonly whole_event: AuditEventJ12_details_jsonJsonJ11_whole_event/u)
@@ -972,15 +892,15 @@ where event_id = :event_id
   assert.match(catalog, /export type AccountStatus = "active" \| "suspended"/u)
   assert.match(catalog, /export type Audit_AccountStatus = "queued" \| "complete"/u)
   assert.match(catalog, /export type Audit_ControlLabel = "line\\nbreak"/u)
-  assert.match(catalog, /export interface Audit_Events \{[\s\S]*?readonly event_id: PgInt8String/u)
-  assert.match(catalog, /readonly event_statuses: string/u)
-  assert.match(catalog, /readonly numeric_values: PgArray<number>/u)
-  assert.match(catalog, /readonly occurred_at: Date \| number/u)
+  assert.match(catalog, /export interface Audit_Events \{[\s\S]*?readonly event_id: bigint/u)
+  assert.match(catalog, /readonly event_statuses: PgArray<"queued" \| "complete" \| null>/u)
+  assert.match(catalog, /readonly numeric_values: PgArray<PgDecimal \| null>/u)
+  assert.match(catalog, /readonly occurred_at: PgTimestampTz/u)
   assert.match(catalog, /readonly score: number/u)
-  assert.match(catalog, /readonly score_list: PgArray<number>/u)
-  assert.match(catalog, /readonly score_history: string/u)
-  assert.match(catalog, /readonly score_span: string/u)
-  assert.match(catalog, /readonly search_document: string/u)
+  assert.match(catalog, /readonly score_list: PgArray<number \| null>/u)
+  assert.match(catalog, /readonly score_history: PgArray<number \| null>/u)
+  assert.match(catalog, /readonly score_span: PgRawValue/u)
+  assert.match(catalog, /readonly search_document: PgRawValue/u)
   assert.doesNotMatch(catalog, /export type AuditScore/u)
   assert.match(catalog, /readonly "audit\.events": Audit_Events/u)
 })
@@ -1026,28 +946,6 @@ test('rejects duplicate, reserved, and colliding generated names before emission
     await assert.rejects(generateFixture(root), invalid.error)
   }
 
-  for (const scalarImport of ['createTypedSqlStatement', 'query']) {
-    const root = await createMinimalFixture('select 1;\n', 'select 1::integer as value\n')
-    const codecProfile = definePostgresCodecProfile({
-      extends: 'node-postgres',
-      name: `colliding-${scalarImport}`,
-      resultType({ decoderType }, fallback) {
-        return decoderType.pgTypeOid === 23
-          ? postgresTypeScriptType(scalarImport, { scalarImports: [scalarImport] })
-          : fallback()
-      },
-    })
-    await assert.rejects(
-      generateFixture(root, { codecProfile }),
-      new RegExp(
-        `generated TypeScript binding ${scalarImport} for postgres-typed-sql scalar type import collides with ${
-          scalarImport === 'createTypedSqlStatement' ? 'generated runtime import' : 'exported statement constant'
-        }`,
-        'u'
-      )
-    )
-  }
-
   const root = await copyFixture()
   const schemaPath = join(root, 'schema.sql')
   const schema = await readFile(schemaPath, 'utf8')
@@ -1087,10 +985,7 @@ create type public.collision_params as enum ('one');
   const dateCatalogSchemaPath = join(dateCatalogCollisionRoot, 'schema.sql')
   const dateCatalogSchema = await readFile(dateCatalogSchemaPath, 'utf8')
   await writeFile(dateCatalogSchemaPath, `${dateCatalogSchema}\ncreate type public.date as enum ('today');\n`)
-  await assert.rejects(
-    generateFixture(dateCatalogCollisionRoot),
-    /generated TypeScript binding Date for enum public\.date collides with ambient TypeScript type/u
-  )
+  await generateFixture(dateCatalogCollisionRoot)
 
   const byteaCatalogCollisionRoot = await copyFixture()
   const byteaCatalogSchemaPath = join(byteaCatalogCollisionRoot, 'schema.sql')
@@ -1114,12 +1009,12 @@ create table public.readings (kind public.date not null);
     'select kind, now()::timestamp with time zone as measured_at from public.readings\n'
   )
   assert.match(dateStatement, /readonly kind: "today"/u)
-  assert.match(dateStatement, /readonly measured_at: Date \| number/u)
+  assert.match(dateStatement, /readonly measured_at: PgTimestampTz/u)
 })
 
 test('reserves only TypeScript utility, ambient, and scalar bindings used by each generated file', async () => {
   const unusedCollisionOutput = await renderQuery(
-    `create type public.pg_int8_string as enum ('scalar');
+    `create type public.pg_decimal as enum ('scalar');
 create type public.record as enum ('utility');
 create type public.date as enum ('ambient_date');
 create type public.uint8_array as enum ('ambient_bytes');
@@ -1134,19 +1029,19 @@ create type public.uint8_array as enum ('ambient_bytes');
   assert.match(unusedCollisionOutput, /readonly utility_kind: "utility" \| null/u)
   assert.match(unusedCollisionOutput, /readonly date_kind: "ambient_date" \| null/u)
   assert.match(unusedCollisionOutput, /readonly bytes_kind: "ambient_bytes" \| null/u)
-  assert.doesNotMatch(unusedCollisionOutput, /PgInt8String/u)
+  assert.doesNotMatch(unusedCollisionOutput, /PgDecimal/u)
   assert.doesNotMatch(unusedCollisionOutput, /Record<string, never>/u)
 
   const cases = [
     {
-      schema: `create type public.pg_int8_string as enum ('scalar');
+      schema: `create type public.pg_decimal as enum ('scalar');
 `,
-      sql: 'select :kind::public.pg_int8_string as kind, 1::bigint as count\n',
+      sql: 'select :kind::public.pg_decimal as kind, 1::numeric as count\n',
     },
     {
-      schema: `create type public.pg_array_parameter as enum ('scalar');
+      schema: `create type public.pg_array_input as enum ('scalar');
 `,
-      sql: 'select :kind::public.pg_array_parameter as kind, cardinality(:values::integer[]) as count\n',
+      sql: 'select :kind::public.pg_array_input as kind, cardinality(:values::integer[]) as count\n',
     },
     {
       schema: `create type public.record as enum ('utility');
@@ -1171,14 +1066,14 @@ create type public.uint8_array as enum ('ambient_bytes');
   }
 
   const catalogScalarCollisionRoot = await createMinimalFixture(
-    `create type public.pg_int8_string as enum ('scalar');
-create table public.binding_values (id bigint not null);
+    `create type public.pg_decimal as enum ('scalar');
+create table public.binding_values (id numeric not null);
 `,
     'select 1 as value\n'
   )
   await assert.rejects(
     generateFixture(catalogScalarCollisionRoot),
-    /generated TypeScript binding PgInt8String for enum public\.pg_int8_string collides with postgres-typed-sql scalar type import/u
+    /generated TypeScript binding PgDecimal for enum public\.pg_decimal collides with postgres-typed-sql scalar type import/u
   )
 })
 
@@ -1202,7 +1097,7 @@ test('encodes arbitrary PostgreSQL identifiers injectively and renders complete 
 create schema a;
 create type public."state-code" as enum ('ok');
 create table public."order-items" (
-  id bigint,
+  id numeric,
   "display-name" text,
   state public."state-code" not null
 );
@@ -1271,8 +1166,8 @@ as assignment;
     `select jsonb_build_object('value', 'ok'::public.json_mood) as payload
 `
   )
-  assert.match(jsonCastOutput, /readonly value: DbJsonSelected/u)
-  assert.match(jsonCastOutput, /import type \{ DbJsonSelected \}/u)
+  assert.match(jsonCastOutput, /readonly value: PgJsonValue/u)
+  assert.match(jsonCastOutput, /import type \{[^}]*PgJsonValue[^}]*\} from 'postgres-typed-sql\/values'/u)
   assert.doesNotMatch(jsonCastOutput, /readonly value: JsonMood/u)
 
   const rejectingOverrideRoot = await createMinimalFixture(
@@ -1299,7 +1194,6 @@ create table public.required_targets (value text not null);
   const config = {
     include: ['queries'],
     rootDir: root,
-    codecProfile: 'node-postgres' as const,
     schema: 'schema.sql',
   }
   const queryFile = join(root, 'queries/query.typed.sql')
@@ -1342,7 +1236,6 @@ test('accepts nullable coordinates when a DML assignment preserves the old point
   const config = {
     include: ['queries'],
     rootDir: root,
-    codecProfile: 'node-postgres' as const,
     schema: 'schema.sql',
   }
   const queryFile = join(root, 'queries/query.typed.sql')
@@ -1368,8 +1261,8 @@ where id = 1
     )
     await generateTypedSql(config)
     const output = await readFile(outputFile, 'utf8')
-    assert.match(output, /readonly latitude: bigint \| number \| string \| null/u)
-    assert.match(output, /readonly longitude: bigint \| number \| string \| null/u)
+    assert.match(output, /readonly latitude: number \| null/u)
+    assert.match(output, /readonly longitude: number \| null/u)
     assert.match(output, /name: 'latitude',[\s\S]*?nullable: true/u)
     assert.match(output, /name: 'longitude',[\s\S]*?nullable: true/u)
   }
@@ -1385,8 +1278,8 @@ where id = 1
   )
   await generateTypedSql(config)
   const output = await readFile(outputFile, 'utf8')
-  assert.match(output, /readonly latitude: bigint \| number \| string \| null/u)
-  assert.match(output, /readonly longitude: bigint \| number \| string \| null/u)
+  assert.match(output, /readonly latitude: number \| null/u)
+  assert.match(output, /readonly longitude: number \| null/u)
 
   for (const expression of [
     'point(:latitude::float8, :longitude::float8)',
@@ -1468,7 +1361,6 @@ set value = coalesce(value, :value)
   const config = {
     include: ['queries'],
     rootDir: root,
-    codecProfile: 'node-postgres' as const,
     schema: 'schema.sql',
   }
   const queryFile = join(root, 'queries/query.typed.sql')
@@ -1476,7 +1368,7 @@ set value = coalesce(value, :value)
 
   await generateTypedSql(config)
   const output = await readFile(outputFile, 'utf8')
-  assert.match(output, /readonly value: bigint \| number \| string \| null/u)
+  assert.match(output, /readonly value: number \| null/u)
   assert.match(output, /name: 'value',[\s\S]*?nullable: true/u)
 
   const rejectedSql = [
@@ -1525,7 +1417,6 @@ from (values (1), (2)) input(value)
   const config = {
     include: ['queries'],
     rootDir: root,
-    codecProfile: 'node-postgres' as const,
     schema: 'schema.sql',
   }
   const queryFile = join(root, 'queries/query.typed.sql')
@@ -1533,7 +1424,7 @@ from (values (1), (2)) input(value)
 
   await generateTypedSql(config)
   let output = await readFile(outputFile, 'utf8')
-  assert.match(output, /readonly offset: bigint \| number \| string\n/u)
+  assert.match(output, /readonly offset: PgInt8Input\n/u)
   assert.match(output, /name: 'offset',[\s\S]*?nullable: false/u)
 
   await writeFile(
@@ -1556,7 +1447,7 @@ from (values (1), (2)) input(value)
   )
   await generateTypedSql(config)
   output = await readFile(outputFile, 'utf8')
-  assert.match(output, /readonly offset: bigint \| number \| string\n/u)
+  assert.match(output, /readonly offset: number\n/u)
   assert.match(output, /name: 'offset',[\s\S]*?nullable: false/u)
 
   await writeFile(
@@ -1574,7 +1465,7 @@ from (values (1), (2)) input(value)
   await writeFile(queryFile, 'call public.accept_null(:value)\n')
   await generateTypedSql(config)
   output = await readFile(outputFile, 'utf8')
-  assert.match(output, /readonly value: bigint \| number \| string\n/u)
+  assert.match(output, /readonly value: number\n/u)
   assert.match(output, /name: 'value',[\s\S]*?nullable: false/u)
 
   await writeFile(
@@ -1601,7 +1492,6 @@ test('narrows CHECK parameters only for direct value-preserving assignments', as
   const config = {
     include: ['queries'],
     rootDir: root,
-    codecProfile: 'node-postgres' as const,
     schema: 'schema.sql',
   }
   await generateTypedSql(config)
@@ -1657,7 +1547,6 @@ create table public.intersect_accounts (
   const config = {
     include: ['queries'],
     rootDir: root,
-    codecProfile: 'node-postgres' as const,
     schema: 'schema.sql',
   }
 
@@ -1692,7 +1581,7 @@ from public.char_values
 
   const output = await readFile(join(root, 'queries/query.typed-sql.ts'), 'utf8')
   assert.match(output, /readonly value: string \| null/u)
-  assert.match(output, /readonly payload: QueryJ7_payloadJson/u)
+  assert.match(output, /readonly payload: PgJson<QueryJ7_payloadJson>/u)
   assert.match(output, /readonly value: string \| null/u)
   assert.doesNotMatch(output, /readonly value: CharValues__Value/u)
 
@@ -1719,7 +1608,6 @@ from public.checked_text_values
   const config = {
     include: ['queries'],
     rootDir: root,
-    codecProfile: 'node-postgres' as const,
     schema: 'schema.sql',
   }
   await generateTypedSql(config)
@@ -1754,10 +1642,10 @@ test('renders nullable and union JSON aggregate element types with array precede
 from public.json_values
 `
   )
-  assert.match(output, /readonly text_values: readonly \(string \| null\)\[\] \| null/u)
-  assert.match(output, /readonly numeric_values: readonly \(number \| string\)\[\] \| null/u)
-  assert.match(output, /readonly object_values: readonly \(QueryJ13_object_valuesJsonJ7_element\)\[\]/u)
-  assert.doesNotMatch(output, /readonly object_values: DbJsonSelected/u)
+  assert.match(output, /readonly text_values: PgJson<readonly \(string \| null\)\[\]> \| null/u)
+  assert.match(output, /readonly numeric_values: PgJson<readonly \(PgDecimal\)\[\]> \| null/u)
+  assert.match(output, /readonly object_values: PgJson<readonly \(QueryJ13_object_valuesJsonJ7_element\)\[\]>/u)
+  assert.doesNotMatch(output, /readonly object_values: PgJsonValue/u)
 })
 
 test('generates correlated and set-operation CHECK result refinements soundly', async () => {
@@ -1787,7 +1675,6 @@ cross join lateral (
   const config = {
     include: ['queries'],
     rootDir: root,
-    codecProfile: 'node-postgres' as const,
     schema: 'schema.sql',
   }
   const queryFile = join(root, 'queries/query.typed.sql')
@@ -1886,12 +1773,12 @@ cross join lateral (
   assert.match(output, /readonly value: \('left_only' \| 'shared'\) \| \('right_only' \| 'shared'\) \| null/u)
   assert.doesNotMatch(output, /readonly value: 'inner_only'/u)
   assert.match(output, /readonly nullable_value: string \| null/u)
-  assert.match(output, /interface QueryJ7_payloadJsonJ12_alternative1 \{[\s\S]*readonly outer_left:/u)
-  assert.match(output, /interface QueryJ7_payloadJsonJ12_alternative2 \{[\s\S]*readonly outer_right:/u)
+  assert.match(output, /readonly payload: PgJson<PgJsonValue>/u)
+  assert.match(output, /jsonPlan: \{"kind":"generic"\}/u)
   assert.doesNotMatch(output, /readonly inner:/u)
 })
 
-test('renders every inferable JSON object alternative from set-operation outputs', async () => {
+test('uses a generic codec for indistinguishable JSON object alternatives from set-operation outputs', async () => {
   const output = await renderQuery(
     'select 1;\n',
     `select payload
@@ -1902,10 +1789,8 @@ from (
 ) source
 `
   )
-  assert.match(output, /interface QueryJ7_payloadJsonJ12_alternative1 \{[\s\S]*readonly a: number/u)
-  assert.match(output, /interface QueryJ7_payloadJsonJ12_alternative2 \{[\s\S]*readonly b: 'two'/u)
-  assert.match(output, /readonly payload: QueryJ7_payloadJsonJ12_alternative1 \| QueryJ7_payloadJsonJ12_alternative2/u)
-  assert.doesNotMatch(output, /readonly payload: DbJsonSelected/u)
+  assert.match(output, /readonly payload: PgJson<PgJsonValue>/u)
+  assert.match(output, /jsonPlan: \{"kind":"generic"\}/u)
 })
 
 test('generates build-object contracts only from proven complete argument lists', async () => {
@@ -1917,7 +1802,6 @@ test('generates build-object contracts only from proven complete argument lists'
   const config = {
     include: ['queries'],
     rootDir: root,
-    codecProfile: 'node-postgres' as const,
     schema: 'schema.sql',
   }
   const queryFile = join(root, 'queries/query.typed.sql')
@@ -1926,9 +1810,9 @@ test('generates build-object contracts only from proven complete argument lists'
   await generateTypedSql(config)
   let output = await readFile(outputFile, 'utf8')
   assert.match(output, /interface QueryJ7_payloadJson \{[\s\S]*readonly answer: '42'/u)
-  assert.match(output, /readonly payload: QueryJ7_payloadJson/u)
-  assert.doesNotMatch(output, /readonly payload: QueryJ7_payloadJson \| null/u)
-  assert.doesNotMatch(output, /readonly payload: DbJsonSelected/u)
+  assert.match(output, /readonly payload: PgJson<QueryJ7_payloadJson>/u)
+  assert.doesNotMatch(output, /readonly payload: PgJson<QueryJ7_payloadJson> \| null/u)
+  assert.doesNotMatch(output, /readonly payload: PgJson<PgJsonValue>/u)
 
   await writeFile(
     queryFile,
@@ -1937,25 +1821,25 @@ test('generates build-object contracts only from proven complete argument lists'
   )
   await generateTypedSql(config)
   output = await readFile(outputFile, 'utf8')
-  assert.match(output, /readonly payload: DbJsonSelected \| null/u)
+  assert.match(output, /readonly payload: PgJson<PgJsonValue> \| null/u)
   assert.doesNotMatch(output, /interface QueryJ7_payloadJson/u)
 
   await writeFile(queryFile, 'select jsonb_build_object(variadic null::text[]) as payload\n')
   await generateTypedSql(config)
   output = await readFile(outputFile, 'utf8')
-  assert.match(output, /readonly payload: DbJsonSelected \| null/u)
+  assert.match(output, /readonly payload: PgJson<PgJsonValue> \| null/u)
 
   await writeFile(queryFile, "select jsonb_build_object('answer', null::text) as payload\n")
   await generateTypedSql(config)
   output = await readFile(outputFile, 'utf8')
   assert.match(output, /interface QueryJ7_payloadJson \{[\s\S]*readonly answer: null/u)
-  assert.match(output, /readonly payload: QueryJ7_payloadJson\n/u)
-  assert.doesNotMatch(output, /readonly payload: QueryJ7_payloadJson \| null/u)
+  assert.match(output, /readonly payload: PgJson<QueryJ7_payloadJson>\n/u)
+  assert.doesNotMatch(output, /readonly payload: PgJson<QueryJ7_payloadJson> \| null/u)
 
   await writeFile(queryFile, "select jsonb_build_object('unpaired') as payload\n")
   await generateTypedSql(config)
   output = await readFile(outputFile, 'utf8')
-  assert.match(output, /readonly payload: DbJsonSelected/u)
+  assert.match(output, /readonly payload: PgJson<PgJsonValue>/u)
   assert.doesNotMatch(output, /interface QueryJ7_payloadJson/u)
 })
 
@@ -1974,7 +1858,6 @@ as $$ begin output_value := input_value * 2; end $$;
   const config = {
     include: ['queries'],
     rootDir: root,
-    codecProfile: 'node-postgres' as const,
     schema: 'schema.sql',
   }
   const queryFile = join(root, 'queries/query.typed.sql')
@@ -2016,7 +1899,6 @@ select value from walk
   const config = {
     include: ['queries'],
     rootDir: root,
-    codecProfile: 'node-postgres' as const,
     schema: 'schema.sql',
   }
   const queryFile = join(root, 'queries/query.typed.sql')
@@ -2050,7 +1932,7 @@ test('encodes arbitrary JSON result and field names only in generated type bindi
     `select jsonb_build_object('outer-key', jsonb_build_object('inner key', 1, '', 2)) as "payload-data"
 `
   )
-  assert.match(output, /readonly "payload-data": QueryJ15_payload\$2d\$dataJson/u)
+  assert.match(output, /readonly "payload-data": PgJson<QueryJ15_payload\$2d\$dataJson>/u)
   assert.match(output, /readonly "outer-key": QueryJ15_payload\$2d\$dataJsonJ12_outer\$2d\$key/u)
   assert.match(output, /readonly "inner key": number/u)
   assert.match(output, /readonly "": number/u)
@@ -2086,7 +1968,7 @@ from (values (1)) source(n)
     }
   )
   assert.match(output, /readonly accountId: number/u)
-  assert.match(output, /readonly accountDetails: QueryJ15_account_detailsJson/u)
+  assert.match(output, /readonly accountDetails: PgJson<QueryJ15_account_detailsJson>/u)
   assert.match(output, /readonly displayName: 'Reader'/u)
   assert.match(output, /readonly recentPosts: readonly/u)
   assert.match(output, /readonly postId: number/u)
@@ -2096,7 +1978,7 @@ from (values (1)) source(n)
   assert.match(output, /name: 'account_id',[\s\S]*?propertyName: 'accountId'/u)
   assert.match(
     output,
-    /jsonMapping: \{"fields":\[\{"name":"display_name","propertyName":"displayName"\},\{"mapping":\{"arrayElement":\{"fields":\[\{"name":"post_id","propertyName":"postId"\},\{"name":"published_at","propertyName":"publishedAt"\}\]\}\},"name":"recent_posts","propertyName":"recentPosts"\},\{"mapping":\{"fields":\[\{"name":"event_type","propertyName":"eventType"\}\]\},"name":"webhook_payload","propertyName":"webhookPayload"\}\]\}/u
+    /jsonPlan: .*"name":"display_name","propertyName":"displayName".*"name":"recent_posts","propertyName":"recentPosts".*"name":"webhook_payload","propertyName":"webhookPayload"/u
   )
 })
 
@@ -2127,8 +2009,8 @@ test('maps JSON array-from and object-from derived row shapes to camel case', as
       },
     }
   )
-  assert.match(output, /readonly accountRows: readonly \(QueryJ12_account_rowsJsonJ7_element\)\[\]/u)
-  assert.match(output, /readonly accountRow: QueryJ11_account_rowJson\n/u)
+  assert.match(output, /readonly accountRows: PgJson<readonly \(QueryJ12_account_rowsJsonJ7_element\)\[\]>/u)
+  assert.match(output, /readonly accountRow: PgJson<QueryJ11_account_rowJson>\n/u)
   assert.match(output, /readonly accountId: number/u)
   assert.match(output, /readonly displayName: 'Reader'/u)
   assert.match(output, /readonly displayName: 'Writer'/u)
@@ -2155,11 +2037,9 @@ cross join (
   )
   assert.match(output, /readonly userId: number/u)
   assert.doesNotMatch(output, /readonly accountId: number/u)
-  assert.match(output, /readonly leftKey: number/u)
-  assert.match(output, /readonly rightKey: number/u)
+  assert.match(output, /readonly details: PgJsonValue/u)
   assert.match(output, /"name":"user_id","propertyName":"userId"/u)
-  assert.match(output, /"name":"left_key","propertyName":"leftKey"/u)
-  assert.match(output, /"name":"right_key","propertyName":"rightKey"/u)
+  assert.match(output, /"name":"details","propertyName":"details","plan":\{"kind":"generic"\}/u)
 })
 
 test('maps ARRAY sublink elements while preserving opaque union paths', async () => {
@@ -2178,7 +2058,7 @@ from public.json_values
     { naming: { structuredJsonFields: 'camelCase' } }
   )
   assert.match(output, /readonly itemId: number/u)
-  assert.match(output, /readonly payloadData: DbJsonSelected/u)
+  assert.match(output, /readonly payloadData: PgJsonValue/u)
   assert.doesNotMatch(output, /readonly fooBar: number/u)
   assert.match(output, /"name":"item_id","propertyName":"itemId"/u)
   assert.match(output, /"name":"payload_data","propertyName":"payloadData"/u)
@@ -2200,7 +2080,7 @@ select jsonb_build_object(
 `,
     { naming: { structuredJsonFields: 'camelCase' } }
   )
-  assert.match(output, /readonly payloadData: DbJsonSelected/u)
+  assert.match(output, /readonly payloadData: PgJsonValue/u)
   assert.doesNotMatch(output, /readonly innerKey: number/u)
   assert.match(output, /"name":"payload_data","propertyName":"payloadData"/u)
   assert.doesNotMatch(output, /"name":"inner_key","propertyName":"innerKey"/u)
@@ -2250,7 +2130,7 @@ test('rejects configured output naming collisions at every modeled object level'
   )
 })
 
-test('merges camel-case runtime mappings across structured JSON unions', async () => {
+test('uses a generic codec for indistinguishable camel-case JSON unions', async () => {
   const output = await renderQuery(
     'select 1;\n',
     `select payload
@@ -2266,31 +2146,17 @@ from (
       },
     }
   )
-  assert.match(output, /readonly outerLeft: number/u)
-  assert.match(output, /readonly outerRight: 'two'/u)
-  assert.match(
-    output,
-    /jsonMapping: \{"fields":\[\{"name":"outer_left","propertyName":"outerLeft"\},\{"name":"outer_right","propertyName":"outerRight"\}\]\}/u
-  )
+  assert.match(output, /readonly payload: PgJson<PgJsonValue>/u)
+  assert.match(output, /jsonPlan: \{"kind":"generic"\}/u)
 })
 
-test('requires structural JSON decoding when configured JSON field naming is used', async () => {
-  const root = await createMinimalFixture(
-    'select 1;\n',
-    `select jsonb_build_object('display_name', 'Reader') as payload
-`
-  )
-  await assert.rejects(
-    generateTypedSql({
-      include: ['queries'],
-      naming: {
-        structuredJsonFields: 'camelCase',
-      },
-      rootDir: root,
-      schema: 'schema.sql',
-    }),
-    /structured JSON field naming for result column "payload" requires a codec profile that decodes structured JSON/u
-  )
+test('emits a JSON plan for configured JSON field naming', async () => {
+  const output = await renderQuery('select 1;\n', "select jsonb_build_object('display_name', 'Reader') as payload\n", {
+    naming: { structuredJsonFields: 'camelCase' },
+  })
+  assert.match(output, /readonly payload: PgJson<QueryJ7_payloadJson>/u)
+  assert.match(output, /readonly displayName: 'Reader'/u)
+  assert.match(output, /jsonPlan: .*"name":"display_name","propertyName":"displayName"/u)
 })
 
 test('uses collision-free JSON binding paths for arrays and nested keys', async () => {
@@ -2321,7 +2187,7 @@ as $$ select 'null'::jsonb $$;
     `select public.jsonb_build_object('key', 1) as payload
 `
   )
-  assert.match(output, /readonly payload: DbJsonSelected \| null/u)
+  assert.match(output, /readonly payload: PgJson<PgJsonValue> \| null/u)
   assert.doesNotMatch(output, /interface QueryJ7_payloadJson/u)
 })
 
@@ -2337,11 +2203,11 @@ from public.json_values
   )
   assert.match(
     output,
-    /readonly payload: readonly \(QueryJ7_payloadJsonJ12_alternative1J7_element\)\[\] \| QueryJ7_payloadJsonJ12_alternative2\n/u
+    /readonly payload: PgJson<readonly \(QueryJ7_payloadJsonJ12_alternative1J7_element\)\[\] \| QueryJ7_payloadJsonJ12_alternative2>\n/u
   )
   assert.match(output, /readonly a: number \| null\n/u)
   assert.match(output, /readonly b: number\n/u)
-  assert.doesNotMatch(output, /DbJsonSelected/u)
+  assert.doesNotMatch(output, /PgJsonValue/u)
 })
 
 test('resolves column type assertions by PostgreSQL OID instead of display spelling', async () => {

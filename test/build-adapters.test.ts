@@ -22,7 +22,7 @@ async function fixture() {
   await writeFile(dependency, JSON.stringify({ resultColumns: 'preserve' }))
   await writeFile(
     config,
-    `import naming from './helper.mjs'; export default {schema:'schema.sql', codecProfile:'node-postgres', imports:${JSON.stringify(imports)}, naming}`
+    `import naming from './helper.mjs'; export default {schema:'schema.sql',  imports:${JSON.stringify(imports)}, naming}`
   )
   return { root, config, schema, helper, dependency, source: join(root, 'query.typed.sql') }
 }
@@ -47,7 +47,7 @@ test('build project refreshes saved inputs, handles parallel requests and recove
     assert.ok(project.watchedFiles.includes(f.config))
     await writeFile(
       f.config,
-      `import {readFileSync} from 'node:fs'; const naming = JSON.parse(readFileSync(new URL('./style.json', import.meta.url))); export default {schema:'schema.sql',codecProfile:'node-postgres',imports:${JSON.stringify(imports)},naming}`
+      `import {readFileSync} from 'node:fs'; const naming = JSON.parse(readFileSync(new URL('./style.json', import.meta.url))); export default {schema:'schema.sql',imports:${JSON.stringify(imports)},naming}`
     )
     assert.match(await project.compile(f.source, sql), /readonly display_name: string \| null/u)
     await writeFile(f.dependency, JSON.stringify({ resultColumns: 'camelCase' }))
@@ -86,7 +86,7 @@ test('Vite accepts missing optional helpers and refreshes when they appear', asy
     try { naming = (await import('./optional.mjs')).default } catch (error) {
       if (error.code !== 'ERR_MODULE_NOT_FOUND') throw error
     }
-    export default {schema:'schema.sql',codecProfile:'node-postgres',imports:${JSON.stringify(imports)},naming}`
+    export default {schema:'schema.sql',imports:${JSON.stringify(imports)},naming}`
   )
   const plugin = postgresTypedSql({ config: f.config })
   const watched = new Set<string>()

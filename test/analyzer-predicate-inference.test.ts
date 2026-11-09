@@ -166,7 +166,7 @@ test('generated result and nested JSON types share predicate and literal proofs'
     jsonb_build_object('score', score, 'role', role) as payload
     from predicate_probe where score > 0 and role = 'admin'`
   )
-  await generateTypedSql({ rootDir: root, schema: 'schema.sql', include: ['queries'], codecProfile: 'node-postgres' })
+  await generateTypedSql({ rootDir: root, schema: 'schema.sql', include: ['queries'] })
   const output = await readFile(join(root, 'queries/query.typed-sql.ts'), 'utf8')
   assert.match(output, /readonly score: number\n/u)
   assert.match(output, /readonly fallback: number\n/u)

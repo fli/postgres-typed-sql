@@ -1,26 +1,6 @@
 # Postgres Typed SQL
 
-For bundled Node applications, the experimental [direct SQL import workflow](docs/direct-imports.md) checks `.typed.sql` imports with TypeScript 7.1 and builds them with esbuild without a generation command.
-
-Postgres Typed SQL generates TypeScript statements from SQL by asking an embedded PostgreSQL engine to perform parse analysis and query rewriting against your real schema.
-
-The package does not approximate PostgreSQL semantics with a separate parser. It bundles PostgreSQL 18.3 through a custom PGlite build and fails when a schema requires an unsupported database feature or extension.
-
-## Status
-
-The `0.1.x` line is a public beta. Its compatibility contract is deliberately narrow:
-
-- Node.js 20.19 or newer
-- PostgreSQL 18.3 analysis semantics
-- local schema SQL files
-- no connection to a hosted or production database
-- no native compilation or lifecycle scripts during installation
-- no fallback analyzer
-
-Supported extensions are `btree_gin`, `btree_gist`, `citext`, `hstore`,
-`pg_stat_statements`, `pg_trgm`, `pgcrypto`, `plpgsql`, and `uuid-ossp`.
-
-## Install
+Generate TypeScript queries using embedded PostgreSQL analysis, then execute them through a lossless, driver-independent runtime.
 
 ```sh
 npm install postgres-typed-sql
@@ -31,331 +11,32 @@ Create `postgres-typed-sql.config.mjs`:
 ```js
 import { defineConfig } from 'postgres-typed-sql'
 
-export default defineConfig({
-  schema: './db/schema.sql',
-  include: ['./src'],
-  imports: {
-    runtime: 'postgres-typed-sql/adapters/node-postgres',
-    scalars: 'postgres-typed-sql/scalars',
-  },
-  extensions: ['pgcrypto'],
-  codecProfile: 'node-postgres',
-  naming: {
-    parameterProperties: 'camelCase',
-    resultColumns: 'camelCase',
-    structuredJsonFields: 'camelCase',
-  },
-})
+export default defineConfig({ schema: './schema.sql', include: ['./src'] })
 ```
 
-`imports` is required because generated statements have a runtime value dependency and a type-only scalar-support dependency. One generation invocation uses the same two exact module specifiers for every output; workspaces that publish different generated-code façades should use separate configurations. The configured modules are two addresses within the ABI owned by this generator version: `runtime` must export `createTypedSqlStatement` and `createTypedSqlExecutor`, and `scalars` must export the scalar bindings used by the selected profile. No package suffixes are inferred.
+Write queries in `*.typed.sql` files with `:named` parameters, then generate:
 
-The generated catalog defaults to `postgres-typed-sql.types.ts` and can be relocated with `typesOutput`. Statement files do not import that artifact: enum labels and supported CHECK-constraint refinements are rendered directly into their parameter, result, and structured-JSON types. The catalog remains available as a standalone database model for application code that needs it.
-
-Add a script:
-
-```json
-{
-  "scripts": {
-    "generate:sql": "postgres-typed-sql generate"
-  }
-}
+```sh
+npx postgres-typed-sql generate
 ```
 
-## Write SQL
-
-Files ending in `.typed.sql` are generated next to their source. Named parameters use `:name` syntax:
-
-```sql
--- src/queries/findAccountByEmail.typed.sql
-select id, email, display_name
-from public.accounts
-where email = :email
-```
-
-Each file contains exactly one PostgreSQL statement. The filename basename determines the generated statement export and runtime display name. A hyphen followed by an ASCII letter or digit is converted to an uppercase character: `find-account-by-email.typed.sql` exports `findAccountByEmail`. Existing camelCase, underscores, and dollar signs retain their spelling. Use one `-- @name fetchAccount` header declaration when the export must differ from the filename. The resulting name must be a supported non-reserved TypeScript binding identifier: an ASCII letter, `_`, or `$`, followed by ASCII letters, digits, `_`, or `$`. Module paths always follow the source filename. Names are scoped to each generated module, so different directories may share an export name.
-
-Named parameter tokens retain their exact spelling for SQL compilation, `@nullable` directives, diagnostics, and runtime metadata. Generated parameter-object properties are application-facing and use conservative camel case by default, so `:platform_slug` is supplied as `{ platformSlug }`. Repeated uses of one raw token still share one positional placeholder and one public property. Set `naming.parameterProperties` to `'preserve'` only when callers deliberately use the raw token spelling.
-
-PostgreSQL infers parameter types from the authored SQL. When an expression does not provide enough context—such as an otherwise ambiguous operator—write an ordinary PostgreSQL cast at that use, for example `:cutoff::timestamptz`. The generator does not maintain a parallel annotation type system and does not inject casts into the SQL. It analyzes the exact compiled `$1`, `$2`, … text that the runtime executes, without supplying out-of-band parameter OIDs.
-
-Parameters are non-null to callers by default, independently of whether PostgreSQL can evaluate the statement with SQL `NULL`. Use `-- @nullable name` to request top-level SQL `NULL`. This changes only the caller contract; it does not provide a PostgreSQL type. Generation accepts the request only when PostgreSQL analysis proves that every use admits `NULL`; proven rejection or incomplete evidence is an error.
-
-Prefer `@nullable` when a NULL contract can be proved. The analyzer models guarded writes, searched CASE result arms, and safe expressions; a NULL result does not have to flow directly into every use. For a caller-owned contract that allows NULL only under conditions outside that proof, use `-- @bindNull name`. This permits top-level NULL in the generated input and binding metadata without claiming database acceptance. The caller owns valid argument combinations and execution errors. It does not turn unknown or rejected admission into acceptance. Neither declaration supplies a PostgreSQL type, and a parameter may have only one NULL declaration. The public generation-analysis report distinguishes `provedNullable`, `callerNullable`, and `nonNull` contracts from the independent admission result.
-
-The built-in node-postgres adapter sends only the generated SQL text and values; it does not add Parse-message parameter type OIDs. A custom adapter conforms to generated parameter typing only when it preserves that property. Supplying out-of-band type hints can make runtime preparation resolve SQL differently from the SQL-only analysis contract.
-
-Inside PostgreSQL expression subscripts, an unparenthesized top-level colon remains the native array-slice delimiter. Use `items[(:index)]` for a named subscript, and use `items[1 : :upper]` or `items[1:(:upper)]` for a named slice bound. `ARRAY[:value]` continues to treat `:value` as a named parameter because `ARRAY[...]` is an array constructor rather than a subscript.
-
-Running `npm run generate:sql` creates `findAccountByEmail.typed-sql.ts` containing:
-
-- parameter and result-row interfaces
-- PostgreSQL types and nullability
-- a conservative row contract and the analyzer's canonical row bounds
-- conservative read/write execution routing
-- stable parameter ordering
-- the compiled `$1`, `$2`, … SQL text
-- metadata for runtime row mapping
-
-The generated statement can be passed directly to a driver that accepts PostgreSQL query configuration objects:
+Execute a generated query with a caller-owned, configured client or pool:
 
 ```ts
-import type { TypedSqlRawRow } from 'postgres-typed-sql/runtime'
+import { nodePostgres } from 'postgres-typed-sql/adapters/node-postgres'
+import findAccount from './findAccount.typed-sql.js'
 
-const result = await client.query<TypedSqlRawRow>(findAccountByEmail.query({ email }))
+const db = nodePostgres({ pool })
+const account = await findAccount(db, { email: 'reader@example.com' })
 ```
 
-`query()` returns only the compiled SQL text and a fresh values array; it does not opt the driver into named prepared
-statements. Direct driver execution returns driver-defined raw object rows whose scalar values should be treated as
-`unknown`, because `query()` controls neither row construction nor scalar parsers. The node-postgres result-row
-generic is not inferred from a query configuration object, so a direct unannotated
-`client.query(statement.query(params))` call defaults to `any`; pass `TypedSqlRawRow` explicitly as shown above.
+Install the driver in the application. Only load trusted schema and configuration files.
 
-The core runtime is driver-neutral. It owns statement construction, named-parameter ordering, result metadata, positional/object row mapping, structured-JSON mapping, and affected-row-count normalization. Driver query options and execution live in adapters. For node-postgres:
+Use the code for API details:
 
-```ts
-import findAccountByEmail from './findAccountByEmail.typed-sql.js'
+- [Value types](src/value-types.ts) and [constructors](src/values.ts).
+- [Execution](src/runtime.ts) and [node-postgres connection requirements](src/adapters/node-postgres.ts).
+- [Configuration](src/config.ts), [direct-import integration](src/content-mapper.ts), and [esbuild integration](src/esbuild.ts).
+- [Analysis report types](src/generation-analysis.ts) and [executable examples](test/consumer).
 
-const account = await findAccountByEmail(client, { email })
-```
-
-Each generated module default-exports a callable that accepts the supplied client and its generated parameter object. The named statement export remains available for metadata, `query()`, and composition with `executeTypedSql(client, statement, params)`. Parameterless callables accept either `run(client)` or `run(client, {})`. A parameterized callable requires its object even when every value is nullable.
-
-The analyzer selects `resultKind` and matching `rowBounds`. Exactly one row returns `Row`, zero or one returns `Row | null`, and other row bounds return `Row[]`, including a proved empty SELECT. DML without RETURNING returns its affected-row count. A supported CALL without output returns `void`. DML with RETURNING uses the existing conservative bounds, so INSERT RETURNING can return an array even for a single VALUES tuple. There is no caller-selected result shape.
-
-When migrating from the removed `executeTypedSqlOne`, `executeTypedSqlOptional`, and `executeTypedSqlCommand` helpers, regenerate statements and review each inferred result shape. If a former One call now returns `Row | null`, keep an explicit missing-row check when the application requires a row. If a former One or Optional call now returns `Row[]`, keep the application's explicit row-count assertion before selecting a row. This includes a single-row INSERT RETURNING whose bounds remain conservative. A former Command call on DML with RETURNING now receives rows instead of an affected-row count. Improved analyzer proofs can change the inferred shape on later regeneration, so review those changes with their callers.
-
-The adapter executes once on the supplied client. It checks every proved row bound after execution, rejects unexpected rows for command and void results, and requires a nonnegative safe affected-row count for commands. A bound failure can occur after SQL has executed, so callers must not automatically retry it. Old generated statements missing result metadata must be regenerated. Custom runtime façades must export both factories from the same exact `imports.runtime` module. Codec profiles control scalar types independently of the execution adapter.
-
-The node-postgres adapter requests array rows for generated statements, maps them by result-column position, enforces `one`, `optional`, and `many` result shapes, and returns the generated row type selected by the configured codec profile. Positional mapping preserves every unique PostgreSQL result name safely, including names such as `__proto__` that object-row construction cannot represent reliably. Other drivers can consume statement `text`, `values(params)`, `columns`, and `resultRowMapping` and use the core mapping functions without importing any node-postgres contract.
-
-Each generated result-column metadata entry has an `expressionSource`. This records the immediate analyzed expression source: a direct table column, a derived PostgreSQL `Var`, or an expression tag such as `CoalesceExpr`. It is syntactic metadata for the result expression at that query level, not ultimate provenance or a list of every contributing column. A union or merged join can therefore have a `derivedVar`, while a cast, `coalesce`, or other multi-input expression has its immediate expression tag; consumers must not interpret either shape as complete lineage.
-
-## Generated property naming
-
-Postgres Typed SQL uses application-facing camel-case parameter properties by default while preserving PostgreSQL result and JSON field names by default. Configure the three boundaries independently:
-
-```js
-export default defineConfig({
-  schema: './db/schema.sql',
-  imports: {
-    runtime: 'postgres-typed-sql/adapters/node-postgres',
-    scalars: 'postgres-typed-sql/scalars',
-  },
-  codecProfile: 'node-postgres',
-  naming: {
-    parameterProperties: 'camelCase',
-    resultColumns: 'camelCase',
-    structuredJsonFields: 'camelCase',
-  },
-})
-```
-
-For example, the raw token `:account_id` is compiled to a positional placeholder but exposed to callers as `accountId`. Parameter metadata retains `name: 'account_id'` and records `propertyName: 'accountId'`; runtime `parameterNames` and `values(params)` lookup use only the public `accountId` property. `@nullable account_id` remains keyed by the raw token.
-
-For result values, a PostgreSQL column `account_id` becomes the mapped row property `accountId`. A modeled JSON value such as `jsonb_build_object('display_name', display_name)` exposes `displayName`. The structured JSON policy applies recursively through inferred objects, `json_build_array`/`jsonb_build_array`, unions, `json_agg`/`jsonb_agg`, and JSON object or array projections from derived subqueries. Ordinary JSON build-array calls are non-null even when an element is SQL `NULL`; an explicit `VARIADIC` call follows the SQL array expression's nullability. Dynamic variadic arrays retain a known array container with opaque elements. Opaque JSON values—including selected JSON columns and dynamically keyed objects—are not traversed, so their internal keys and object identity are preserved.
-
-Naming is deterministic and conservative: conventional lower-snake-case identifiers are camel-cased, already camel-case names stay unchanged, and unusual names such as `URL`, `__proto__`, leading or repeated underscores, spaces, and hyphens are preserved. Generation rejects parameter, result, or modeled JSON properties that collide after transformation. Parameter collisions must be resolved by choosing distinct SQL tokens or explicitly selecting `'preserve'`; they never fall back, receive suffixes, or overwrite one another.
-
-The generated row type describes mapped execution through the node-postgres adapter's `executeTypedSql` and generated default callable. Direct `client.query(statement.query(params))` execution remains raw and returns driver/PostgreSQL result names because the driver constructs those object rows. Parameter-object lookup still uses the generated public property names. Generated catalog types and opaque JSON contents are unaffected.
-
-Structured JSON field naming requires a codec profile with `structuredJson: true` when a query needs a nested mapping, because the runtime must know that `json` and `jsonb` values are decoded into JavaScript objects and arrays. The built-in `node-postgres` profile provides this capability.
-
-Structured JSON fields use the same predicate-aware nullability analysis as top-level result expressions. For PostgreSQL ranges, `lower(value)` is non-null only when the active predicate proves that the range is nonempty and has a finite lower bound; `upper(value)` uses the corresponding upper-bound proof. `not isempty(value)` alone is insufficient because a nonempty range may still be unbounded.
-
-Predicate analysis also uses strict comparisons, supported inner-join conditions, boolean tests, and CASE fallthrough.
-For example, `WHERE score > 0` proves that a selected `score` is non-null, and
-`CASE WHEN score IS NULL THEN 0 ELSE score END` is non-null. An ELSE branch can still include SQL UNKNOWN: the
-analysis does not treat failure to satisfy a condition as proof that the condition is false. Outer-join ON conditions
-do not constrain preserved rows. A predicate proving that a joined row exists can recover that row's declared
-non-null columns without removing nullability from its genuinely nullable columns.
-`RETURNING` keeps OLD and NEW row images separate, including inside correlated subqueries. Reusing an UPDATE input
-predicate for an unchanged NEW value also requires catalog evidence that triggers, inherited targets, and generated
-columns cannot rewrite that value.
-
-Exact text predicates also compose: `a = b AND b = 'ready'` refines both values to `'ready'`, while
-`a = 'ready' OR a = 'queued'` produces their literal union. Exclusions can narrow an existing CHECK domain.
-Repeated proven conditions remove unreachable CASE arms, and contradictory qualifiers can establish an empty result.
-Validated, enforced, inheritable CHECK constraints such as `CHECK (value IS NOT NULL)` also establish result
-non-nullability. `CHECK (value > 0)` does not, because SQL UNKNOWN satisfies a CHECK.
-
-Common integer, numeric, and floating-point arithmetic and casts, text functions, supported windows, PostgreSQL `GREATEST`/`LEAST`, and selected
-aggregates have audited nullability rules. These rules use PostgreSQL function identities; declaring an arbitrary
-function `STRICT` does not prove that it returns a non-null value for non-null arguments. Aggregate inference keeps
-ordinary nonempty groups separate from empty global inputs, grouping sets, and filters that can remove every input.
-Known nonempty VALUES inputs and matching `HAVING count(value) > 0` predicates provide additional aggregate proofs.
-Window inference uses native frame metadata; frames that may be empty or exclude the current row remain conservative.
-Supported lag/lead defaults must cover both the value and an absent row, and a NULL offset still permits a NULL result.
-CASE facts about the current row do not constrain values fetched from other rows by window functions.
-
-Known JSON shapes survive general `COALESCE`, supported `to_json`/`to_jsonb` conversions, literal-key object
-projections, and concatenation of known JSON objects. Object concatenation uses the right operand's value for duplicate
-keys. Aggregate FILTER predicates refine the modeled element shape. Constant JSON literals, known constant paths and
-array positions, and deletion of known object keys preserve structural information. SQL NULL and JSON null are tracked
-separately, so `COALESCE` cannot incorrectly erase a JSON null value. Custom codecs retain their declared contracts.
-Known JSON literal objects also participate in `naming.structuredJsonFields` and the corresponding runtime key mapping;
-the default `preserve` setting keeps their original keys.
-
-## Codec profiles
-
-Drivers choose how PostgreSQL values become JavaScript values, and applications can replace those parsers. Postgres Typed SQL therefore does not claim one universal decoded scalar type.
-
-The default `conservative` profile emits `unknown` for parameter and result scalar values. It is safe when the generator does not know the driver's conversion rules.
-
-Set `codecProfile: 'node-postgres'` only when execution uses the `pg-types` 2.2.0 default text-parser contract used by the supported node-postgres 8.x releases. This profile models parsed JSON, JavaScript numbers for the built-in integer and floating-point parsers, structural objects for `point`, `circle`, and `interval`, strings for scalar `bigint` and `numeric` values, and `Date | number` for `date`/`timestamp`/`timestamptz` because PostgreSQL infinity values decode to numeric infinities. In contrast to scalar `numeric`, the registered `numeric[]` parser applies `parseFloat` to each non-NULL element, so generated `numeric[]` results contain JavaScript numbers and can lose decimal precision. Registered built-in array results use a recursive `PgArray<T>` type that includes multidimensional arrays and SQL `NULL` elements. Unregistered result OIDs—including user-defined enum and domain arrays, composites, and ranges—use node-postgres's raw-string fallback; scalar enums are narrowed to their database labels. PostgreSQL reports scalar domains using their recursively resolved base result type, so a domain over `integer` is a number while a domain over `integer[]` uses the registered array parser. Comma-delimited array parameters use `PgArrayParameter<T> | string`: the array form accepts one-dimensional JavaScript arrays and SQL `NULL` elements, while a serialized PostgreSQL array-literal string is the escape hatch for valid multidimensional values. Nested JavaScript arrays are excluded because TypeScript cannot prove that their dimensions are rectangular or rule out `NULL` subarrays. Non-comma-delimited arrays use serialized strings, domains over arrays use one serialized string per outer element, and `bytea[]` elements use `PgByteaHexString` for compatibility across supported node-postgres 8.x releases. Interval objects and temporal infinity numbers can be passed back as parameters. Root `json`/`jsonb` parameters follow node-postgres serialization: objects are JSON-stringified, while JSON arrays, JSON strings, and JSON null should be supplied as serialized JSON text because root JavaScript arrays and `null` mean PostgreSQL arrays and SQL `NULL`. If the application installs custom type parsers, uses binary result mode, or uses a node-postgres release with a different default parser table, use the conservative profile unless those parser results still match the generated contract.
-
-Under the exact built-in node-postgres profile, SQL array expressions with a proven single dimension can use a
-narrower readonly array type. For example, `ARRAY[1, 2]` produces `readonly number[]`, while nullable elements remain
-in the element union. Scalar `ARRAY(SELECT ...)` expressions can use the same refinement. Array columns with unknown
-dimensions, nested array expressions, unregistered array decoders, and custom codec profiles keep their existing
-types. Proofs propagate through CTEs, derived outputs, CASE, and COALESCE only when every reachable non-null alternative
-has a known shape. Element types follow the array decoder, including the numeric-array parser's number representation.
-
-### Custom codecs and OIDs
-
-Applications can extend either built-in profile. A profile has a stable `name`, an `extends` fallback, and independent hooks for result decoding, parameter encoding, and scalar values nested inside PostgreSQL JSON conversion:
-
-```ts
-import {
-  defineConfig,
-  definePostgresCodecProfile,
-  postgresResultTypesByOid,
-  postgresTypeScriptType,
-} from 'postgres-typed-sql'
-
-const moneyOid = 81_234
-const moneyArrayOid = 81_235
-
-const applicationCodecs = definePostgresCodecProfile({
-  name: 'application-codecs-v1',
-  extends: 'node-postgres',
-
-  resultType: postgresResultTypesByOid({
-    [moneyOid]: postgresTypeScriptType('Money', { scalarImports: ['Money'] }),
-    [moneyArrayOid]: postgresTypeScriptType('PgArray<Money>', {
-      scalarImports: ['Money', 'PgArray'],
-    }),
-  }),
-
-  parameterType({ type }, fallback) {
-    return type.pgTypeSchema === 'billing' && type.pgTypeName === 'money'
-      ? postgresTypeScriptType('MoneyInput', { scalarImports: ['MoneyInput'] })
-      : fallback()
-  },
-
-  jsonScalarType({ type }, fallback) {
-    return type.pgTypeSchema === 'billing' && type.pgTypeName === 'money'
-      ? postgresTypeScriptType('MoneyJson', { scalarImports: ['MoneyJson'] })
-      : fallback()
-  },
-})
-
-export default defineConfig({
-  codecProfile: applicationCodecs,
-  // schema, include, and imports omitted
-})
-```
-
-Every hook must either return `postgresTypeScriptType(...)` or call its `fallback`. Names listed in `scalarImports` are emitted as type-only imports from `imports.scalars`, so the configured scalar façade must export them. `ambientBindings` is available for global TypeScript names such as `Date` and `Uint8Array`.
-
-Result OIDs are intentionally exact. Registering a custom parser for scalar OID `81_234` says nothing about array OID `81_235`; node-postgres can register and invoke those parsers independently. Define both entries when both runtime parsers are installed. Parameter hooks are different: the node-postgres fallback recursively asks the active custom profile for array element input types because JavaScript array parameters are serialized element by element. JSON hooks describe values after PostgreSQL has converted them into JSON, which is a third representation boundary and should not be inferred from either the result or parameter hook.
-
-OID matching is ideal when the runtime parser registration is itself keyed by OID. For extension or application types whose OIDs vary between databases, hooks can instead match `pgTypeSchema` and `pgTypeName`. A result hook receives both `declaredType` and `decoderType`: `declaredType` preserves the SQL expression's domain identity, while `decoderType` reflects PostgreSQL text-protocol domain flattening. Generated statement and catalog headers record the resolved profile name so checked-in output makes its decoder contract visible.
-
-A profile that decodes `json`/`jsonb` into traversable objects and arrays may set `structuredJson: true`. If it does, provide `opaqueJsonType` when the inherited opaque type is not accurate. `supportsStringLiteralRefinement` can additionally enable or disable enum, CHECK-constraint, and exact JSON-string refinements when a custom conversion preserves—or changes—their textual representation.
-
-## Directives
-
-Directives are SQL comments at the beginning of a `.typed.sql` file:
-
-```sql
--- @access read
--- @nullable inferred_cutoff
--- @column id bigint
-
-select id
-from accounts
-where email = :email
-  and created_at >= :inferred_cutoff::timestamptz
-```
-
-- `@access` can explicitly declare `read` or `write`. `read` is an assertion that analysis can prove read-only-compatible execution; it is not a trust override. `write` selects the conservative write execution route and does not necessarily claim that the statement mutates data.
-- `@nullable name` requests top-level SQL `NULL` in the generated caller type. It is proof-gated: generation succeeds only when canonical PostgreSQL evidence is `accepts`, and fails for `rejects` or `unknown`.
-- `@column` asserts that a result column exists and optionally asserts its PostgreSQL type.
-
-PostgreSQL still performs the authoritative parse, name resolution, type inference, rewriting, function/operator resolution, and catalog lookup.
-
-Caller permission and PostgreSQL admission are deliberately different facts. An accepting PostgreSQL use never widens the generated caller API without `@nullable`; the directive states the intended application contract and asks generation to verify it. Generated parameter metadata records the resolved contract as a required `nullable` boolean and does not expose analyzer admission.
-
-Top-level SQL `NULL` is also distinct from values nested inside a parameter. `PgArrayParameter<T>` continues to permit NULL array elements without making the outer array nullable. JSON objects may contain JSON null, and serialized JSON text such as `'null'` remains a non-null SQL parameter value; only an accepted nullable directive adds top-level SQL `null` to the generated property.
-
-### Migrating parameter annotations
-
-Parameter type annotations are intentionally unsupported. Move type information into the SQL and keep only caller-nullability intent:
-
-| Previous declaration | SQL-first form                                                                                   |
-| -------------------- | ------------------------------------------------------------------------------------------------ |
-| `@param value text`  | Remove it when PostgreSQL can infer the type; otherwise cast the relevant use as `:value::text`. |
-| `@param value ?`     | `@nullable value`                                                                                |
-| `@param value text?` | `@nullable value`, plus `:value::text` where SQL context does not infer `text`.                  |
-
-Prefer contextual inference from columns, function signatures, operators, `VALUES`, DML targets, and other ordinary SQL constructs. Add casts only where they express an actual SQL type boundary or resolve an ambiguity. Typemods such as `varchar(100)` are authored SQL semantics rather than parameter metadata and must be migrated deliberately; do not assume that a base-type cast preserves typemod behavior.
-
-For row-producing statements, generated `resultKind` is derived from the analyzer's row bounds. At-most-one proofs include direct primary/unique-key lookups and supported inner-join chains in which every relation is determined through primary or unique keys. A `rowBounds.max` value of `null` means that analysis did not prove a finite upper bound, not that execution is known to produce multiple rows; the public contract remains conservatively `many`.
-
-Bounds also compose through ordinary window functions, supported DISTINCT and grouping, directional LEFT joins with
-unique matches, and bounded lateral subqueries. Unique-key lookups may use supported immutable expressions over
-parameters and constants, such as `email = lower(:email)`. Constant OFFSET values reduce proven bounds before LIMIT
-is applied. Set-returning expressions, grouping sets, unsupported join forms, and volatile lookup expressions retain
-conservative bounds.
-Simple CTEs and subqueries can retain projected candidate keys. Finite IN/OR alternatives and finite DISTINCT/GROUP BY
-domains can establish upper bounds greater than one. Partial and expression indexes are usable only when their native
-expressions and predicates match the supported proof rules; NULL lookups require `NULLS NOT DISTINCT`. Operator-family,
-collation, index validity, and inheritance checks still apply.
-
-## Schema input
-
-Schema files are executed in order inside a new in-memory database for each generation. They should contain plain PostgreSQL SQL. `pg_dump` guard lines such as `\\restrict` and `\\unrestrict` are accepted; other `psql` meta-commands are rejected.
-
-For fidelity, generate from the same canonical schema artifact used by deployment. Include tables, views, types, domains, functions, constraints, indexes, and extensions that affect query analysis.
-
-## Compatibility
-
-PostgreSQL major versions and extensions can change analysis results. Version `0.1.x` makes no compatibility claim for PostgreSQL 17 or earlier, future PostgreSQL releases, or extensions outside the supported list. Unsupported configurations produce an error instead of falling back to approximate types.
-
-## Programmatic API
-
-```ts
-import { generateTypedSql } from 'postgres-typed-sql'
-
-const result = await generateTypedSql({
-  rootDir: process.cwd(),
-  schema: ['./db/base.sql', './db/functions.sql'],
-  include: ['./src'],
-  imports: { runtime: 'postgres-typed-sql/adapters/node-postgres', scalars: 'postgres-typed-sql/scalars' },
-})
-```
-
-Generation is intentionally single-flight within one Node.js process because each run owns an isolated PostgreSQL instance.
-
-Policy analyzers and other build tools can request a complete, versioned analysis report:
-
-```ts
-const result = await generateTypedSql(config, { analysis: true })
-for (const statement of result.analysis.statements) {
-  // Exact emitted module/export identity and compiled SQL, with access evidence.
-  console.log(statement.module, statement.export, statement.sqlSha256, statement.accessEvidence)
-}
-```
-
-The optional report binds facts to the SQL and schema bytes consumed by generation. It is returned only after successful output installation and does not add analysis machinery to the runtime entry point. Persisted reports require consumer-owned freshness, inventory, configuration, and compatibility checks. See [the analysis contract and beta.15.1 migration guide](./docs/generation-analysis.md) for guarantees, limitations, and an isolated policy-tool integration example.
-
-## Security
-
-Schema SQL is executable code. Only generate from schema files you trust. The embedded database is local and in-memory, but SQL functions and extension behavior should still be treated as code execution within the generator process.
-
-See [SECURITY.md](./SECURITY.md) for reporting instructions.
-
-## License
-
-MIT. Published packages also include the PGlite and PostgreSQL license texts for the bundled engine.
+For development, run `pnpm setup:worktree`, `pnpm build:engine` when the native engine needs building, and `pnpm test:all`.

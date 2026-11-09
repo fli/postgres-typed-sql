@@ -1,3 +1,7 @@
+import type { PostgresTypeFact } from './postgres-types.js'
+import type { PgJsonPlan } from './value-types.js'
+import { decodePgValue, encodePgValue } from './value-codecs.js'
+
 export type TypedSqlParams = object
 
 export type TypedSqlResultKind = 'one' | 'optional' | 'many' | 'command' | 'void'
@@ -29,48 +33,12 @@ export interface TypedSqlRowBounds {
 }
 
 export interface TypedSqlQueryConfig {
+  readonly name?: string
   readonly text: string
   readonly values: unknown[]
 }
 
-export type TypedSqlRawRow = Readonly<Record<string, unknown>>
-export type TypedSqlArrayRow = readonly unknown[]
-
 declare const typedSqlStatementRow: unique symbol
-
-function isTypedSqlArrayRow(row: TypedSqlArrayRow | TypedSqlRawRow): row is TypedSqlArrayRow {
-  return Array.isArray(row)
-}
-
-export type TypedSqlRowNameSource = 'property' | 'sql'
-
-export interface TypedSqlJsonFieldMappingMetadata {
-  readonly mapping?: TypedSqlJsonMappingMetadata
-  readonly name: string
-  readonly propertyName: string
-}
-
-export interface TypedSqlJsonMappingMetadata {
-  readonly arrayElement?: TypedSqlJsonMappingMetadata
-  readonly fields?: readonly TypedSqlJsonFieldMappingMetadata[]
-}
-
-const typedSqlJsonFieldMappings = new WeakMap<
-  TypedSqlJsonMappingMetadata,
-  ReadonlyMap<string, TypedSqlJsonFieldMappingMetadata>
->()
-
-function jsonFieldMappings(
-  mapping: TypedSqlJsonMappingMetadata
-): ReadonlyMap<string, TypedSqlJsonFieldMappingMetadata> {
-  const cached = typedSqlJsonFieldMappings.get(mapping)
-  if (cached) {
-    return cached
-  }
-  const fields = new Map(mapping.fields?.map((field) => [field.name, field]))
-  typedSqlJsonFieldMappings.set(mapping, fields)
-  return fields
-}
 
 /** Immediate analyzed expression metadata; this is not ultimate column lineage. */
 export type TypedSqlColumnExpressionSourceMetadata =
@@ -97,9 +65,10 @@ export type TypedSqlColumnExpressionSourceMetadata =
     }
 
 export interface TypedSqlColumnMetadata {
+  readonly type?: PostgresTypeFact
+  readonly jsonPlan?: PgJsonPlan
   /** The immediate analyzed expression source, not all underlying contributing columns. */
   readonly expressionSource: TypedSqlColumnExpressionSourceMetadata
-  readonly jsonMapping?: TypedSqlJsonMappingMetadata
   readonly name: string
   readonly nullable: boolean
   readonly pgType: string
@@ -109,6 +78,7 @@ export interface TypedSqlColumnMetadata {
 }
 
 export interface TypedSqlParameterMetadata {
+  readonly type?: PostgresTypeFact
   readonly name: string
   readonly nullable: boolean
   readonly pgType: string
@@ -123,6 +93,7 @@ export interface TypedSqlStatement<
   Access extends TypedSqlAccessKind = TypedSqlAccessKind,
   Kind extends TypedSqlResultKind = TypedSqlResultKind,
 > {
+  readonly valueModel?: PgValueModel
   readonly access: Access
   readonly resultKind: Kind
   readonly columns: readonly TypedSqlColumnMetadata[]
@@ -145,6 +116,7 @@ export interface TypedSqlDefinition<
   Access extends TypedSqlAccessKind = TypedSqlAccessKind,
   Kind extends TypedSqlResultKind = TypedSqlResultKind,
 > {
+  readonly valueModel?: PgValueModel
   readonly access?: Access
   readonly resultKind: Kind
   readonly columns?: readonly TypedSqlColumnMetadata[]
@@ -220,6 +192,14 @@ export function validateTypedSqlResultMetadata(metadata: {
   )
 }
 
+function freezeMetadata<T>(value: T): T {
+  if (value !== null && typeof value === 'object') {
+    for (const item of Object.values(value)) freezeMetadata(item)
+    Object.freeze(value)
+  }
+  return value
+}
+
 export function createTypedSqlStatement<
   Params extends TypedSqlParams,
   Row,
@@ -230,15 +210,18 @@ export function createTypedSqlStatement<
   validateTypedSqlResultMetadata({ ...definition, resultRowMapping })
   const { name, text } = definition
   const parameterNames = Object.freeze([...definition.parameterNames])
+  const columns = freezeMetadata(structuredClone(definition.columns ?? []))
+  const parameters = freezeMetadata(structuredClone(definition.parameters ?? []))
   return Object.freeze({
     // oxlint-disable-next-line typescript-eslint/no-unsafe-type-assertion -- The generated statement declaration pins Access to this metadata value.
+    valueModel: definition.valueModel,
     access: (definition.access ?? typedSqlAccessForCommand(definition.command ?? 'unknown')) as Access,
     resultKind: definition.resultKind,
-    columns: Object.freeze([...(definition.columns ?? [])]),
+    columns,
     command: definition.command ?? 'unknown',
     name: definition.name,
     parameterNames,
-    parameters: definition.parameters ?? [],
+    parameters,
     resultRowMapping,
     rowBounds: Object.freeze({ ...definition.rowBounds }),
     text,
@@ -259,83 +242,6 @@ export function createTypedSqlStatement<
       })
     },
   })
-}
-
-export function mapTypedSqlRow<Params extends TypedSqlParams, Row>(
-  statement: TypedSqlStatement<Params, Row>,
-  row: TypedSqlArrayRow | TypedSqlRawRow,
-  rowNameSource: TypedSqlRowNameSource = 'sql'
-): Row {
-  if (statement.columns.length === 0) {
-    // oxlint-disable-next-line typescript/no-unsafe-type-assertion -- A generated zero-column SELECT row is represented by an empty array and maps to the generated empty-record row type. Custom object-row statements retain their raw row.
-    return (isTypedSqlArrayRow(row) ? {} : row) as Row
-  }
-
-  const mapped: Record<string, unknown> = {}
-  for (const [columnIndex, column] of statement.columns.entries()) {
-    const rowKey = rowNameSource === 'sql' ? column.name : column.propertyName
-    if (!isTypedSqlArrayRow(row) && !Object.hasOwn(row, rowKey)) {
-      throw new Error(
-        `Typed SQL statement ${statement.name} expected result column ${JSON.stringify(rowKey)} from ${rowNameSource} row names.`
-      )
-    }
-    if (isTypedSqlArrayRow(row) && columnIndex >= row.length) {
-      throw new Error(
-        `Typed SQL statement ${statement.name} expected result column ${columnIndex + 1} from an array row.`
-      )
-    }
-    const rawValue = isTypedSqlArrayRow(row) ? row[columnIndex] : row[rowKey]
-    Object.defineProperty(mapped, column.propertyName, {
-      configurable: true,
-      enumerable: true,
-      value: column.jsonMapping ? mapTypedSqlJsonValue(column.jsonMapping, rawValue) : rawValue,
-      writable: true,
-    })
-  }
-
-  // oxlint-disable-next-line typescript/no-unsafe-type-assertion -- Generated statement metadata maps each SQL result column to the generated Row property.
-  return mapped as Row
-}
-
-export function mapTypedSqlJsonValue(mapping: TypedSqlJsonMappingMetadata, value: unknown): unknown {
-  if (value === null) {
-    return null
-  }
-
-  if (Array.isArray(value)) {
-    const elementMapping = mapping.arrayElement
-    return elementMapping ? value.map((element) => mapTypedSqlJsonValue(elementMapping, element)) : value
-  }
-
-  if (typeof value !== 'object' || !mapping.fields) {
-    return value
-  }
-
-  const fieldMappingByName = jsonFieldMappings(mapping)
-  const mapped: Record<string, unknown> = {}
-  for (const [name, fieldValue] of Object.entries(value)) {
-    const fieldMapping = fieldMappingByName.get(name)
-    const propertyName = fieldMapping?.propertyName ?? name
-    if (Object.hasOwn(mapped, propertyName)) {
-      throw new Error(`Typed SQL JSON fields collide at mapped property ${JSON.stringify(propertyName)}.`)
-    }
-    Object.defineProperty(mapped, propertyName, {
-      configurable: true,
-      enumerable: true,
-      value: fieldMapping?.mapping ? mapTypedSqlJsonValue(fieldMapping.mapping, fieldValue) : fieldValue,
-      writable: true,
-    })
-  }
-
-  return mapped
-}
-
-export function mapTypedSqlRows<Params extends TypedSqlParams, Row>(
-  statement: TypedSqlStatement<Params, Row>,
-  rows: readonly (TypedSqlArrayRow | TypedSqlRawRow)[],
-  rowNameSource: TypedSqlRowNameSource = 'sql'
-): Row[] {
-  return rows.map((row) => mapTypedSqlRow(statement, row, rowNameSource))
 }
 
 export function typedSqlRowCount(rowCount: bigint | number | null | undefined): number {
@@ -386,4 +292,206 @@ export function typedSqlAffectedRowCount(result: unknown): number {
       numericProperty(result, 'numAffectedRows') ??
       numericProperty(result, 'count')
   )
+}
+
+export type PgValueModel = 'postgres-lossless-v1'
+export type PgExecutionPhase = 'encode' | 'transport' | 'decode' | 'contract'
+export type PgExecutionState = 'notExecuted' | 'mayHaveExecuted'
+
+export class PgExecutionError extends Error {
+  readonly code?: string
+  readonly phase: PgExecutionPhase
+  readonly executionState: PgExecutionState
+
+  constructor(message: string, phase: PgExecutionPhase, executionState: PgExecutionState, cause?: unknown) {
+    super(message, { cause })
+    this.name = 'PgExecutionError'
+    this.phase = phase
+    this.executionState = executionState
+    if (cause !== null && typeof cause === 'object' && 'code' in cause && typeof cause.code === 'string') {
+      this.code = cause.code
+    }
+  }
+}
+
+export interface PostgresExecutionRequest {
+  readonly name?: string
+  readonly text: string
+  readonly values: readonly (string | null)[]
+  readonly parameters: readonly PostgresTypeFact[]
+  readonly columns: readonly {
+    readonly name: string
+    readonly type: PostgresTypeFact
+    readonly jsonPlan?: PgJsonPlan
+  }[]
+}
+
+export interface PostgresExecutionResponse {
+  readonly rows: readonly (readonly (string | null)[])[]
+  readonly columnTypes: readonly PostgresTypeFact[]
+  readonly rowCount: number | null | undefined
+}
+
+declare const postgresExecutorBrand: unique symbol
+export interface PostgresExecutor {
+  readonly valueModel: PgValueModel
+  readonly [postgresExecutorBrand]: true
+  execute(request: PostgresExecutionRequest): Promise<PostgresExecutionResponse>
+}
+
+const verifiedExecutors = new WeakSet<object>()
+
+/** Used by transport adapters to register their implementation of the verified transport contract. */
+export function createPostgresExecutor(
+  execute: (request: PostgresExecutionRequest) => Promise<PostgresExecutionResponse>
+): PostgresExecutor {
+  const executor = Object.freeze({ valueModel: 'postgres-lossless-v1' as const, execute })
+  verifiedExecutors.add(executor)
+  return executor as PostgresExecutor
+}
+
+function executionError(
+  error: unknown,
+  phase: PgExecutionPhase,
+  state: PgExecutionState,
+  message: string
+): PgExecutionError {
+  return error instanceof PgExecutionError ? error : new PgExecutionError(message, phase, state, error)
+}
+
+export async function executeTypedSql<
+  Params extends TypedSqlParams,
+  Row,
+  Access extends TypedSqlAccessKind,
+  Kind extends TypedSqlResultKind,
+>(
+  executor: PostgresExecutor,
+  statement: TypedSqlStatement<Params, Row, Access, Kind>,
+  params: NoInfer<Params>
+): Promise<TypedSqlExecutionResult<Row, Kind>> {
+  let parameterTypes: PostgresTypeFact[]
+  let columns: PostgresExecutionRequest['columns']
+  try {
+    if (!executor || !verifiedExecutors.has(executor) || executor.valueModel !== 'postgres-lossless-v1') {
+      throw new Error('A verified postgres-lossless-v1 executor is required.')
+    }
+    if (statement.valueModel !== 'postgres-lossless-v1') {
+      throw new Error(`Typed SQL statement ${statement.name} has a stale value model; regenerate it.`)
+    }
+    validateTypedSqlResultMetadata(statement)
+    if (
+      statement.parameterNames.length !== statement.parameters.length ||
+      statement.resultRowMapping !== 'positional'
+    ) {
+      throw new Error(`Typed SQL statement ${statement.name} has incomplete metadata; regenerate it.`)
+    }
+    parameterTypes = statement.parameters.map((parameter, index) => {
+      if (!parameter.type || parameter.propertyName !== statement.parameterNames[index]) {
+        throw new Error(`Typed SQL statement ${statement.name} has incomplete parameter metadata; regenerate it.`)
+      }
+      return parameter.type
+    })
+    columns = statement.columns.map((column) => {
+      if (!column.type)
+        throw new Error(`Typed SQL statement ${statement.name} has incomplete column metadata; regenerate it.`)
+      return { type: column.type, name: column.name, ...(column.jsonPlan ? { jsonPlan: column.jsonPlan } : {}) }
+    })
+  } catch (error) {
+    throw executionError(error, 'contract', 'notExecuted', 'Typed SQL metadata or executor contract failed.')
+  }
+
+  let values: (string | null)[]
+  let queryName: string | undefined
+  try {
+    const query = statement.query(params)
+    if (query.text !== statement.text || query.values.length !== statement.parameters.length) {
+      throw new TypeError('A statement query must preserve its SQL text and parameter count.')
+    }
+    queryName = query.name
+    values = query.values.map((value, index) => {
+      const parameter = statement.parameters[index]
+      const type = parameterTypes[index]
+      if (!parameter || !type) throw new Error('Missing parameter metadata.')
+      if (value === null && !parameter.nullable)
+        throw new TypeError(`Parameter ${parameter.propertyName} does not accept SQL NULL.`)
+      return encodePgValue(type, value)
+    })
+  } catch (error) {
+    throw executionError(error, 'encode', 'notExecuted', `Could not encode parameters for ${statement.name}.`)
+  }
+
+  let result: PostgresExecutionResponse
+  try {
+    result = await executor.execute({
+      ...(queryName === undefined ? {} : { name: queryName }),
+      text: statement.text,
+      values,
+      parameters: parameterTypes,
+      columns,
+    })
+  } catch (error) {
+    throw executionError(error, 'transport', 'mayHaveExecuted', `Execution of ${statement.name} failed.`)
+  }
+
+  try {
+    const { min, max } = statement.rowBounds
+    if (result.columnTypes.length !== statement.columns.length)
+      throw new PgExecutionError('Result column count does not match metadata.', 'contract', 'mayHaveExecuted')
+    if (statement.resultKind === 'command' || statement.resultKind === 'void') {
+      if (result.rows.length !== 0)
+        throw new PgExecutionError('A command returned unexpected rows.', 'contract', 'mayHaveExecuted')
+      try {
+        return (
+          statement.resultKind === 'command' ? typedSqlRowCount(result.rowCount) : undefined
+        ) as TypedSqlExecutionResult<Row, Kind>
+      } catch (error) {
+        throw new PgExecutionError('Invalid command row count.', 'contract', 'mayHaveExecuted', error)
+      }
+    }
+    if (result.rows.length < min || (max !== null && result.rows.length > max)) {
+      throw new PgExecutionError(
+        `Typed SQL statement ${statement.name} returned ${result.rows.length} rows; expected rowBounds [${min}, ${max ?? 'unbounded'}].`,
+        'contract',
+        'mayHaveExecuted'
+      )
+    }
+    const rows = result.rows.map((row) => {
+      if (row.length !== statement.columns.length)
+        throw new PgExecutionError('Result row width does not match metadata.', 'contract', 'mayHaveExecuted')
+      const mapped: Record<string, unknown> = {}
+      for (const [index, column] of statement.columns.entries()) {
+        const type = result.columnTypes[index]
+        const source = row[index]
+        if (!type || (source !== null && typeof source !== 'string'))
+          throw new PgExecutionError('Result field is not text or SQL NULL.', 'contract', 'mayHaveExecuted')
+        if (source === null && !column.nullable)
+          throw new PgExecutionError(
+            `Column ${column.name} unexpectedly returned SQL NULL.`,
+            'contract',
+            'mayHaveExecuted'
+          )
+        Object.defineProperty(mapped, column.propertyName, {
+          configurable: true,
+          enumerable: true,
+          writable: true,
+          value: source === null ? null : decodePgValue(type, source, column.jsonPlan),
+        })
+      }
+      return mapped as Row
+    })
+    return (statement.resultKind === 'many' ? rows : (rows[0] ?? null)) as TypedSqlExecutionResult<Row, Kind>
+  } catch (error) {
+    throw executionError(error, 'decode', 'mayHaveExecuted', `Could not decode result for ${statement.name}.`)
+  }
+}
+
+export function createTypedSqlExecutor<
+  Params extends TypedSqlParams,
+  Row,
+  Access extends TypedSqlAccessKind,
+  Kind extends TypedSqlResultKind,
+>(
+  statement: TypedSqlStatement<Params, Row, Access, Kind>
+): (executor: PostgresExecutor, ...args: TypedSqlParameterArgs<Params>) => Promise<TypedSqlExecutionResult<Row, Kind>> {
+  return (executor, ...args) => executeTypedSql(executor, statement, (args[0] ?? {}) as Params)
 }

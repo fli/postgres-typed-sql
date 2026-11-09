@@ -19,7 +19,7 @@ test('project snapshots include extension archives and engine JavaScript', async
     await writeFile(join(root, 'query.typed.sql'), 'select name from widget')
     await writeFile(
       join(root, 'config.mjs'),
-      `export default {schema:'schema.sql',include:['.'],extensions:['citext'],codecProfile:'node-postgres',imports:{runtime:'postgres-typed-sql/runtime',scalars:'postgres-typed-sql/scalars'}}`
+      `export default {schema:'schema.sql',include:['.'],extensions:['citext'],imports:{runtime:'postgres-typed-sql/runtime',scalars:'postgres-typed-sql/scalars'}}`
     )
     const script = `
       import assert from 'node:assert/strict';

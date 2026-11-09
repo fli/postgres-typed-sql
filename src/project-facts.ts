@@ -1,5 +1,6 @@
 import type { TypedSqlAccessEvidence, TypedSqlParameterAnalysis } from './generation-analysis.js'
 import type {
+  PgValueModel,
   TypedSqlAccessKind,
   TypedSqlColumnMetadata,
   TypedSqlCommandKind,
@@ -10,9 +11,10 @@ import type {
 import type { SupportedExtension } from './engine.js'
 
 /** Version of the project analysis shape and its semantic guarantees. */
-export const projectAnalysisVersion = 1 as const
+export const projectAnalysisVersion = 2 as const
 
 export interface QueryDescriptor {
+  readonly valueModel: PgValueModel
   readonly name: string
   readonly text: string
   readonly access: TypedSqlAccessKind

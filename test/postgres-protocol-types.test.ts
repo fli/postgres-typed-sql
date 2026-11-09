@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import { PGlite } from '../src/vendor/pglite/index.js'
+import { parseJson } from '../src/json-values.js'
 
 test('PostgreSQL prepares and executes authored casts with untyped wire parameters', async () => {
   const database = new PGlite()
@@ -44,19 +45,15 @@ test('PostgreSQL result metadata flattens domains but preserves custom array and
 
     const scalarDomain = await database.query<{ readonly value: unknown }>('select value from events')
     assert.equal(scalarDomain.fields[0]?.dataTypeID, 23)
-    assert.equal(scalarDomain.rows[0]?.value, 42)
 
     const arrayDomain = await database.query<{ readonly value: unknown }>('select array[1, 2]::score_list as value')
     assert.equal(arrayDomain.fields[0]?.dataTypeID, 1007)
-    assert.deepEqual(arrayDomain.rows[0]?.value, [1, 2])
 
     const domainArray = await database.query<{ readonly value: unknown }>('select array[1, 2]::score[] as value')
     assert.notEqual(domainArray.fields[0]?.dataTypeID, 1007)
-    assert.equal(domainArray.rows[0]?.value, '{1,2}')
 
     const oidDomain = await database.query<{ readonly value: unknown }>('select 42::object_id as value')
     assert.equal(oidDomain.fields[0]?.dataTypeID, 26)
-    assert.equal(oidDomain.rows[0]?.value, 42)
 
     const composite = await database.query<{ readonly value: unknown }>('select events as value from events')
     assert.equal(composite.rows[0]?.value, '(1,42)')
@@ -64,7 +61,7 @@ test('PostgreSQL result metadata flattens domains but preserves custom array and
     const range = await database.query<{ readonly value: unknown }>("select '[1,3)'::score_span as value")
     assert.equal(range.rows[0]?.value, '[1,3)')
 
-    const jsonSpecialNumbers = await database.query<{ readonly value: unknown }>(`
+    const jsonSpecialNumbers = await database.query<{ readonly value: string }>(`
       select jsonb_build_object(
         'finite', 1.5::numeric,
         'numeric_nan', 'NaN'::numeric,
@@ -72,10 +69,12 @@ test('PostgreSQL result metadata flattens domains but preserves custom array and
         'oid', 42::oid,
         'oid_domain', 43::object_id
         ,'custom_cast', 'ok'::json_mood
-      ) as value
+      )::text as value
     `)
-    assert.deepEqual(jsonSpecialNumbers.rows[0]?.value, {
-      finite: 1.5,
+    const jsonSource = jsonSpecialNumbers.rows[0]?.value
+    assert.ok(jsonSource)
+    assert.deepEqual(parseJson(jsonSource).value, {
+      finite: { kind: 'finite', negative: false, coefficient: 15n, exponent: -1n },
       float_infinity: 'Infinity',
       numeric_nan: 'NaN',
       oid: '42',

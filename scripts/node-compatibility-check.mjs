@@ -17,6 +17,7 @@ try {
   })
   const require = nodeModule.createRequire(join(root, 'package.json'))
   const { openQueryProject } = await import(pathToFileURL(require.resolve('postgres-typed-sql/project')).href)
+  const { createPostgresExecutor } = await import(pathToFileURL(require.resolve('postgres-typed-sql/runtime')).href)
   const { transform } = await import(pathToFileURL(require.resolve('esbuild')).href)
   await writeFile(join(root, 'schema.sql'), 'create table widget (id integer primary key);')
   const query = join(root, 'query.typed.sql')
@@ -24,7 +25,7 @@ try {
   const config = join(root, 'config.mjs')
   await writeFile(
     config,
-    `export default {schema:'schema.sql',include:['.'],codecProfile:'node-postgres',imports:{runtime:'postgres-typed-sql/adapters/node-postgres',scalars:'postgres-typed-sql/scalars'}}`
+    `export default {schema:'schema.sql',include:['.'],imports:{runtime:'postgres-typed-sql/adapters/node-postgres',scalars:'postgres-typed-sql/scalars'}}`
   )
   const project = await openQueryProject(config)
   try {
@@ -33,7 +34,12 @@ try {
     const modulePath = join(root, 'query.mjs')
     await writeFile(modulePath, code)
     const { default: execute } = await import(pathToFileURL(modulePath).href)
-    assert.deepEqual(await execute({ query: async () => ({ rows: [[7]], rowCount: 1 }) }, {}), { value: 7 })
+    const executor = createPostgresExecutor(async (request) => ({
+      rows: [['7']],
+      columnTypes: request.columns.map((column) => column.type),
+      rowCount: 1,
+    }))
+    assert.deepEqual(await execute(executor, {}), { value: 7 })
     if (typeof nodeModule.registerHooks === 'function') {
       assert.deepEqual(await project.sources(), [query])
       const snapshot = await project.analyzeProject()

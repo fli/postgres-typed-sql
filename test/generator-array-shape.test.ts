@@ -3,10 +3,9 @@ import { readFile, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import test from 'node:test'
 
-import { definePostgresCodecProfile, postgresTypeScriptType } from '../src/index.js'
 import { createMinimalFixture, generateTypedSql } from './generator-test-support.js'
 
-test('narrows flat SQL arrays while preserving decoder-specific element types and nested dimensions', async () => {
+test('preserves array element nullability, dimensions, and lossless scalar types', async () => {
   const root = await createMinimalFixture(
     `create type public.array_state as enum ('ready', 'missing');
      create table public.array_inputs(id integer not null, nullable_id integer);`,
@@ -26,25 +25,25 @@ test('narrows flat SQL arrays while preserving decoder-specific element types an
       (select array[1, 2] where false) as optional_values`
   )
   await generateTypedSql({
-    codecProfile: 'node-postgres',
     include: ['queries'],
     rootDir: root,
     schema: 'schema.sql',
   })
   const output = await readFile(join(root, 'queries/query.typed-sql.ts'), 'utf8')
-  for (const name of ['flat_values', 'empty_values', 'selected_values', 'numeric_values']) {
-    assert.match(output, new RegExp(`readonly ${name}: readonly \\(number\\)\\[\\]\\n`, 'u'))
+  for (const name of ['flat_values', 'empty_values', 'selected_values']) {
+    assert.match(output, new RegExp(`readonly ${name}: PgArray<number>\\n`, 'u'))
   }
   for (const name of ['nullable_values', 'nullable_selected_values']) {
-    assert.match(output, new RegExp(`readonly ${name}: readonly \\(number \\| null\\)\\[\\]\\n`, 'u'))
+    assert.match(output, new RegExp(`readonly ${name}: PgArray<number \\| null>\\n`, 'u'))
   }
-  assert.match(output, /readonly nested_selected_values: PgArray<number>\n/u)
-  assert.match(output, /readonly nested_values: PgArray<number>\n/u)
-  assert.match(output, /readonly numeric_value: PgNumericString\n/u)
-  assert.match(output, /readonly cast_numeric_values: readonly \(number\)\[\]\n/u)
-  assert.match(output, /readonly cast_numeric_value: PgNumericString\n/u)
-  assert.match(output, /readonly enum_values: string\n/u)
-  assert.match(output, /readonly optional_values: readonly \(number\)\[\] \| null\n/u)
+  assert.match(output, /readonly nested_selected_values: PgArray<number \| null>\n/u)
+  assert.match(output, /readonly nested_values: PgArray<number \| null>\n/u)
+  assert.match(output, /readonly numeric_values: PgArray<PgDecimal>\n/u)
+  assert.match(output, /readonly numeric_value: PgDecimal\n/u)
+  assert.match(output, /readonly cast_numeric_values: PgArray<PgDecimal>\n/u)
+  assert.match(output, /readonly cast_numeric_value: PgDecimal\n/u)
+  assert.match(output, /readonly enum_values: PgArray<"ready" \| "missing">\n/u)
+  assert.match(output, /readonly optional_values: PgArray<number> \| null\n/u)
 })
 
 test('combines SQL array shape facts across every set-operation output arm', async () => {
@@ -52,18 +51,18 @@ test('combines SQL array shape facts across every set-operation output arm', asy
     'select 1;',
     'select array[1, 2] as values union all select array[null::integer] as values'
   )
-  const config = { codecProfile: 'node-postgres' as const, include: ['queries'], rootDir: root, schema: 'schema.sql' }
+  const config = { include: ['queries'], rootDir: root, schema: 'schema.sql' }
   await generateTypedSql(config)
   const outputFile = join(root, 'queries/query.typed-sql.ts')
   let output = await readFile(outputFile, 'utf8')
-  assert.match(output, /readonly values: readonly \(number \| null\)\[\]\n/u)
+  assert.match(output, /readonly values: PgArray<number \| null>\n/u)
   await writeFile(
     join(root, 'queries/query.typed.sql'),
     'select array[1, 2] as values union all select array[array[1, 2]] as values'
   )
   await generateTypedSql(config)
   output = await readFile(outputFile, 'utf8')
-  assert.match(output, /readonly values: PgArray<number>\n/u)
+  assert.match(output, /readonly values: PgArray<number \| null>\n/u)
 })
 
 test('transports flat array shape through CTEs, VALUES, CASE and COALESCE while rejecting mixed dimensions', async () => {
@@ -80,42 +79,28 @@ test('transports flat array shape through CTEs, VALUES, CASE and COALESCE while 
       coalesce(t.values,array[1]) as unknown_values
     from array_composition t cross join arrays a`
   )
-  await generateTypedSql({ rootDir: root, schema: 'schema.sql', include: ['queries'], codecProfile: 'node-postgres' })
+  await generateTypedSql({ rootDir: root, schema: 'schema.sql', include: ['queries'] })
   const output = await readFile(join(root, 'queries/query.typed-sql.ts'), 'utf8')
   for (const name of ['cte_values', 'case_values', 'coalesced'])
-    assert.match(output, new RegExp(`readonly ${name}: readonly \\(number\\)\\[\\]\\n`, 'u'))
-  assert.match(output, /readonly derived_values: readonly \(number \| null\)\[\]\n/u)
-  assert.match(output, /readonly optional_case: readonly \(number\)\[\] \| null\n/u)
-  for (const name of ['mixed_dimensions', 'unknown_values'])
     assert.match(output, new RegExp(`readonly ${name}: PgArray<number>\\n`, 'u'))
+  assert.match(output, /readonly derived_values: PgArray<number \| null>\n/u)
+  assert.match(output, /readonly optional_case: PgArray<number> \| null\n/u)
+  for (const name of ['mixed_dimensions', 'unknown_values'])
+    assert.match(output, new RegExp(`readonly ${name}: PgArray<number \\| null>\\n`, 'u'))
 })
 
-test('does not narrow custom SQL array decoders based on their profile name or TypeScript type text', async () => {
-  const root = await createMinimalFixture('select 1;', 'select array[1, 2] as values')
-  const config = { include: ['queries'], rootDir: root, schema: 'schema.sql' }
-  const sameNameProfile = definePostgresCodecProfile({
-    extends: 'node-postgres',
-    name: 'node-postgres',
-    resultType({ decoderType }, fallback) {
-      return decoderType.pgTypeOid === 1007 ? postgresTypeScriptType('string') : fallback()
-    },
-  })
-  await generateTypedSql({ ...config, codecProfile: sameNameProfile })
-  const outputFile = join(root, 'queries/query.typed-sql.ts')
-  let output = await readFile(outputFile, 'utf8')
-  assert.match(output, /readonly values: string\n/u)
-
-  const sameTypeProfile = definePostgresCodecProfile({
-    extends: 'node-postgres',
-    name: 'same-array-type',
-    resultType(_context, fallback) {
-      return fallback()
-    },
-  })
-  await generateTypedSql({ ...config, codecProfile: sameTypeProfile })
-  output = await readFile(outputFile, 'utf8')
-  assert.match(output, /readonly values: PgArray<number>\n/u)
-  await generateTypedSql({ ...config, codecProfile: 'conservative' })
-  output = await readFile(outputFile, 'utf8')
-  assert.match(output, /readonly values: unknown\n/u)
+test('uses conservative array aggregate element types and accepts convenient array parameters', async () => {
+  const root = await createMinimalFixture(
+    'create table array_members(id bigint not null, maybe_id bigint);',
+    `select array_agg(id) as ids,
+      array_agg(maybe_id) as maybe_ids,
+      array_agg(maybe_id) filter (where maybe_id is not null) as filtered_ids
+    from array_members where id = any(:ids::bigint[])`
+  )
+  await generateTypedSql({ include: ['queries'], rootDir: root, schema: 'schema.sql' })
+  const output = await readFile(join(root, 'queries/query.typed-sql.ts'), 'utf8')
+  assert.match(output, /readonly ids: PgArray<bigint \| null> \| null\n/u)
+  assert.match(output, /readonly maybe_ids: PgArray<bigint \| null> \| null\n/u)
+  assert.match(output, /readonly filtered_ids: PgArray<bigint \| null> \| null\n/u)
+  assert.match(output, /readonly ids: PgArrayInput<PgInt8Input \| null>/u)
 })

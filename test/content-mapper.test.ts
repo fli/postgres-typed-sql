@@ -76,7 +76,7 @@ test(
       await writeFile(schema, 'create table widget (id integer primary key);')
       await writeFile(
         config,
-        "export default {schema: ['schema.sql'], codecProfile: 'node-postgres', imports: {runtime:'postgres-typed-sql/adapters/node-postgres', scalars:'postgres-typed-sql/scalars'}}"
+        "export default {schema: ['schema.sql'], imports: {runtime:'postgres-typed-sql/adapters/node-postgres', scalars:'postgres-typed-sql/scalars'}}"
       )
       await writeFile(fileName, 'invalid saved text')
       const open = () =>
