@@ -471,12 +471,12 @@ test('source inventory does not analyze invalid saved SQL and supports unsaved b
   }
 })
 
-test('late codec imports reject analysis even when the import rejection is caught', async () => {
+test('late configuration imports reject analysis even when the import rejection is caught', async () => {
   const { root, config, sourcePath } = await fixture()
   await writeFile(join(root, 'late.mjs'), 'export const value = 1')
   await writeFile(
     config,
-    `export default {schema:'schema.sql',imports:${JSON.stringify(imports)},codecProfile:{extends:'node-postgres',name:'late',resultType(){void import('./late.mjs').catch(()=>{});return {type:'number',ambientBindings:[],scalarImports:[]}}}}`
+    `setTimeout(() => { void import('./late.mjs').catch(() => {}) }, 0); export default {schema:'schema.sql',imports:${JSON.stringify(imports)}}`
   )
   const project = await openQueryProject(config)
   try {

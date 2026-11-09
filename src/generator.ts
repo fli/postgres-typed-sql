@@ -447,7 +447,6 @@ function compileTypedSql(config: TypedSqlConfig, parameterNaming: PostgresTypedS
   }
 
   return {
-    valueModel: postgresValueModel,
     access: config.access,
     columns: config.columns,
     name: config.name,

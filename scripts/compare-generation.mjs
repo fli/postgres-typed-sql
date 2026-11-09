@@ -98,7 +98,6 @@ if (firstArg === '--worker') {
     rootDir: root,
     schema: 'schema.sql',
     include: ['queries'],
-    codecProfile: 'node-postgres',
     imports: { runtime: 'postgres-typed-sql/runtime', scalars: 'postgres-typed-sql/scalars' },
   }
   const generated = await generateTypedSql(config, { analysis: true })
