@@ -402,7 +402,7 @@ test('public project snapshots expose runtime facts without outputs and reject f
     assert.equal(buffer.descriptor.resultKind, 'one')
     assert.match(buffer.moduleText, /select 1 as value/u)
     const snapshot = await project.analyzeProject()
-    assert.equal(snapshot.version, 1)
+    assert.equal(snapshot.version, 2)
     assert.equal(snapshot.rootDir, root)
     assert.deepEqual(
       snapshot.inputs.filter((input) => input.role === 'sql').map((input) => input.path),
