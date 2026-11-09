@@ -20,25 +20,4 @@ export type {
 } from './generation-analysis.js'
 export { postgresVersion, supportedExtensions } from './engine.js'
 export type { SupportedExtension } from './engine.js'
-export {
-  defaultPostgresCodecProfile,
-  definePostgresCodecProfile,
-  postgresResultTypesByOid,
-  postgresTypeScriptType,
-  resolvePostgresCodecProfile,
-} from './postgres-codecs.js'
-export type {
-  BuiltInPostgresCodecProfile,
-  PostgresBooleanFallback,
-  PostgresCodecProfile,
-  PostgresCodecProfileDefinition,
-  PostgresCodecTypePosition,
-  PostgresJsonScalarTypeContext,
-  PostgresParameterTypeContext,
-  PostgresResultTypeContext,
-  PostgresStringLiteralRefinementContext,
-  PostgresTypeScriptResolution,
-  PostgresTypeScriptResolutionFallback,
-  ResolvedPostgresCodecProfile,
-} from './postgres-codecs.js'
 export type { PostgresTypeFact, PostgresTypeKind } from './postgres-types.js'

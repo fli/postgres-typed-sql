@@ -162,7 +162,6 @@ test('uses canonical destination identity through symlinked parent directories',
   const config = {
     include: ['queries', 'query-link'],
     rootDir: root,
-    codecProfile: 'node-postgres' as const,
     schema: 'schema.sql',
     typesOutput: 'query-link/catalog.typed-sql.ts',
   }

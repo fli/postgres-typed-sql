@@ -42,8 +42,8 @@ await writeFile(
 await writeFile(
   resolve(consumer, 'postgres-typed-sql.config.mjs'),
   `import naming from './config-helper.mjs'
-export default { schema: ['schema.sql'], codecProfile: 'node-postgres', naming,
-imports: {runtime:'./runtime-facade.mjs',scalars:'postgres-typed-sql/scalars'}}
+export default { schema: ['schema.sql'], naming,
+imports: {runtime:'./runtime-facade.mjs',scalars:'postgres-typed-sql/values'}}
 `
 )
 await writeFile(
@@ -125,8 +125,8 @@ const refreshSchema = (primary) =>
 await writeFile(resolve(consumer, 'schema.sql'), refreshSchema(true))
 await writeFile(resolve(consumer, 'refresh.typed.sql'), 'select id as widget_id from refresh_widget where id = :id')
 const refreshCaller = (many) => `import run, {type RefreshRow} from './refresh.typed.sql'
-import type {NodePostgresTypedSqlClient} from 'postgres-typed-sql/adapters/node-postgres'
-declare const client: NodePostgresTypedSqlClient
+import type {PostgresExecutor} from 'postgres-typed-sql/runtime'
+declare const client: PostgresExecutor
 const value: ${many ? 'RefreshRow[]' : 'RefreshRow | null'} = await run(client, {id: 1})
 void value
 `

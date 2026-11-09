@@ -131,6 +131,12 @@ export type TypedSqlPostgresIrJsonShape =
       readonly value: boolean | number | string
     }
   | {
+      /** An exact JSON decimal in scientific notation, without an invented SQL scalar type. */
+      readonly kind: 'jsonNumber'
+      readonly nullability: TypedSqlPostgresIrResultNullability
+      readonly source: string
+    }
+  | {
       readonly alternatives: readonly TypedSqlPostgresIrJsonShape[]
       readonly kind: 'union'
       readonly nullability: TypedSqlPostgresIrResultNullability
@@ -265,6 +271,8 @@ function jsonShapeKey(shape: TypedSqlPostgresIrJsonShape): string {
       return JSON.stringify({ kind: shape.kind, nullability: shape.nullability.kind })
     case 'jsonScalar':
       return JSON.stringify({ kind: shape.kind, nullability: shape.nullability.kind, value: shape.value })
+    case 'jsonNumber':
+      return JSON.stringify({ kind: shape.kind, nullability: shape.nullability.kind, source: shape.source })
     case 'scalar':
       return JSON.stringify({
         checkConstraintType: shape.checkConstraintType ? checkConstraintTypeKey(shape.checkConstraintType) : undefined,

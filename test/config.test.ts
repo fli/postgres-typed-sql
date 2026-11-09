@@ -1,74 +1,53 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { resolveConfig as resolveConfigBase, type PostgresTypedSqlConfig } from '../src/config.js'
+import { resolveConfig as resolveConfigBase } from '../src/config.js'
 
-const testImports = {
-  runtime: 'postgres-typed-sql/adapters/node-postgres',
-  scalars: 'postgres-typed-sql/scalars',
-} as const
+const resolveConfig = resolveConfigBase
 
-function resolveConfig(
-  config: Omit<PostgresTypedSqlConfig, 'imports'> & { imports?: PostgresTypedSqlConfig['imports'] }
-) {
-  return resolveConfigBase({ ...config, imports: config.imports ?? testImports })
-}
-
-test('config requires exact generated-code imports and rejects the removed package prefix', () => {
-  assert.throws(
-    () => resolveConfigBase({ schema: 'schema.sql' } as PostgresTypedSqlConfig),
-    /imports option is required/u
-  )
-  assert.throws(
-    () => resolveConfig({ imports: { runtime: '', scalars: 'postgres-typed-sql/scalars' }, schema: 'schema.sql' }),
-    /imports\.runtime must be a non-empty module specifier/u
-  )
-  assert.throws(
-    () =>
-      resolveConfig({
-        imports: { runtime: 'postgres-typed-sql/adapters/node-postgres', scalars: ' ' },
-        schema: 'schema.sql',
-      }),
-    /imports\.scalars must be a non-empty module specifier/u
-  )
-  assert.throws(
-    () =>
-      resolveConfigBase({
-        imports: testImports,
-        packageImport: '@example/db',
-        schema: 'schema.sql',
-      } as unknown as PostgresTypedSqlConfig),
-    /packageImport is no longer supported/u
-  )
-})
-
-test('config defaults to conservative scalars and rejects unknown profiles', () => {
-  const resolved = resolveConfig({ schema: 'schema.sql' })
-  assert.equal(resolved.codecProfile.name, 'conservative')
-  assert.deepEqual(resolved.naming, {
+test('config defaults generated imports and permits independent overrides', () => {
+  const defaults = resolveConfig({ schema: 'schema.sql' })
+  assert.deepEqual(defaults.imports, {
+    runtime: 'postgres-typed-sql/runtime',
+    scalars: 'postgres-typed-sql/values',
+  })
+  assert.deepEqual(resolveConfig({ schema: 'schema.sql', imports: { runtime: '@example/runtime' } }).imports, {
+    runtime: '@example/runtime',
+    scalars: 'postgres-typed-sql/values',
+  })
+  assert.deepEqual(resolveConfig({ schema: 'schema.sql', imports: { scalars: '@example/values' } }).imports, {
+    runtime: 'postgres-typed-sql/runtime',
+    scalars: '@example/values',
+  })
+  assert.deepEqual(defaults.naming, {
     parameterProperties: 'camelCase',
     resultColumns: 'preserve',
     structuredJsonFields: 'preserve',
   })
   assert.throws(
-    () =>
-      resolveConfig({
-        codecProfile: 'custom-driver' as PostgresTypedSqlConfig['codecProfile'],
-        schema: 'schema.sql',
-      }),
-    /Unsupported PostgreSQL codec profile "custom-driver"/u
+    () => resolveConfig({ schema: 'schema.sql', imports: { runtime: '' } }),
+    /imports\.runtime must be a non-empty module specifier/u
+  )
+  assert.throws(
+    () => resolveConfig({ schema: 'schema.sql', imports: { scalars: ' ' } }),
+    /imports\.scalars must be a non-empty module specifier/u
   )
 })
 
-test('config rejects the removed scalarProfile option with migration guidance', () => {
-  assert.throws(
-    () =>
-      resolveConfig({
-        scalarProfile: 'node-postgres',
-        schema: 'schema.sql',
-      } as unknown as PostgresTypedSqlConfig),
-    /scalarProfile is no longer supported\. Configure codecProfile instead/u
-  )
+test('removed config options fail with migration guidance even for JavaScript callers', () => {
+  for (const [option, value, message] of [
+    ['packageImport', '@example/db', /packageImport is no longer supported/u],
+    ['scalarProfile', 'node-postgres', /scalarProfile is no longer supported.*lossless model/u],
+    ['codecProfile', 'node-postgres', /codecProfile is no longer supported.*application code/u],
+    [
+      'codecProfile',
+      { name: 'custom', extends: 'node-postgres' },
+      /codecProfile is no longer supported.*application code/u,
+    ],
+    ['codecProfile', undefined, /codecProfile is no longer supported/u],
+  ] as const) {
+    assert.throws(() => resolveConfig({ schema: 'schema.sql', [option]: value }), message)
+  }
 })
 
 test('config resolves and validates generated output naming', () => {

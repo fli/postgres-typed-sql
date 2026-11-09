@@ -12,15 +12,15 @@ export async function verifyMapperLanguageServer({ root, typescriptPackage }) {
   const uri = (file) => pathToFileURL(resolve(root, file)).href
   const sql = 'select id from widget where id = :id'
   const caller = `import run from './find.typed.sql'
-import type {NodePostgresTypedSqlClient} from 'postgres-typed-sql/adapters/node-postgres'
-declare const client: NodePostgresTypedSqlClient
+import type {PostgresExecutor} from 'postgres-typed-sql/runtime'
+declare const client: PostgresExecutor
 const value = await run(client, {id:1})
 void value
 `
   await writeFile(resolve(root, 'schema.sql'), 'create table widget (id integer primary key)')
   await writeFile(
     resolve(root, 'postgres-typed-sql.config.mjs'),
-    "export default {schema:'schema.sql',codecProfile:'node-postgres',imports:{runtime:'postgres-typed-sql/adapters/node-postgres',scalars:'postgres-typed-sql/scalars'}}"
+    "export default {schema:'schema.sql',imports:{runtime:'postgres-typed-sql/runtime',scalars:'postgres-typed-sql/values'}}"
   )
   await writeFile(
     resolve(root, 'tsconfig.json'),
@@ -145,15 +145,15 @@ export async function verifyMapperWatch({ root, typescriptPackage }) {
   await writeFile(resolve(settings, 'preserve.mjs'), naming(false))
   await writeFile(
     resolve(settings, 'config.mjs'),
-    "import naming from '#naming'; export default {rootDir:'..',schema:'schema.sql',codecProfile:'node-postgres',naming,imports:{runtime:'postgres-typed-sql/adapters/node-postgres',scalars:'postgres-typed-sql/scalars'}}"
+    "import naming from '#naming'; export default {rootDir:'..',schema:'schema.sql',naming,imports:{runtime:'postgres-typed-sql/runtime',scalars:'postgres-typed-sql/values'}}"
   )
   await writeFile(resolve(root, 'schema.sql'), schema(true))
   await writeFile(resolve(root, 'find.typed.sql'), 'select id, display_name from widget where id = :id')
   await writeFile(
     resolve(root, 'caller.mts'),
     `import run, {type FindRow} from './find.typed.sql'
-import type {NodePostgresTypedSqlClient} from 'postgres-typed-sql/adapters/node-postgres'
-declare const client: NodePostgresTypedSqlClient
+import type {PostgresExecutor} from 'postgres-typed-sql/runtime'
+declare const client: PostgresExecutor
 const result: FindRow | null = await run(client, {id:1})
 if (result) void result.displayName
 `

@@ -140,14 +140,17 @@ test('infers bounded JSON literals, constant paths, positions, and deletion with
     const columns = result.queries[0]?.resultColumns
     const column = (name: string) => columns?.find((candidate) => candidate.name === name)
     assert.equal(column('literal')?.jsonShape?.kind, 'object')
-    for (const name of ['duplicate', 'path', 'literal_path', 'jsonb_scalar']) {
+    for (const name of ['duplicate', 'path', 'literal_path']) {
       const shape = column(name)?.jsonShape
       assert.equal(shape?.kind, 'jsonScalar', name)
       assert.equal(
         shape?.kind === 'jsonScalar' ? shape.value : undefined,
-        name === 'path' || name === 'literal_path' ? 'Reader' : name === 'jsonb_scalar' ? 42 : 'ready'
+        name === 'path' || name === 'literal_path' ? 'Reader' : 'ready'
       )
     }
+    const scalar = column('jsonb_scalar')?.jsonShape
+    assert.equal(scalar?.kind, 'jsonNumber')
+    if (scalar?.kind === 'jsonNumber') assert.equal(scalar.source, '42e0')
     assert.deepEqual(column('path_text')?.checkConstraintType, { kind: 'literalUnion', labels: ['Reader'] })
     assert.equal(column('last')?.jsonShape?.kind, 'stringLiteral')
     for (const name of [
@@ -181,7 +184,10 @@ test('infers bounded JSON literals, constant paths, positions, and deletion with
       assert.equal(shape?.kind, 'stringLiteral', query.name)
       assert.equal(shape?.nullability.kind, 'nullable', query.name)
     }
-    for (const query of result.queries.slice(3))
+    assert.equal(result.queries[3]?.resultColumns[0]?.jsonShape?.kind, 'opaque')
+    const largeExponent = result.queries[4]?.resultColumns[0]?.jsonShape
+    assert.equal(largeExponent?.kind, 'jsonNumber')
+    for (const query of result.queries.slice(5))
       assert.equal(query.resultColumns[0]?.jsonShape?.kind, 'opaque', query.name)
     assert.deepEqual((await database.query(sql)).rows, [
       {
@@ -209,6 +215,51 @@ test('infers bounded JSON literals, constant paths, positions, and deletion with
         scalar_null: null,
       },
     ])
+  } finally {
+    await database.close()
+  }
+})
+
+test('preserves exact JSON literal numbers in serializable shapes', async () => {
+  const database = await createAnalysisDatabase({ schemaFiles: [schemaFile] })
+  try {
+    const result = await buildTypedSqlPostgresIrFromCompiledConfigs(database, [
+      config(
+        'exactNumbers',
+        `select '{"integer":9007199254740993,"scale":1.2300,"negativeZero":-0.00,"huge":1e1000000000000000000000000,"numbers":[1,2],"text":"ready","flag":true}'::json as payload`
+      ),
+    ])
+    const shape = result.queries[0]?.resultColumns[0]?.jsonShape
+    assert.equal(shape?.kind, 'object')
+    if (shape?.kind !== 'object') return
+    const field = (name: string) => shape.fields.find((candidate) => candidate.name === name)?.shape
+    for (const [name, source] of [
+      ['integer', '9007199254740993e0'],
+      ['scale', '12300e-4'],
+      ['negativeZero', '-0e-2'],
+      ['huge', '1e1000000000000000000000000'],
+    ] as const) {
+      const number = field(name)
+      assert.equal(number?.kind, 'jsonNumber', name)
+      if (number?.kind === 'jsonNumber') assert.equal(number.source, source, name)
+    }
+    const text = field('text')
+    const flag = field('flag')
+    assert.equal(text?.kind, 'jsonScalar')
+    assert.equal(flag?.kind, 'jsonScalar')
+    if (text?.kind === 'jsonScalar') assert.equal(text.value, 'ready')
+    if (flag?.kind === 'jsonScalar') assert.equal(flag.value, true)
+    const numbers = field('numbers')
+    assert.equal(numbers?.kind, 'array')
+    if (numbers?.kind === 'array') {
+      assert.equal(numbers.element.kind, 'union')
+      if (numbers.element.kind === 'union')
+        assert.deepEqual(
+          numbers.element.alternatives.map((item) => (item.kind === 'jsonNumber' ? item.source : undefined)),
+          ['1e0', '2e0']
+        )
+    }
+    assert.doesNotThrow(() => JSON.stringify(shape))
   } finally {
     await database.close()
   }

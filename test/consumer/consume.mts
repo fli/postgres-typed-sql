@@ -2,11 +2,16 @@ import runOneWidget, { type OneWidgetRow } from './oneWidget.typed-sql.js'
 import runDeleteWidget from './deleteWidget.typed-sql.js'
 import runCallWidget from './callWidget.typed-sql.js'
 import { echoBytes } from './echoBytes.typed-sql.js'
-import runFindWidget, { findWidget, type FindWidgetRow } from './findWidget.typed-sql.js'
+import runFindWidget, {
+  findWidget,
+  type FindWidgetRow,
+  type FindWidgetJ12_details_jsonJson,
+} from './findWidget.typed-sql.js'
 import runInsertWidget, { insertWidget, type InsertWidgetRow } from './insertWidget.typed-sql.js'
-import type { NodePostgresTypedSqlClient } from 'postgres-typed-sql/adapters/node-postgres'
+import type { PostgresExecutor } from 'postgres-typed-sql/runtime'
 import type { TypedSqlColumnMetadata } from 'postgres-typed-sql/runtime'
-import type { PgArray, PgArrayParameter } from 'postgres-typed-sql/scalars'
+import type { PgDecimal as ScalarPgDecimal } from 'postgres-typed-sql/scalars'
+import type { PgArray, PgArrayInput, PgDecimal, PgDecimalInput, PgJson, PgRawValue } from 'postgres-typed-sql/values'
 import {
   generateTypedSql,
   generationAnalysisVersion,
@@ -45,11 +50,18 @@ const requiredAnalysis: TypedSqlGenerationAnalysis = optionalResult.analysis
 void requiredAnalysis
 void analysisVersion
 
-declare const client: NodePostgresTypedSqlClient
+declare const client: PostgresExecutor
 
 type IsExactly<Left, Right> =
   (<Value>() => Value extends Left ? 1 : 2) extends <Value>() => Value extends Right ? 1 : 2 ? true : false
 type AssertTrue<Value extends true> = Value
+type ScalarBarrelMatchesValues = AssertTrue<IsExactly<ScalarPgDecimal, PgDecimal>>
+type WidgetIdIsBigint = AssertTrue<IsExactly<FindWidgetRow['id'], bigint>>
+type WidgetMetricsAreExact = AssertTrue<IsExactly<FindWidgetRow['metrics'], PgArray<PgDecimal | null>>>
+type WidgetSearchIsRaw = AssertTrue<IsExactly<FindWidgetRow['searchDocument'], PgRawValue>>
+type WidgetDetailsAreDocument = AssertTrue<
+  IsExactly<FindWidgetRow['detailsJson'], PgJson<FindWidgetJ12_details_jsonJson>>
+>
 type PublicMetadataHasNoSource = AssertTrue<IsExactly<Extract<keyof TypedSqlColumnMetadata, 'source'>, never>>
 
 const publicColumnMetadata: TypedSqlColumnMetadata = {
@@ -62,15 +74,23 @@ const publicColumnMetadata: TypedSqlColumnMetadata = {
   propertyName: 'value',
 }
 const publicMetadataHasNoSource: PublicMetadataHasNoSource = true
+const exactResultTypes: [
+  ScalarBarrelMatchesValues,
+  WidgetIdIsBigint,
+  WidgetMetricsAreExact,
+  WidgetSearchIsRaw,
+  WidgetDetailsAreDocument,
+] = [true, true, true, true, true]
 
 void publicColumnMetadata.expressionSource
 void publicMetadataHasNoSource
+void exactResultTypes
 
 const query = findWidget.query({ code: 'widget-code', metrics: [] })
 const values: readonly unknown[] = query.values
 
 void values
-void client.query(query)
+void query
 
 echoBytes.query({ payloads: [] })
 echoBytes.query({ payloads: [null] })
@@ -80,18 +100,24 @@ echoBytes.query({ payloads: null })
 
 findWidget.query({ code: 'widget-code', metrics: [] })
 findWidget.query({ code: 'widget-code', metrics: [1, '2', 3n, null] })
-findWidget.query({ code: 'widget-code', metrics: '{{1,2},{3,4}}' })
+findWidget.query({
+  code: 'widget-code',
+  metrics: {
+    dimensions: [
+      { lowerBound: 0, length: 2 },
+      { lowerBound: 1, length: 2 },
+    ],
+    values: [1, '2', 3n, null],
+  },
+})
 
 // @ts-expect-error Array element NULL does not make the top-level SQL parameter nullable.
 findWidget.query({ code: 'widget-code', metrics: null })
 
-const flatParameter: PgArrayParameter<number> = [1, null, 2]
-const recursiveResult: PgArray<number> = [
-  [1, null],
-  [2, null],
-]
+const flatParameter: PgArrayInput<PgDecimalInput | null> = [1, null, 2]
+const arrayResult: PgArray<PgDecimal | null> = { dimensions: [], values: [] }
 void flatParameter
-void recursiveResult
+void arrayResult
 
 // @ts-expect-error Nested JavaScript arrays cannot prove rectangular PostgreSQL dimensions.
 findWidget.query({ code: 'widget-code', metrics: [[1], [2, 3]] })

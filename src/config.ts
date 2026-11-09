@@ -1,11 +1,5 @@
 import { isAbsolute, resolve } from 'node:path'
 
-import {
-  defaultPostgresCodecProfile,
-  resolvePostgresCodecProfile,
-  type PostgresCodecProfile,
-  type ResolvedPostgresCodecProfile,
-} from './postgres-codecs.js'
 import type { SupportedExtension } from './engine.js'
 
 export type PostgresTypedSqlPropertyNaming = 'camelCase' | 'preserve'
@@ -27,12 +21,10 @@ export interface PostgresTypedSqlImportsConfig {
 }
 
 export interface PostgresTypedSqlConfig {
-  /** Driver codec behavior used for generated parameter, result, and JSON types. Defaults to conservative. */
-  readonly codecProfile?: PostgresCodecProfile
   /** Directories recursively searched for *.typed.sql files. Defaults to rootDir. */
   readonly include?: readonly string[]
   /** Exact module specifiers written into generated TypeScript. */
-  readonly imports: PostgresTypedSqlImportsConfig
+  readonly imports?: Partial<PostgresTypedSqlImportsConfig>
   /** Naming conventions for generated TypeScript properties. */
   readonly naming?: PostgresTypedSqlNamingConfig
   /** Project directory used to resolve every relative path. Defaults to process.cwd(). */
@@ -52,7 +44,6 @@ export interface ResolvedPostgresTypedSqlNamingConfig {
 }
 
 export interface ResolvedPostgresTypedSqlConfig {
-  readonly codecProfile: ResolvedPostgresCodecProfile
   readonly extensions: readonly SupportedExtension[]
   readonly imports: PostgresTypedSqlImportsConfig
   readonly include: readonly string[]
@@ -82,17 +73,19 @@ export function resolveConfig(config: PostgresTypedSqlConfig): ResolvedPostgresT
     throw new Error('packageImport is no longer supported. Configure imports.runtime and imports.scalars explicitly.')
   }
   if (Object.hasOwn(config, 'scalarProfile')) {
-    throw new Error('scalarProfile is no longer supported. Configure codecProfile instead.')
+    throw new Error('scalarProfile is no longer supported. Generated values use the built-in lossless model.')
   }
-  if (!config.imports || typeof config.imports !== 'object') {
-    throw new Error('The imports option is required and must configure runtime and scalars.')
+  if (Object.hasOwn(config, 'codecProfile')) {
+    throw new Error('codecProfile is no longer supported. Map the built-in lossless values in application code.')
+  }
+  if (config.imports !== undefined && (!config.imports || typeof config.imports !== 'object')) {
+    throw new Error('The imports option must configure runtime and scalars module specifiers.')
   }
   const rootDir = resolve(config.rootDir ?? process.cwd())
   const schema = typeof config.schema === 'string' ? [config.schema] : config.schema
   if (!schema || schema.length === 0) {
     throw new Error('The schema option must name at least one SQL file.')
   }
-  const codecProfile = resolvePostgresCodecProfile(config.codecProfile ?? defaultPostgresCodecProfile)
   const parameterProperties = config.naming?.parameterProperties ?? 'camelCase'
   if (parameterProperties !== 'preserve' && parameterProperties !== 'camelCase') {
     throw new Error(`Unsupported parameter-property naming ${JSON.stringify(parameterProperties)}.`)
@@ -107,11 +100,10 @@ export function resolveConfig(config: PostgresTypedSqlConfig): ResolvedPostgresT
   }
 
   return {
-    codecProfile,
     extensions: config.extensions ?? [],
     imports: {
-      runtime: requireModuleSpecifier(config.imports.runtime, 'imports.runtime'),
-      scalars: requireModuleSpecifier(config.imports.scalars, 'imports.scalars'),
+      runtime: requireModuleSpecifier(config.imports?.runtime ?? 'postgres-typed-sql/runtime', 'imports.runtime'),
+      scalars: requireModuleSpecifier(config.imports?.scalars ?? 'postgres-typed-sql/values', 'imports.scalars'),
     },
     include: (config.include ?? ['.']).map((entry) => fromRoot(rootDir, entry)),
     naming: {

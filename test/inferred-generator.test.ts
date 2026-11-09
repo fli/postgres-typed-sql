@@ -6,13 +6,18 @@ import { pathToFileURL } from 'node:url'
 
 import ts from 'typescript'
 
-import type { NodePostgresTypedSqlClient } from '../src/adapters/node-postgres.js'
-import type { TypedSqlResultKind, TypedSqlStatement } from '../src/runtime.js'
+import { createPostgresExecutor } from '../src/runtime.js'
+import type {
+  PostgresExecutionResponse,
+  PostgresExecutor,
+  TypedSqlResultKind,
+  TypedSqlStatement,
+} from '../src/runtime.js'
 
 import { createMinimalFixture, generateTypedSql } from './generator-test-support.js'
 
 interface GeneratedModule {
-  readonly default: (client: NodePostgresTypedSqlClient, params?: object) => Promise<unknown>
+  readonly default: (client: PostgresExecutor, params?: object) => Promise<unknown>
   readonly query: TypedSqlStatement<object, unknown>
 }
 
@@ -28,12 +33,12 @@ test('generated default callables derive every execution shape and honor the exa
   const cases: readonly {
     readonly sql: string
     readonly kind: TypedSqlResultKind
-    readonly rows: readonly unknown[]
+    readonly rows: PostgresExecutionResponse['rows']
     readonly expected: unknown
     readonly count?: number
     readonly params?: object
   }[] = [
-    { sql: 'select 1 as value', kind: 'one', rows: [[1]], expected: { value: 1 } },
+    { sql: 'select 1 as value', kind: 'one', rows: [['1']], expected: { value: 1 } },
     { sql: 'select from generate_series(1, 2)', kind: 'many', rows: [[], []], expected: [{}, {}] },
     { sql: 'select 1 as value where false', kind: 'many', rows: [], expected: [] },
     { sql: 'select label from items where id = :id', kind: 'optional', rows: [], expected: null, params: { id: 1 } },
@@ -46,11 +51,11 @@ test('generated default callables derive every execution shape and honor the exa
     { sql: 'insert into items values (1, null)', kind: 'command', rows: [], count: 1, expected: 1 },
     { sql: 'update items set label = null', kind: 'command', rows: [], count: 2, expected: 2 },
     { sql: 'delete from items', kind: 'command', rows: [], count: 0, expected: 0 },
-    { sql: 'insert into items values (1, null) returning id', kind: 'many', rows: [[1]], expected: [{ id: 1 }] },
+    { sql: 'insert into items values (1, null) returning id', kind: 'many', rows: [['1']], expected: [{ id: 1 }] },
     {
       sql: 'update items set label = null where id = :id returning id',
       kind: 'optional',
-      rows: [[1]],
+      rows: [['1']],
       expected: { id: 1 },
       params: { id: 1 },
     },
@@ -82,14 +87,16 @@ test('generated default callables derive every execution shape and honor the exa
     const generated = (await import(pathToFileURL(modulePath).href)) as GeneratedModule
     assert.equal(generated.query.resultKind, example.kind, example.sql)
     let calls = 0
-    const client: NodePostgresTypedSqlClient = {
-      async query(config) {
-        calls++
-        assert.equal(config.text, generated.query.text)
-        assert.equal(config.rowMode, 'array')
-        return { rows: example.rows, rowCount: example.count ?? null }
-      },
-    }
+    const client = createPostgresExecutor(async (request) => {
+      calls++
+      assert.equal(request.text, generated.query.text)
+      assert.deepEqual(request.values, example.params ? ['1'] : [])
+      return {
+        rows: example.rows,
+        rowCount: example.count ?? null,
+        columnTypes: request.columns.map((column) => column.type),
+      }
+    })
     assert.deepEqual(await generated.default(client, example.params), example.expected, example.sql)
     assert.equal(calls, 1)
   }

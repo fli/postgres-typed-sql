@@ -3,10 +3,9 @@ import { readFile, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import test from 'node:test'
 
-import { definePostgresCodecProfile, postgresTypeScriptType } from '../src/index.js'
 import { createAnalysisDatabase } from '../src/engine.js'
 
-import { createMinimalFixture, generateTypedSql, generateFixture, renderQuery } from './generator-test-support.js'
+import { createMinimalFixture, generateTypedSql, renderQuery } from './generator-test-support.js'
 
 test('renders a CASE-authored JSON state machine as a precise discriminated union', async () => {
   const output = await renderQuery(
@@ -41,14 +40,13 @@ left join lateral (
   assert.match(output, /interface QueryJ8_playbackJsonJ12_alternative2 \{[\s\S]*readonly state: 'unavailable'/u)
   assert.match(
     output,
-    /readonly playback: QueryJ8_playbackJsonJ12_alternative1 \| QueryJ8_playbackJsonJ12_alternative2\n/u
+    /readonly playback: PgJson<QueryJ8_playbackJsonJ12_alternative1 \| QueryJ8_playbackJsonJ12_alternative2>\n/u
   )
-  assert.doesNotMatch(output, /readonly playback: DbJsonSelected/u)
   assert.doesNotMatch(output, /readonly publicationPublicId: string \| null/u)
   assert.doesNotMatch(output, /readonly manifestObjectKey: string \| null/u)
 })
 
-test('renders VALUES JSON unions while keeping function RTE outputs explicitly nullable', async () => {
+test('uses generic JSON for ambiguous VALUES objects and keeps function outputs nullable', async () => {
   const output = await renderQuery(
     'select 1;\n',
     `select source.payload, generated.value
@@ -60,9 +58,8 @@ from (
 cross join generate_series(1, 2) generated(value)
 `
   )
-  assert.match(output, /readonly left: 'left-value'/u)
-  assert.match(output, /readonly right: 'right-value'/u)
-  assert.match(output, /readonly payload: QueryJ7_payloadJsonJ12_alternative1 \| QueryJ7_payloadJsonJ12_alternative2/u)
+  assert.match(output, /readonly payload: PgJson<PgJsonValue>/u)
+  assert.match(output, /jsonPlan: \{"kind":"generic"\}/u)
   assert.match(output, /readonly value: number \| null/u)
   assert.match(output, /name: 'value',[\s\S]*?nullable: true/u)
 })
@@ -77,7 +74,6 @@ test('renders JSON build-array element structures through existing unions, namin
 `
   )
   const config = {
-    codecProfile: 'node-postgres' as const,
     include: ['queries'],
     naming: {
       structuredJsonFields: 'camelCase' as const,
@@ -98,56 +94,23 @@ test('renders JSON build-array element structures through existing unions, namin
   assert.match(output, /readonly errorCode: null/u)
   assert.match(
     output,
-    /readonly payload: readonly \(QueryJ7_payloadJsonJ7_elementJ12_alternative1 \| QueryJ7_payloadJsonJ7_elementJ12_alternative2\)\[\]\n/u
+    /readonly payload: PgJson<readonly \(QueryJ7_payloadJsonJ7_elementJ12_alternative1 \| QueryJ7_payloadJsonJ7_elementJ12_alternative2\)\[\]>\n/u
   )
-  assert.doesNotMatch(output, /readonly payload: DbJsonSelected/u)
   assert.doesNotMatch(output, /readonly payload: .*\[\] \| null/u)
-  assert.match(output, /"arrayElement":\{"fields":/u)
+  assert.match(output, /jsonPlan: \{"kind":"array","element":/u)
   assert.match(output, /"name":"display_name","propertyName":"displayName"/u)
   assert.match(output, /"name":"error_code","propertyName":"errorCode"/u)
 
   await writeFile(queryFile, 'select jsonb_build_array() as payload\n')
   await generateTypedSql(config)
   output = await readFile(outputFile, 'utf8')
-  assert.match(output, /readonly payload: readonly \(DbJsonSelected\)\[\]\n/u)
+  assert.match(output, /readonly payload: PgJson<readonly \(PgJsonValue\)\[\]>\n/u)
   assert.doesNotMatch(output, /readonly payload: .*\[\] \| null/u)
 
   await writeFile(queryFile, 'select jsonb_build_array(variadic :entries::text[]) as payload\n')
   await generateTypedSql(config)
   output = await readFile(outputFile, 'utf8')
-  assert.match(output, /readonly payload: readonly \(DbJsonSelected \| null\)\[\] \| null/u)
-
-  const customOpaqueJsonProfile = definePostgresCodecProfile({
-    extends: 'node-postgres',
-    name: 'custom-opaque-json',
-    opaqueJsonType: postgresTypeScriptType('OpaqueJsonValue', {
-      scalarImports: ['OpaqueJsonValue'],
-    }),
-    structuredJson: true,
-  })
-  await generateTypedSql({ ...config, codecProfile: customOpaqueJsonProfile })
-  output = await readFile(outputFile, 'utf8')
-  assert.match(output, /import type \{ [^}]*OpaqueJsonValue[^}]* \} from 'postgres-typed-sql\/scalars'/u)
-  assert.match(output, /readonly payload: readonly \(OpaqueJsonValue \| null\)\[\] \| null/u)
-
-  await writeFile(queryFile, 'select jsonb_build_array() as payload\n')
-  await generateTypedSql({ ...config, codecProfile: customOpaqueJsonProfile })
-  output = await readFile(outputFile, 'utf8')
-  assert.match(output, /readonly payload: readonly \(OpaqueJsonValue\)\[\]\n/u)
-  assert.doesNotMatch(output, /OpaqueJsonValue \| null/u)
-
-  await writeFile(
-    queryFile,
-    "select jsonb_build_array(jsonb_build_object('display_name', 'Reader'::text)) as payload\n"
-  )
-  await generateTypedSql({
-    ...config,
-    codecProfile: 'conservative',
-    naming: { structuredJsonFields: 'preserve' },
-  })
-  output = await readFile(outputFile, 'utf8')
-  assert.match(output, /readonly payload: unknown/u)
-  assert.doesNotMatch(output, /interface QueryJ7_payloadJson/u)
+  assert.match(output, /readonly payload: PgJson<readonly \(PgJsonValue \| null\)\[\]> \| null/u)
 })
 
 test('keeps I/O-cast JSON shapes opaque and strict conversion results nullable', async () => {
@@ -162,7 +125,6 @@ end)::jsonb as payload
   const config = {
     include: ['queries'],
     rootDir: root,
-    codecProfile: 'node-postgres' as const,
     schema: 'schema.sql',
   }
   const queryFile = join(root, 'queries/query.typed.sql')
@@ -170,7 +132,7 @@ end)::jsonb as payload
 
   await generateTypedSql(config)
   let output = await readFile(outputFile, 'utf8')
-  assert.match(output, /readonly payload: DbJsonSelected\n/u)
+  assert.match(output, /readonly payload: PgJson<PgJsonValue>\n/u)
   assert.doesNotMatch(output, /'\{"a":1\}'/u)
   assert.doesNotMatch(output, /'\{"b":2\}'/u)
 
@@ -180,43 +142,15 @@ end)::jsonb as payload
   )
   await generateTypedSql(config)
   output = await readFile(outputFile, 'utf8')
-  assert.match(output, /readonly payload: QueryJ7_payloadJson \| null/u)
+  assert.match(output, /readonly payload: PgJson<QueryJ7_payloadJson> \| null/u)
   assert.match(output, /name: 'payload',[\s\S]*?nullable: true/u)
 
   await writeFile(queryFile, 'select row_to_json(source_row, false) as payload from (values (1)) source_row(value)\n')
   await generateTypedSql(config)
   output = await readFile(outputFile, 'utf8')
-  assert.match(output, /readonly payload: QueryJ7_payloadJson\n/u)
-  assert.doesNotMatch(output, /readonly payload: QueryJ7_payloadJson \| null/u)
+  assert.match(output, /readonly payload: PgJson<QueryJ7_payloadJson>\n/u)
+  assert.doesNotMatch(output, /readonly payload: PgJson<QueryJ7_payloadJson> \| null/u)
   assert.match(output, /name: 'payload',[\s\S]*?nullable: false/u)
-})
-
-test('uses the codec JSON scalar type when exact string-literal refinement is disabled', async () => {
-  const root = await createMinimalFixture(
-    'select 1;\n',
-    "select jsonb_build_object('state', 'active'::text) as payload\n"
-  )
-  const codecProfile = definePostgresCodecProfile({
-    extends: 'node-postgres',
-    name: 'decoded-json-text',
-    jsonScalarType({ type }, fallback) {
-      return type.pgTypeSchema === 'pg_catalog' && type.pgTypeName === 'text'
-        ? postgresTypeScriptType('DecodedJsonText', { scalarImports: ['DecodedJsonText'] })
-        : fallback()
-    },
-    supportsStringLiteralRefinement({ position, type }, fallback) {
-      return position === 'json' && type.pgTypeSchema === 'pg_catalog' && type.pgTypeName === 'text'
-        ? false
-        : fallback()
-    },
-  })
-
-  await generateFixture(root, { codecProfile })
-
-  const output = await readFile(join(root, 'queries/query.typed-sql.ts'), 'utf8')
-  assert.match(output, /import type \{ DecodedJsonText \} from 'postgres-typed-sql\/scalars'/u)
-  assert.match(output, /readonly state: DecodedJsonText/u)
-  assert.doesNotMatch(output, /readonly state: 'active'/u)
 })
 
 test('generates composed JSON unions, projections, conversions, and filtered aggregate element types', async () => {
@@ -238,24 +172,23 @@ test('generates composed JSON unions, projections, conversions, and filtered agg
      from public.json_inputs source`
   )
   await generateTypedSql({
-    codecProfile: 'node-postgres',
     include: ['queries'],
     naming: { structuredJsonFields: 'camelCase' },
     rootDir: root,
     schema: 'schema.sql',
   })
   const output = await readFile(join(root, 'queries/query.typed-sql.ts'), 'utf8')
-  assert.match(output, /readonly fallback: [^\n]*alternative1 \| [^\n]*alternative2\n/u)
-  assert.match(output, /readonly converted_text: 'ready'\n/u)
-  assert.match(output, /readonly converted_row: Query[^\n]*Json\n/u)
+  assert.match(output, /readonly fallback: PgJson<[^\n]*alternative1 \| [^\n]*alternative2>\n/u)
+  assert.match(output, /readonly converted_text: PgJson<'ready'>\n/u)
+  assert.match(output, /readonly converted_row: PgJson<Query[^\n]*Json>\n/u)
   assert.match(output, /readonly id: number\n/u)
   assert.match(output, /readonly displayName: string \| null\n/u)
-  assert.match(output, /readonly converted_array: readonly \(Query[^\n]*\)\[\]\n/u)
+  assert.match(output, /readonly converted_array: PgJson<readonly \(Query[^\n]*\)\[\]>\n/u)
   assert.match(output, /readonly displayName: 'Reader'\n/u)
-  assert.match(output, /readonly projected_json: 'ready'\n/u)
+  assert.match(output, /readonly projected_json: PgJson<'ready'>\n/u)
   assert.match(output, /readonly projected_text: 'ready'\n/u)
-  assert.match(output, /readonly filtered: readonly \(string\)\[\] \| null\n/u)
-  assert.match(output, /readonly strict_values: readonly \(string\)\[\] \| null\n/u)
+  assert.match(output, /readonly filtered: PgJson<readonly \(string\)\[\]> \| null\n/u)
+  assert.match(output, /readonly strict_values: PgJson<readonly \(string\)\[\]> \| null\n/u)
   assert.doesNotMatch(output, /readonly state: 'old'/u)
   assert.match(output, /"name":"display_name","propertyName":"displayName"/u)
 })
@@ -275,16 +208,15 @@ test('separates JSON-null projections while keeping custom JSON conversions opaq
       to_jsonb(jsonb_build_object('value', 'ready'::public.json_source) ->> 'value') as custom_text`
   )
   await generateTypedSql({
-    codecProfile: 'node-postgres',
     include: ['queries'],
     rootDir: root,
     schema: 'schema.sql',
   })
   const output = await readFile(join(root, 'queries/query.typed-sql.ts'), 'utf8')
-  assert.match(output, /readonly json_null: null\n/u)
-  assert.match(output, /readonly custom_value: DbJsonSelected\n/u)
-  assert.match(output, /readonly domain_value: DbJsonSelected\n/u)
-  assert.match(output, /readonly custom_text: string \| null\n/u)
+  assert.match(output, /readonly json_null: PgJson<null>\n/u)
+  assert.match(output, /readonly custom_value: PgJson<PgJsonValue>\n/u)
+  assert.match(output, /readonly domain_value: PgJson<PgJsonValue>\n/u)
+  assert.match(output, /readonly custom_text: PgJson<string> \| null\n/u)
   assert.doesNotMatch(output, /readonly fallback:/u)
   const database = await createAnalysisDatabase({ schemaFiles: [join(root, 'schema.sql')] })
   try {
@@ -297,26 +229,18 @@ test('separates JSON-null projections while keeping custom JSON conversions opaq
   }
 })
 
-test('uses custom codec scalar conversion contracts for inferred to_jsonb values', async () => {
-  const root = await createMinimalFixture('select 1;', `select to_jsonb('ready'::text) as payload`)
-  const codecProfile = definePostgresCodecProfile({
-    extends: 'node-postgres',
-    name: 'custom-converted-text',
-    jsonScalarType({ type }, fallback) {
-      return type.pgTypeOid === 25
-        ? postgresTypeScriptType('DecodedJsonText', { scalarImports: ['DecodedJsonText'] })
-        : fallback()
-    },
-    supportsStringLiteralRefinement({ position }, fallback) {
-      return position === 'json' ? false : fallback()
-    },
-  })
-  const config = { codecProfile, include: ['queries'], rootDir: root, schema: 'schema.sql' }
-  await generateTypedSql(config)
-  let output = await readFile(join(root, 'queries/query.typed-sql.ts'), 'utf8')
-  assert.match(output, /readonly payload: DecodedJsonText\n/u)
-  assert.doesNotMatch(output, /readonly payload: 'ready'/u)
-  await generateTypedSql({ ...config, codecProfile: 'conservative' })
-  output = await readFile(join(root, 'queries/query.typed-sql.ts'), 'utf8')
-  assert.match(output, /readonly payload: unknown\n/u)
+test('rejects colliding camelCase fields in structured JSON', async () => {
+  const root = await createMinimalFixture(
+    'select 1;',
+    "select jsonb_build_object('foo_bar', 1, 'fooBar', 2) as payload"
+  )
+  await assert.rejects(
+    generateTypedSql({
+      include: ['queries'],
+      naming: { structuredJsonFields: 'camelCase' },
+      rootDir: root,
+      schema: 'schema.sql',
+    }),
+    /duplicate JSON field in result column "payload" name "fooBar"/u
+  )
 })

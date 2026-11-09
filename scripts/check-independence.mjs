@@ -9,7 +9,15 @@ if (listed.status !== 0) {
   throw new Error(listed.stderr.toString('utf8'))
 }
 
-const paths = listed.stdout.toString('utf8').split('\0').filter(Boolean)
+const deleted = spawnSync('git', ['ls-files', '--deleted', '-z'], { encoding: 'buffer' })
+if (deleted.status !== 0) {
+  throw new Error(deleted.stderr.toString('utf8'))
+}
+const deletedPaths = new Set(deleted.stdout.toString('utf8').split('\0'))
+const paths = listed.stdout
+  .toString('utf8')
+  .split('\0')
+  .filter((path) => path && !deletedPaths.has(path))
 
 const violations = []
 for (const path of paths) {

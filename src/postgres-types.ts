@@ -28,6 +28,23 @@ export interface PostgresTypeFact {
   readonly pgArrayDelimiter?: string
 }
 
+/** Keep generation metadata independent of the larger analyzer expression tree. */
+export function postgresTypeFact(type: PostgresTypeFact): PostgresTypeFact {
+  return {
+    pgType: type.pgType,
+    pgTypeKind: type.pgTypeKind,
+    pgTypeName: type.pgTypeName,
+    // OIDs belong to the analysis database. Execution resolves schema/name on its connection.
+    pgTypeOid: 0,
+    pgTypeSchema: type.pgTypeSchema,
+    ...(type.pgCastsToJson ? { pgCastsToJson: true } : {}),
+    ...(type.pgEnumLabels ? { pgEnumLabels: type.pgEnumLabels } : {}),
+    ...(type.pgArrayDelimiter ? { pgArrayDelimiter: type.pgArrayDelimiter } : {}),
+    ...(type.pgArrayElementType ? { pgArrayElementType: postgresTypeFact(type.pgArrayElementType) } : {}),
+    ...(type.pgBaseType ? { pgBaseType: postgresTypeFact(type.pgBaseType) } : {}),
+  }
+}
+
 const pgCatalogTypeAliases = new Map([
   ['bool', 'boolean'],
   ['bpchar', 'text'],

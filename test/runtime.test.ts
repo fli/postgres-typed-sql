@@ -1,20 +1,37 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
+import type { PgFiniteDecimal, PgJson } from '../src/value-types.js'
+
 import {
-  executeTypedSql,
-  type NodePostgresTypedSqlClient,
-  type NodePostgresTypedSqlQueryConfig,
-} from '../src/adapters/node-postgres.js'
-import {
+  createPostgresExecutor,
   createTypedSqlStatement,
-  mapTypedSqlJsonValue,
-  mapTypedSqlRow,
+  executeTypedSql,
   typedSqlRowCount,
   type TypedSqlColumnMetadata,
-  type TypedSqlQueryConfig,
-  type TypedSqlStatement,
 } from '../src/runtime.js'
+
+const textType = {
+  pgType: 'text',
+  pgTypeName: 'text',
+  pgTypeSchema: 'pg_catalog',
+  pgTypeKind: 'base',
+  pgTypeOid: 25,
+} as const
+const int4 = {
+  pgType: 'integer',
+  pgTypeName: 'int4',
+  pgTypeSchema: 'pg_catalog',
+  pgTypeKind: 'base',
+  pgTypeOid: 23,
+} as const
+const jsonb = {
+  pgType: 'jsonb',
+  pgTypeName: 'jsonb',
+  pgTypeSchema: 'pg_catalog',
+  pgTypeKind: 'base',
+  pgTypeOid: 3802,
+} as const
 
 type IsExactly<Left, Right> =
   (<Value>() => Value extends Left ? 1 : 2) extends <Value>() => Value extends Right ? 1 : 2 ? true : false
@@ -32,10 +49,23 @@ const publicMetadataTypeAssertions: [ExpressionSourceIsRequired, ObsoleteSourceI
 test('runtime binds named parameters in generated order', async () => {
   const statement = createTypedSqlStatement<{ readonly email: string }, { readonly email: string }, 'read', 'optional'>(
     {
+      valueModel: 'postgres-lossless-v1',
+      parameters: [
+        {
+          name: 'email',
+          propertyName: 'email',
+          nullable: false,
+          type: textType,
+          pgType: 'text',
+          pgTypeName: 'text',
+          pgTypeSchema: 'pg_catalog',
+        },
+      ],
       rowBounds: { min: 0, max: 1, proof: 'test' },
       resultKind: 'optional',
       columns: [
         {
+          type: textType,
           expressionSource: { kind: 'expression', tag: 'OpExpr' },
           name: 'email',
           nullable: false,
@@ -67,35 +97,17 @@ test('runtime binds named parameters in generated order', async () => {
 
   // @ts-expect-error A direct query config cannot claim the generated result row type.
   void rawQuery.type
-  // @ts-expect-error Human statement names do not opt driver query configs into named preparation.
-  void rawQuery.name
+  const explicitPreparedName: string | undefined = rawQuery.name
+  void explicitPreparedName
   // @ts-expect-error Driver query options belong to adapters, not the core query config.
   void rawQuery.rowMode
 
-  const directClient: NodePostgresTypedSqlClient = {
-    async query() {
-      return { rows: [] }
-    },
-  }
-  const directResult = directClient.query(rawQuery)
-  type DirectRow = Awaited<typeof directResult>['rows'][number]
-  void directResult
-  const adapterDoesNotClaimDriverRows: IsExactly<DirectRow, unknown> = true
-  assert.equal(adapterDoesNotClaimDriverRows, true)
-
   const row = await executeTypedSql(
-    {
-      async query(config: NodePostgresTypedSqlQueryConfig) {
-        assert.deepEqual(config.values, ['reader@example.test'])
-        assert.equal(config.rowMode, 'array')
-        assert.equal(Object.hasOwn(config, 'name'), false)
-        assert.equal(Object.hasOwn(config, 'types'), false)
-        return {
-          rowCount: 1,
-          rows: [['reader@example.test']],
-        }
-      },
-    },
+    createPostgresExecutor(async (request) => {
+      assert.deepEqual(request.values, ['reader@example.test'])
+      assert.equal(Object.hasOwn(request, 'name'), false)
+      return { rowCount: 1, rows: [['reader@example.test']], columnTypes: [textType] }
+    }),
     statement,
     { email: 'reader@example.test' }
   )
@@ -135,8 +147,21 @@ test('runtime looks up public parameter properties independently of raw SQL meta
   )
 })
 
-test('node-postgres adapter reports command row counts without adding a driver client to the core runtime', async () => {
+test('runtime passes encoded parameters and returns affected row counts', async () => {
   const statement = createTypedSqlStatement<{ readonly id: number }, Record<string, never>, 'write', 'command'>({
+    valueModel: 'postgres-lossless-v1',
+    columns: [],
+    parameters: [
+      {
+        name: 'id',
+        propertyName: 'id',
+        nullable: false,
+        type: int4,
+        pgType: 'integer',
+        pgTypeName: 'int4',
+        pgTypeSchema: 'pg_catalog',
+      },
+    ],
     rowBounds: { min: 0, max: 0, proof: 'test' },
     resultKind: 'command',
     command: 'delete',
@@ -144,108 +169,91 @@ test('node-postgres adapter reports command row counts without adding a driver c
     parameterNames: ['id'],
     text: 'delete from accounts where id = $1',
   })
-
   const affected = await executeTypedSql(
-    {
-      async query(config) {
-        assert.deepEqual(config, {
-          text: 'delete from accounts where id = $1',
-          values: [42],
-        })
-        return { rowCount: 1, rows: [] }
-      },
-    },
+    createPostgresExecutor(async (request) => {
+      assert.equal(request.text, 'delete from accounts where id = $1')
+      assert.deepEqual(request.values, ['42'])
+      assert.deepEqual(request.parameters, [int4])
+      return { rowCount: 1, rows: [], columnTypes: [] }
+    }),
     statement,
     { id: 42 }
   )
   assert.equal(affected, 1)
 })
 
-test('human statement names never become node-postgres prepared-statement names', async () => {
-  const first = createTypedSqlStatement<Record<string, never>, Record<string, never>, 'read', 'many'>({
-    rowBounds: { min: 0, max: null, proof: 'test' },
-    resultKind: 'many',
-    name: 'findById',
-    parameterNames: [],
-    text: 'select 1',
+test('human statement names do not appear in transport requests', async () => {
+  const make = (text: string) =>
+    createTypedSqlStatement<Record<string, never>, Record<string, never>, 'read', 'many'>({
+      valueModel: 'postgres-lossless-v1',
+      columns: [],
+      rowBounds: { min: 0, max: null, proof: 'test' },
+      resultKind: 'many',
+      name: 'findById',
+      parameterNames: [],
+      text,
+    })
+  const requests: string[] = []
+  const executor = createPostgresExecutor(async (request) => {
+    assert.equal(Object.hasOwn(request, 'name'), false)
+    requests.push(request.text)
+    return { rows: [], columnTypes: [], rowCount: 0 }
   })
-  const second = createTypedSqlStatement<Record<string, never>, Record<string, never>, 'read', 'many'>({
-    rowBounds: { min: 0, max: null, proof: 'test' },
-    resultKind: 'many',
-    name: 'findById',
-    parameterNames: [],
-    text: 'select 2',
-  })
-  const configs: NodePostgresTypedSqlQueryConfig[] = []
-  const client: NodePostgresTypedSqlClient = {
-    async query(config) {
-      configs.push(config)
-      return { rows: [] }
-    },
-  }
-
-  await executeTypedSql(client, first, {})
-  await executeTypedSql(client, second, {})
-
-  assert.deepEqual(configs, [
-    { text: 'select 1', values: [] },
-    { text: 'select 2', values: [] },
-  ])
-  assert.equal(first.name, 'findById')
-  assert.equal(second.name, 'findById')
+  await executeTypedSql(executor, make('select 1'), {})
+  await executeTypedSql(executor, make('select 2'), {})
+  assert.deepEqual(requests, ['select 1', 'select 2'])
 })
 
-test('node-postgres adapter rejects rows that do not match the requested mapping representation', async () => {
-  const positional = createTypedSqlStatement<Record<string, never>, { readonly value: number }, 'read', 'many'>({
-    rowBounds: { min: 0, max: null, proof: 'test' },
-    resultKind: 'many',
-    columns: [
-      {
-        expressionSource: { kind: 'expression', tag: 'Const' },
-        name: 'value',
-        nullable: false,
-        pgType: 'integer',
-        pgTypeName: 'int4',
-        pgTypeSchema: 'pg_catalog',
-        propertyName: 'value',
-      },
-    ],
-    name: 'positionalRows',
-    parameterNames: [],
-    text: 'select 1 as value',
-  })
-  await assert.rejects(
-    executeTypedSql(
-      {
-        async query() {
-          return { rows: [{ value: 1 }] }
-        },
-      },
-      positional,
-      {}
-    ),
-    /expected node-postgres row 1 to use rowMode: 'array'/u
-  )
-
-  const object = createTypedSqlStatement<Record<string, never>, { readonly value: number }, 'read', 'many'>({
+test('execution rejects legacy object-row descriptors before transport', async () => {
+  const statement = createTypedSqlStatement<Record<string, never>, { readonly value: number }, 'read', 'many'>({
+    valueModel: 'postgres-lossless-v1',
     rowBounds: { min: 0, max: null, proof: 'test' },
     resultKind: 'many',
     name: 'objectRows',
     parameterNames: [],
     text: 'select 1 as value',
   })
+  let calls = 0
+  const executor = createPostgresExecutor(async () => {
+    calls++
+    return { rows: [], columnTypes: [], rowCount: 0 }
+  })
   await assert.rejects(
-    executeTypedSql(
-      {
-        async query() {
-          return { rows: [[1]] }
-        },
-      },
-      object,
-      {}
-    ),
-    /expected node-postgres row 1 to be an object/u
+    executeTypedSql(executor, statement, {}),
+    (error: unknown) =>
+      error instanceof Error && error.cause instanceof Error && /incomplete metadata/u.test(error.cause.message)
   )
+  assert.equal(calls, 0)
+})
+
+test('runtime maps duplicate SQL aliases by position', async () => {
+  const column = {
+    name: 'value',
+    nullable: false,
+    type: int4,
+    pgType: 'integer',
+    pgTypeName: 'int4',
+    pgTypeSchema: 'pg_catalog',
+    expressionSource: { kind: 'expression', tag: 'Const' },
+  } as const
+  const statement = createTypedSqlStatement<Record<string, never>, { first: number; second: number }, 'read', 'one'>({
+    valueModel: 'postgres-lossless-v1',
+    columns: [
+      { ...column, propertyName: 'first' },
+      { ...column, propertyName: 'second' },
+    ],
+    rowBounds: { min: 1, max: 1, proof: 'test' },
+    resultKind: 'one',
+    name: 'duplicates',
+    parameterNames: [],
+    text: 'select 1 as value, 2 as value',
+  })
+  const result = await executeTypedSql(
+    createPostgresExecutor(async () => ({ rows: [['1', '2']], columnTypes: [int4, int4], rowCount: 1 })),
+    statement,
+    {}
+  )
+  assert.deepEqual(result, { first: 1, second: 2 })
 })
 
 test('runtime accepts only nonnegative safe integer row counts', () => {
@@ -286,6 +294,7 @@ test('runtime preserves an exact __proto__ output property from array rows witho
     resultKind: 'optional',
     columns: [
       {
+        type: textType,
         expressionSource: { kind: 'expression', tag: 'OpExpr' },
         name: '__proto__',
         nullable: false,
@@ -295,24 +304,14 @@ test('runtime preserves an exact __proto__ output property from array rows witho
         propertyName: '__proto__',
       },
     ],
+    valueModel: 'postgres-lossless-v1',
     name: 'prototypeProperty',
     parameterNames: [],
     text: 'select value as "__proto__"',
   })
 
-  const mapped = mapTypedSqlRow(statement, ['preserved'])
-  assert.equal(Object.getPrototypeOf(mapped), Object.prototype)
-  assert.equal(Object.hasOwn(mapped, '__proto__'), true)
-  assert.equal(mapped.__proto__, 'preserved')
-  assert.deepEqual(Object.keys(mapped), ['__proto__'])
-
   const executed = await executeTypedSql(
-    {
-      async query(config: NodePostgresTypedSqlQueryConfig) {
-        assert.equal(config.rowMode, 'array')
-        return { rows: [['executed']] }
-      },
-    },
+    createPostgresExecutor(async () => ({ rows: [['executed']], columnTypes: [textType], rowCount: 1 })),
     statement,
     {}
   )
@@ -327,23 +326,16 @@ test('runtime maps zero-column array rows to empty row objects', async () => {
     resultKind: 'many',
     columns: [],
     command: 'select',
+    valueModel: 'postgres-lossless-v1',
     name: 'emptyRows',
     parameterNames: [],
     text: 'select from generate_series(1, 2)',
   })
 
-  assert.deepEqual(mapTypedSqlRow(statement, []), {})
   assert.equal(statement.resultRowMapping, 'positional')
-  const legacyObjectRow = { preserved: true }
-  assert.equal(mapTypedSqlRow(statement, legacyObjectRow), legacyObjectRow)
   assert.deepEqual(
     await executeTypedSql(
-      {
-        async query(config: NodePostgresTypedSqlQueryConfig) {
-          assert.equal(config.rowMode, 'array')
-          return { rows: [[], []] }
-        },
-      },
+      createPostgresExecutor(async () => ({ rows: [[], []], columnTypes: [], rowCount: 2 })),
       statement,
       {}
     ),
@@ -351,163 +343,34 @@ test('runtime maps zero-column array rows to empty row objects', async () => {
   )
 })
 
-test('runtime preserves object rows when result-column metadata is omitted', async () => {
-  const statement = createTypedSqlStatement<Record<string, never>, { readonly value: number }, 'read', 'many'>({
-    rowBounds: { min: 0, max: null, proof: 'test' },
-    resultKind: 'many',
-    name: 'customObjectRows',
-    parameterNames: [],
-    text: 'select 1 as value',
-  })
-
-  assert.deepEqual(statement.columns, [])
-  assert.equal(statement.resultRowMapping, undefined)
-  const rows = await executeTypedSql(
-    {
-      async query(config: NodePostgresTypedSqlQueryConfig) {
-        assert.equal(config.rowMode, undefined)
-        return { rows: [{ value: 1 }] }
-      },
-    },
-    statement,
-    {}
-  )
-  assert.deepEqual(rows, [{ value: 1 }])
-})
-
-test('runtime public statement contract preserves legacy custom object-row mapping', async () => {
-  interface CustomRow {
-    readonly camelValue: number
-  }
-
-  const customStatement: TypedSqlStatement<Record<string, never>, CustomRow> = {
-    access: 'read',
-    resultKind: 'many',
-    columns: [
-      {
-        expressionSource: { kind: 'expression', tag: 'Const' },
-        name: 'camel_value',
-        nullable: false,
-        pgType: 'integer',
-        pgTypeName: 'int4',
-        pgTypeSchema: 'pg_catalog',
-        propertyName: 'camelValue',
-      },
-    ],
-    command: 'select',
-    name: 'structurallyCompatibleCustomStatement',
-    parameterNames: [],
-    parameters: [],
-    query: (): TypedSqlQueryConfig => ({ text: 'select 1 as camel_value', values: [] }),
-    rowBounds: { max: null, min: 0, proof: 'custom' },
-    text: 'select 1 as camel_value',
-    values: () => [],
-  }
-
-  assert.equal(customStatement.resultRowMapping, undefined)
-  assert.deepEqual(
-    await executeTypedSql(
-      {
-        async query(config: NodePostgresTypedSqlQueryConfig) {
-          assert.equal(config.rowMode, undefined)
-          return { rows: [{ camel_value: 1 }] }
-        },
-      },
-      customStatement,
-      {}
-    ),
-    [{ camelValue: 1 }]
-  )
-})
-
-test('runtime maps nested structured JSON while preserving opaque values and unknown fields', () => {
-  const opaquePayload = {
-    event_type: 'account.created',
-    external_account_id: 'external-1',
-  }
-  const mapped = mapTypedSqlJsonValue(
-    {
-      fields: [
-        {
-          name: 'account_id',
-          propertyName: 'accountId',
-        },
-        {
-          mapping: {
-            arrayElement: {
-              fields: [
-                {
-                  name: 'post_id',
-                  propertyName: 'postId',
-                },
-              ],
-            },
-          },
-          name: 'recent_posts',
-          propertyName: 'recentPosts',
-        },
-        {
-          name: 'webhook_payload',
-          propertyName: 'webhookPayload',
-        },
-      ],
-    },
-    {
-      account_id: 'account-1',
-      extra_field: true,
-      recent_posts: [{ post_id: 'post-1' }, null],
-      webhook_payload: opaquePayload,
-    }
-  )
-
-  assert.deepEqual(mapped, {
-    accountId: 'account-1',
-    extra_field: true,
-    recentPosts: [{ postId: 'post-1' }, null],
-    webhookPayload: opaquePayload,
-  })
-  assert.equal((mapped as { readonly webhookPayload: unknown }).webhookPayload, opaquePayload)
-})
-
-test('runtime mapping treats an opaque union field as an identity-preserving traversal barrier', () => {
-  const opaque = { inner_key: 1, innerKey: 2 }
-  const mapped = mapTypedSqlJsonValue(
-    { fields: [{ name: 'payload_data', propertyName: 'payloadData' }] },
-    { payload_data: opaque }
-  ) as { readonly payloadData: unknown }
-
-  assert.equal(mapped.payloadData, opaque)
-  assert.deepEqual(mapped.payloadData, { inner_key: 1, innerKey: 2 })
-})
-
 test('runtime execution applies generated nested JSON mappings to positional rows', async () => {
   const statement = createTypedSqlStatement<
     Record<string, never>,
     {
-      readonly accountRows: readonly {
-        readonly accountId: number
-        readonly displayName: string
-      }[]
+      readonly accountRows: PgJson<
+        readonly {
+          readonly accountId: PgFiniteDecimal
+          readonly displayName: string
+        }[]
+      >
     },
     'read',
     'many'
   >({
+    valueModel: 'postgres-lossless-v1',
     rowBounds: { min: 0, max: null, proof: 'test' },
     resultKind: 'many',
     columns: [
       {
         expressionSource: { kind: 'expression', tag: 'SubLink' },
-        jsonMapping: {
-          arrayElement: {
+        type: jsonb,
+        jsonPlan: {
+          kind: 'array',
+          element: {
+            kind: 'object',
             fields: [
-              {
-                name: 'account_id',
-                propertyName: 'accountId',
-              },
-              {
-                name: 'display_name',
-                propertyName: 'displayName',
-              },
+              { name: 'account_id', propertyName: 'accountId', plan: { kind: 'number' } },
+              { name: 'display_name', propertyName: 'displayName', plan: { kind: 'string' } },
             ],
           },
         },
@@ -525,82 +388,21 @@ test('runtime execution applies generated nested JSON mappings to positional row
   })
 
   const rows = await executeTypedSql(
-    {
-      async query() {
-        return {
-          rows: [
-            [
-              [
-                {
-                  account_id: 1,
-                  display_name: 'Reader',
-                },
-              ],
-            ],
-          ],
-        }
-      },
-    },
+    createPostgresExecutor(async () => ({
+      rows: [['[{"account_id":1,"display_name":"Reader"}]']],
+      columnTypes: [jsonb],
+      rowCount: 1,
+    })),
     statement,
     {}
   )
 
-  assert.deepEqual(rows, [
+  assert.equal(rows[0]?.accountRows.kind, 'json')
+  assert.equal(rows[0]?.accountRows.source, '[{"account_id":1,"display_name":"Reader"}]')
+  assert.deepEqual(rows[0]?.accountRows.value, [
     {
-      accountRows: [
-        {
-          accountId: 1,
-          displayName: 'Reader',
-        },
-      ],
+      accountId: { kind: 'finite', coefficient: 1n, exponent: 0n, negative: false },
+      displayName: 'Reader',
     },
   ])
-})
-
-test('runtime maps prototype-sensitive nested JSON properties safely', () => {
-  const source = JSON.parse('{"__proto__":{"constructor":"preserved"}}') as unknown
-  const mapped = mapTypedSqlJsonValue(
-    {
-      fields: [
-        {
-          mapping: {
-            fields: [
-              {
-                name: 'constructor',
-                propertyName: 'constructorValue',
-              },
-            ],
-          },
-          name: '__proto__',
-          propertyName: '__proto__',
-        },
-      ],
-    },
-    source
-  ) as { readonly __proto__: { readonly constructorValue: string } }
-
-  assert.equal(Object.getPrototypeOf(mapped), Object.prototype)
-  assert.equal(Object.hasOwn(mapped, '__proto__'), true)
-  assert.equal(mapped.__proto__.constructorValue, 'preserved')
-})
-
-test('runtime rejects nested JSON properties that collide after mapping', () => {
-  assert.throws(
-    () =>
-      mapTypedSqlJsonValue(
-        {
-          fields: [
-            {
-              name: 'foo_bar',
-              propertyName: 'fooBar',
-            },
-          ],
-        },
-        {
-          foo_bar: 1,
-          fooBar: 2,
-        }
-      ),
-    /JSON fields collide at mapped property "fooBar"/u
-  )
 })

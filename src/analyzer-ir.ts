@@ -57,6 +57,7 @@ import {
   type TypedSqlPostgresIrRowBounds,
 } from './analyzer-ir-model.js'
 import type { PostgresQueryable } from './database.js'
+import { parseJson } from './json-values.js'
 import { loadPostgresTypeFacts } from './postgres-type-facts.js'
 import {
   analyzerExprChildren as exprChildren,
@@ -78,6 +79,7 @@ import {
   postgresJsonValueMayBeStructured,
   type PostgresTypeFact,
 } from './postgres-types.js'
+import { formatDecimal, isDecimalAtom } from './scalar-values.js'
 
 export type {
   TypedSqlPostgresIr,
@@ -3539,10 +3541,8 @@ function jsonLiteralShape(expr: PgAnalyzerExpr): TypedSqlPostgresIrJsonShape | n
   const visit = (value: unknown, depth: number): TypedSqlPostgresIrJsonShape => {
     if (++nodes > 4096 || depth > 64) throw new Error('JSON literal shape limit')
     if (value === null) return { kind: 'null', nullability }
-    // Keep the public, JSON-serializable IR free of Infinity/-Infinity: JSON
-    // serialization would silently turn those values into null.
-    if (typeof value === 'number' && !Number.isFinite(value)) return { kind: 'opaque', nullability }
-    if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
+    if (isDecimalAtom(value)) return { kind: 'jsonNumber', nullability, source: formatDecimal(value) }
+    if (typeof value === 'string' || typeof value === 'boolean') {
       return { kind: 'jsonScalar', nullability, value }
     }
     if (Array.isArray(value)) {
@@ -3564,7 +3564,7 @@ function jsonLiteralShape(expr: PgAnalyzerExpr): TypedSqlPostgresIrJsonShape | n
     }
   }
   try {
-    return visit(JSON.parse(expr.constJson) as unknown, 0)
+    return visit(parseJson(expr.constJson).value, 0)
   } catch {
     return null
   }
@@ -3623,6 +3623,7 @@ function projectJsonShape(
       scalarArrayIndex &&
       (key === 0 || key === -1) &&
       (alternative.kind === 'null' ||
+        alternative.kind === 'jsonNumber' ||
         alternative.kind === 'jsonScalar' ||
         alternative.kind === 'scalar' ||
         alternative.kind === 'stringLiteral')

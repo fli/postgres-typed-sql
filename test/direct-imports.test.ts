@@ -20,7 +20,7 @@ async function fixture(schema = 'create table widget (id integer primary key, di
   const config = join(root, 'postgres-typed-sql.config.mjs')
   await writeFile(
     config,
-    `import naming from './helper.mjs'\nexport default {schema: ['schema.sql'], codecProfile: 'node-postgres', imports: ${JSON.stringify(imports)}, naming}`
+    `import naming from './helper.mjs'\nexport default {schema: ['schema.sql'], imports: ${JSON.stringify(imports)}, naming}`
   )
   return { root, config, sourcePath: join(root, 'findWidget.typed.sql') }
 }
@@ -40,7 +40,6 @@ test('direct compilation consumes supplied text, preserves legacy modules, and w
     await writeFile(sourcePath, sql)
     await generateTypedSql({
       schema: ['schema.sql'],
-      codecProfile: 'node-postgres',
       imports,
       rootDir: root,
       naming: { resultColumns: 'camelCase' },
@@ -120,7 +119,7 @@ test('a repeated cached helper import cannot relabel evaluated configuration wit
 import {writeFile} from 'node:fs/promises'
 await writeFile(new URL('./helper.mjs', import.meta.url), "export default {resultColumns: 'preserve'}")
 await import('./helper.mjs')
-export default {schema: ['schema.sql'], codecProfile: 'node-postgres', naming, imports: ${JSON.stringify(imports)}}`
+export default {schema: ['schema.sql'], naming, imports: ${JSON.stringify(imports)}}`
   )
   const project = await openQueryProject(config)
   try {
@@ -141,7 +140,7 @@ test('package export changes invalidate configuration and unchanged revisions ha
   await writeFile(join(helper, 'preserve.mjs'), "export default {resultColumns: 'preserve'}")
   await writeFile(
     config,
-    `import naming from 'config-helper'; export default {schema: 'schema.sql', codecProfile: 'node-postgres', naming, imports: ${JSON.stringify(imports)}}`
+    `import naming from 'config-helper'; export default {schema: 'schema.sql', naming, imports: ${JSON.stringify(imports)}}`
   )
   const first = await openQueryProject(config, { configDependencies: [manifest] })
   try {
@@ -204,7 +203,7 @@ test('different module URLs cannot retain two source revisions under one depende
 import {writeFile} from 'node:fs/promises'
 await writeFile(new URL('./helper.mjs', import.meta.url), "export default {resultColumns: 'preserve'}")
 await import('./helper.mjs?fresh')
-export default {schema: 'schema.sql', codecProfile: 'node-postgres', naming, imports: ${JSON.stringify(imports)}}`
+export default {schema: 'schema.sql', naming, imports: ${JSON.stringify(imports)}}`
   )
   try {
     await assert.rejects(openQueryProject(config), /dependency changed while evaluating/u)
@@ -213,25 +212,20 @@ export default {schema: 'schema.sql', codecProfile: 'node-postgres', naming, imp
   }
 })
 
-test('fresh projects preserve custom codec closures and include helper source in identity', async () => {
+test('fresh projects preserve imported naming configuration and include helper source in identity', async () => {
   const { root, config, sourcePath } = await fixture()
   const helper = join(root, 'helper.mjs')
-  const profile = (type: string) =>
-    `const type = '${type}'; export default {extends:'node-postgres',name:'custom',resultType(){return {type,ambientBindings:[],scalarImports:[]}}}`
-  await writeFile(helper, profile('number'))
-  await writeFile(
-    config,
-    `import codecProfile from './helper.mjs'; export default {schema:'schema.sql',codecProfile,imports:${JSON.stringify(imports)}}`
-  )
+  const namingSource = (naming: string) => `const spelling = '${naming}'; export default {resultColumns: spelling}`
+  await writeFile(helper, namingSource('camelCase'))
   const first = await openQueryProject(config)
   try {
-    assert.match(await first.compile(sourcePath, 'select id from widget'), /readonly id: number/u)
-    await writeFile(helper, profile('string'))
-    await assert.rejects(first.compile(sourcePath, 'select id from widget'), /input changed/u)
+    assert.match(await first.compile(sourcePath, 'select display_name from widget'), /readonly displayName: string/u)
+    await writeFile(helper, namingSource('preserve'))
+    await assert.rejects(first.compile(sourcePath, 'select display_name from widget'), /input changed/u)
     const next = await openQueryProject(config)
     try {
       assert.notEqual(next.configIdentity, first.configIdentity)
-      assert.match(await next.compile(sourcePath, 'select id from widget'), /readonly id: string/u)
+      assert.match(await next.compile(sourcePath, 'select display_name from widget'), /readonly display_name: string/u)
     } finally {
       await next.close()
     }
@@ -292,7 +286,7 @@ test('package aliases include root export manifests below nested package scopes'
   await writeFile(join(helper, 'lib', 'preserve.mjs'), "export default {resultColumns:'preserve'}")
   await writeFile(
     config,
-    `import naming from '#naming'; export default {schema:'schema.sql',codecProfile:'node-postgres',naming,imports:${JSON.stringify(imports)}}`
+    `import naming from '#naming'; export default {schema:'schema.sql',naming,imports:${JSON.stringify(imports)}}`
   )
   const first = await openQueryProject(config, { configDependencies: [join(root, 'package.json'), manifest] })
   try {
@@ -322,7 +316,7 @@ test('declared package metadata remains watched when Node returns no resolved mo
   await writeFile(join(helper, 'helper.mjs'), "export default {resultColumns:'preserve'}")
   await writeFile(
     config,
-    `import naming from '#naming'; export default {schema:'schema.sql',codecProfile:'node-postgres',naming,imports:${JSON.stringify(imports)}}`
+    `import naming from '#naming'; export default {schema:'schema.sql',naming,imports:${JSON.stringify(imports)}}`
   )
   const options = { configDependencies: [scope, manifest] }
   try {
@@ -353,7 +347,7 @@ test('handled missing ESM helpers remain valid configuration inputs and refresh 
     `let naming = {resultColumns:'camelCase'};
 try { naming = (await import('./optional.mjs')).default }
 catch (error) { if (error.code !== 'ERR_MODULE_NOT_FOUND') throw error }
-export default {schema:'schema.sql',codecProfile:'node-postgres',naming,imports:${JSON.stringify(imports)}}`
+export default {schema:'schema.sql',naming,imports:${JSON.stringify(imports)}}`
   )
   const first = await openQueryProject(config)
   try {

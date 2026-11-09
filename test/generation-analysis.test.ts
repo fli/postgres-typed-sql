@@ -1,14 +1,12 @@
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
 import { readFile, mkdir, rm, writeFile } from 'node:fs/promises'
-import { writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { runInNewContext } from 'node:vm'
 import test from 'node:test'
 import ts from 'typescript'
 
 import {
-  definePostgresCodecProfile,
   generateTypedSql,
   generationAnalysisVersion,
   type PostgresTypedSqlConfig,
@@ -252,35 +250,17 @@ test('isolated policy consumer rejects misassociation, incompleteness, divergenc
   await assert.rejects(validate(), /Stale input/u)
 })
 
-for (const change of ['sql', 'schema', 'inventory'] as const) {
-  test(`rejects concurrent ${change} changes before outputs commit`, async (t) => {
-    const root = await createMinimalFixture('create table widgets (id integer primary key);', 'select id from widgets;')
-    t.after(() => rm(root, { recursive: true, force: true }))
-    await generateTypedSql(configFor(root))
-    const previous = await readFile(join(root, 'queries/query.typed-sql.ts'), 'utf8')
-    const catalog = await readFile(join(root, 'postgres-typed-sql.types.ts'), 'utf8')
-    let changed = false
-    const codecProfile = definePostgresCodecProfile({
-      name: 'concurrent-input-test',
-      extends: 'conservative',
-      resultType(_context, fallback) {
-        if (!changed) {
-          changed = true
-          const path =
-            change === 'schema' ? 'schema.sql' : change === 'sql' ? 'queries/query.typed.sql' : 'queries/new.typed.sql'
-          writeFileSync(join(root, path), '-- changed during analysis\nselect 1;')
-        }
-        return fallback()
-      },
-    })
-    await assert.rejects(
-      generateTypedSql({ ...configFor(root), codecProfile }, { analysis: true }),
-      change === 'inventory' ? /SQL inventory changed/u : /Analysis input changed/u
-    )
-    assert.equal(await readFile(join(root, 'queries/query.typed-sql.ts'), 'utf8'), previous)
-    assert.equal(await readFile(join(root, 'postgres-typed-sql.types.ts'), 'utf8'), catalog)
-  })
-}
+test('concurrent generation fails without replacing previous outputs', async (t) => {
+  const root = await createMinimalFixture('create table widgets (id integer primary key);', 'select id from widgets;')
+  t.after(() => rm(root, { recursive: true, force: true }))
+  await generateTypedSql(configFor(root))
+  const previous = await readFile(join(root, 'queries/query.typed-sql.ts'), 'utf8')
+  const first = generateTypedSql(configFor(root), { analysis: true })
+  await assert.rejects(generateTypedSql(configFor(root), { analysis: true }), /Concurrent generation/u)
+  const completed = await first
+  assert.equal(completed.analysis.statements.length, 1)
+  assert.equal(await readFile(join(root, 'queries/query.typed-sql.ts'), 'utf8'), previous)
+})
 
 test('analysis rejects overwriting a consumed schema through an aliased output path', async (t) => {
   const root = await createMinimalFixture('create table widgets (id integer primary key);', 'select 1;')

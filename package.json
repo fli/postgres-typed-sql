@@ -1,6 +1,6 @@
 {
   "name": "postgres-typed-sql",
-  "version": "0.1.0-beta.22",
+  "version": "0.1.0-beta.23",
   "description": "PostgreSQL-native typed SQL generation for TypeScript",
   "type": "module",
   "license": "MIT",
@@ -49,6 +49,11 @@
       "import": "./dist/scalars.js",
       "default": "./dist/scalars.js"
     },
+    "./values": {
+      "types": "./dist/values.d.ts",
+      "import": "./dist/values.js",
+      "default": "./dist/values.js"
+    },
     "./esbuild": {
       "types": "./dist/esbuild.d.ts",
       "import": "./dist/esbuild.js",
@@ -75,9 +80,7 @@
     "LICENSE",
     "NOTICE",
     "README.md",
-    "docs/generation-analysis.md",
-    "SECURITY.md",
-    "docs/direct-imports.md"
+    "SECURITY.md"
   ],
   "scripts": {
     "build": "pnpm run clean && tsc -p tsconfig.build.json && node scripts/stage-engine.mjs",
@@ -88,7 +91,7 @@
     "format:check": "prettier --check .",
     "lint": "eslint .",
     "pack:check": "sh scripts/pack-check.sh",
-    "test": "node --test --test-reporter=spec dist-test/test/*.test.js",
+    "test": "node --test --test-concurrency=2 --test-reporter=spec dist-test/test/*.test.js",
     "test:build": "tsc -p tsconfig.test.json && node scripts/stage-test-engine.mjs",
     "test:all": "pnpm run scan:independence && pnpm run typecheck && pnpm run lint && pnpm run format:check && pnpm run build && pnpm run test:build && pnpm test && pnpm run pack:check && pnpm run pack:check:direct",
     "scan:independence": "node scripts/check-independence.mjs",
@@ -99,9 +102,10 @@
   "devDependencies": {
     "@eslint/js": "9.31.0",
     "@types/node": "24.0.14",
+    "@types/pg": "8.23.1",
     "esbuild": "0.25.12",
     "eslint": "9.31.0",
-    "pg-types": "2.2.0",
+    "pg": "8.23.1",
     "prettier": "3.6.2",
     "typescript": "5.8.3",
     "typescript-eslint": "8.37.0"

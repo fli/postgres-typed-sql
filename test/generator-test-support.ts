@@ -7,8 +7,8 @@ import { generateTypedSql as generateTypedSqlBase } from '../src/generator.js'
 
 const fixtureRoot = new URL('./fixtures/', import.meta.url)
 const testImports = {
-  runtime: 'postgres-typed-sql/adapters/node-postgres',
-  scalars: 'postgres-typed-sql/scalars',
+  runtime: 'postgres-typed-sql/runtime',
+  scalars: 'postgres-typed-sql/values',
 } as const
 
 export function generateTypedSql(
@@ -21,7 +21,6 @@ type FixtureOptions = Omit<Partial<PostgresTypedSqlConfig>, 'rootDir'>
 
 export function generateFixture(rootDir: string, options: FixtureOptions = {}) {
   return generateTypedSql({
-    codecProfile: 'node-postgres',
     include: ['queries'],
     rootDir,
     schema: 'schema.sql',
