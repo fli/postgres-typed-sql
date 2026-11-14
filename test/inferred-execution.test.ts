@@ -49,8 +49,8 @@ const definition = {
   text: 'select 7 as value',
 } as const
 const noOutput = { ...definition, columns: [] }
-function executor(rows: PostgresExecutionResponse['rows'], rowCount?: number | null, columns = [int4]) {
-  return createPostgresExecutor(async () => ({ rows, rowCount, columnTypes: columns }))
+function executor(rows: PostgresExecutionResponse['rows'], rowCount?: number | null) {
+  return createPostgresExecutor(async () => ({ rows, rowCount }))
 }
 function hasError(pattern: RegExp) {
   return (error: unknown): boolean =>
@@ -89,16 +89,16 @@ test('execution selects inferred results and uses the supplied executor exactly 
   let calls = 0
   const client = createPostgresExecutor(async () => {
     calls++
-    return { rows: [['7']], rowCount: 1, columnTypes: [int4] }
+    return { rows: [['7']], rowCount: 1 }
   })
   const manyResult: (typeof row)[] = await createTypedSqlExecutor(many)(client)
   const oneResult: typeof row = await createTypedSqlExecutor(one)(client, {})
   const optionalResult: typeof row | null = await createTypedSqlExecutor(optional)(client)
   assert.deepEqual([manyResult, oneResult, optionalResult], [[row], row, row])
   assert.equal(calls, 3)
-  const empty = createPostgresExecutor(async (request) => {
+  const empty = createPostgresExecutor(async () => {
     calls++
-    return { rows: [], rowCount: 2, columnTypes: request.columns.map((column) => column.type) }
+    return { rows: [], rowCount: 2 }
   })
   const count: number = await createTypedSqlExecutor(command)(empty)
   const nothing: void = await createTypedSqlExecutor(noResult)(empty)
@@ -112,11 +112,11 @@ test('execution enforces all proved row bounds and does not retry', async () => 
   let calls = 0
   const empty = createPostgresExecutor(async () => {
     calls++
-    return { rows: [], columnTypes: [int4], rowCount: 0 }
+    return { rows: [], rowCount: 0 }
   })
   const two = createPostgresExecutor(async () => {
     calls++
-    return { rows: [['7'], ['7']], columnTypes: [int4], rowCount: 2 }
+    return { rows: [['7'], ['7']], rowCount: 2 }
   })
   await assert.rejects(createTypedSqlExecutor(one)(empty), /rowBounds/u)
   await assert.rejects(createTypedSqlExecutor(optional)(two), /rowBounds/u)
@@ -138,7 +138,7 @@ test('execution enforces all proved row bounds and does not retry', async () => 
 })
 
 test('command and void reject rows and only command requires a valid count', async () => {
-  const client = (rows: PostgresExecutionResponse['rows'], rowCount?: number | null) => executor(rows, rowCount, [])
+  const client = (rows: PostgresExecutionResponse['rows'], rowCount?: number | null) => executor(rows, rowCount)
   await assert.rejects(createTypedSqlExecutor(command)(client([[]], 1)), /unexpected rows/u)
   await assert.rejects(createTypedSqlExecutor(noResult)(client([[]], 1)), /unexpected rows/u)
   for (const count of [undefined, null, -1, 1.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1]) {
@@ -152,7 +152,7 @@ test('stale and inconsistent metadata fail before executing SQL', async () => {
   let calls = 0
   const client = createPostgresExecutor(async () => {
     calls++
-    return { rows: [], columnTypes: [], rowCount: 0 }
+    return { rows: [], rowCount: 0 }
   })
   for (const invalid of [
     { ...many, resultKind: undefined },
@@ -200,7 +200,7 @@ test('DML without output columns rejects row results before querying', async () 
   let calls = 0
   const client = createPostgresExecutor(async () => {
     calls++
-    return { rows: [], columnTypes: [], rowCount: 3 }
+    return { rows: [], rowCount: 3 }
   })
   for (const command of ['delete', 'insert', 'update', 'merge'] as const) {
     for (const [resultKind, rowBounds] of [
@@ -222,10 +222,9 @@ test('DML without output columns rejects row results before querying', async () 
 })
 
 test('output column validation preserves empty returning and zero-column results', async () => {
-  const empty = createPostgresExecutor(async (request) => ({
+  const empty = createPostgresExecutor(async () => ({
     rows: [],
     rowCount: 0,
-    columnTypes: request.columns.map((column) => column.type),
   }))
   for (const command of ['delete', 'insert', 'update', 'merge'] as const) {
     const affected = createTypedSqlStatement<Record<string, never>, never>({
@@ -249,7 +248,7 @@ test('output column validation preserves empty returning and zero-column results
     resultKind: 'many',
     rowBounds: bounds,
   })
-  assert.deepEqual(await createTypedSqlExecutor(zeroColumns)(executor([[]], 1, [])), [{}])
+  assert.deepEqual(await createTypedSqlExecutor(zeroColumns)(executor([[]], 1)), [{}])
   const call = createTypedSqlStatement<Record<string, never>, never>({
     ...noOutput,
     command: 'unknown',
@@ -282,7 +281,7 @@ test('required nullable parameters remain required and fail before querying when
   const client = createPostgresExecutor(async (request) => {
     calls++
     assert.deepEqual(request.values, [null])
-    return { rows: [], columnTypes: [int4], rowCount: 0 }
+    return { rows: [], rowCount: 0 }
   })
   await run(client, { value: null })
   // @ts-expect-error Nullable does not permit omitting the parameter object.
