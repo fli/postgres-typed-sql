@@ -65,6 +65,7 @@ export interface TypedSqlPostgresIrColumn extends PostgresTypeFact {
   readonly checkConstraintType?: TypedSqlPostgresIrCheckConstraintTypeExpression
   /** The immediate analyzed expression source, not ultimate column lineage. */
   readonly expressionSource: TypedSqlPostgresIrColumnExpressionSource
+  readonly jsonbFunctionOid?: number
   readonly jsonShape?: TypedSqlPostgresIrJsonShape
   readonly name: string | null
   readonly nullability: TypedSqlPostgresIrResultNullability
@@ -131,10 +132,9 @@ export type TypedSqlPostgresIrJsonShape =
       readonly value: boolean | number | string
     }
   | {
-      /** An exact JSON decimal in scientific notation, without an invented SQL scalar type. */
       readonly kind: 'jsonNumber'
       readonly nullability: TypedSqlPostgresIrResultNullability
-      readonly source: string
+      readonly decimalSource?: string
     }
   | {
       readonly alternatives: readonly TypedSqlPostgresIrJsonShape[]
@@ -153,6 +153,7 @@ export type TypedSqlPostgresIrJsonShape =
     })
 
 export interface TypedSqlPostgresIrJsonField {
+  readonly optional?: boolean
   readonly name: string
   readonly shape: TypedSqlPostgresIrJsonShape
 }
@@ -273,7 +274,11 @@ function jsonShapeKey(shape: TypedSqlPostgresIrJsonShape): string {
     case 'jsonScalar':
       return JSON.stringify({ kind: shape.kind, nullability: shape.nullability.kind, value: shape.value })
     case 'jsonNumber':
-      return JSON.stringify({ kind: shape.kind, nullability: shape.nullability.kind, source: shape.source })
+      return JSON.stringify({
+        kind: shape.kind,
+        nullability: shape.nullability.kind,
+        decimalSource: shape.decimalSource,
+      })
     case 'scalar':
       return JSON.stringify({
         checkConstraintType: shape.checkConstraintType ? checkConstraintTypeKey(shape.checkConstraintType) : undefined,

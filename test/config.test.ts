@@ -97,3 +97,21 @@ test('config resolves and validates generated output naming', () => {
     /Unsupported structured-JSON field naming "snakeCase"/u
   )
 })
+
+test('JSONB contract reserves kind for the generated discriminator', () => {
+  assert.throws(
+    () =>
+      resolveConfig({
+        schema: 'schema.sql',
+        jsonbFunctionContracts: [
+          {
+            schema: 'public',
+            name: 'checkout',
+            argumentTypes: [],
+            variants: { ready: { kind: 'string' }, unavailable: {} },
+          },
+        ],
+      }),
+    /variant cannot declare kind/u
+  )
+})
