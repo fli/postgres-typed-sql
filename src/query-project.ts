@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto'
 import { readFile } from 'node:fs/promises'
 import { fork, type ChildProcess } from 'node:child_process'
 import { dirname, isAbsolute, resolve } from 'node:path'
+import { setImmediate } from 'node:timers/promises'
 import type { ProjectAnalysis, ProjectInput, QueryAnalysis } from './project-facts.js'
 
 export class QueryProjectError extends Error {
@@ -107,7 +108,7 @@ export async function openQueryProject(
       ) {
         const inputs = parseInputs('inputs' in message ? message.inputs : undefined)
         if (!inputs) return fail(new Error('Invalid SQL worker inputs.'))
-        const verify = async (): Promise<void> => {
+        const verifyInputs = async (): Promise<void> => {
           for (const [path, hash] of inputs) {
             let current: string
             try {
@@ -120,6 +121,19 @@ export async function openQueryProject(
             }
             if (current !== hash) throw new Error(`SQL configuration input changed. Refresh the project: ${path}`)
           }
+        }
+        let activeScan = Promise.resolve()
+        let queuedScan: Promise<void> | undefined
+        const verify = (): Promise<void> => {
+          queuedScan ??= (async () => {
+            await setImmediate()
+            await activeScan
+            queuedScan = undefined
+            const scan = verifyInputs()
+            activeScan = scan.catch(() => {})
+            await scan
+          })()
+          return queuedScan
         }
         if (
           !('rootDir' in message) ||

@@ -246,20 +246,21 @@ export function flattenJsonShapeAlternatives(
 function jsonShapeKey(shape: TypedSqlPostgresIrJsonShape): string {
   switch (shape.kind) {
     case 'array':
-      return JSON.stringify({
-        element: jsonShapeKey(shape.element),
-        elements: shape.elements?.map(jsonShapeKey),
-        kind: shape.kind,
-        nullability: shape.nullability.kind,
-      })
+      return (
+        keyPart(JSON.stringify([shape.kind, shape.nullability.kind])) +
+        keyPart(jsonShapeKey(shape.element)) +
+        (shape.elements == null ? '0' : `1${keyList(shape.elements.map(jsonShapeKey))}`)
+      )
     case 'object':
-      return JSON.stringify({
-        fields: shape.fields
-          .map((field) => [field.name, jsonShapeKey(field.shape)] as const)
-          .toSorted(([left], [right]) => left.localeCompare(right)),
-        kind: shape.kind,
-        nullability: shape.nullability.kind,
-      })
+      return (
+        keyPart(JSON.stringify([shape.kind, shape.nullability.kind])) +
+        keyList(
+          shape.fields
+            .map((field) => [field.name, jsonShapeKey(field.shape)] as const)
+            .toSorted(([left], [right]) => left.localeCompare(right))
+            .map(([name, key]) => keyPart(name) + keyPart(key))
+        )
+      )
     case 'null':
     case 'sqlNull':
       return JSON.stringify({
@@ -292,12 +293,19 @@ function jsonShapeKey(shape: TypedSqlPostgresIrJsonShape): string {
         value: shape.value,
       })
     case 'union':
-      return JSON.stringify({
-        alternatives: shape.alternatives.map(jsonShapeKey).toSorted(),
-        kind: shape.kind,
-        nullability: shape.nullability.kind,
-      })
+      return (
+        keyPart(JSON.stringify([shape.kind, shape.nullability.kind])) +
+        keyList(shape.alternatives.map(jsonShapeKey).toSorted())
+      )
   }
+}
+
+function keyPart(value: string): string {
+  return `${value.length}:${value}`
+}
+
+function keyList(values: readonly string[]): string {
+  return `${values.length}:${values.map(keyPart).join('')}`
 }
 
 function uniqueJsonShapes(shapes: readonly TypedSqlPostgresIrJsonShape[]): readonly TypedSqlPostgresIrJsonShape[] {

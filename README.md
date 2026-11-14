@@ -32,6 +32,14 @@ const account = await findAccount(db, { email: 'reader@example.com' })
 
 Install the driver in the application. Only load trusted schema and configuration files.
 
+Direct imports and `openQueryProject()` can reuse catalog lookups within one analysis database. Set
+`assumeStableAnalysisCatalog: true` in the SQL config only if analyzing statements leaves the catalog
+and its name resolution stable for the session. This includes code reached during PostgreSQL parsing,
+such as type input functions. Catalog contents, search path, and settings that affect catalog output
+must stay stable. The default is `false`. The worker discards its database and catalog results after
+an analysis error or when the project closes. Source text and native statement analysis still run
+for each request.
+
 Use the code for API details:
 
 - [Value types](src/value-types.ts) and [constructors](src/values.ts).

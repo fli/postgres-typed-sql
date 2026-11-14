@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 
 import {
   buildTypedSqlPostgresIrFromCompiledConfigs,
+  enableAnalysisCatalogReuse,
   type TypedSqlPostgresIr,
   type TypedSqlPostgresIrColumn,
 } from '../src/analyzer-ir.js'
@@ -59,6 +60,45 @@ function firstEnvelopeQuery(analysis: MutableEnvelopeObject): MutableEnvelopeObj
   const statement = envelopeObject(envelopeArray(analysis.statements)[0])
   return envelopeObject(envelopeArray(statement.queries)[0])
 }
+
+testWithDatabase('reuses successful catalog reads without skipping statement or index analysis', async (database) => {
+  await database.query('create table public.catalog_reuse (name text)')
+  await database.query('create unique index on public.catalog_reuse (lower(name)) where name is not null')
+  await database.query('create table public.catalog_other (name text not null)')
+  await database.query('create unique index on public.catalog_other (lower(name))')
+  const statement = config('catalogReuse', 'select name from public.catalog_reuse where lower(name) = $1', ['name'])
+  const other = config('catalogOther', 'select name from public.catalog_other where lower(name) = $1', ['name'])
+  const calls: string[] = []
+  const client: PostgresQueryable = {
+    query<Row>(text: string, params?: readonly unknown[]) {
+      calls.push(text)
+      return database.query<Row>(text, params)
+    },
+  }
+  const analyze = () => buildTypedSqlPostgresIrFromCompiledConfigs(client, [statement])
+  const baseline = await analyze()
+  const uncachedCalls = calls.splice(0)
+  const otherBaseline = await buildTypedSqlPostgresIrFromCompiledConfigs(client, [other])
+  const uncachedOtherCalls = calls.splice(0)
+  assert.ok(uncachedCalls.some((sql) => sql.includes('from pg_index')))
+  enableAnalysisCatalogReuse(client)
+  assert.deepEqual(await analyze(), baseline)
+  assert.deepEqual(calls.splice(0), uncachedCalls)
+  assert.deepEqual(await analyze(), baseline)
+  assert.equal(calls.filter((sql) => sql.includes('pg_temp.postgres_typed_sql_analyze(')).length, 2)
+  assert.ok(calls.includes('select 1'))
+  assert.ok(!calls.some((sql) => sql.includes('from pg_index')))
+  assert.ok(calls.length < uncachedCalls.length)
+
+  calls.length = 0
+  assert.deepEqual(await buildTypedSqlPostgresIrFromCompiledConfigs(client, [other]), otherBaseline)
+  assert.ok(calls.some((sql) => sql.includes('from pg_index')))
+  calls.length = 0
+  const otherClient = { query: client.query }
+  enableAnalysisCatalogReuse(otherClient)
+  assert.deepEqual(await buildTypedSqlPostgresIrFromCompiledConfigs(otherClient, [other]), otherBaseline)
+  assert.deepEqual(calls, uncachedOtherCalls)
+})
 
 testWithDatabase('decodes native JSON text to the same values as the legacy jsonb transport', async (database) => {
   await database.query('create table public.transport_probe (id bigint, value text)')

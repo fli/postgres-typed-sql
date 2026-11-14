@@ -100,6 +100,50 @@ export type {
 const ANALYZER_SCHEMA_VERSION = 12
 const ANALYZER_SQL_FUNCTION = 'pg_temp.postgres_typed_sql_analyze'
 
+const ANALYSIS_CATALOG_CACHE_LIMIT = 1024
+
+interface AnalysisCatalogCache {
+  readonly checks: Map<string, readonly CheckConstraintLiteralUnionFact[]>
+  readonly columns: Map<string, readonly ColumnCatalogRow[]>
+  readonly equalityOperators: Map<string, readonly UniqueEqualityOperatorCatalogRow[]>
+  readonly indexes: Map<string, readonly UniqueIndexCatalogRow[]>
+  readonly procs: Map<string, readonly ProcCatalogRow[]>
+  readonly types: Map<string, ReadonlyMap<number, PostgresTypeFact>>
+}
+
+const analysisCatalogCaches = new WeakMap<PostgresQueryable, AnalysisCatalogCache>()
+
+export function enableAnalysisCatalogReuse(client: PostgresQueryable): void {
+  if (!analysisCatalogCaches.has(client)) {
+    analysisCatalogCaches.set(client, {
+      checks: new Map(),
+      columns: new Map(),
+      equalityOperators: new Map(),
+      indexes: new Map(),
+      procs: new Map(),
+      types: new Map(),
+    })
+  }
+}
+
+async function cachedCatalogValue<T>(
+  cache: Map<string, T> | undefined,
+  oids: readonly number[],
+  load: () => Promise<T>
+): Promise<T> {
+  if (!cache) return load()
+  const key = JSON.stringify(oids)
+  const cached = cache.get(key)
+  if (cached !== undefined) return cached
+  const value = await load()
+  if (cache.size >= ANALYSIS_CATALOG_CACHE_LIMIT) {
+    const oldest = cache.keys().next().value
+    if (oldest !== undefined) cache.delete(oldest)
+  }
+  cache.set(key, value)
+  return value
+}
+
 function dollarQuotedSqlText(sql: string): string {
   let delimiter = '$postgres_typed_sql$'
   while (sql.includes(delimiter)) {
@@ -1666,6 +1710,7 @@ function walkQueryRelations(query: PgAnalyzerQuery, visitRelid: (relid: number) 
 }
 
 async function loadCatalog(client: PostgresQueryable, analyses: readonly PgAnalyzerResult[]): Promise<CatalogFacts> {
+  const cache = analysisCatalogCaches.get(client)
   const typeOids = new Set<number>()
   const procOids = new Set<number>()
   const relationRelids = new Set<number>()
@@ -1684,8 +1729,13 @@ async function loadCatalog(client: PostgresQueryable, analyses: readonly PgAnaly
 
   const procs = new Map<number, ProcCatalogRow>()
   if (procOids.size > 0) {
-    const result = await client.query<ProcCatalogRow>(
-      `
+    const rows = await cachedCatalogValue(
+      cache?.procs,
+      [...procOids],
+      async () =>
+        (
+          await client.query<ProcCatalogRow>(
+            `
         select
           p.oid < 16384 and namespace.nspname = 'pg_catalog' as is_builtin,
           p.oid::int as oid,
@@ -1695,17 +1745,24 @@ async function loadCatalog(client: PostgresQueryable, analyses: readonly PgAnaly
           on namespace.oid = p.pronamespace
         where p.oid = any($1::oid[])
       `,
-      [[...procOids]]
+            [[...procOids]]
+          )
+        ).rows
     )
-    for (const row of result.rows) {
+    for (const row of rows) {
       procs.set(row.oid, row)
     }
   }
 
   const columns = new Map<string, ColumnCatalogRow>()
   if (relationRelids.size > 0) {
-    const result = await client.query<ColumnCatalogRow>(
-      `
+    const rows = await cachedCatalogValue(
+      cache?.columns,
+      [...relationRelids],
+      async () =>
+        (
+          await client.query<ColumnCatalogRow>(
+            `
         select
           c.oid::int as relid,
           c.relname,
@@ -1724,9 +1781,11 @@ async function loadCatalog(client: PostgresQueryable, analyses: readonly PgAnaly
           and a.attnum > 0
           and not a.attisdropped
       `,
-      [[...relationRelids]]
+            [[...relationRelids]]
+          )
+        ).rows
     )
-    for (const row of result.rows) {
+    for (const row of rows) {
       columns.set(`${row.relid}:${row.attnum}`, row)
       typeOids.add(row.atttypid)
     }
@@ -1735,13 +1794,21 @@ async function loadCatalog(client: PostgresQueryable, analyses: readonly PgAnaly
   // Whole-row JSON conversions need every visible attribute type, even when
   // the parsed expression only mentions the relation's composite type.
   typeOids.add(25)
-  const types = await loadPostgresTypeFacts(client, [...typeOids])
+  const typeFacts = await cachedCatalogValue(cache?.types, [...typeOids], () =>
+    loadPostgresTypeFacts(client, [...typeOids])
+  )
+  const types = cache ? structuredClone(typeFacts) : typeFacts
 
   const uniqueIndexesByRelid = new Map<number, UniqueIndexCatalogRow[]>()
   const uniqueEqualityOperators = new Set<string>()
   if (relationRelids.size > 0) {
-    const result = await client.query<UniqueIndexCatalogRow>(
-      `
+    const rows = await cachedCatalogValue(
+      cache?.indexes,
+      [...relationRelids],
+      async () =>
+        (
+          await client.query<UniqueIndexCatalogRow>(
+            `
         select
           i.indrelid::int as relid,
           i.indexrelid::int as indexrelid,
@@ -1795,9 +1862,11 @@ async function loadCatalog(client: PostgresQueryable, analyses: readonly PgAnaly
           relation_class.relname
         having count(*) = i.indnkeyatts
       `,
-      [[...relationRelids]]
+            [[...relationRelids]]
+          )
+        ).rows
     )
-    for (const row of result.rows) {
+    for (const row of rows) {
       let expressions: readonly PgAnalyzerExpr[] = []
       let predicate: PgAnalyzerExpr | null = null
       if (row.expressions_sql || row.predicate_sql) {
@@ -1824,10 +1893,15 @@ async function loadCatalog(client: PostgresQueryable, analyses: readonly PgAnaly
       entries.sort(compareUniqueIndexCatalogRows)
     }
 
-    const opfamilyOids = [...new Set(result.rows.flatMap((row) => row.opfamily_oids))]
+    const opfamilyOids = [...new Set(rows.flatMap((row) => row.opfamily_oids))]
     if (opfamilyOids.length > 0) {
-      const equalityResult = await client.query<UniqueEqualityOperatorCatalogRow>(
-        `
+      const equalityRows = await cachedCatalogValue(
+        cache?.equalityOperators,
+        opfamilyOids,
+        async () =>
+          (
+            await client.query<UniqueEqualityOperatorCatalogRow>(
+              `
           select
             operator.amopfamily::int as amopfamily,
             operator.amopopr::int as amopopr
@@ -1844,9 +1918,11 @@ async function loadCatalog(client: PostgresQueryable, analyses: readonly PgAnaly
             and access_method.amname = 'btree'
             and implementation.proisstrict
         `,
-        [opfamilyOids]
+              [opfamilyOids]
+            )
+          ).rows
       )
-      for (const row of equalityResult.rows) {
+      for (const row of equalityRows) {
         uniqueEqualityOperators.add(uniqueEqualityOperatorKey(row.amopfamily, row.amopopr))
       }
     }
@@ -1854,9 +1930,10 @@ async function loadCatalog(client: PostgresQueryable, analyses: readonly PgAnaly
 
   const checkConstraintTypesByColumn = new Map<string, CheckConstraintLiteralUnionFact>()
   if (relationRelids.size > 0) {
-    for (const fact of await loadCheckConstraintLiteralUnionFacts(client, {
-      relids: [...relationRelids],
-    })) {
+    const checks = await cachedCatalogValue(cache?.checks, [...relationRelids], () =>
+      loadCheckConstraintLiteralUnionFacts(client, { relids: [...relationRelids] })
+    )
+    for (const fact of cache ? structuredClone(checks) : checks) {
       checkConstraintTypesByColumn.set(checkConstraintLiteralUnionColumnKey(fact), fact)
     }
   }
