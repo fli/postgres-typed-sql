@@ -190,3 +190,51 @@ test('preserves explicit JSON null alternatives independently of SQL null and po
       [1, 2]
     )
 })
+
+test('deduplicates deeply nested JSON shapes without collapsing distinct structures', () => {
+  const leaf = stringLiteral('value:"\\\\:1')
+  let left: TypedSqlPostgresIrJsonShape = leaf
+  let equivalent: TypedSqlPostgresIrJsonShape = stringLiteral('value:"\\\\:1')
+  let different: TypedSqlPostgresIrJsonShape = stringLiteral('value:"\\\\:2')
+  for (let depth = 0; depth < 32; depth++) {
+    left = objectShape([['a:1"\\\\', left]])
+    equivalent = objectShape([['a:1"\\\\', equivalent]])
+    different = objectShape([['a:1"\\\\', different]])
+  }
+
+  const joined = joinJsonShapes([left, equivalent, different], left)
+  assert.equal(joined.kind, 'union')
+  if (joined.kind === 'union') assert.equal(joined.alternatives.length, 2)
+})
+
+test('keeps absent positional JSON elements distinct from an empty list', () => {
+  const element = stringLiteral('element')
+  const unspecified: TypedSqlPostgresIrJsonShape = { kind: 'array', element, nullability: nonNull }
+  const empty: TypedSqlPostgresIrJsonShape = { ...unspecified, elements: [] }
+  assert.equal(unionJsonShapes(unspecified, empty).kind, 'union')
+})
+
+test('distinguishes field boundaries while normalizing nested union alternatives', () => {
+  const first = stringLiteral('first')
+  const second = stringLiteral('second')
+  const nestedUnion = (alternatives: readonly TypedSqlPostgresIrJsonShape[]): TypedSqlPostgresIrJsonShape => ({
+    alternatives,
+    kind: 'union',
+    nullability: nonNull,
+  })
+  const left = objectShape([
+    ['1:a', nestedUnion([first, second])],
+    ['b', first],
+  ])
+  const reordered = objectShape([
+    ['b', first],
+    ['1:a', nestedUnion([second, first])],
+  ])
+  const different = objectShape([
+    ['1', nestedUnion([first, second])],
+    ['a:b', first],
+  ])
+  const joined = joinJsonShapes([left, reordered, different], left)
+  assert.equal(joined.kind, 'union')
+  if (joined.kind === 'union') assert.equal(joined.alternatives.length, 2)
+})

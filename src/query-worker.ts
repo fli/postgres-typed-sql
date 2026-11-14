@@ -10,6 +10,7 @@ import { trackConfigImports } from './config-loader-sync.js'
 import { createAnalysisDatabase, type AnalysisDatabase } from './engine.js'
 import { analyzeTypedSqlSource, findTypedSqlFiles } from './generator.js'
 import { buildCatalogTypes } from './catalog-generator.js'
+import { enableAnalysisCatalogReuse } from './analyzer-ir.js'
 import { projectAnalysisVersion } from './project-facts.js'
 
 const watched = new Set<string>()
@@ -140,15 +141,18 @@ async function main(): Promise<void> {
           if (message.operation === 'inventory') {
             result = await inventory()
           } else {
-            database ??= await createAnalysisDatabase({
-              extensions: config.extensions,
-              schemaFiles: config.schemaFiles,
-              readSchemaFile: async (path) => {
-                const content = schemaContents.get(path)
-                if (content === undefined) throw new Error(`Missing schema snapshot ${path}.`)
-                return content
-              },
-            })
+            if (!database) {
+              database = await createAnalysisDatabase({
+                extensions: config.extensions,
+                schemaFiles: config.schemaFiles,
+                readSchemaFile: async (path) => {
+                  const content = schemaContents.get(path)
+                  if (content === undefined) throw new Error(`Missing schema snapshot ${path}.`)
+                  return content
+                },
+              })
+              if (config.assumeStableAnalysisCatalog) enableAnalysisCatalogReuse(database)
+            }
             if (message.operation === 'catalog') {
               result = await buildCatalogTypes(database, config)
             } else if (message.operation === 'project') {

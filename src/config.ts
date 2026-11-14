@@ -21,6 +21,8 @@ export interface PostgresTypedSqlImportsConfig {
 }
 
 export interface PostgresTypedSqlConfig {
+  /** Reuse catalog query results in a project session whose catalog and catalog name resolution are stable. */
+  readonly assumeStableAnalysisCatalog?: boolean
   /** Directories recursively searched for *.typed.sql files. Defaults to rootDir. */
   readonly include?: readonly string[]
   /** Exact module specifiers written into generated TypeScript. */
@@ -44,6 +46,7 @@ export interface ResolvedPostgresTypedSqlNamingConfig {
 }
 
 export interface ResolvedPostgresTypedSqlConfig {
+  readonly assumeStableAnalysisCatalog?: true
   readonly extensions: readonly SupportedExtension[]
   readonly imports: PostgresTypedSqlImportsConfig
   readonly include: readonly string[]
@@ -78,6 +81,10 @@ export function resolveConfig(config: PostgresTypedSqlConfig): ResolvedPostgresT
   if (Object.hasOwn(config, 'codecProfile')) {
     throw new Error('codecProfile is no longer supported. Map the built-in lossless values in application code.')
   }
+  const assumeStableAnalysisCatalog = config.assumeStableAnalysisCatalog
+  if (assumeStableAnalysisCatalog !== undefined && typeof assumeStableAnalysisCatalog !== 'boolean') {
+    throw new Error('assumeStableAnalysisCatalog must be a boolean.')
+  }
   if (config.imports !== undefined && (!config.imports || typeof config.imports !== 'object')) {
     throw new Error('The imports option must configure runtime and scalars module specifiers.')
   }
@@ -100,6 +107,7 @@ export function resolveConfig(config: PostgresTypedSqlConfig): ResolvedPostgresT
   }
 
   return {
+    ...(assumeStableAnalysisCatalog ? { assumeStableAnalysisCatalog: true } : {}),
     extensions: config.extensions ?? [],
     imports: {
       runtime: requireModuleSpecifier(config.imports?.runtime ?? 'postgres-typed-sql/runtime', 'imports.runtime'),

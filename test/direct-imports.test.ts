@@ -52,6 +52,58 @@ test('direct compilation consumes supplied text, preserves legacy modules, and w
   }
 })
 
+test('catalog reuse preserves project output, first SQL error, and schema refresh', async () => {
+  const { root, config, sourcePath } = await fixture()
+  const secondPath = join(root, 'second.typed.sql')
+  const sql = 'select id from widget where id = :id'
+  const originalConfig = await readFile(config, 'utf8')
+  try {
+    await writeFile(sourcePath, sql)
+    await writeFile(secondPath, sql)
+    const baseline = await openQueryProject(config)
+    let original
+    try {
+      original = await baseline.analyzeProject()
+    } finally {
+      await baseline.close()
+    }
+
+    await writeFile(
+      config,
+      originalConfig.replace('export default {', 'export default {assumeStableAnalysisCatalog:true,')
+    )
+    const project = await openQueryProject(config)
+    try {
+      assert.notEqual(project.configIdentity, original.configIdentity)
+      const first = await project.compile(sourcePath, sql)
+      const { statements } = await project.analyzeProject()
+      assert.deepEqual(statements, original.statements)
+      assert.equal(first, statements[0]?.moduleText)
+
+      await writeFile(sourcePath, 'select id from missing_table')
+      await writeFile(secondPath, '-- @name\nselect 1')
+      await assert.rejects(
+        project.analyzeProject(),
+        /^Error: findWidget\.typed\.sql: failed to analyze typed SQL findWidget: relation "missing_table" does not exist$/u
+      )
+      assert.equal(await project.compile(sourcePath, sql), first)
+
+      await writeFile(join(root, 'schema.sql'), 'create table widget (id integer);')
+      await assert.rejects(project.compile(sourcePath, sql), /SQL configuration input changed/u)
+    } finally {
+      await project.close()
+    }
+    const refreshed = await openQueryProject(config)
+    try {
+      assert.match(await refreshed.compile(sourcePath, sql), /resultKind: 'many'/u)
+    } finally {
+      await refreshed.close()
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
 test('projects reload imported helpers and schema constraints and reject obsolete work', async () => {
   const { root, config, sourcePath } = await fixture()
   const sql = 'select id, display_name from widget where id = :id'
