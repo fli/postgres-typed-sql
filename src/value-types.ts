@@ -148,6 +148,7 @@ export type PgJsonPlan =
       readonly kind: 'object'
       readonly fields: readonly {
         readonly name: string
+        readonly optional?: boolean
         readonly propertyName: string
         readonly plan: PgJsonPlan
       }[]

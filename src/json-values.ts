@@ -338,13 +338,19 @@ function decoded(plan: PgJsonPlan, value: GenericValue): unknown {
         return fail('Expected JSON object')
       const entries = new Map(plainEntries(value))
       const result: Record<string, unknown> = {}
+      let omitted: Set<string> | undefined
       for (const field of plan.fields) {
-        if (!entries.has(field.name)) return fail(`Missing JSON field ${field.name}`)
+        if (!entries.has(field.name)) {
+          if (!field.optional) return fail(`Missing JSON field ${field.name}`)
+          omitted ??= new Set()
+          omitted.add(field.propertyName)
+          continue
+        }
         setProperty(result, field.propertyName, decoded(field.plan, entries.get(field.name) as GenericValue))
         entries.delete(field.name)
       }
       for (const [key, item] of entries) {
-        if (Object.hasOwn(result, key)) return fail(`JSON field collision at ${key}`)
+        if (Object.hasOwn(result, key) || omitted?.has(key)) return fail(`JSON field collision at ${key}`)
         setProperty(result, key, item)
       }
       return Object.freeze(result)
@@ -420,13 +426,19 @@ function encoded(plan: PgJsonPlan, value: unknown, ancestors = new Set<object>()
       try {
         const entries = new Map(plainEntries(value))
         const output = new Map<string, string>()
+        let omitted: Set<string> | undefined
         for (const field of plan.fields) {
-          if (!entries.has(field.propertyName)) return fail(`Missing JSON field ${field.propertyName}`)
+          if (!entries.has(field.propertyName)) {
+            if (!field.optional) return fail(`Missing JSON field ${field.propertyName}`)
+            omitted ??= new Set()
+            omitted.add(field.name)
+            continue
+          }
           output.set(field.name, encoded(field.plan, entries.get(field.propertyName), ancestors))
           entries.delete(field.propertyName)
         }
         for (const [key, item] of entries) {
-          if (output.has(key)) return fail(`JSON field collision at ${key}`)
+          if (output.has(key) || omitted?.has(key)) return fail(`JSON field collision at ${key}`)
           output.set(key, genericSource(item, ancestors, true))
         }
         return `{${Array.from(output, ([key, item]) => `${JSON.stringify(key)}:${item}`).join(',')}}`
@@ -484,12 +496,16 @@ function disjoint(a: PgJsonPlan, b: PgJsonPlan): boolean {
   if (a.kind === 'object' && b.kind === 'object') {
     return a.fields.some(
       (left) =>
+        !left.optional &&
         left.plan.kind === 'literal' &&
+        !left.plan.nullable &&
         b.fields.some(
           (right) =>
+            !right.optional &&
             right.name === left.name &&
             right.propertyName === left.propertyName &&
             right.plan.kind === 'literal' &&
+            !right.plan.nullable &&
             left.plan.kind === 'literal' &&
             left.plan.value !== right.plan.value
         )
@@ -532,9 +548,16 @@ function checkedPlan(plan: PgJsonPlan): PgJsonPlan {
           properties.has(field.propertyName)
         )
           return fail('JSON codec has duplicate field names')
+        if (field.optional && Object.hasOwn(Object.prototype, field.propertyName))
+          return fail(`Optional JSON field shadows Object.prototype: ${field.propertyName}`)
         names.add(field.name)
         properties.add(field.propertyName)
-        return Object.freeze({ name: field.name, propertyName: field.propertyName, plan: checkedPlan(field.plan) })
+        return Object.freeze({
+          name: field.name,
+          propertyName: field.propertyName,
+          ...(field.optional ? { optional: true } : {}),
+          plan: checkedPlan(field.plan),
+        })
       })
       return Object.freeze({ kind: 'object', fields: Object.freeze(fields), nullable: plan.nullable })
     }
