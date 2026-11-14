@@ -94,7 +94,6 @@ test('generated default callables derive every execution shape and honor the exa
       return {
         rows: example.rows,
         rowCount: example.count ?? null,
-        columnTypes: request.columns.map((column) => column.type),
       }
     })
     assert.deepEqual(await generated.default(client, example.params), example.expected, example.sql)

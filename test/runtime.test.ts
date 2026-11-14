@@ -106,7 +106,7 @@ test('runtime binds named parameters in generated order', async () => {
     createPostgresExecutor(async (request) => {
       assert.deepEqual(request.values, ['reader@example.test'])
       assert.equal(Object.hasOwn(request, 'name'), false)
-      return { rowCount: 1, rows: [['reader@example.test']], columnTypes: [textType] }
+      return { rowCount: 1, rows: [['reader@example.test']] }
     }),
     statement,
     { email: 'reader@example.test' }
@@ -173,8 +173,8 @@ test('runtime passes encoded parameters and returns affected row counts', async 
     createPostgresExecutor(async (request) => {
       assert.equal(request.text, 'delete from accounts where id = $1')
       assert.deepEqual(request.values, ['42'])
-      assert.deepEqual(request.parameters, [int4])
-      return { rowCount: 1, rows: [], columnTypes: [] }
+      assert.deepEqual(request.columnNames, [])
+      return { rowCount: 1, rows: [] }
     }),
     statement,
     { id: 42 }
@@ -197,7 +197,7 @@ test('human statement names do not appear in transport requests', async () => {
   const executor = createPostgresExecutor(async (request) => {
     assert.equal(Object.hasOwn(request, 'name'), false)
     requests.push(request.text)
-    return { rows: [], columnTypes: [], rowCount: 0 }
+    return { rows: [], rowCount: 0 }
   })
   await executeTypedSql(executor, make('select 1'), {})
   await executeTypedSql(executor, make('select 2'), {})
@@ -216,7 +216,7 @@ test('execution rejects legacy object-row descriptors before transport', async (
   let calls = 0
   const executor = createPostgresExecutor(async () => {
     calls++
-    return { rows: [], columnTypes: [], rowCount: 0 }
+    return { rows: [], rowCount: 0 }
   })
   await assert.rejects(
     executeTypedSql(executor, statement, {}),
@@ -249,7 +249,7 @@ test('runtime maps duplicate SQL aliases by position', async () => {
     text: 'select 1 as value, 2 as value',
   })
   const result = await executeTypedSql(
-    createPostgresExecutor(async () => ({ rows: [['1', '2']], columnTypes: [int4, int4], rowCount: 1 })),
+    createPostgresExecutor(async () => ({ rows: [['1', '2']], rowCount: 1 })),
     statement,
     {}
   )
@@ -311,7 +311,7 @@ test('runtime preserves an exact __proto__ output property from array rows witho
   })
 
   const executed = await executeTypedSql(
-    createPostgresExecutor(async () => ({ rows: [['executed']], columnTypes: [textType], rowCount: 1 })),
+    createPostgresExecutor(async () => ({ rows: [['executed']], rowCount: 1 })),
     statement,
     {}
   )
@@ -335,7 +335,7 @@ test('runtime maps zero-column array rows to empty row objects', async () => {
   assert.equal(statement.resultRowMapping, 'positional')
   assert.deepEqual(
     await executeTypedSql(
-      createPostgresExecutor(async () => ({ rows: [[], []], columnTypes: [], rowCount: 2 })),
+      createPostgresExecutor(async () => ({ rows: [[], []], rowCount: 2 })),
       statement,
       {}
     ),
@@ -390,7 +390,6 @@ test('runtime execution applies generated nested JSON mappings to positional row
   const rows = await executeTypedSql(
     createPostgresExecutor(async () => ({
       rows: [['[{"account_id":1,"display_name":"Reader"}]']],
-      columnTypes: [jsonb],
       rowCount: 1,
     })),
     statement,

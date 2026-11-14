@@ -318,17 +318,11 @@ export interface PostgresExecutionRequest {
   readonly name?: string
   readonly text: string
   readonly values: readonly (string | null)[]
-  readonly parameters: readonly PostgresTypeFact[]
-  readonly columns: readonly {
-    readonly name: string
-    readonly type: PostgresTypeFact
-    readonly jsonPlan?: PgJsonPlan
-  }[]
+  readonly columnNames: readonly string[]
 }
 
 export interface PostgresExecutionResponse {
   readonly rows: readonly (readonly (string | null)[])[]
-  readonly columnTypes: readonly PostgresTypeFact[]
   readonly rowCount: number | null | undefined
 }
 
@@ -341,7 +335,10 @@ export interface PostgresExecutor {
 
 const verifiedExecutors = new WeakSet<object>()
 
-/** Used by transport adapters to register their implementation of the verified transport contract. */
+/**
+ * Register a transport that validates the result field names, order, and text format
+ * against the request and returns positional rows of raw text or SQL NULL.
+ */
 export function createPostgresExecutor(
   execute: (request: PostgresExecutionRequest) => Promise<PostgresExecutionResponse>
 ): PostgresExecutor {
@@ -370,7 +367,6 @@ export async function executeTypedSql<
   params: NoInfer<Params>
 ): Promise<TypedSqlExecutionResult<Row, Kind>> {
   let parameterTypes: PostgresTypeFact[]
-  let columns: PostgresExecutionRequest['columns']
   try {
     if (!executor || !verifiedExecutors.has(executor) || executor.valueModel !== 'postgres-lossless-v1') {
       throw new Error('A verified postgres-lossless-v1 executor is required.')
@@ -391,11 +387,8 @@ export async function executeTypedSql<
       }
       return parameter.type
     })
-    columns = statement.columns.map((column) => {
-      if (!column.type)
-        throw new Error(`Typed SQL statement ${statement.name} has incomplete column metadata; regenerate it.`)
-      return { type: column.type, name: column.name, ...(column.jsonPlan ? { jsonPlan: column.jsonPlan } : {}) }
-    })
+    if (statement.columns.some((column) => !column.type))
+      throw new Error(`Typed SQL statement ${statement.name} has incomplete column metadata; regenerate it.`)
   } catch (error) {
     throw executionError(error, 'contract', 'notExecuted', 'Typed SQL metadata or executor contract failed.')
   }
@@ -426,8 +419,7 @@ export async function executeTypedSql<
       ...(queryName === undefined ? {} : { name: queryName }),
       text: statement.text,
       values,
-      parameters: parameterTypes,
-      columns,
+      columnNames: statement.columns.map((column) => column.name),
     })
   } catch (error) {
     throw executionError(error, 'transport', 'mayHaveExecuted', `Execution of ${statement.name} failed.`)
@@ -435,8 +427,6 @@ export async function executeTypedSql<
 
   try {
     const { min, max } = statement.rowBounds
-    if (result.columnTypes.length !== statement.columns.length)
-      throw new PgExecutionError('Result column count does not match metadata.', 'contract', 'mayHaveExecuted')
     if (statement.resultKind === 'command' || statement.resultKind === 'void') {
       if (result.rows.length !== 0)
         throw new PgExecutionError('A command returned unexpected rows.', 'contract', 'mayHaveExecuted')
@@ -460,7 +450,7 @@ export async function executeTypedSql<
         throw new PgExecutionError('Result row width does not match metadata.', 'contract', 'mayHaveExecuted')
       const mapped: Record<string, unknown> = {}
       for (const [index, column] of statement.columns.entries()) {
-        const type = result.columnTypes[index]
+        const type = column.type
         const source = row[index]
         if (!type || (source !== null && typeof source !== 'string'))
           throw new PgExecutionError('Result field is not text or SQL NULL.', 'contract', 'mayHaveExecuted')
