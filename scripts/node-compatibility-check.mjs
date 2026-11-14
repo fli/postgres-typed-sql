@@ -34,9 +34,8 @@ try {
     const modulePath = join(root, 'query.mjs')
     await writeFile(modulePath, code)
     const { default: execute } = await import(pathToFileURL(modulePath).href)
-    const executor = createPostgresExecutor(async (request) => ({
+    const executor = createPostgresExecutor(async () => ({
       rows: [['7']],
-      columnTypes: request.columns.map((column) => column.type),
       rowCount: 1,
     }))
     assert.deepEqual(await execute(executor, {}), { value: 7 })

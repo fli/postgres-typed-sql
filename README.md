@@ -30,6 +30,19 @@ const db = nodePostgres({ pool })
 const account = await findAccount(db, { email: 'reader@example.com' })
 ```
 
+The node-postgres adapter sends one application query per execution. Configure every client or
+pool connection with UTF8 client encoding, `DateStyle=ISO,YMD`, `IntervalStyle=postgres`,
+`TimeZone=UTC`, `bytea_output=hex`, and `extra_float_digits=3`. Use a schema and search path
+compatible with the ones used to generate the statements. The adapter does not verify session
+settings or database types. Incompatible settings or schema changes can cause incorrect values
+or decoding errors.
+
+If you implement a custom transport with `createPostgresExecutor`, use `request.columnNames`
+in place of `request.columns`. Check the actual field count, names, order, and text format even
+when the result has no rows. Return `{ rows, rowCount }` with positional raw text or SQL NULL
+values. Remove any use of `request.parameters` and any returned `columnTypes`; the runtime now
+uses the generated statement metadata to encode and decode values.
+
 Install the driver in the application. Only load trusted schema and configuration files.
 
 Direct imports and `openQueryProject()` can reuse catalog lookups within one analysis database. Set

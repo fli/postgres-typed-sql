@@ -30,7 +30,6 @@ const findExecutor = createPostgresExecutor(async (request) => {
         '{"URL":"widget-code","display_name":null,"count":1}',
       ],
     ],
-    columnTypes: request.columns.map((column) => column.type),
     rowCount: 1,
   }
 })
@@ -54,25 +53,25 @@ equal(found.detailsJson.source, '{"URL":"widget-code","display_name":null,"count
 if (!Object.isFrozen(found.detailsJson.value) || !Object.isFrozen(found.metrics)) {
   throw new Error('Expected immutable decoded values')
 }
-const returningExecutor = createPostgresExecutor(async (request) => {
+const returningExecutor = createPostgresExecutor(async () => {
   calls++
-  return { rows: [['8']], columnTypes: request.columns.map((column) => column.type), rowCount: 1 }
+  return { rows: [['8']], rowCount: 1 }
 })
 equal(await runInsertWidget(returningExecutor, { code: 'inserted', widgetLabel: null }), [{ id: 8n }])
-const oneExecutor = createPostgresExecutor(async (request) => {
+const oneExecutor = createPostgresExecutor(async () => {
   calls++
-  return { rows: [['1']], columnTypes: request.columns.map((column) => column.type), rowCount: 1 }
+  return { rows: [['1']], rowCount: 1 }
 })
 equal(await runOneWidget(oneExecutor), { value: 1 })
 equal(await runOneWidget(oneExecutor, {}), { value: 1 })
-const commandExecutor = createPostgresExecutor(async (request) => {
+const commandExecutor = createPostgresExecutor(async () => {
   calls++
-  return { rows: [], columnTypes: request.columns.map((column) => column.type), rowCount: 2 }
+  return { rows: [], rowCount: 2 }
 })
 equal(await runDeleteWidget(commandExecutor, { code: 'deleted' }), 2)
-const callExecutor = createPostgresExecutor(async (request) => {
+const callExecutor = createPostgresExecutor(async () => {
   calls++
-  return { rows: [], columnTypes: request.columns.map((column) => column.type), rowCount: null }
+  return { rows: [], rowCount: null }
 })
 equal(await runCallWidget(callExecutor), undefined)
 equal(calls, 6)
@@ -89,9 +88,8 @@ try {
     throw error
   }
 }
-const emptyExecutor = createPostgresExecutor(async (request) => ({
+const emptyExecutor = createPostgresExecutor(async () => ({
   rows: [],
-  columnTypes: request.columns.map((column) => column.type),
   rowCount: 0,
 }))
 try {

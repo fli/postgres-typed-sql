@@ -8,7 +8,7 @@ import { pathToFileURL } from 'node:url'
 import { Client, Pool } from 'pg'
 import ts from 'typescript'
 
-import { nodePostgres } from '../src/adapters/node-postgres.js'
+import { nodePostgres, type NodePostgresTypedSqlQueryConfig } from '../src/adapters/node-postgres.js'
 import { createTypedSqlStatement, executeTypedSql, PgExecutionError, type TypedSqlStatement } from '../src/runtime.js'
 import { parseJson, json, formatDecimal } from '../src/values.js'
 import type { PgArray, PgDate, PgDecimal, PgJson, PgRawValue, PgTimestampTz } from '../src/values.js'
@@ -90,7 +90,17 @@ test(
         birthday: '1990-06-15',
         status: 'active',
       }
-      const row = await executeTypedSql(nodePostgres({ client }), prepared, params)
+      const calls: NodePostgresTypedSqlQueryConfig[] = []
+      const executor = nodePostgres({
+        client: {
+          query(config) {
+            calls.push(config)
+            return client.query(config)
+          },
+        },
+      })
+      const row = await executeTypedSql(executor, prepared, params)
+      assert.equal(calls.length, 1)
       assert.equal(row.id, 9007199254740993n)
       assert.equal(formatDecimal(row.amount), '12345678901234567890123400e-6')
       assert.equal(row.payload.source, payload.source)
@@ -122,7 +132,8 @@ test(
       )
       assert.equal(preparedNames.rowCount, 1)
       const revised = json({ ...row.profile.value, amount: row.amount }, row.profile.codec)
-      const echoed = await executeTypedSql(nodePostgres({ client }), prepared, { ...params, payload: revised })
+      const echoed = await executeTypedSql(executor, prepared, { ...params, payload: revised })
+      assert.equal(calls.length, 2)
       assert.match(echoed.payload.source, /"account_id":9007199254740993/u)
       assert.match(echoed.payload.source, /"birthday":"1990-06-15"/u)
       assert.match(echoed.payload.source, /"oid":"42"/u)
@@ -163,11 +174,7 @@ test(
       const client = await pool.connect()
       try {
         await client.query('begin')
-        await client.query('set local extra_float_digits = 0')
-        await assert.rejects(
-          executeTypedSql(nodePostgres({ client }), statement, {}),
-          (error) => error instanceof PgExecutionError && error.executionState === 'notExecuted'
-        )
+        assert.deepEqual(await executeTypedSql(nodePostgres({ client }), statement, {}), {})
         await client.query('rollback')
       } finally {
         client.release()
@@ -179,6 +186,76 @@ test(
     }
   }
 )
+
+test('generated reads and writes share a caller-managed transaction', { skip: !connectionString }, async () => {
+  const pool = new Pool({ connectionString, options, max: 1 })
+  const schema = `transaction_${randomUUID().replaceAll('-', '')}`
+  const schemaSql = `create schema ${schema}; create table ${schema}.items (value bigint not null);`
+  const root = await createMinimalFixture(schemaSql, `select value from ${schema}.items`)
+  const client = await pool.connect()
+  try {
+    await client.query(schemaSql)
+    await writeFile(join(root, 'queries/write.typed.sql'), `insert into ${schema}.items values (:value::bigint)`)
+    await writeFile(join(root, 'queries/fail.typed.sql'), 'select 1 / :divisor::int as value')
+    await generateFixture(root, {
+      imports: { runtime: new URL('../src/runtime.js', import.meta.url).href, scalars: 'postgres-typed-sql/values' },
+    })
+    async function load<Statement>(name: string): Promise<Statement> {
+      const source = await readFile(join(root, `queries/${name}.typed-sql.ts`), 'utf8')
+      const moduleFile = join(root, `${name}.mjs`)
+      await writeFile(
+        moduleFile,
+        ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.ESNext } }).outputText
+      )
+      const module: Record<string, Statement> = await import(pathToFileURL(moduleFile).href)
+      const statement = module[name]
+      assert.ok(statement)
+      return statement
+    }
+    const read = await load<TypedSqlStatement<Record<string, never>, { value: bigint }, 'read', 'many'>>('query')
+    const write = await load<TypedSqlStatement<{ value: string }, never, 'write', 'command'>>('write')
+    const fail = await load<TypedSqlStatement<{ divisor: number }, { value: number }, 'read', 'one'>>('fail')
+    const calls: string[] = []
+    const executor = nodePostgres({
+      client: {
+        query(config) {
+          calls.push(config.text)
+          return client.query(config)
+        },
+      },
+    })
+    await client.query('begin')
+    assert.equal(await executeTypedSql(executor, write, { value: '9007199254740993' }), 1)
+    assert.deepEqual(calls, [write.text])
+    assert.deepEqual(await executeTypedSql(executor, read, {}), [{ value: 9007199254740993n }])
+    assert.deepEqual(calls, [write.text, read.text])
+    await assert.rejects(executeTypedSql(executor, fail, { divisor: 0 }), {
+      name: 'PgExecutionError',
+      code: '22012',
+      phase: 'transport',
+      executionState: 'mayHaveExecuted',
+    })
+    await assert.rejects(executeTypedSql(executor, read, {}), {
+      name: 'PgExecutionError',
+      code: '25P02',
+      phase: 'transport',
+      executionState: 'mayHaveExecuted',
+    })
+    assert.deepEqual(calls, [write.text, read.text, fail.text, read.text])
+    await client.query('rollback')
+    assert.deepEqual(await executeTypedSql(executor, read, {}), [])
+    assert.deepEqual(calls, [write.text, read.text, fail.text, read.text, read.text])
+  } finally {
+    try {
+      await client.query('rollback')
+      await client.query(`drop schema if exists ${schema} cascade`)
+    } finally {
+      client.release()
+      await pool.end()
+      await rm(root, { recursive: true, force: true })
+    }
+  }
+})
 
 test(
   'real database errors retain SQLSTATE, original cause and execution uncertainty',
