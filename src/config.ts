@@ -20,7 +20,28 @@ export interface PostgresTypedSqlImportsConfig {
   readonly scalars: string
 }
 
+export type JsonbContractShape =
+  | 'string'
+  | 'boolean'
+  | 'number'
+  | 'int4'
+  | 'json'
+  | 'null'
+  | { readonly object: Readonly<Record<string, JsonbContractField>> }
+  | { readonly array: JsonbContractShape }
+  | { readonly nullable: JsonbContractShape }
+export type JsonbContractField = JsonbContractShape | { readonly optional: JsonbContractShape }
+export interface JsonbFunctionContract {
+  readonly schema: string
+  readonly name: string
+  readonly argumentTypes: readonly (string | { readonly schema: string; readonly name: string })[]
+  readonly variants: Readonly<Record<string, Readonly<Record<string, JsonbContractField>>>>
+  readonly allowJsonNull?: true
+}
+
 export interface PostgresTypedSqlConfig {
+  /** Runtime-checked JSONB results for direct calls to specific PostgreSQL function overloads. */
+  readonly jsonbFunctionContracts?: readonly JsonbFunctionContract[]
   /** Reuse catalog query results in a project session whose catalog and catalog name resolution are stable. */
   readonly assumeStableAnalysisCatalog?: boolean
   /** Directories recursively searched for *.typed.sql files. Defaults to rootDir. */
@@ -47,6 +68,7 @@ export interface ResolvedPostgresTypedSqlNamingConfig {
 
 export interface ResolvedPostgresTypedSqlConfig {
   readonly assumeStableAnalysisCatalog?: true
+  readonly jsonbFunctionContracts: readonly JsonbFunctionContract[]
   readonly extensions: readonly SupportedExtension[]
   readonly imports: PostgresTypedSqlImportsConfig
   readonly include: readonly string[]
@@ -108,6 +130,7 @@ export function resolveConfig(config: PostgresTypedSqlConfig): ResolvedPostgresT
 
   return {
     ...(assumeStableAnalysisCatalog ? { assumeStableAnalysisCatalog: true } : {}),
+    jsonbFunctionContracts: parseContracts(config.jsonbFunctionContracts),
     extensions: config.extensions ?? [],
     imports: {
       runtime: requireModuleSpecifier(config.imports?.runtime ?? 'postgres-typed-sql/runtime', 'imports.runtime'),
@@ -123,4 +146,86 @@ export function resolveConfig(config: PostgresTypedSqlConfig): ResolvedPostgresT
     schemaFiles: schema.map((entry) => fromRoot(rootDir, entry)),
     typesOutput: fromRoot(rootDir, config.typesOutput ?? 'postgres-typed-sql.types.ts'),
   }
+}
+
+function contractRecord(value: unknown): Record<string, unknown> {
+  if (!value || typeof value !== 'object' || Array.isArray(value))
+    throw new Error('Expected an object in jsonbFunctionContracts.')
+  const prototype: unknown = Object.getPrototypeOf(value)
+  if (prototype !== Object.prototype && prototype !== null)
+    throw new Error('Expected a plain object in jsonbFunctionContracts.')
+  return value as Record<string, unknown>
+}
+
+function contractIdentifier(value: unknown): string {
+  if (typeof value !== 'string' || !value.length || value.includes('\0'))
+    throw new Error('Invalid PostgreSQL name in jsonbFunctionContracts.')
+  return value
+}
+
+function contractShape(value: unknown, depth: number): JsonbContractShape {
+  if (depth > 100) throw new Error('JSONB contract is too deeply nested.')
+  switch (value) {
+    case 'string':
+    case 'boolean':
+    case 'number':
+    case 'int4':
+    case 'json':
+    case 'null':
+      return value
+  }
+  const record = contractRecord(value)
+  const keys = Object.keys(record)
+  if (keys.length === 1) {
+    switch (keys[0]) {
+      case 'object':
+        return { object: contractFields(record.object, depth + 1) }
+      case 'array':
+        return { array: contractShape(record.array, depth + 1) }
+      case 'nullable':
+        return { nullable: contractShape(record.nullable, depth + 1) }
+    }
+  }
+  throw new Error('Invalid JSONB contract shape.')
+}
+
+function contractFields(value: unknown, depth: number): Readonly<Record<string, JsonbContractField>> {
+  return Object.fromEntries(
+    Object.entries(contractRecord(value)).map(([key, entry]) => {
+      if (entry && typeof entry === 'object') {
+        const record = contractRecord(entry)
+        if (Object.keys(record).length === 1 && Object.hasOwn(record, 'optional'))
+          return [key, { optional: contractShape(record.optional, depth) }]
+      }
+      return [key, contractShape(entry, depth)]
+    })
+  )
+}
+
+function parseContracts(input: unknown): readonly JsonbFunctionContract[] {
+  if (input === undefined) return []
+  if (!Array.isArray(input)) throw new Error('jsonbFunctionContracts must be an array.')
+  return Array.from(input, (entry: unknown) => {
+    const contract = contractRecord(entry)
+    const schema = contractIdentifier(contract.schema)
+    const name = contractIdentifier(contract.name)
+    if (!Array.isArray(contract.argumentTypes)) throw new Error('Invalid JSONB contract argumentTypes.')
+    const argumentTypes = Array.from(contract.argumentTypes, (value: unknown) => {
+      if (typeof value === 'string') return contractIdentifier(value)
+      const type = contractRecord(value)
+      return { schema: contractIdentifier(type.schema), name: contractIdentifier(type.name) }
+    })
+    if (contract.allowJsonNull !== undefined && contract.allowJsonNull !== true)
+      throw new Error('allowJsonNull must be true when present.')
+    const entries = Object.entries(contractRecord(contract.variants))
+    if (entries.length < 2) throw new Error('JSONB contract requires at least two variants.')
+    const variants = Object.fromEntries(
+      entries.map(([tag, fields]) => {
+        const parsed = contractFields(fields, 0)
+        if (Object.hasOwn(parsed, 'kind')) throw new Error('JSONB contract variant cannot declare kind.')
+        return [tag, parsed]
+      })
+    )
+    return { schema, name, argumentTypes, variants, allowJsonNull: contract.allowJsonNull }
+  })
 }

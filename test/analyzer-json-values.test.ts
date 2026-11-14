@@ -150,7 +150,7 @@ test('infers bounded JSON literals, constant paths, positions, and deletion with
     }
     const scalar = column('jsonb_scalar')?.jsonShape
     assert.equal(scalar?.kind, 'jsonNumber')
-    if (scalar?.kind === 'jsonNumber') assert.equal(scalar.source, '42e0')
+    if (scalar?.kind === 'jsonNumber') assert.equal(scalar.decimalSource, '42e0')
     assert.deepEqual(column('path_text')?.checkConstraintType, { kind: 'literalUnion', labels: ['Reader'] })
     assert.equal(column('last')?.jsonShape?.kind, 'stringLiteral')
     for (const name of [
@@ -241,7 +241,7 @@ test('preserves exact JSON literal numbers in serializable shapes', async () => 
     ] as const) {
       const number = field(name)
       assert.equal(number?.kind, 'jsonNumber', name)
-      if (number?.kind === 'jsonNumber') assert.equal(number.source, source, name)
+      if (number?.kind === 'jsonNumber') assert.equal(number.decimalSource, source, name)
     }
     const text = field('text')
     const flag = field('flag')
@@ -255,7 +255,7 @@ test('preserves exact JSON literal numbers in serializable shapes', async () => 
       assert.equal(numbers.element.kind, 'union')
       if (numbers.element.kind === 'union')
         assert.deepEqual(
-          numbers.element.alternatives.map((item) => (item.kind === 'jsonNumber' ? item.source : undefined)),
+          numbers.element.alternatives.map((item) => (item.kind === 'jsonNumber' ? item.decimalSource : undefined)),
           ['1e0', '2e0']
         )
     }

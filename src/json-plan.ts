@@ -33,6 +33,7 @@ function embeddedPlanForShape(shape: TypedSqlPostgresIrJsonShape, naming: Postgr
         nullable: resultNullabilityAllowsNull(shape.nullability),
         fields: shape.fields.map((field) => ({
           name: field.name,
+          ...(field.optional ? { optional: true } : {}),
           propertyName: naming === 'camelCase' ? camelCasePropertyName(field.name) : field.name,
           plan: embeddedPlanForShape(field.shape, naming),
         })),

@@ -1,5 +1,8 @@
 export { defineConfig, resolveConfig } from './config.js'
 export type {
+  JsonbContractField,
+  JsonbContractShape,
+  JsonbFunctionContract,
   PostgresTypedSqlConfig,
   PostgresTypedSqlImportsConfig,
   PostgresTypedSqlNamingConfig,

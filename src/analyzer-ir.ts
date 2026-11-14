@@ -3618,7 +3618,7 @@ function jsonLiteralShape(expr: PgAnalyzerExpr): TypedSqlPostgresIrJsonShape | n
   const visit = (value: unknown, depth: number): TypedSqlPostgresIrJsonShape => {
     if (++nodes > 4096 || depth > 64) throw new Error('JSON literal shape limit')
     if (value === null) return { kind: 'null', nullability }
-    if (isDecimalAtom(value)) return { kind: 'jsonNumber', nullability, source: formatDecimal(value) }
+    if (isDecimalAtom(value)) return { kind: 'jsonNumber', nullability, decimalSource: formatDecimal(value) }
     if (typeof value === 'string' || typeof value === 'boolean') {
       return { kind: 'jsonScalar', nullability, value }
     }
@@ -4336,6 +4336,9 @@ function normalizeCompiledIr(catalog: CatalogFacts, analyzed: AnalyzedCompiledCo
     return {
       ...(arrayShape ? { arrayShape } : {}),
       expressionSource: expressionSourceForExpr(expr),
+      ...(isJsonType(typeFact.pgTypeName) && expr?.tag === 'FuncExpr' && expr.funcid && !query.hasSetOperations
+        ? { jsonbFunctionOid: expr.funcid }
+        : {}),
       jsonShape,
       name: target.resname ?? null,
       nullability,

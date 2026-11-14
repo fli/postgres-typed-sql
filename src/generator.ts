@@ -45,6 +45,8 @@ import {
   type PostgresTypeFact,
 } from './postgres-types.js'
 import { jsonPlanForShape, safeJsonCodecShape } from './json-plan.js'
+import { resolveJsonbContracts } from './jsonb-contracts.js'
+import { isJsonPlanSupported } from './json-values.js'
 import type { PgJsonPlan } from './value-types.js'
 import { compileNamedParameters, parseTypedSqlSource } from './sql-source.js'
 import type { QueryAnalysis, QueryDescriptor } from './project-facts.js'
@@ -460,7 +462,9 @@ function compileTypedSql(config: TypedSqlConfig, parameterNaming: PostgresTypedS
 }
 
 interface GeneratedJsonTypeDeclaration {
-  readonly fields: readonly Pick<ResolvedSqlField, 'nullable' | 'propertyName' | 'tsType' | 'typeIncludesNull'>[]
+  readonly fields: readonly (Pick<ResolvedSqlField, 'nullable' | 'propertyName' | 'tsType' | 'typeIncludesNull'> & {
+    readonly optional?: boolean
+  })[]
   readonly name: string
 }
 
@@ -657,6 +661,7 @@ function tsTypeForJsonShape(
         reserveGeneratedTypeBinding(usedNames, name, `JSON object ${name}`, sourceFile)
         declarations.push({
           fields: shape.fields.map((field) => ({
+            optional: field.optional,
             nullable: resultNullabilityAllowsNull(field.shape.nullability) && !jsonShapeIncludesNull(field.shape),
             propertyName: propertyNameForNaming(field.name, naming),
             tsType: render(field.shape, `${name}${encodedTypeNameSegment(field.name)}`),
@@ -743,7 +748,7 @@ function renderInterface(name: string, fields: GeneratedJsonTypeDeclaration['fie
     `export interface ${name} {`,
     ...fields.map(
       (field) =>
-        `  readonly ${quotePropertyName(field.propertyName)}: ${field.tsType}${field.nullable && !field.typeIncludesNull ? ' | null' : ''}`
+        `  readonly ${quotePropertyName(field.propertyName)}${field.optional ? '?' : ''}: ${field.tsType}${field.nullable && !field.typeIncludesNull ? ' | null' : ''}`
     ),
     '}',
   ].join('\n')
@@ -916,6 +921,7 @@ async function resolveTypedSqlWithAnalyzer(
     }))
   )
 
+  const contracts = await resolveJsonbContracts(client, generatorConfig.jsonbFunctionContracts)
   const resolvedQueries: ResolvedTypedSql[] = []
   if (result.queries.length !== configs.length) {
     throw new Error('PostgreSQL analyzer returned an incomplete statement result.')
@@ -947,9 +953,12 @@ async function resolveTypedSqlWithAnalyzer(
       const name = column.name ?? `column_${columnIndex + 1}`
       const propertyName = propertyNameForNaming(name, generatorConfig.naming.resultColumns)
       const suggestedJsonTypeName = `${pascalCaseIdentifier(config.name)}${encodedTypeNameSegment(name)}Json`
-      const safeJsonShape = column.jsonShape
-        ? safeJsonCodecShape(applyOpaqueJsonBarriers(column.jsonShape), generatorConfig.naming.structuredJsonFields)
-        : undefined
+      const contractShape = column.jsonbFunctionOid ? contracts.get(column.jsonbFunctionOid) : undefined
+      const safeJsonShape =
+        contractShape ??
+        (column.jsonShape
+          ? safeJsonCodecShape(applyOpaqueJsonBarriers(column.jsonShape), generatorConfig.naming.structuredJsonFields)
+          : undefined)
       if (safeJsonShape) {
         validateJsonShapeNames(
           safeJsonShape,
@@ -961,6 +970,8 @@ async function resolveTypedSqlWithAnalyzer(
       const jsonPlan = safeJsonShape
         ? jsonPlanForShape(safeJsonShape, generatorConfig.naming.structuredJsonFields)
         : undefined
+      if (contractShape && jsonPlan && !isJsonPlanSupported(jsonPlan))
+        throw new Error(`Invalid JSONB contract codec for ${name}.`)
       const jsonShape = safeJsonShape
       let tsType: string
       if (jsonShape) {
