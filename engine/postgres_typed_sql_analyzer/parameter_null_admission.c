@@ -12,6 +12,30 @@
 #include "parameter_null_admission.h"
 #include "query_scope.h"
 
+typedef struct IndirectScopeKey
+{
+  const Query *query;
+  const struct IndirectScopeEntry *parent;
+} IndirectScopeKey;
+
+typedef struct IndirectScopeEntry
+{
+  IndirectScopeKey key;
+} IndirectScopeEntry;
+
+typedef struct IndirectQueryKey
+{
+  const Query *query;
+  const IndirectScopeEntry *owner;
+  int depth;
+} IndirectQueryKey;
+
+typedef struct IndirectQueryEntry
+{
+  IndirectQueryKey key;
+  bool mentions_parameter;
+} IndirectQueryEntry;
+
 typedef struct PtsParameterUsageContext
 {
   int param_id;
@@ -19,6 +43,8 @@ typedef struct PtsParameterUsageContext
   PtsNullAdmissionAnalysis *null_admission_analysis;
   PtsParameterNodeAnalysis *node_analysis;
   const PtsQueryScope *scope;
+  HTAB *indirect_scopes;
+  HTAB *indirect_queries;
 } PtsParameterUsageContext;
 
 static bool mentions_indirect_parameter(Node *node,
@@ -92,6 +118,19 @@ typedef struct IndirectParameterContext
   int depth;
 } IndirectParameterContext;
 
+static const IndirectScopeEntry *
+intern_indirect_scope(HTAB *scopes, const PtsQueryScope *scope)
+{
+  IndirectScopeKey key;
+
+  if (scope == NULL)
+    return NULL;
+  MemSet(&key, 0, sizeof(key));
+  key.query = scope->query;
+  key.parent = intern_indirect_scope(scopes, scope->parent);
+  return hash_search(scopes, &key, HASH_ENTER, NULL);
+}
+
 static bool
 indirect_parameter_walker(Node *node, void *opaque)
 {
@@ -126,6 +165,9 @@ indirect_parameter_walker(Node *node, void *opaque)
     const PtsQueryScope *owner = scope;
     PtsQueryScope child;
     IndirectParameterContext nested;
+    IndirectQueryKey key;
+    IndirectQueryEntry *entry;
+    bool result;
 
     if (scope == NULL || var->varno == 0 || var->varattno < 0 ||
         var->varno > list_length(scope->query->rtable))
@@ -192,8 +234,19 @@ indirect_parameter_walker(Node *node, void *opaque)
     nested.usage = context->usage;
     nested.scope = &child;
     nested.depth = context->depth + 1;
-    return query_tree_walker((Query *) source, indirect_parameter_walker,
-                             &nested, QTW_IGNORE_CTE_SUBQUERIES);
+    MemSet(&key, 0, sizeof(key));
+    key.query = source;
+    key.owner = intern_indirect_scope(context->usage->indirect_scopes, owner);
+    key.depth = nested.depth;
+    entry = hash_search(context->usage->indirect_queries, &key, HASH_FIND, NULL);
+    if (entry != NULL)
+      return entry->mentions_parameter;
+
+    result = query_tree_walker((Query *) source, indirect_parameter_walker,
+                               &nested, QTW_IGNORE_CTE_SUBQUERIES);
+    entry = hash_search(context->usage->indirect_queries, &key, HASH_ENTER, NULL);
+    entry->mentions_parameter = result;
+    return result;
   }
   return expression_tree_walker(node, indirect_parameter_walker, opaque);
 }
@@ -513,17 +566,32 @@ pts_update_parameter_usage_null_admissions(const Query *query,
 
   for (index = 0; index < param_count; index++)
   {
+    HASHCTL scope_ctl = {0};
+    HASHCTL query_ctl = {0};
     PtsParameterUsageContext context = {
       index + 1,
       {false, PTS_NULL_UNKNOWN},
       null_admission_analysis,
       node_analysis,
+      NULL,
+      NULL,
       NULL
     };
+
+    scope_ctl.keysize = sizeof(IndirectScopeKey);
+    scope_ctl.entrysize = sizeof(IndirectScopeEntry);
+    context.indirect_scopes = hash_create("indirect parameter scopes", 32,
+                                          &scope_ctl, HASH_ELEM | HASH_BLOBS);
+    query_ctl.keysize = sizeof(IndirectQueryKey);
+    query_ctl.entrysize = sizeof(IndirectQueryEntry);
+    context.indirect_queries = hash_create("indirect parameter queries", 32,
+                                           &query_ctl, HASH_ELEM | HASH_BLOBS);
 
     pts_execution_reachable_query_walker(
       query, parameter_usage_null_admission_query, &context);
     merge_parameter_usage_evidence(&evidence[index], &context.evidence);
+    hash_destroy(context.indirect_queries);
+    hash_destroy(context.indirect_scopes);
   }
 
   pts_destroy_parameter_node_analysis(node_analysis);
