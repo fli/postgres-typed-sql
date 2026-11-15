@@ -41,7 +41,13 @@ function embeddedPlanForShape(shape: TypedSqlPostgresIrJsonShape, naming: Postgr
     case 'union':
       return {
         kind: 'union',
-        alternatives: shape.alternatives.map((alternative) => embeddedPlanForShape(alternative, naming)),
+        alternatives: [
+          ...shape.alternatives.map((alternative) => embeddedPlanForShape(alternative, naming)),
+          ...(resultNullabilityAllowsNull(shape.nullability) &&
+          !shape.alternatives.some((alternative) => alternative.kind === 'null' || alternative.kind === 'sqlNull')
+            ? [{ kind: 'null' as const }]
+            : []),
+        ],
       }
     case 'scalar': {
       const type = basePostgresType(shape)
@@ -64,7 +70,9 @@ export function jsonPlanForShape(
   naming: PostgresTypedSqlPropertyNaming
 ): PgJsonPlan {
   // A SQL-null root is handled by the row decoder, outside the JSON document.
-  return withoutSqlNullability(embeddedPlanForShape(shape, naming))
+  const root =
+    shape.kind === 'union' ? { ...shape, nullability: { kind: 'nonNull' as const, basis: 'root_sql_null' } } : shape
+  return withoutSqlNullability(embeddedPlanForShape(root, naming))
 }
 
 const jsonStringType: PostgresTypeFact = {

@@ -78,6 +78,28 @@ test('JSON input snapshots, validates, and serializes supported inputs', () => {
   )
 })
 
+test('JSON parameters omit undefined object properties while preserving exact numbers', () => {
+  const input = {
+    omitted: undefined,
+    nested: { omitted: undefined, amount: jsonNumber('1.2300') },
+    big: 9007199254740993n,
+  }
+  const document = json(input)
+  assert.equal(document.source, '{"nested":{"amount":12300e-4},"big":9007199254740993}')
+  assert.equal(encodePgValue(type('jsonb'), input), document.source)
+  assert.deepEqual(Object.keys(document.value), ['nested', 'big'])
+  // @ts-expect-error omitted properties are absent from the decoded value
+  void document.value.omitted
+  assert.throws(() => encodePgValue(type('jsonb'), [undefined]), /Invalid JSON value/u)
+  assert.throws(() => encodeJsonParameter(undefined), /Invalid JSON value/u)
+  const uncertain: { required: string | undefined; optional?: number } = { required: undefined }
+  const decoded = json(uncertain).value
+  const absent: typeof decoded = {}
+  const present: typeof decoded = { required: 'value', optional: jsonNumber('1') }
+  assert.deepEqual(decoded, absent)
+  assert.equal(present.required, 'value')
+})
+
 test('modeled JSON maps field names, exact scalar values, and unknown properties in both directions', () => {
   const plan: PgJsonPlan = {
     kind: 'object',

@@ -372,3 +372,29 @@ export function compileNamedParameters(sql: string, sourceFile = 'typed SQL'): C
   chunks.push(sql.slice(chunkStart))
   return { parameterNames, sql: chunks.join('') }
 }
+
+/** Remove a terminating statement delimiter while preserving quoted text and trailing comments. */
+export function stripTerminalSqlSemicolon(sql: string): string {
+  let index = 0
+  let lastCode = -1
+  while (index < sql.length) {
+    const character = sql[index]
+    if (character === '-' && sql[index + 1] === '-') {
+      index = lineCommentEnd(sql, index)
+    } else if (character === '/' && sql[index + 1] === '*') {
+      index = blockCommentEnd(sql, index)
+    } else if (character === "'" || character === '"') {
+      index = quotedEnd(sql, index, character, character === "'" && isEscapeStringQuote(sql, index))
+      lastCode = index - 1
+    } else if (character === '$' && dollarQuoteDelimiterAt(sql, index)) {
+      const delimiter = dollarQuoteDelimiterAt(sql, index) ?? ''
+      const end = sql.indexOf(delimiter, index + delimiter.length)
+      index = end < 0 ? sql.length : end + delimiter.length
+      lastCode = index - 1
+    } else {
+      if (character && !/\s/u.test(character)) lastCode = index
+      index += 1
+    }
+  }
+  return sql[lastCode] === ';' ? sql.slice(0, lastCode) + sql.slice(lastCode + 1) : sql
+}

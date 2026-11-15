@@ -27,6 +27,7 @@ export type JsonbContractShape =
   | 'int4'
   | 'json'
   | 'null'
+  | { readonly projection: string }
   | { readonly object: Readonly<Record<string, JsonbContractField>> }
   | { readonly array: JsonbContractShape }
   | { readonly nullable: JsonbContractShape }
@@ -178,6 +179,14 @@ function contractShape(value: unknown, depth: number): JsonbContractShape {
   const keys = Object.keys(record)
   if (keys.length === 1) {
     switch (keys[0]) {
+      case 'projection':
+        if (
+          typeof record.projection !== 'string' ||
+          !record.projection.endsWith('.typed.sql') ||
+          record.projection.includes('\0')
+        )
+          throw new Error('JSONB contract projection must name a .typed.sql file.')
+        return { projection: record.projection }
       case 'object':
         return { object: contractFields(record.object, depth + 1) }
       case 'array':
@@ -228,4 +237,22 @@ function parseContracts(input: unknown): readonly JsonbFunctionContract[] {
     )
     return { schema, name, argumentTypes, variants, allowJsonNull: contract.allowJsonNull }
   })
+}
+
+export function jsonbContractProjectionPaths(contracts: readonly JsonbFunctionContract[]): string[] {
+  const paths = new Set<string>()
+  const visit = (value: JsonbContractShape): void => {
+    if (typeof value === 'string') return
+    if ('projection' in value) paths.add(value.projection)
+    else if ('array' in value) visit(value.array)
+    else if ('nullable' in value) visit(value.nullable)
+    else
+      for (const field of Object.values(value.object))
+        visit(typeof field === 'object' && 'optional' in field ? field.optional : field)
+  }
+  for (const contract of contracts)
+    for (const fields of Object.values(contract.variants))
+      for (const field of Object.values(fields))
+        visit(typeof field === 'object' && 'optional' in field ? field.optional : field)
+  return [...paths]
 }

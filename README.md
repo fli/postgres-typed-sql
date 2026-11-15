@@ -78,7 +78,7 @@ export default defineConfig({
         ready: {
           session: { object: { publicId: 'string', pricingDetails: 'json' } },
           payment: { object: { paymentStarted: 'boolean' } },
-          buyer: { object: { revision: 'string', buyerDraft: 'json', taxQuote: 'json' } },
+          buyer: { projection: 'apps/web/src/features/checkout/load-checkout-buyer-state.typed.sql' },
         },
       },
     },
@@ -89,6 +89,16 @@ export default defineConfig({
 Add the other fields the application reads to the contract. The keys in each object are the
 wire names. Generated properties follow `naming.structuredJsonFields`. Unlisted fields are
 preserved as generic JSON at runtime and aren't part of the generated TypeScript type.
+
+`projection` names a typed SQL file relative to `rootDir`. Its selected columns define the
+JSON object fields, their wire names, codecs, and nullability. The generator tracks the file
+as an input. Use `{ nullable: { projection: '...' } }` when the object itself may be null.
+The function must produce the same object shape as the projection. The decoder checks it
+when the function result is read.
+
+JSON parameters accept plain objects with `undefined` properties. Encoding omits those
+properties recursively and preserves explicit `null`. An `undefined` array element or a
+top-level `undefined` JSON input is invalid.
 
 Use the function as a direct result expression in a typed SQL query:
 

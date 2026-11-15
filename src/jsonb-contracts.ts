@@ -12,15 +12,21 @@ const type = (name: string, oid: number) => ({
   pgTypeSchema: 'pg_catalog',
 })
 
-function objectFields(fields: Readonly<Record<string, JsonbContractField>>) {
+function objectFields(
+  fields: Readonly<Record<string, JsonbContractField>>,
+  projection: (path: string) => TypedSqlPostgresIrJsonShape
+) {
   return Object.entries(fields).map(([name, item]) =>
     typeof item === 'object' && 'optional' in item
-      ? { name, shape: shape(item.optional), optional: true }
-      : { name, shape: shape(item) }
+      ? { name, shape: shape(item.optional, projection), optional: true }
+      : { name, shape: shape(item, projection) }
   )
 }
 
-function shape(value: JsonbContractShape): TypedSqlPostgresIrJsonShape {
+function shape(
+  value: JsonbContractShape,
+  projection: (path: string) => TypedSqlPostgresIrJsonShape
+): TypedSqlPostgresIrJsonShape {
   if (typeof value === 'string') {
     switch (value) {
       case 'json':
@@ -37,22 +43,26 @@ function shape(value: JsonbContractShape): TypedSqlPostgresIrJsonShape {
         return { kind: 'scalar', ...type('int4', 23), nullability: nonNull }
     }
   }
-  if ('nullable' in value) return { ...shape(value.nullable), nullability: nullable }
-  if ('array' in value) return { kind: 'array', element: shape(value.array), nullability: nonNull }
+  if ('nullable' in value) return { ...shape(value.nullable, projection), nullability: nullable }
+  if ('array' in value) return { kind: 'array', element: shape(value.array, projection), nullability: nonNull }
+  if ('projection' in value) return projection(value.projection)
   return {
     kind: 'object',
-    fields: objectFields(value.object),
+    fields: objectFields(value.object, projection),
     nullability: nonNull,
   }
 }
 
-function contractShape(contract: JsonbFunctionContract): TypedSqlPostgresIrJsonShape {
+function contractShape(
+  contract: JsonbFunctionContract,
+  projection: (path: string) => TypedSqlPostgresIrJsonShape
+): TypedSqlPostgresIrJsonShape {
   const alternatives: TypedSqlPostgresIrJsonShape[] = Object.entries(contract.variants).map(([variant, fields]) => ({
     kind: 'object',
     nullability: nonNull,
     fields: [
       { name: 'kind', shape: { kind: 'stringLiteral', ...type('text', 25), value: variant, nullability: nonNull } },
-      ...objectFields(fields),
+      ...objectFields(fields, projection),
     ],
   }))
   if (contract.allowJsonNull) alternatives.push({ kind: 'null', nullability: nonNull })
@@ -61,9 +71,13 @@ function contractShape(contract: JsonbFunctionContract): TypedSqlPostgresIrJsonS
 
 export async function resolveJsonbContracts(
   client: PostgresQueryable,
-  contracts: readonly JsonbFunctionContract[]
+  contracts: readonly JsonbFunctionContract[],
+  projection: (
+    path: string,
+    contract: (oid: number) => TypedSqlPostgresIrJsonShape | undefined
+  ) => TypedSqlPostgresIrJsonShape
 ): Promise<Map<number, TypedSqlPostgresIrJsonShape>> {
-  const result = new Map<number, TypedSqlPostgresIrJsonShape>()
+  const definitions = new Map<number, JsonbFunctionContract>()
   for (const contract of contracts) {
     const args = contract.argumentTypes.map((arg) =>
       typeof arg === 'string' ? { schema: 'pg_catalog', name: arg } : arg
@@ -89,8 +103,23 @@ export async function resolveJsonbContracts(
     const row = rows.rows[0]
     if (!row || rows.rows.length !== 1) throw new Error(`JSONB function contract overload not found: ${signature}.`)
     if (!row.valid) throw new Error(`JSONB function contract requires a scalar function returning jsonb: ${signature}.`)
-    if (result.has(row.oid)) throw new Error(`Duplicate JSONB function contract: ${signature}.`)
-    result.set(row.oid, contractShape(contract))
+    if (definitions.has(row.oid)) throw new Error(`Duplicate JSONB function contract: ${signature}.`)
+    definitions.set(row.oid, contract)
   }
+  const result = new Map<number, TypedSqlPostgresIrJsonShape>()
+  const resolving = new Set<number>()
+  const resolve = (oid: number): TypedSqlPostgresIrJsonShape | undefined => {
+    const existing = result.get(oid)
+    if (existing) return existing
+    const definition = definitions.get(oid)
+    if (!definition) return undefined
+    if (resolving.has(oid)) throw new Error('Cyclic JSONB contract projections are not supported.')
+    resolving.add(oid)
+    const resolved = contractShape(definition, (path) => projection(path, resolve))
+    resolving.delete(oid)
+    result.set(oid, resolved)
+    return resolved
+  }
+  for (const oid of definitions.keys()) resolve(oid)
   return result
 }
