@@ -304,3 +304,13 @@ testWithDatabase('JSON constructor NULL proof requires static safe keys and scal
   assert.equal((await analyzeNative<UsageAnalysis>(database, customSql)).paramUsageNullAdmissions[0], 'unknown')
   await assert.rejects(database.query(customSql, [null]), /custom JSON conversion/u)
 })
+
+testWithDatabase('guarded insert source reports an unreachable action', async (database) => {
+  await database.query('create table public.guarded_insert_probe (value integer not null)')
+  const sql = 'insert into public.guarded_insert_probe(value) select $1::int where $1 is not null'
+  assert.deepEqual(queryFacts(await analyze(database, sql)).dmlParameterNullAdmissions, [
+    { admission: 'accepts', basis: 'action_unreachable_when_null', paramId: 1 },
+  ])
+  await database.query(sql, [null])
+  assert.deepEqual((await database.query('select * from public.guarded_insert_probe')).rows, [])
+})

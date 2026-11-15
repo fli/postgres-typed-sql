@@ -53,7 +53,47 @@ must stay stable. The default is `false`. The worker discards its database and c
 an analysis error or when the project closes. Source text and native statement analysis still run
 for each request.
 
+### Declare nullable inputs
+
+Parameters reject SQL NULL by default. `-- @nullable name` permits it only when analysis
+proves that every modeled use accepts NULL. This includes a direct `INSERT ... SELECT`
+whose `WHERE :name IS NOT NULL` condition prevents the insert when the input is NULL.
+
+Use `-- @bindNull name` when the caller owns NULL admission, such as an optional argument
+of a PL/pgSQL function whose body the analyzer cannot prove safe:
+
+```sql
+-- @bindNull acceptance_snapshot
+select result
+from public.reserve_paypal_checkout_approval(
+  :public_id::uuid, :checkout_session_id::bigint, :environment::text,
+  :client_id::text, :partner_merchant_id::text, :checkout_public_id::uuid,
+  :acceptance_snapshot::jsonb
+) as result
+limit 1
+```
+
+Both declarations generate a required parameter property that accepts `null`.
+`@bindNull` grants permission to bind SQL NULL; it does not establish that execution
+will succeed. The analysis report keeps that permission separate from admission evidence.
+No input CTE is needed. A plain `null` JSON parameter means SQL NULL; `json(null)`
+means a non-null JSON document containing JSON null.
+
 ### Declare a JSONB function result
+
+For an ordinary object, declare `returns` with an object shape or an existing query projection:
+
+```js
+{
+  schema: 'public',
+  name: 'reserve_paypal_checkout_approval',
+  argumentTypes: ['uuid', 'int8', 'text', 'text', 'text', 'uuid', 'jsonb'],
+  returns: { projection: 'apps/web/src/features/checkout/load-paypal-checkout-approval.typed.sql' },
+}
+```
+
+`returns` accepts the same shape grammar as nested fields. Declare exactly one of
+`returns` and `variants`. An ordinary object needs no discriminator.
 
 When a PL/pgSQL function returns different JSONB objects, add a string `kind` field to each
 outcome in SQL. For example, return `jsonb_build_object('kind', 'unavailable')` when there is no
@@ -91,10 +131,30 @@ wire names. Generated properties follow `naming.structuredJsonFields`. Unlisted 
 preserved as generic JSON at runtime and aren't part of the generated TypeScript type.
 
 `projection` names a typed SQL file relative to `rootDir`. Its selected columns define the
-JSON object fields, their wire names, codecs, and nullability. The generator tracks the file
+JSON object fields, their wire names, codecs, and nullability. Analysis uses the original
+statement's result columns, so `UPDATE ... RETURNING` and data-modifying CTEs work as
+projections without executing their writes. The generator tracks the file
 as an input. Use `{ nullable: { projection: '...' } }` when the object itself may be null.
 The function must produce the same object shape as the projection. The decoder checks it
 when the function result is read.
+
+Projection properties follow `naming.resultColumns`, matching the standalone query row.
+JSON columns within a projection decode to `PgJson` documents with the same nested
+interpretation as standalone results. Fields inside those documents follow
+`naming.structuredJsonFields`. Ordinary contract object fields also use
+`naming.structuredJsonFields`.
+
+PostgreSQL serializes both a SQL NULL JSON column and a JSON-null document as JSON null
+inside a row object. A nullable projected JSON column decodes that wire null to SQL `null`.
+A nonnullable projected JSON column retains a `PgJson` document with `value: null`.
+Use an explicit SQL discriminator if that original distinction is required. SQL arrays
+lose lower bounds when converted to JSON, so their projected values retain the JSON
+representation rather than pretending to recover a `PgArray`. Custom JSON casts also
+retain their JSON representation. Reversible scalars, including bytea, bigint and
+microsecond timestamps, use their standalone SQL value types.
+Projected bytea remains a `Uint8Array`. If its bytes are edited, the enclosing document's
+`source` reflects the edit through its generated codec, so subsequent JSON bindings send
+the current bytes. Documents without bytea retain their original source text.
 
 JSON parameters accept plain objects with `undefined` properties. Encoding omits those
 properties recursively and preserves explicit `null`. An `undefined` array element or a
@@ -120,7 +180,10 @@ if (result?.value.kind === 'ready') {
 }
 ```
 
-The contract targets one overload of a scalar PostgreSQL function declared `RETURNS jsonb`.
+The contract targets one PostgreSQL function overload declared `RETURNS jsonb` or
+`RETURNS SETOF jsonb`. Each returned document is checked independently. Direct target
+calls and direct range-function outputs support contracts, including lateral calls,
+aliases, ordinality, and transparent CTE or subquery forwarding.
 Use exact catalog type names for its declared input types in order, including defaulted inputs.
 A string names a type in `pg_catalog` (for example, `int4` for `integer`). Use
 `{ schema: 'app', name: 'checkout_id' }` for a type in another schema. PostgreSQL chooses the
@@ -139,6 +202,35 @@ A required field with `{ nullable: 'string' }` can contain JSON null but must be
 a null column. Add `allowJsonNull: true` to accept a JSON null document, which produces a
 `PgJson` with `value: null`. An unknown tag, missing required field, or wrong value type
 raises a `PgExecutionError` in the `decode` phase.
+
+### Construct typed JSON fixtures
+
+Every generated statement exposes `jsonCodecs` keyed by its JSON result properties.
+Use the existing `json` or `parseJson` constructor with that codec before any database call:
+
+For example, generate `image-dimensions.typed.sql` from:
+
+```sql
+select jsonb_build_object('width', 1600::int4, 'height', 900::int4) as dimensions
+```
+
+Then construct the document with native-number fields:
+
+```ts
+import { json } from 'postgres-typed-sql/values'
+import { imageDimensions } from './image-dimensions.typed-sql.js'
+
+const dimensions = json({ width: 1600, height: 900 }, imageDimensions.jsonCodecs.dimensions)
+```
+
+Supply all fields required by the generated shape. The codec checks the same field names,
+scalar interpretations, variants and nullability as execution. Generic `json(value)` still
+uses exact decimal values for JSON numbers; a generated codec can instead interpret an
+inferred PostgreSQL int4 as a native number. Rebuild fixtures with their codec when values
+change so `value`, `source`, and `codec` stay consistent. Nested `PgJson` documents are
+accepted only where a generated projection codec declares a JSON column boundary.
+
+See the [consumer migration examples](docs/consumer-contract-migration.md) for the four consumer changes.
 
 Use the code for API details:
 

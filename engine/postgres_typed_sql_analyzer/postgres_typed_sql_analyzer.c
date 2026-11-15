@@ -1851,6 +1851,28 @@ append_rtable(StringInfo out, const PtsQueryScope *scope, int depth)
       appendStringInfo(out, ",\"joinMergedCols\":%d", rte->joinmergedcols);
       append_expr_list(out, scope, "joinAliasVars", rte->joinaliasvars, depth);
     }
+    if (rte->rtekind == RTE_FUNCTION)
+    {
+      ListCell *function_cell;
+      bool first_function = true;
+
+      append_bool_field(out, "functionOrdinality", rte->funcordinality);
+      appendStringInfoString(out, ",\"functionOutputs\":[");
+      foreach(function_cell, rte->functions)
+      {
+        const RangeTblFunction *function =
+          lfirst_node(RangeTblFunction, function_cell);
+
+        if (!first_function)
+          appendStringInfoChar(out, ',');
+        first_function = false;
+        appendStringInfo(out, "{\"columnCount\":%d,\"expression\":",
+                         function->funccolcount);
+        append_expr_node(out, scope, function->funcexpr, depth - 1);
+        appendStringInfoChar(out, '}');
+      }
+      appendStringInfoChar(out, ']');
+    }
     if (rte->rtekind == RTE_VALUES)
     {
       append_expr_rows(out, scope, "valuesLists", rte->values_lists, depth);

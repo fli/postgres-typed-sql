@@ -117,6 +117,8 @@ export type PgAnalyzerRteKind =
   | 'VALUES'
 
 export interface PgAnalyzerRte {
+  readonly functionOutputs?: readonly { readonly expression: PgAnalyzerExpr; readonly columnCount: number }[]
+  readonly functionOrdinality?: boolean
   readonly cteName?: string
   readonly cteLevelSup?: number
   readonly cteSelfReference?: boolean

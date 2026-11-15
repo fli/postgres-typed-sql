@@ -32,13 +32,18 @@ export type JsonbContractShape =
   | { readonly array: JsonbContractShape }
   | { readonly nullable: JsonbContractShape }
 export type JsonbContractField = JsonbContractShape | { readonly optional: JsonbContractShape }
-export interface JsonbFunctionContract {
+export type JsonbFunctionContract = {
   readonly schema: string
   readonly name: string
   readonly argumentTypes: readonly (string | { readonly schema: string; readonly name: string })[]
-  readonly variants: Readonly<Record<string, Readonly<Record<string, JsonbContractField>>>>
   readonly allowJsonNull?: true
-}
+} & (
+  | { readonly returns: JsonbContractShape; readonly variants?: never }
+  | {
+      readonly variants: Readonly<Record<string, Readonly<Record<string, JsonbContractField>>>>
+      readonly returns?: never
+    }
+)
 
 export interface PostgresTypedSqlConfig {
   /** Runtime-checked JSONB results for direct calls to specific PostgreSQL function overloads. */
@@ -226,6 +231,16 @@ function parseContracts(input: unknown): readonly JsonbFunctionContract[] {
     })
     if (contract.allowJsonNull !== undefined && contract.allowJsonNull !== true)
       throw new Error('allowJsonNull must be true when present.')
+    if (Object.hasOwn(contract, 'returns') === Object.hasOwn(contract, 'variants'))
+      throw new Error('JSONB contract requires exactly one of returns or variants.')
+    if (Object.hasOwn(contract, 'returns'))
+      return {
+        schema,
+        name,
+        argumentTypes,
+        returns: contractShape(contract.returns, 0),
+        allowJsonNull: contract.allowJsonNull,
+      }
     const entries = Object.entries(contractRecord(contract.variants))
     if (entries.length < 2) throw new Error('JSONB contract requires at least two variants.')
     const variants = Object.fromEntries(
@@ -250,9 +265,12 @@ export function jsonbContractProjectionPaths(contracts: readonly JsonbFunctionCo
       for (const field of Object.values(value.object))
         visit(typeof field === 'object' && 'optional' in field ? field.optional : field)
   }
-  for (const contract of contracts)
-    for (const fields of Object.values(contract.variants))
-      for (const field of Object.values(fields))
-        visit(typeof field === 'object' && 'optional' in field ? field.optional : field)
+  for (const contract of contracts) {
+    if (contract.returns !== undefined) visit(contract.returns)
+    else
+      for (const fields of Object.values(contract.variants))
+        for (const field of Object.values(fields))
+          visit(typeof field === 'object' && 'optional' in field ? field.optional : field)
+  }
   return [...paths]
 }

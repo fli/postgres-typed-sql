@@ -115,3 +115,47 @@ test('JSONB contract reserves kind for the generated discriminator', () => {
     /variant cannot declare kind/u
   )
 })
+
+test('JSONB contracts accept one root shape and discover nested projections', async () => {
+  const { jsonbContractProjectionPaths } = await import('../src/config.js')
+  const contracts = resolveConfig({
+    schema: 'schema.sql',
+    jsonbFunctionContracts: [
+      {
+        schema: 'public',
+        name: 'checkout',
+        argumentTypes: [],
+        returns: { object: { item: { optional: { array: { projection: 'item.typed.sql' } } } } },
+        allowJsonNull: true,
+      },
+    ],
+  }).jsonbFunctionContracts
+  assert.deepEqual(jsonbContractProjectionPaths(contracts), ['item.typed.sql'])
+})
+
+test('JSONB contracts require exactly one contract form', () => {
+  const base = { schema: 'public', name: 'checkout', argumentTypes: [] }
+  // @ts-expect-error A contract requires a return shape or variants.
+  const neither: import('../src/config.js').JsonbFunctionContract = base
+  // @ts-expect-error Contract forms are exclusive.
+  const both: import('../src/config.js').JsonbFunctionContract = {
+    ...base,
+    returns: 'string',
+    variants: { a: {}, b: {} },
+  }
+  for (const contract of [neither, both]) {
+    assert.throws(() => resolveConfig({ schema: 'schema.sql', jsonbFunctionContracts: [contract] }), /exactly one/u)
+  }
+  assert.throws(
+    () => resolveConfig({ schema: 'schema.sql', jsonbFunctionContracts: [{ ...base, variants: { only: {} } }] }),
+    /at least two variants/u
+  )
+  assert.throws(
+    () =>
+      resolveConfig({
+        schema: 'schema.sql',
+        jsonbFunctionContracts: [{ ...base, returns: { projection: 'bad.sql' } }],
+      }),
+    /must name a .typed.sql file/u
+  )
+})

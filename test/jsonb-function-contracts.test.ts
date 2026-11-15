@@ -128,6 +128,8 @@ test('declared JSONB contracts narrow complete results and validate PostgreSQL p
     consume,
     `
 import type { PgFiniteDecimal, PgJson, PgJsonValue } from 'postgres-typed-sql/values'
+import { json } from 'postgres-typed-sql/values'
+import { query } from './queries/query.typed-sql.js'
 import type { QueryRow } from './queries/query.typed-sql.js'
 import type { OverloadsRow } from './queries/overloads.typed-sql.js'
 import type { CombinedRow } from './queries/combined.typed-sql.js'
@@ -143,6 +145,7 @@ if (row.result !== null) {
       exact<number>(value.revision)
       exact<PgFiniteDecimal>(value.lineItems[0]!)
       exact<PgJsonValue>(value.session.pricingDetails)
+      json({ ...value, session: { pricingDetails: { total: 3 } } }, query.jsonCodecs.result)
       exact<boolean>(value.payment.started)
       exact<number | null>(value.buyer.taxQuote)
       type OptionalNote = Assert<Equal<typeof value.buyer.buyerNote, string | null | undefined>>
@@ -229,6 +232,10 @@ type Combined = Assert<Equal<CombinedRow['result'], GenericJson>>
       const exact = values.jsonNumber('9007199254740993')
       assert.deepEqual(doc.value.lineItems, [exact])
       assert.deepEqual(doc.value.session.pricingDetails, { total: exact })
+      assert.deepEqual(values.json({ ...doc.value, session: { pricingDetails: { total: 3 } } }, doc.codec).value, {
+        ...doc.value,
+        session: { pricingDetails: { total: values.jsonNumber('3') } },
+      })
       assert.deepEqual(values.json(doc.value, doc.codec).value, doc.value)
 
       assert.deepEqual((await run('unavailable')).result?.value, { kind: 'unavailable' })
@@ -299,7 +306,7 @@ test('generation rejects missing, incompatible, and duplicate function signature
   )
   await assert.rejects(
     generateFixture(root, { jsonbFunctionContracts: [{ ...candidate, name: 'invalid' }] }),
-    /requires a scalar function returning jsonb: public\.invalid\(\)/u
+    /requires a function returning jsonb: public\.invalid\(\)/u
   )
   await assert.rejects(
     generateFixture(root, { jsonbFunctionContracts: [candidate, candidate] }),
@@ -329,7 +336,7 @@ test('contract projections infer nested fields and track external SQL inputs', a
     rootDir: root,
     schema: 'schema.sql',
     include: ['queries'],
-    naming: { structuredJsonFields: 'camelCase' },
+    naming: { resultColumns: 'camelCase', structuredJsonFields: 'camelCase' },
     jsonbFunctionContracts: [projectedContract],
   } as const
   const result = await generateTypedSql(options, { analysis: true })
@@ -467,4 +474,31 @@ test('projection preserves a directly called function contract', async (t) => {
     await client.query('drop function if exists public.outer_contract(), public.inner_contract()')
     await client.end()
   }
+})
+
+test('root projections reject cycles and colliding result names', async (t) => {
+  const root = await createMinimalFixture(
+    `create function public.root_projection() returns jsonb language sql as $$select '{}'::jsonb$$;`,
+    'select public.root_projection() as result'
+  )
+  t.after(() => rm(root, { recursive: true, force: true }))
+  await mkdir(join(root, 'projections'))
+  const projection = join(root, 'projections/root.typed.sql')
+  const options = {
+    naming: { resultColumns: 'camelCase' },
+    jsonbFunctionContracts: [
+      {
+        schema: 'public',
+        name: 'root_projection',
+        argumentTypes: [],
+        returns: { projection: 'projections/root.typed.sql' },
+      },
+    ],
+  } as const
+  for (const sql of ['select 1 as item_id,2 as item_id', 'select 1 as item_id,2 as "itemId"']) {
+    await writeFile(projection, sql)
+    await assert.rejects(generateFixture(root, options), /duplicate JSON field/u)
+  }
+  await writeFile(projection, 'select public.root_projection() as nested')
+  await assert.rejects(generateFixture(root, options), /Cyclic JSONB contract projections/u)
 })

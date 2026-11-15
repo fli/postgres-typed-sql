@@ -1511,6 +1511,7 @@ function walkDirectQueryExpressions(query: PgAnalyzerQuery, visitExpr: (expr: Pg
     walkExpr(target.expr, visitExpr)
   }
   for (const rte of query.rtable ?? []) {
+    for (const output of rte.functionOutputs ?? []) walkExpr(output.expression, visitExpr)
     for (const expression of [...(rte.joinAliasVars ?? []), ...(rte.groupExprs ?? [])]) {
       walkExpr(expression, visitExpr)
     }
@@ -4319,6 +4320,34 @@ function queryOutputSqlArrayShape(
   })
 }
 
+function exactJsonbFunctionOid(
+  scope: QueryScope,
+  expression: PgAnalyzerExpr | null | undefined,
+  seen: readonly PgAnalyzerExpr[] = []
+): number | undefined {
+  if (!expression || scope.query.hasSetOperations || seen.includes(expression)) return undefined
+  if (expression.tag === 'FuncExpr') return expression.funcid
+  if (expression.tag !== 'Var') return undefined
+  const source = resolveImmediateVarSource(scope, expression)
+  const visited = [...seen, expression]
+  if (source.kind === 'queryOutput')
+    return exactJsonbFunctionOid(source.scope, resultTargets(source.scope.query)[source.outputIndex]?.expr, visited)
+  if (source.kind === 'expressions' && source.expressions.length === 1)
+    return exactJsonbFunctionOid(source.scope, source.expressions[0], visited)
+  if (source.kind !== 'opaque' || source.rteKind !== 'FUNCTION') return undefined
+  const owner = queryScopeAtLevel(scope, expression.varlevelsup ?? 0)
+  const rte = owner?.query.rtable?.[(expression.varno ?? 0) - 1]
+  let attribute = expression.varattno ?? 0
+  for (const output of rte?.functionOutputs ?? []) {
+    if (attribute <= output.columnCount)
+      return attribute === 1 && output.columnCount === 1 && output.expression.tag === 'FuncExpr'
+        ? output.expression.funcid
+        : undefined
+    attribute -= output.columnCount
+  }
+  return undefined
+}
+
 function normalizeCompiledIr(catalog: CatalogFacts, analyzed: AnalyzedCompiledConfig): TypedSqlPostgresIr {
   const { analysis, config, primaryQuery: query, rewrittenQueries } = analyzed
   const rootScope = queryScope(query, null, { catalog, expressionKeys: new WeakMap(), queryScopes: new WeakMap() })
@@ -4333,12 +4362,11 @@ function normalizeCompiledIr(catalog: CatalogFacts, analyzed: AnalyzedCompiledCo
       : undefined
     const jsonShape = inferredJsonShape ? jsonShapeWithNullability(inferredJsonShape, nullability) : undefined
     const arrayShape = isSqlArrayType(typeFact) ? queryOutputSqlArrayShape(catalog, rootScope, outputIndex) : null
+    const jsonbFunctionOid = isJsonType(typeFact.pgTypeName) ? exactJsonbFunctionOid(rootScope, expr) : undefined
     return {
       ...(arrayShape ? { arrayShape } : {}),
       expressionSource: expressionSourceForExpr(expr),
-      ...(isJsonType(typeFact.pgTypeName) && expr?.tag === 'FuncExpr' && expr.funcid && !query.hasSetOperations
-        ? { jsonbFunctionOid: expr.funcid }
-        : {}),
+      ...(jsonbFunctionOid ? { jsonbFunctionOid } : {}),
       jsonShape,
       name: target.resname ?? null,
       nullability,

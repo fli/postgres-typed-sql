@@ -1,13 +1,36 @@
-import { resultNullabilityAllowsNull, type TypedSqlPostgresIrJsonShape } from './analyzer-ir-model.js'
+import {
+  resultNullabilityAllowsNull,
+  type TypedSqlPostgresIrJsonShape,
+  type TypedSqlPostgresIrCheckConstraintTypeExpression,
+} from './analyzer-ir-model.js'
 import { isJsonPlanSupported } from './json-values.js'
-import { basePostgresType, resolveTypeScriptJsonScalarTypeForPostgresType } from './postgres-codecs.js'
+import {
+  basePostgresType,
+  postgresJsonSupportsStringLiteralRefinement,
+  resolveTypeScriptJsonScalarTypeForPostgresType,
+} from './postgres-codecs.js'
 import { postgresTypeFact, type PostgresTypeFact } from './postgres-types.js'
 import { camelCasePropertyName } from './typescript-names.js'
 import type { PostgresTypedSqlPropertyNaming } from './config.js'
 import type { PgJsonPlan } from './value-types.js'
 
+function constraintLabels(expression: TypedSqlPostgresIrCheckConstraintTypeExpression): readonly string[] {
+  if (expression.kind === 'literalUnion') return expression.labels
+  const members = expression.members.map(constraintLabels)
+  const labels = [...new Set(members.flat())]
+  return expression.kind === 'union'
+    ? labels
+    : labels.filter((label) => members.every((member) => member.includes(label)))
+}
+
 function embeddedPlanForShape(shape: TypedSqlPostgresIrJsonShape, naming: PostgresTypedSqlPropertyNaming): PgJsonPlan {
   switch (shape.kind) {
+    case 'document':
+      return {
+        kind: 'document',
+        plan: jsonPlanForShape(shape.value, naming),
+        nullable: resultNullabilityAllowsNull(shape.nullability),
+      }
     case 'opaque':
       return { kind: 'generic' }
     case 'null':
@@ -34,7 +57,7 @@ function embeddedPlanForShape(shape: TypedSqlPostgresIrJsonShape, naming: Postgr
         fields: shape.fields.map((field) => ({
           name: field.name,
           ...(field.optional ? { optional: true } : {}),
-          propertyName: naming === 'camelCase' ? camelCasePropertyName(field.name) : field.name,
+          propertyName: field.propertyName ?? (naming === 'camelCase' ? camelCasePropertyName(field.name) : field.name),
           plan: embeddedPlanForShape(field.shape, naming),
         })),
       }
@@ -51,6 +74,18 @@ function embeddedPlanForShape(shape: TypedSqlPostgresIrJsonShape, naming: Postgr
       }
     case 'scalar': {
       const type = basePostgresType(shape)
+      if (shape.checkConstraintType && postgresJsonSupportsStringLiteralRefinement(shape))
+        return {
+          kind: 'string',
+          values: constraintLabels(shape.checkConstraintType),
+          nullable: resultNullabilityAllowsNull(shape.nullability),
+        }
+      if (shape.sqlScalar)
+        return {
+          kind: 'scalar',
+          type: postgresTypeFact(shape),
+          nullable: resultNullabilityAllowsNull(shape.nullability),
+        }
       const resolved = resolveTypeScriptJsonScalarTypeForPostgresType(type)
       if (resolved.type === 'PgJsonValue') return { kind: 'generic' }
       if (resolved.type === 'string')
@@ -88,6 +123,7 @@ export function safeJsonCodecShape(
   shape: TypedSqlPostgresIrJsonShape,
   naming: PostgresTypedSqlPropertyNaming
 ): TypedSqlPostgresIrJsonShape {
+  if (shape.kind === 'document') return { ...shape, value: safeJsonCodecShape(shape.value, naming) }
   if (shape.kind === 'object')
     return {
       ...shape,

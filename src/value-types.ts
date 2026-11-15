@@ -89,11 +89,15 @@ export interface PgRawValue {
 
 export type JsonReadonly<T> = PgJsonValue extends T
   ? T
-  : T extends readonly unknown[]
-    ? { readonly [Key in keyof T]: JsonReadonly<T[Key]> }
-    : T extends object
-      ? { readonly [Key in keyof T]: JsonReadonly<T[Key]> }
-      : T
+  : T extends { readonly [jsonDocumentType]: true }
+    ? T
+    : T extends Uint8Array
+      ? T
+      : T extends readonly unknown[]
+        ? { readonly [Key in keyof T]: JsonReadonly<T[Key]> }
+        : T extends object
+          ? { readonly [Key in keyof T]: JsonReadonly<T[Key]> }
+          : T
 export type PgJsonValue =
   | null
   | boolean
@@ -110,6 +114,17 @@ export type PgJsonInput =
   | PgFiniteDecimal
   | readonly PgJsonInput[]
   | { readonly [key: string]: PgJsonInput | undefined }
+export type JsonCodecInput<T> = unknown extends T
+  ? T
+  : PgJsonValue extends T
+    ? PgJsonInput
+    : T extends { readonly [jsonDocumentType]: true } | Uint8Array
+      ? T
+      : T extends readonly unknown[]
+        ? { readonly [Key in keyof T]: JsonCodecInput<T[Key]> }
+        : T extends object
+          ? { readonly [Key in keyof T]: JsonCodecInput<T[Key]> }
+          : T
 export type JsonDecoded<T> = PgJsonInput extends T
   ? PgJsonValue
   : T extends number | bigint | PgFiniteDecimal
@@ -137,6 +152,7 @@ export interface PgJsonCodec<T> {
 export interface PgJson<T = PgJsonValue> {
   readonly kind: 'json'
   readonly value: JsonReadonly<T>
+  /** Original JSON text; projected bytea edits are reflected through the generated codec. */
   readonly source: string
   readonly codec: PgJsonCodec<T>
   readonly [jsonDocumentType]: true
@@ -146,8 +162,9 @@ export type PgJsonParameter = PgJson<unknown> | PgJsonInput
 /** The generated JSON interpretation; not an application mapping extension point. */
 export type PgJsonPlan =
   | { readonly kind: 'generic' }
+  | { readonly kind: 'document'; readonly plan: PgJsonPlan; readonly nullable?: boolean }
   | { readonly kind: 'null' }
-  | { readonly kind: 'string'; readonly nullable?: boolean }
+  | { readonly kind: 'string'; readonly values?: readonly string[]; readonly nullable?: boolean }
   | { readonly kind: 'number'; readonly nullable?: boolean }
   | { readonly kind: 'literal'; readonly value: string | boolean; readonly nullable?: boolean }
   | { readonly kind: 'scalar'; readonly type: PostgresTypeFact; readonly nullable?: boolean }

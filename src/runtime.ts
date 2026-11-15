@@ -1,5 +1,7 @@
 import type { PostgresTypeFact } from './postgres-types.js'
-import type { PgJsonPlan } from './value-types.js'
+import type { PgJsonCodec, PgJsonPlan } from './value-types.js'
+import { cachedJsonCodec } from './json-values.js'
+import { basePostgresType } from './postgres-codecs.js'
 import { decodePgValue, encodePgValue } from './value-codecs.js'
 
 export type TypedSqlParams = object
@@ -39,6 +41,7 @@ export interface TypedSqlQueryConfig {
 }
 
 declare const typedSqlStatementRow: unique symbol
+const genericJsonPlan: PgJsonPlan = Object.freeze({ kind: 'generic' })
 
 /** Immediate analyzed expression metadata; this is not ultimate column lineage. */
 export type TypedSqlColumnExpressionSourceMetadata =
@@ -87,6 +90,15 @@ export interface TypedSqlParameterMetadata {
   readonly propertyName: string
 }
 
+export type TypedSqlJsonCodecs<Row> = {
+  readonly [Key in keyof Row as NonNullable<Row[Key]> extends {
+    readonly kind: 'json'
+    readonly codec: PgJsonCodec<unknown>
+  }
+    ? Key
+    : never]: NonNullable<Row[Key]> extends { readonly codec: PgJsonCodec<infer Value> } ? PgJsonCodec<Value> : never
+}
+
 export interface TypedSqlStatement<
   Params extends TypedSqlParams,
   Row,
@@ -97,6 +109,8 @@ export interface TypedSqlStatement<
   readonly access: Access
   readonly resultKind: Kind
   readonly columns: readonly TypedSqlColumnMetadata[]
+  /** Generated codecs describe JSON content, excluding the column's SQL NULL. */
+  readonly jsonCodecs: TypedSqlJsonCodecs<Row>
   readonly command: TypedSqlCommandKind
   readonly name: string
   readonly parameterNames: readonly (keyof Params & string)[]
@@ -106,8 +120,8 @@ export interface TypedSqlStatement<
   readonly rowBounds: TypedSqlRowBounds
   readonly text: string
   readonly [typedSqlStatementRow]?: Row
-  query(params: Params): TypedSqlQueryConfig
-  values(params: Params): readonly unknown[]
+  readonly query: (params: Params) => TypedSqlQueryConfig
+  readonly values: (params: Params) => readonly unknown[]
 }
 
 export interface TypedSqlDefinition<
@@ -212,12 +226,23 @@ export function createTypedSqlStatement<
   const parameterNames = Object.freeze([...definition.parameterNames])
   const columns = freezeMetadata(structuredClone(definition.columns ?? []))
   const parameters = freezeMetadata(structuredClone(definition.parameters ?? []))
-  return Object.freeze({
+  const jsonCodecs = Object.freeze(
+    Object.fromEntries(
+      columns.flatMap((column) => {
+        const type = column.type && basePostgresType(column.type)
+        return type?.pgTypeSchema === 'pg_catalog' && ['json', 'jsonb'].includes(type.pgTypeName)
+          ? [[column.propertyName, cachedJsonCodec(column.jsonPlan ?? genericJsonPlan)]]
+          : []
+      })
+    )
+  ) as TypedSqlJsonCodecs<Row>
+  const statement: TypedSqlStatement<Params, Row, Access, Kind> = {
     // oxlint-disable-next-line typescript-eslint/no-unsafe-type-assertion -- The generated statement declaration pins Access to this metadata value.
     valueModel: definition.valueModel,
     access: (definition.access ?? typedSqlAccessForCommand(definition.command ?? 'unknown')) as Access,
     resultKind: definition.resultKind,
     columns,
+    jsonCodecs,
     command: definition.command ?? 'unknown',
     name: definition.name,
     parameterNames,
@@ -241,7 +266,9 @@ export function createTypedSqlStatement<
         return params[parameterName]
       })
     },
-  })
+  }
+  Object.defineProperty(statement, 'jsonCodecs', { enumerable: false })
+  return Object.freeze(statement)
 }
 
 export function typedSqlRowCount(rowCount: bigint | number | null | undefined): number {

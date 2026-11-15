@@ -48,7 +48,7 @@ import { jsonPlanForShape, safeJsonCodecShape } from './json-plan.js'
 import { resolveJsonbContracts } from './jsonb-contracts.js'
 import { isJsonPlanSupported } from './json-values.js'
 import type { PgJsonPlan } from './value-types.js'
-import { compileNamedParameters, parseTypedSqlSource, stripTerminalSqlSemicolon } from './sql-source.js'
+import { compileNamedParameters, parseTypedSqlSource } from './sql-source.js'
 import type { QueryAnalysis, QueryDescriptor } from './project-facts.js'
 import type { TypedSqlResultKind } from './runtime.js'
 import {
@@ -495,6 +495,9 @@ function validateJsonShapeNames(
   context: string
 ): void {
   switch (shape.kind) {
+    case 'document':
+      validateJsonShapeNames(shape.value, naming, sourceFile, `${context}.value`)
+      break
     case 'array':
       validateJsonShapeNames(shape.element, naming, sourceFile, `${context}[]`)
       break
@@ -503,7 +506,7 @@ function validateJsonShapeNames(
         validateJsonShapeNames(field.shape, naming, sourceFile, `${context}.${field.name}`)
       }
       assertUniquePublicNames(
-        shape.fields.map((field) => propertyNameForNaming(field.name, naming)),
+        shape.fields.map((field) => field.propertyName ?? propertyNameForNaming(field.name, naming)),
         `JSON field in ${context}`,
         sourceFile
       )
@@ -557,6 +560,8 @@ function applyOpaqueJsonBarriersToAlternatives(
 
   const rewrite = (shape: TypedSqlPostgresIrJsonShape): TypedSqlPostgresIrJsonShape => {
     switch (shape.kind) {
+      case 'document':
+        return { ...shape, value: applyOpaqueJsonBarriers(shape.value) }
       case 'array': {
         const element = safeArrayElements[arrayIndex]
         arrayIndex += 1
@@ -639,7 +644,9 @@ function scalarTsTypeForJsonShape(
     return tsTypeForCheckConstraintType(shape.checkConstraintType)
   }
 
-  const resolved = resolveTypeScriptJsonScalarTypeForPostgresType(shape)
+  const resolved = shape.sqlScalar
+    ? resolveTypeScriptResultTypeForPostgresType(shape)
+    : resolveTypeScriptJsonScalarTypeForPostgresType(shape)
   collectTypeResolutionDependencies(dependencies, resolved)
   return resolved.type
 }
@@ -671,6 +678,9 @@ function tsTypeForJsonShape(
 ): string {
   function render(shape: TypedSqlPostgresIrJsonShape, name: string): string {
     switch (shape.kind) {
+      case 'document':
+        dependencies.scalar.add('PgJson')
+        return `PgJson<${render(shape.value, `${name}${encodedTypeNameSegment('value')}`)}>`
       case 'array':
         return `readonly (${render(shape.element, `${name}${encodedTypeNameSegment('element')}`)}${resultNullabilityAllowsNull(shape.element.nullability) && !jsonShapeIncludesNull(shape.element) ? ' | null' : ''})[]`
       case 'object':
@@ -679,7 +689,7 @@ function tsTypeForJsonShape(
           fields: shape.fields.map((field) => ({
             optional: field.optional,
             nullable: resultNullabilityAllowsNull(field.shape.nullability) && !jsonShapeIncludesNull(field.shape),
-            propertyName: propertyNameForNaming(field.name, naming),
+            propertyName: field.propertyName ?? propertyNameForNaming(field.name, naming),
             tsType: render(field.shape, `${name}${encodedTypeNameSegment(field.name)}`),
           })),
           name,
@@ -938,46 +948,52 @@ async function resolveTypedSqlWithAnalyzer(
     }))
   )
 
-  const projectionResult = projections.length
+  const analyzedByPath = new Map(configs.map((config, index) => [config.sourcePath, result.queries[index]]))
+  const missingProjections = projections.filter((config) => !analyzedByPath.has(config.sourcePath))
+  const projectionResult = missingProjections.length
     ? await buildTypedSqlPostgresIrFromCompiledConfigs(
         client,
-        projections.flatMap((config) => {
-          const base = {
-            name: config.name,
-            parameterNames: config.parameters.map((parameter) => parameter.name),
-            sourceFile: config.sourceFile,
-          }
-          return [
-            { ...base, sql: config.sql },
-            {
-              ...base,
-              sql: `select to_jsonb(projected) as value from (${stripTerminalSqlSemicolon(config.sql)}\n) projected`,
-            },
-          ]
-        })
+        missingProjections.map((config) => ({
+          name: config.name,
+          parameterNames: config.parameters.map((parameter) => parameter.name),
+          sourceFile: config.sourceFile,
+          sql: config.sql,
+        }))
       )
     : undefined
-  const projectionByPath = new Map(
-    projections.map((projection, index) => [
-      projection.sourcePath,
-      {
-        direct: projectionResult?.queries[index * 2],
-        wrapped: projectionResult?.queries[index * 2 + 1],
-      },
-    ])
-  )
+  for (const [index, projection] of missingProjections.entries())
+    analyzedByPath.set(projection.sourcePath, projectionResult?.queries[index])
   const contracts = await resolveJsonbContracts(client, generatorConfig.jsonbFunctionContracts, (path, contract) => {
-    const query = projectionByPath.get(resolve(generatorConfig.rootDir, path))
-    const inferred = query?.wrapped?.resultColumns[0]?.jsonShape
-    if (!inferred || inferred.kind !== 'object') throw new Error(`Cannot infer JSONB contract projection ${path}.`)
-    const fields = inferred.fields.map((field, index) => {
-      const column = query?.direct?.resultColumns[index]
-      const nested = column?.jsonbFunctionOid ? contract(column.jsonbFunctionOid) : undefined
-      return nested && column ? { ...field, shape: { ...nested, nullability: column.nullability } } : field
+    const query = analyzedByPath.get(resolve(generatorConfig.rootDir, path))
+    if (!query?.resultColumns.length) throw new Error(`Cannot infer JSONB contract projection ${path}.`)
+    const fields = query.resultColumns.map((column, index): TypedSqlPostgresIrJsonField => {
+      const name = column.name ?? `column_${index + 1}`
+      const nested = column.jsonbFunctionOid ? contract(column.jsonbFunctionOid) : undefined
+      const isJson = resolveTypeScriptResultTypeForPostgresType(column).type === 'PgJson'
+      const value: TypedSqlPostgresIrJsonShape = nested ??
+        column.jsonShape ?? {
+          ...column,
+          kind: 'scalar',
+          ...(!postgresJsonValueMayBeStructured(column) &&
+          resolveTypeScriptResultTypeForPostgresType(column).type !== 'PgRawValue'
+            ? { sqlScalar: true as const }
+            : {}),
+        }
+      return {
+        name,
+        propertyName: propertyNameForNaming(name, generatorConfig.naming.resultColumns),
+        shape: isJson
+          ? {
+              kind: 'document',
+              value: safeJsonCodecShape(applyOpaqueJsonBarriers(value), generatorConfig.naming.structuredJsonFields),
+              nullability: column.nullability,
+            }
+          : value,
+      }
     })
     return safeJsonCodecShape(
       applyOpaqueJsonBarriers({
-        ...inferred,
+        kind: 'object',
         fields,
         nullability: { kind: 'nonNull', basis: 'jsonb_contract_projection' },
       }),
@@ -1103,7 +1119,10 @@ async function resolveTypedSqlWithAnalyzer(
             ? 'PostgreSQL proves that one of its uses rejects NULL'
             : 'PostgreSQL could not prove that every use accepts NULL'
         throw new Error(
-          `${config.sourceFile}:${parameter.nullBinding?.line}: @nullable ${parameter.name} cannot be satisfied because ${reason}.`
+          `${config.sourceFile}:${parameter.nullBinding?.line}: @nullable ${parameter.name} cannot be satisfied because ${reason}.` +
+            (analyzed.nullAdmission === 'unknown'
+              ? ` Use @bindNull ${parameter.name} when the caller owns NULL admission for this input.`
+              : '')
         )
       }
       parameterAnalysis.push({

@@ -190,3 +190,51 @@ test('primitive JSON plans validate the source shape and retain exact numbers', 
   assert.equal(parseJson('null', stringCodec).value, null)
   assert.throws(() => parseJson('1', stringCodec))
 })
+
+test('projected JSON documents preserve their generated codec and nullable column boundary', () => {
+  const childPlan: PgJsonPlan = {
+    kind: 'object',
+    fields: [
+      { name: 'native_count', propertyName: 'nativeCount', plan: { kind: 'scalar', type: type('int4') } },
+      { name: 'precise', propertyName: 'precise', plan: { kind: 'scalar', type: type('int8') } },
+    ],
+  }
+  const codec = createJsonCodec({
+    kind: 'object',
+    fields: [
+      { name: 'details', propertyName: 'details', plan: { kind: 'document', plan: childPlan } },
+      {
+        name: 'optional',
+        propertyName: 'optional',
+        plan: { kind: 'document', plan: { kind: 'generic' }, nullable: true },
+      },
+      { name: 'explicit', propertyName: 'explicit', plan: { kind: 'document', plan: { kind: 'generic' } } },
+    ],
+  })
+  const doc = parseJson(
+    '{"details":{"precise":9007199254740993,"native_count":7},"optional":null,"explicit":null}',
+    codec
+  )
+  assert.ok(
+    doc.value &&
+      typeof doc.value === 'object' &&
+      'details' in doc.value &&
+      'optional' in doc.value &&
+      'explicit' in doc.value
+  )
+  const details = doc.value.details
+  assert.ok(isPgJson(details))
+  assert.deepEqual(details.value, { nativeCount: 7, precise: 9007199254740993n })
+  assert.equal(details.source, '{"native_count":7,"precise":9007199254740993}')
+  assert.deepEqual(parseJson(details.source, details.codec).value, details.value)
+  assert.equal(doc.value.optional, null)
+  assert.ok(isPgJson(doc.value.explicit))
+  assert.equal(doc.value.explicit.value, null)
+  const view = doc.value
+  assert.deepEqual(json(doc.value, doc.codec).value, doc.value)
+  assert.throws(() => json({ ...view, details: { ...details } }, codec), /projected JSON document/u)
+  assert.throws(() => json({ ...view, details: json({ nativeCount: 7, precise: 1 }) }, codec))
+  assert.throws(() => json({ ...view, optional: json(null) }, codec), /represents wire null as SQL NULL/u)
+  // @ts-expect-error Only a generated document plan accepts nested PgJson documents.
+  assert.throws(() => json({ details }), /cannot be nested/u)
+})

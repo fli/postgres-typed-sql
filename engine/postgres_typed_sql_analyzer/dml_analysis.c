@@ -136,17 +136,18 @@ static Bitmapset *
 prove_action_wide_admissions(const Query *query)
 {
   const RangeTblEntry *target_rte = NULL;
+  const Query *source = query;
   PtsDmlWriteEnforcement *enforcement;
   ParamCollector collector = {NULL};
   Bitmapset *proven = NULL;
   ListCell *cell;
   int param_id = -1;
 
-  if (query->commandType != CMD_UPDATE || query->resultRelation <= 0 ||
+  if ((query->commandType != CMD_UPDATE && query->commandType != CMD_INSERT) || query->resultRelation <= 0 ||
       query->resultRelation > list_length(query->rtable))
     return NULL;
   target_rte = rt_fetch(query->resultRelation, query->rtable);
-  enforcement = pts_inspect_dml_write_enforcement(query, target_rte, CMD_UPDATE);
+  enforcement = pts_inspect_dml_write_enforcement(query, target_rte, query->commandType);
   if (query->onConflict != NULL || query->mergeActionList != NIL ||
       query->querySource != QSRC_ORIGINAL ||
       !pts_dml_write_allows_action_unreachable_proof(enforcement))
@@ -155,7 +156,27 @@ prove_action_wide_admissions(const Query *query)
     return NULL;
   }
 
-  foreach(cell, query->targetList)
+  if (query->commandType == CMD_INSERT)
+  {
+    const RangeTblRef *reference;
+    const RangeTblEntry *input;
+
+    if (query->jointree == NULL || list_length(query->jointree->fromlist) != 1 ||
+        !IsA(linitial(query->jointree->fromlist), RangeTblRef))
+      goto finished;
+    reference = linitial_node(RangeTblRef, query->jointree->fromlist);
+    input = rt_fetch(reference->rtindex, query->rtable);
+    if (input->rtekind != RTE_SUBQUERY || input->subquery == NULL)
+      goto finished;
+    source = input->subquery;
+    /* Aggregation can produce a row even when the input filter rejects NULL. */
+    if (source->commandType != CMD_SELECT || source->hasAggs ||
+        source->groupClause != NIL || source->groupingSets != NIL ||
+        source->setOperations != NULL || source->hasTargetSRFs)
+      goto finished;
+  }
+
+  foreach(cell, source->targetList)
   {
     const TargetEntry *target = lfirst_node(TargetEntry, cell);
 
@@ -164,10 +185,10 @@ prove_action_wide_admissions(const Query *query)
   }
   while ((param_id = bms_next_member(collector.params, param_id)) >= 0)
   {
-    PtsNullEvaluation predicate = query->jointree == NULL ||
-                                  query->jointree->quals == NULL
+    PtsNullEvaluation predicate = source->jointree == NULL ||
+                                  source->jointree->quals == NULL
       ? pts_make_null_evaluation(PTS_NULL_PROOF_TRUE, true, false)
-      : pts_check_parameter_null_evaluation(query->jointree->quals, param_id,
+      : pts_check_parameter_null_evaluation(source->jointree->quals, param_id,
                                             NULL);
 
     if (predicate.evaluation_safe &&
@@ -176,7 +197,8 @@ prove_action_wide_admissions(const Query *query)
     {
       proven = bms_add_member(proven, param_id);
     }
-    else if (pts_dml_write_allows_old_row_preservation_proof(enforcement) &&
+    else if (query->commandType == CMD_UPDATE &&
+             pts_dml_write_allows_old_row_preservation_proof(enforcement) &&
              predicate.evaluation_safe &&
              (predicate.proof == PTS_NULL_PROOF_TRUE ||
               predicate.proof == PTS_NULL_PROOF_UNKNOWN) &&
@@ -185,6 +207,7 @@ prove_action_wide_admissions(const Query *query)
       proven = bms_add_member(proven, param_id);
     }
   }
+finished:
   bms_free(collector.params);
   pts_release_dml_write_enforcement(enforcement);
   return proven;
@@ -246,9 +269,9 @@ pts_append_dml_analysis(StringInfo out, const Query *query)
                                   query->jointree->quals == NULL
       ? pts_make_null_evaluation(PTS_NULL_PROOF_TRUE, true, false)
       : pts_check_parameter_null_evaluation(query->jointree->quals, param_id, NULL);
-    kind = predicate.evaluation_safe &&
+    kind = query->commandType == CMD_INSERT || (predicate.evaluation_safe &&
            (predicate.proof == PTS_NULL_PROOF_FALSE ||
-            predicate.proof == PTS_NULL_PROOF_NULL)
+            predicate.proof == PTS_NULL_PROOF_NULL))
       ? ADMISSION_ACTION_UNREACHABLE : ADMISSION_ROW_VALUES_PRESERVED;
     if (!first) appendStringInfoChar(out, ',');
     first = false;
