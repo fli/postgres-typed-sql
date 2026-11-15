@@ -153,6 +153,10 @@ export async function openQueryProject(
           'enginePaths' in message && Array.isArray(message.enginePaths)
             ? message.enginePaths.filter((path: unknown): path is string => typeof path === 'string')
             : []
+        const projectionPaths =
+          'projectionPaths' in message && Array.isArray(message.projectionPaths)
+            ? message.projectionPaths.filter((path: unknown): path is string => typeof path === 'string')
+            : []
         const identity = message.configIdentity
         const request = async (operation: string, sourcePath?: string, content?: string): Promise<unknown> => {
           if (closed) throw new Error('SQL analysis project is closed.')
@@ -180,8 +184,11 @@ export async function openQueryProject(
         }
         const sourceInputs: ProjectInput[] = [
           ...inputs
-            .filter(([path]) => !schemaFiles.includes(path) && !enginePaths.includes(path))
+            .filter(
+              ([path]) => !schemaFiles.includes(path) && !enginePaths.includes(path) && !projectionPaths.includes(path)
+            )
             .map(([path, sha256]) => ({ path, sha256, role: 'config' as const })),
+          ...projectionPaths.map((path) => ({ path, sha256: hashForPath(path), role: 'projection' as const })),
           ...schemaFiles.map((path) => ({
             path,
             sha256: hashForPath(path),

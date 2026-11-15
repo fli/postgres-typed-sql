@@ -11,7 +11,7 @@ import type {
 import type { SupportedExtension } from './engine.js'
 
 /** Version of the project analysis shape and its semantic guarantees. */
-export const projectAnalysisVersion = 2 as const
+export const projectAnalysisVersion = 3 as const
 
 export interface QueryDescriptor {
   readonly valueModel: PgValueModel
@@ -43,7 +43,7 @@ export interface QueryAnalysis {
 export interface ProjectInput {
   readonly path: string
   readonly sha256: string
-  readonly role: 'config' | 'schema' | 'sql' | 'engine'
+  readonly role: 'config' | 'schema' | 'sql' | 'projection' | 'engine'
 }
 
 export interface ProjectAnalysis {

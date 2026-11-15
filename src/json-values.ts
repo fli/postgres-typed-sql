@@ -244,7 +244,7 @@ function genericSource(value: unknown, ancestors = new Set<object>(), literalDoc
             if (i > 0) actions.push({ kind: 'text', text: ',' })
           }
         } else {
-          const entries = plainEntries(item)
+          const entries = plainEntries(item).filter(([, entry]) => entry !== undefined)
           output.push('{')
           actions.push({ kind: 'text', text: '}' })
           entries.reverse().forEach(([key, entry], index) => {
@@ -424,7 +424,7 @@ function encoded(plan: PgJsonPlan, value: unknown, ancestors = new Set<object>()
         return fail('Invalid or cyclic JSON object')
       ancestors.add(value)
       try {
-        const entries = new Map(plainEntries(value))
+        const entries = new Map(plainEntries(value).filter(([, entry]) => entry !== undefined))
         const output = new Map<string, string>()
         let omitted: Set<string> | undefined
         for (const field of plan.fields) {

@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import { lstat, mkdir, readFile, readdir, realpath, rename, rm, writeFile } from 'node:fs/promises'
-import { basename, dirname, join, relative } from 'node:path'
+import { basename, dirname, join, relative, resolve } from 'node:path'
 
 import { buildTypedSqlPostgresIrFromCompiledConfigs } from './analyzer-ir.js'
 import {
@@ -17,7 +17,7 @@ import {
 } from './analyzer-ir-model.js'
 import { buildCatalogTypes } from './catalog-generator.js'
 import type { PostgresTypedSqlPropertyNaming, ResolvedPostgresTypedSqlConfig } from './config.js'
-import { resolveConfig, type PostgresTypedSqlConfig } from './config.js'
+import { jsonbContractProjectionPaths, resolveConfig, type PostgresTypedSqlConfig } from './config.js'
 import type { PostgresQueryable } from './database.js'
 import { createAnalysisDatabase, type AnalysisDatabase } from './engine.js'
 import {
@@ -48,7 +48,7 @@ import { jsonPlanForShape, safeJsonCodecShape } from './json-plan.js'
 import { resolveJsonbContracts } from './jsonb-contracts.js'
 import { isJsonPlanSupported } from './json-values.js'
 import type { PgJsonPlan } from './value-types.js'
-import { compileNamedParameters, parseTypedSqlSource } from './sql-source.js'
+import { compileNamedParameters, parseTypedSqlSource, stripTerminalSqlSemicolon } from './sql-source.js'
 import type { QueryAnalysis, QueryDescriptor } from './project-facts.js'
 import type { TypedSqlResultKind } from './runtime.js'
 import {
@@ -318,6 +318,22 @@ async function readTypedSqlConfigs(generatorConfig: ResolvedPostgresTypedSqlConf
   }
 
   return configs
+}
+
+async function readProjectionConfigs(
+  config: ResolvedPostgresTypedSqlConfig,
+  existing: readonly TypedSqlConfig[],
+  contents?: ReadonlyMap<string, string>
+): Promise<TypedSqlConfig[]> {
+  return Promise.all(
+    jsonbContractProjectionPaths(config.jsonbFunctionContracts).map(async (path) => {
+      const sourcePath = resolve(config.rootDir, path)
+      const found = existing.find((entry) => entry.sourcePath === sourcePath)
+      if (found && !contents?.has(sourcePath)) return found
+      const content = contents?.get(sourcePath) ?? (await readFile(sourcePath, 'utf8'))
+      return { ...parseTypedSqlConfig({ sourcePath, content, config }), sourceSha256: sha256(content) }
+    })
+  )
 }
 
 function parseTypedSqlConfig(input: {
@@ -909,7 +925,8 @@ async function assertColumnAssertions(
 async function resolveTypedSqlWithAnalyzer(
   configs: readonly CompiledTypedSql[],
   client: AnalysisDatabase,
-  generatorConfig: ResolvedPostgresTypedSqlConfig
+  generatorConfig: ResolvedPostgresTypedSqlConfig,
+  projections: readonly CompiledTypedSql[] = []
 ): Promise<ResolvedTypedSql[]> {
   const result = await buildTypedSqlPostgresIrFromCompiledConfigs(
     client,
@@ -921,7 +938,52 @@ async function resolveTypedSqlWithAnalyzer(
     }))
   )
 
-  const contracts = await resolveJsonbContracts(client, generatorConfig.jsonbFunctionContracts)
+  const projectionResult = projections.length
+    ? await buildTypedSqlPostgresIrFromCompiledConfigs(
+        client,
+        projections.flatMap((config) => {
+          const base = {
+            name: config.name,
+            parameterNames: config.parameters.map((parameter) => parameter.name),
+            sourceFile: config.sourceFile,
+          }
+          return [
+            { ...base, sql: config.sql },
+            {
+              ...base,
+              sql: `select to_jsonb(projected) as value from (${stripTerminalSqlSemicolon(config.sql)}\n) projected`,
+            },
+          ]
+        })
+      )
+    : undefined
+  const projectionByPath = new Map(
+    projections.map((projection, index) => [
+      projection.sourcePath,
+      {
+        direct: projectionResult?.queries[index * 2],
+        wrapped: projectionResult?.queries[index * 2 + 1],
+      },
+    ])
+  )
+  const contracts = await resolveJsonbContracts(client, generatorConfig.jsonbFunctionContracts, (path, contract) => {
+    const query = projectionByPath.get(resolve(generatorConfig.rootDir, path))
+    const inferred = query?.wrapped?.resultColumns[0]?.jsonShape
+    if (!inferred || inferred.kind !== 'object') throw new Error(`Cannot infer JSONB contract projection ${path}.`)
+    const fields = inferred.fields.map((field, index) => {
+      const column = query?.direct?.resultColumns[index]
+      const nested = column?.jsonbFunctionOid ? contract(column.jsonbFunctionOid) : undefined
+      return nested && column ? { ...field, shape: { ...nested, nullability: column.nullability } } : field
+    })
+    return safeJsonCodecShape(
+      applyOpaqueJsonBarriers({
+        ...inferred,
+        fields,
+        nullability: { kind: 'nonNull', basis: 'jsonb_contract_projection' },
+      }),
+      generatorConfig.naming.structuredJsonFields
+    )
+  })
   const resolvedQueries: ResolvedTypedSql[] = []
   if (result.queries.length !== configs.length) {
     throw new Error('PostgreSQL analyzer returned an incomplete statement result.')
@@ -1423,6 +1485,10 @@ export async function generateTypedSql(
     const inputs: TypedSqlAnalysisInput[] = []
     const rawConfigs = await readTypedSqlConfigs(resolvedConfig)
     const configs = rawConfigs.map((config) => compileTypedSql(config, resolvedConfig.naming.parameterProperties))
+    const projectionConfigs = await readProjectionConfigs(resolvedConfig, rawConfigs)
+    const projections = projectionConfigs.map((config) =>
+      compileTypedSql(config, resolvedConfig.naming.parameterProperties)
+    )
     database = await createAnalysisDatabase({
       extensions,
       schemaFiles: resolvedConfig.schemaFiles,
@@ -1437,7 +1503,7 @@ export async function generateTypedSql(
         : {}),
     })
     const catalogContents = await buildCatalogTypes(database, resolvedConfig)
-    const resolvedConfigs = await resolveTypedSqlWithAnalyzer(configs, database, resolvedConfig)
+    const resolvedConfigs = await resolveTypedSqlWithAnalyzer(configs, database, resolvedConfig, projections)
 
     const staleFiles = await findStaleGeneratedFiles(resolvedConfigs, resolvedConfig)
     const outputs = [
@@ -1450,7 +1516,13 @@ export async function generateTypedSql(
     let analysis: TypedSqlGenerationAnalysis | undefined
     if (collectAnalysis) {
       inputs.push(
-        ...rawConfigs.map((entry) => ({ path: entry.sourcePath, role: 'sql' as const, sha256: entry.sourceSha256 }))
+        ...rawConfigs
+          .concat(
+            projectionConfigs.filter(
+              (projection) => !rawConfigs.some((entry) => entry.sourcePath === projection.sourcePath)
+            )
+          )
+          .map((entry) => ({ path: entry.sourcePath, role: 'sql' as const, sha256: entry.sourceSha256 }))
       )
       const inputIdentities = new Set(await Promise.all(inputs.map((entry) => filesystemPathIdentity(entry.path))))
       for (const path of [...outputs.map((entry) => entry.outputPath), ...staleFiles]) {
@@ -1512,11 +1584,16 @@ export async function analyzeTypedSqlSource(input: {
   readonly sourcePath: string
   readonly content: string
   readonly database: AnalysisDatabase
+  readonly projectionContents?: ReadonlyMap<string, string>
   readonly config: ResolvedPostgresTypedSqlConfig
 }): Promise<QueryAnalysis> {
   const parsed = parseTypedSqlConfig(input)
   const compiled = compileTypedSql(parsed, input.config.naming.parameterProperties)
-  const [statement] = await resolveTypedSqlWithAnalyzer([compiled], input.database, input.config)
+  const projectionConfigs = await readProjectionConfigs(input.config, [parsed], input.projectionContents)
+  const projections = projectionConfigs.map((config) =>
+    compileTypedSql(config, input.config.naming.parameterProperties)
+  )
+  const [statement] = await resolveTypedSqlWithAnalyzer([compiled], input.database, input.config, projections)
   if (!statement) throw new Error('PostgreSQL analyzer returned no statement.')
   return {
     source: input.sourcePath,

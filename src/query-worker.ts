@@ -5,7 +5,7 @@ import { dirname, isAbsolute, relative, resolve, sep } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { MessageChannel, type MessagePort } from 'node:worker_threads'
 
-import { resolveConfig, type PostgresTypedSqlConfig } from './config.js'
+import { jsonbContractProjectionPaths, resolveConfig, type PostgresTypedSqlConfig } from './config.js'
 import { trackConfigImports } from './config-loader-sync.js'
 import { createAnalysisDatabase, type AnalysisDatabase } from './engine.js'
 import { analyzeTypedSqlSource, findTypedSqlFiles } from './generator.js'
@@ -91,6 +91,13 @@ async function main(): Promise<void> {
   syncHooks?.seal()
   for (const [path] of dependencies) watched.add(path)
   for (const path of config.schemaFiles) watched.add(path)
+  const projectionPaths = jsonbContractProjectionPaths(config.jsonbFunctionContracts).map((path) =>
+    resolve(config.rootDir, path)
+  )
+  for (const path of projectionPaths) watched.add(path)
+  const projectionContents = new Map(
+    await Promise.all(projectionPaths.map(async (path) => [path, await readFile(path, 'utf8')] as const))
+  )
   const schemas = await Promise.all(
     config.schemaFiles.map(async (path) => [path, await readFile(path, 'utf8')] as const)
   )
@@ -107,6 +114,8 @@ async function main(): Promise<void> {
     throw new Error(`SQL configuration source was not observed. Restart without preloading this module: ${path}`)
   }
   for (const [path, content] of schemas) inputs.push([path, createHash('sha256').update(content).digest('hex')])
+  for (const [path, content] of projectionContents)
+    inputs.push([path, createHash('sha256').update(content).digest('hex')])
   inputs.sort(([left], [right]) => left.localeCompare(right))
   const enginePaths = await engineInputFiles(fileURLToPath(new URL('./vendor/', import.meta.url)))
   for (const path of enginePaths) {
@@ -160,7 +169,9 @@ async function main(): Promise<void> {
               const statements = []
               for (const sourcePath of paths) {
                 const content = await readFile(sourcePath, 'utf8')
-                statements.push(await analyzeTypedSqlSource({ sourcePath, content, database, config }))
+                statements.push(
+                  await analyzeTypedSqlSource({ sourcePath, content, database, config, projectionContents })
+                )
               }
               if (JSON.stringify(paths) !== JSON.stringify(await inventory()))
                 throw new Error('SQL inventory changed during analysis.')
@@ -179,7 +190,7 @@ async function main(): Promise<void> {
                 statements,
               }
             } else {
-              result = await analyzeTypedSqlSource({ ...message, database, config })
+              result = await analyzeTypedSqlSource({ ...message, database, config, projectionContents })
             }
           }
           syncHooks?.assertNoLateImports()
@@ -205,6 +216,7 @@ async function main(): Promise<void> {
     include: config.include,
     inputs,
     schemaFiles: config.schemaFiles,
+    projectionPaths,
     enginePaths,
   })
 }

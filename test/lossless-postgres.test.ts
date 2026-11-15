@@ -10,8 +10,8 @@ import ts from 'typescript'
 
 import { nodePostgres, type NodePostgresTypedSqlQueryConfig } from '../src/adapters/node-postgres.js'
 import { createTypedSqlStatement, executeTypedSql, PgExecutionError, type TypedSqlStatement } from '../src/runtime.js'
-import { parseJson, json, formatDecimal } from '../src/values.js'
-import type { PgArray, PgDate, PgDecimal, PgJson, PgRawValue, PgTimestampTz } from '../src/values.js'
+import { parseJson, json, jsonNumber, formatDecimal } from '../src/values.js'
+import type { PgArray, PgDate, PgDecimal, PgJson, PgJsonInput, PgRawValue, PgTimestampTz } from '../src/values.js'
 import { createMinimalFixture, generateFixture } from './generator-test-support.js'
 
 const connectionString = process.env.POSTGRES_TYPED_SQL_TEST_URL
@@ -152,6 +152,75 @@ test(
     }
   }
 )
+
+test('JSONB parameters omit undefined properties in a real typed query', { skip: !connectionString }, async () => {
+  const client = new Client({ connectionString, options })
+  await client.connect()
+  try {
+    const jsonb = {
+      pgType: 'jsonb',
+      pgTypeName: 'jsonb',
+      pgTypeKind: 'base',
+      pgTypeOid: 3802,
+      pgTypeSchema: 'pg_catalog',
+    } as const
+    const statement = createTypedSqlStatement<{ payload: PgJsonInput }, { payload: PgJson }, 'read', 'one'>({
+      valueModel: 'postgres-lossless-v1',
+      name: 'json_input',
+      text: 'select $1::jsonb as payload',
+      command: 'select',
+      resultKind: 'one',
+      rowBounds: { min: 1, max: 1, proof: 'constant' },
+      parameterNames: ['payload'],
+      parameters: [
+        {
+          name: 'payload',
+          propertyName: 'payload',
+          nullable: false,
+          type: jsonb,
+          pgType: 'jsonb',
+          pgTypeName: 'jsonb',
+          pgTypeSchema: 'pg_catalog',
+        },
+      ],
+      columns: [
+        {
+          name: 'payload',
+          propertyName: 'payload',
+          nullable: false,
+          type: jsonb,
+          pgType: 'jsonb',
+          pgTypeName: 'jsonb',
+          pgTypeSchema: 'pg_catalog',
+          expressionSource: { kind: 'expression', tag: 'Param' },
+        },
+      ],
+    })
+    const calls: NodePostgresTypedSqlQueryConfig[] = []
+    const executor = nodePostgres({
+      client: {
+        query(config) {
+          calls.push(config)
+          return client.query(config)
+        },
+      },
+    })
+    const row = await executeTypedSql(executor, statement, {
+      payload: {
+        omitted: undefined,
+        nested: { omitted: undefined, explicit: null, exact: jsonNumber('1.2300') },
+        big: 9007199254740993n,
+      },
+    })
+    assert.equal(calls.length, 1)
+    assert.deepEqual(row.payload.value, {
+      big: jsonNumber('9007199254740993'),
+      nested: { explicit: null, exact: jsonNumber('1.2300') },
+    })
+  } finally {
+    await client.end()
+  }
+})
 
 test(
   'node-postgres pool execution keeps transaction policy outside the adapter',

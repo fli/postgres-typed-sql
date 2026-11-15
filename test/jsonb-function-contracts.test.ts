@@ -10,6 +10,7 @@ import ts from 'typescript'
 
 import type { PostgresTypedSqlConfig } from '../src/config.js'
 import { openQueryProject } from '../src/project.js'
+import { generateTypedSql } from '../src/generator.js'
 import type { PostgresExecutor } from '../src/runtime.js'
 import type { PgFiniteDecimal, PgJson, PgJsonValue } from '../src/values.js'
 import { createMinimalFixture, generateFixture } from './generator-test-support.js'
@@ -304,4 +305,166 @@ test('generation rejects missing, incompatible, and duplicate function signature
     generateFixture(root, { jsonbFunctionContracts: [candidate, candidate] }),
     /Duplicate JSONB function contract: public\.candidate\(\)/u
   )
+})
+
+test('contract projections infer nested fields and track external SQL inputs', async (t) => {
+  const projectionSchema = `create function public.projection_contract(bad boolean) returns jsonb language sql as $$
+    select case when bad then '{"kind":"ready","item":{"item_id":"wrong"}}'::jsonb
+      else '{"kind":"ready","item":{"item_id":7}}'::jsonb end $$;`
+  const root = await createMinimalFixture(
+    projectionSchema,
+    'select public.projection_contract(:bad::boolean) as result'
+  )
+  t.after(() => rm(root, { recursive: true, force: true }))
+  await mkdir(join(root, 'projections'))
+  const projection = join(root, 'projections/item.typed.sql')
+  await writeFile(projection, 'select 7::int4 as item_id; -- trailing comment')
+  const projectedContract = {
+    schema: 'public',
+    name: 'projection_contract',
+    argumentTypes: ['bool'],
+    variants: { unavailable: {}, ready: { item: { projection: 'projections/item.typed.sql' } } },
+  } as const
+  const options = {
+    rootDir: root,
+    schema: 'schema.sql',
+    include: ['queries'],
+    naming: { structuredJsonFields: 'camelCase' },
+    jsonbFunctionContracts: [projectedContract],
+  } as const
+  const result = await generateTypedSql(options, { analysis: true })
+  assert.ok(result.analysis.inputs.some((input) => input.path === projection))
+  const generated = await readFile(join(root, 'queries/query.typed-sql.ts'), 'utf8')
+  assert.match(generated, /itemId/)
+  assert.match(generated, /item_id/)
+  await writeFile(
+    join(root, 'postgres-typed-sql.config.mjs'),
+    `export default ${JSON.stringify({ ...options, rootDir: '.' })}`
+  )
+  let changedModule = ''
+  const project = await openQueryProject(join(root, 'postgres-typed-sql.config.mjs'))
+  try {
+    const snapshot = await project.analyzeProject()
+    assert.ok(snapshot.inputs.some((input) => input.path === projection && input.role === 'projection'))
+    const before = await project.compile(
+      join(root, 'queries/query.typed.sql'),
+      'select public.projection_contract(:bad::boolean) as result'
+    )
+    await writeFile(projection, 'select true as item_id -- trailing comment')
+    await assert.rejects(
+      project.compile(
+        join(root, 'queries/query.typed.sql'),
+        'select public.projection_contract(:bad::boolean) as result'
+      )
+    )
+    await project.close()
+    const reopened = await openQueryProject(join(root, 'postgres-typed-sql.config.mjs'))
+    try {
+      const after = await reopened.compile(
+        join(root, 'queries/query.typed.sql'),
+        'select public.projection_contract(:bad::boolean) as result'
+      )
+      assert.notEqual(after, before)
+      assert.match(after, /itemId: boolean/)
+      assert.match(after, /"pgTypeName":"bool"/)
+      changedModule = after
+    } finally {
+      await reopened.close()
+    }
+  } finally {
+    await project.close()
+  }
+  if (!connectionString) return
+  await mkdir(join(root, 'node_modules'))
+  await symlink(packageRoot, join(root, 'node_modules/postgres-typed-sql'), 'dir')
+  const adapter: typeof import('../src/adapters/node-postgres.js') = await import(
+    new URL('../../dist/adapters/node-postgres.js', import.meta.url).href
+  )
+  const { default: run } = await importQuery<{
+    default: (
+      db: PostgresExecutor,
+      params: { bad: boolean }
+    ) => Promise<{ result: PgJson<{ kind: string; item?: { itemId: number } }> | null }>
+  }>(root, 'query')
+  const client = new Client({
+    connectionString,
+    options:
+      '-c extra_float_digits=3 -c TimeZone=UTC -c DateStyle=ISO,YMD -c IntervalStyle=postgres -c bytea_output=hex',
+  })
+  await client.connect()
+  try {
+    await client.query(projectionSchema)
+    const db = adapter.nodePostgres({ client })
+    assert.deepEqual((await run(db, { bad: false })).result?.value, { kind: 'ready', item: { itemId: 7 } })
+    await assert.rejects(run(db, { bad: true }), { name: 'PgExecutionError', phase: 'decode' })
+    const changedPath = join(root, 'changed.mjs')
+    await writeFile(
+      changedPath,
+      ts.transpileModule(changedModule, { compilerOptions: { module: ts.ModuleKind.ESNext } }).outputText
+    )
+    const changed = (await import(pathToFileURL(changedPath).href)) as { default: typeof run }
+    await assert.rejects(changed.default(db, { bad: false }), { name: 'PgExecutionError', phase: 'decode' })
+  } finally {
+    await client.query('drop function if exists public.projection_contract(boolean)')
+    await client.end()
+  }
+})
+
+test('projection preserves a directly called function contract', async (t) => {
+  const root = await createMinimalFixture(
+    `
+    create function public.outer_contract() returns jsonb language sql as $$ select '{"kind":"yes","item":{"nested":null}}'::jsonb $$;
+    create function public.inner_contract() returns jsonb language sql as $$ select '{}'::jsonb $$;
+  `,
+    'select public.outer_contract() as result'
+  )
+  t.after(() => rm(root, { recursive: true, force: true }))
+  await mkdir(join(root, 'projections'))
+  await writeFile(join(root, 'projections/item.typed.sql'), 'select public.inner_contract() as nested')
+  await generateFixture(root, {
+    jsonbFunctionContracts: [
+      {
+        schema: 'public',
+        name: 'outer_contract',
+        argumentTypes: [],
+        variants: { yes: { item: { projection: 'projections/item.typed.sql' } }, no: {} },
+      },
+      {
+        schema: 'public',
+        name: 'inner_contract',
+        argumentTypes: [],
+        variants: { found: { count: 'int4' }, missing: {} },
+      },
+    ],
+  })
+  const generated = await readFile(join(root, 'queries/query.typed-sql.ts'), 'utf8')
+  assert.match(generated, /"found"/)
+  assert.match(generated, /count: number/)
+  assert.match(generated, /nested: .* \| null/)
+  if (!connectionString) return
+  await mkdir(join(root, 'node_modules'))
+  await symlink(packageRoot, join(root, 'node_modules/postgres-typed-sql'), 'dir')
+  const adapter: typeof import('../src/adapters/node-postgres.js') = await import(
+    new URL('../../dist/adapters/node-postgres.js', import.meta.url).href
+  )
+  const { default: run } = await importQuery<{ default: (db: PostgresExecutor) => Promise<{ result: PgJson | null }> }>(
+    root,
+    'query'
+  )
+  const client = new Client({
+    connectionString,
+    options:
+      '-c extra_float_digits=3 -c TimeZone=UTC -c DateStyle=ISO,YMD -c IntervalStyle=postgres -c bytea_output=hex',
+  })
+  await client.connect()
+  try {
+    await client.query(await readFile(join(root, 'schema.sql'), 'utf8'))
+    assert.deepEqual((await run(adapter.nodePostgres({ client }))).result?.value, {
+      kind: 'yes',
+      item: { nested: null },
+    })
+  } finally {
+    await client.query('drop function if exists public.outer_contract(), public.inner_contract()')
+    await client.end()
+  }
 })

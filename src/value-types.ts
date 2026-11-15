@@ -109,7 +109,7 @@ export type PgJsonInput =
   | bigint
   | PgFiniteDecimal
   | readonly PgJsonInput[]
-  | { readonly [key: string]: PgJsonInput }
+  | { readonly [key: string]: PgJsonInput | undefined }
 export type JsonDecoded<T> = PgJsonInput extends T
   ? PgJsonValue
   : T extends number | bigint | PgFiniteDecimal
@@ -117,7 +117,15 @@ export type JsonDecoded<T> = PgJsonInput extends T
     : T extends readonly unknown[]
       ? { readonly [Key in keyof T]: JsonDecoded<T[Key]> }
       : T extends object
-        ? { readonly [Key in keyof T]: JsonDecoded<T[Key]> }
+        ? {
+            readonly [Key in keyof T as undefined extends T[Key] ? never : Key]: JsonDecoded<T[Key]>
+          } & {
+            readonly [Key in keyof T as undefined extends T[Key]
+              ? Exclude<T[Key], undefined> extends never
+                ? never
+                : Key
+              : never]?: JsonDecoded<Exclude<T[Key], undefined>>
+          }
         : T
 
 declare const jsonCodecType: unique symbol
