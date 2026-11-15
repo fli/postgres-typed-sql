@@ -57,6 +57,19 @@ function contractShape(
   contract: JsonbFunctionContract,
   projection: (path: string) => TypedSqlPostgresIrJsonShape
 ): TypedSqlPostgresIrJsonShape {
+  if (contract.returns !== undefined) {
+    const result = shape(contract.returns, projection)
+    return contract.allowJsonNull || result.nullability.kind !== 'nonNull'
+      ? {
+          kind: 'union',
+          alternatives: [
+            { ...result, nullability: nonNull },
+            { kind: 'null', nullability: nonNull },
+          ],
+          nullability: nonNull,
+        }
+      : result
+  }
   const alternatives: TypedSqlPostgresIrJsonShape[] = Object.entries(contract.variants).map(([variant, fields]) => ({
     kind: 'object',
     nullability: nonNull,
@@ -85,7 +98,7 @@ export async function resolveJsonbContracts(
     const rows = await client.query<{ oid: number; valid: boolean }>(
       `
       SELECT p.oid::int AS oid,
-        (p.prokind = 'f' AND NOT p.proretset AND p.prorettype = 'pg_catalog.jsonb'::regtype) AS valid
+        (p.prokind = 'f' AND p.prorettype = 'pg_catalog.jsonb'::regtype) AS valid
       FROM pg_catalog.pg_proc p
       JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
       WHERE n.nspname::text = $1 AND p.proname::text = $2
@@ -102,7 +115,7 @@ export async function resolveJsonbContracts(
     const signature = `${contract.schema}.${contract.name}(${args.map((arg) => `${arg.schema}.${arg.name}`).join(', ')})`
     const row = rows.rows[0]
     if (!row || rows.rows.length !== 1) throw new Error(`JSONB function contract overload not found: ${signature}.`)
-    if (!row.valid) throw new Error(`JSONB function contract requires a scalar function returning jsonb: ${signature}.`)
+    if (!row.valid) throw new Error(`JSONB function contract requires a function returning jsonb: ${signature}.`)
     if (definitions.has(row.oid)) throw new Error(`Duplicate JSONB function contract: ${signature}.`)
     definitions.set(row.oid, contract)
   }

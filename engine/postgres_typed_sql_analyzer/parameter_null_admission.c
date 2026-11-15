@@ -3,6 +3,7 @@
 #include "nodes/nodeFuncs.h"
 #include "nodes/parsenodes.h"
 #include "nodes/primnodes.h"
+#include "parser/parsetree.h"
 #include "utils/hsearch.h"
 #include "utils/lsyscache.h"
 
@@ -17,7 +18,11 @@ typedef struct PtsParameterUsageContext
   PtsParameterUsageEvidence evidence;
   PtsNullAdmissionAnalysis *null_admission_analysis;
   PtsParameterNodeAnalysis *node_analysis;
+  const PtsQueryScope *scope;
 } PtsParameterUsageContext;
+
+static bool mentions_indirect_parameter(Node *node,
+                                       PtsParameterUsageContext *context);
 
 static void
 mark_parameter_usage(PtsParameterUsageContext *context,
@@ -56,6 +61,12 @@ mark_required_nonnull_parameter_usage(PtsParameterUsageContext *context,
 {
     PtsNullEvaluation evaluation;
 
+  if (mentions_indirect_parameter((Node *) expr, context))
+  {
+    mark_parameter_usage(context, PTS_NULL_UNKNOWN);
+    return;
+  }
+
   if (!pts_node_mentions_external_parameter(expr, context->param_id, context->node_analysis))
   {
     return;
@@ -72,6 +83,144 @@ mark_required_nonnull_parameter_usage(PtsParameterUsageContext *context,
   {
     mark_parameter_usage(context, PTS_NULL_UNKNOWN);
   }
+}
+
+typedef struct IndirectParameterContext
+{
+  PtsParameterUsageContext *usage;
+  const PtsQueryScope *scope;
+  int depth;
+} IndirectParameterContext;
+
+static bool
+indirect_parameter_walker(Node *node, void *opaque)
+{
+  IndirectParameterContext *context = opaque;
+
+  if (node == NULL)
+    return false;
+  if (context->depth > 32)
+    return true;
+  if (IsA(node, Param))
+  {
+    const Param *param = (const Param *) node;
+    return context->depth > 0 && param->paramkind == PARAM_EXTERN &&
+           param->paramid == context->usage->param_id;
+  }
+  if (IsA(node, Query))
+  {
+    const Query *query = (const Query *) node;
+    PtsQueryScope child = {query, context->scope};
+    IndirectParameterContext nested = {context->usage, &child,
+                                      context->depth + 1};
+    return query_tree_walker((Query *) query, indirect_parameter_walker,
+                             &nested, QTW_IGNORE_CTE_SUBQUERIES);
+  }
+  if (IsA(node, Var))
+  {
+    const Var *var = (const Var *) node;
+    const PtsQueryScope *scope = pts_query_scope_at_level(context->scope,
+                                                          var->varlevelsup);
+    const RangeTblEntry *rte;
+    const Query *source = NULL;
+    const PtsQueryScope *owner = scope;
+    PtsQueryScope child;
+    IndirectParameterContext nested;
+
+    if (scope == NULL || var->varno == 0 || var->varattno < 0 ||
+        var->varno > list_length(scope->query->rtable))
+      return false;
+    rte = rt_fetch(var->varno, scope->query->rtable);
+    if (var->varattno == 0)
+    {
+      int attno;
+      for (attno = 1; attno <= list_length(rte->eref->colnames); attno++)
+      {
+        Var field = *var;
+        field.varattno = attno;
+        if (indirect_parameter_walker((Node *) &field, context))
+          return true;
+      }
+      return false;
+    }
+    if (rte->rtekind == RTE_CTE && rte->self_reference)
+      return true;
+    if (rte->rtekind == RTE_JOIN || rte->rtekind == RTE_GROUP)
+    {
+      const List *expressions = rte->rtekind == RTE_JOIN
+                                  ? rte->joinaliasvars : rte->groupexprs;
+      if (var->varattno <= list_length(expressions))
+      {
+        nested.usage = context->usage;
+        nested.scope = scope;
+        nested.depth = context->depth + 1;
+        return indirect_parameter_walker(
+          (Node *) list_nth(expressions, var->varattno - 1), &nested);
+      }
+      return false;
+    }
+    if (rte->rtekind == RTE_VALUES)
+    {
+      ListCell *cell;
+      nested.usage = context->usage;
+      nested.scope = scope;
+      nested.depth = context->depth + 1;
+      foreach(cell, rte->values_lists)
+      {
+        const List *row = (const List *) lfirst(cell);
+        if (var->varattno <= list_length(row) &&
+            indirect_parameter_walker(
+              (Node *) list_nth(row, var->varattno - 1), &nested))
+          return true;
+      }
+      return false;
+    }
+    if (rte->rtekind == RTE_SUBQUERY)
+      source = rte->subquery;
+    else if (rte->rtekind == RTE_CTE && !rte->self_reference)
+    {
+      const CommonTableExpr *cte;
+      owner = pts_query_scope_at_level(scope, rte->ctelevelsup);
+      cte = owner == NULL ? NULL : pts_cte_by_name(owner->query, rte->ctename);
+      if (cte != NULL && IsA(cte->ctequery, Query))
+        source = (const Query *) cte->ctequery;
+    }
+    if (source == NULL)
+      return false;
+    child.query = source;
+    child.parent = owner;
+    nested.usage = context->usage;
+    nested.scope = &child;
+    nested.depth = context->depth + 1;
+    return query_tree_walker((Query *) source, indirect_parameter_walker,
+                             &nested, QTW_IGNORE_CTE_SUBQUERIES);
+  }
+  return expression_tree_walker(node, indirect_parameter_walker, opaque);
+}
+
+static bool
+mentions_indirect_parameter(Node *node, PtsParameterUsageContext *context)
+{
+  IndirectParameterContext indirect = {context, context->scope, 0};
+  return node != NULL && indirect_parameter_walker(node, &indirect);
+}
+
+static bool
+indirect_callable_walker(Node *node, void *opaque)
+{
+  PtsParameterUsageContext *context = opaque;
+  IndirectParameterContext indirect = {context, context->scope, 0};
+
+  if (node == NULL || IsA(node, Query))
+    return false;
+  if (nodeTag(node) >= T_Aggref && nodeTag(node) <= T_ReturningExpr &&
+      !IsA(node, NamedArgExpr) && !IsA(node, FieldSelect) &&
+      !IsA(node, RelabelType) && !IsA(node, CollateExpr) &&
+      !IsA(node, ArrayExpr) && !IsA(node, RowExpr) &&
+      !IsA(node, NullTest) && !IsA(node, BooleanTest) &&
+      indirect_parameter_walker(node, &indirect))
+    mark_parameter_usage(context, PTS_NULL_UNKNOWN);
+  return expression_tree_walker(node, indirect_callable_walker, opaque);
 }
 
 static bool
@@ -337,6 +486,10 @@ parameter_usage_null_admission_query(const PtsQueryScope *scope,
   PtsParameterUsageContext *context =
     (PtsParameterUsageContext *) walker_context;
 
+  context->scope = scope;
+  query_tree_walker((Query *) scope->query, indirect_callable_walker,
+                    walker_context, QTW_EXAMINE_SORTGROUP | QTW_IGNORE_CTE_SUBQUERIES);
+
   /* PostgreSQL's query_tree_walker deliberately does not visit utilityStmt. */
   if (scope->query->utilityStmt != NULL)
   {
@@ -364,7 +517,8 @@ pts_update_parameter_usage_null_admissions(const Query *query,
       index + 1,
       {false, PTS_NULL_UNKNOWN},
       null_admission_analysis,
-      node_analysis
+      node_analysis,
+      NULL
     };
 
     pts_execution_reachable_query_walker(

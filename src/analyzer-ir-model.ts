@@ -97,6 +97,11 @@ export type TypedSqlPostgresIrCheckConstraintTypeExpression =
 
 export type TypedSqlPostgresIrJsonShape =
   | {
+      readonly kind: 'document'
+      readonly value: TypedSqlPostgresIrJsonShape
+      readonly nullability: TypedSqlPostgresIrResultNullability
+    }
+  | {
       readonly kind: 'array'
       readonly element: TypedSqlPostgresIrJsonShape
       /** Exact positions when constructed from a complete static argument list. */
@@ -149,12 +154,14 @@ export type TypedSqlPostgresIrJsonShape =
   | (PostgresTypeFact & {
       readonly checkConstraintType?: TypedSqlPostgresIrCheckConstraintTypeExpression
       readonly kind: 'scalar'
+      readonly sqlScalar?: true
       readonly nullability: TypedSqlPostgresIrResultNullability
     })
 
 export interface TypedSqlPostgresIrJsonField {
   readonly optional?: boolean
   readonly name: string
+  readonly propertyName?: string
   readonly shape: TypedSqlPostgresIrJsonShape
 }
 
@@ -246,6 +253,8 @@ export function flattenJsonShapeAlternatives(
 
 function jsonShapeKey(shape: TypedSqlPostgresIrJsonShape): string {
   switch (shape.kind) {
+    case 'document':
+      return keyPart(JSON.stringify([shape.kind, shape.nullability.kind])) + keyPart(jsonShapeKey(shape.value))
     case 'array':
       return (
         keyPart(JSON.stringify([shape.kind, shape.nullability.kind])) +
@@ -257,7 +266,7 @@ function jsonShapeKey(shape: TypedSqlPostgresIrJsonShape): string {
         keyPart(JSON.stringify([shape.kind, shape.nullability.kind])) +
         keyList(
           shape.fields
-            .map((field) => [field.name, jsonShapeKey(field.shape)] as const)
+            .map((field) => [field.name, keyPart(field.propertyName ?? '') + jsonShapeKey(field.shape)] as const)
             .toSorted(([left], [right]) => left.localeCompare(right))
             .map(([name, key]) => keyPart(name) + keyPart(key))
         )
@@ -281,6 +290,7 @@ function jsonShapeKey(shape: TypedSqlPostgresIrJsonShape): string {
       })
     case 'scalar':
       return JSON.stringify({
+        sqlScalar: shape.sqlScalar,
         checkConstraintType: shape.checkConstraintType ? checkConstraintTypeKey(shape.checkConstraintType) : undefined,
         kind: shape.kind,
         nullability: shape.nullability.kind,

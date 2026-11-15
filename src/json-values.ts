@@ -10,7 +10,7 @@ import {
 } from './scalar-values.js'
 import type {
   JsonDecoded,
-  JsonReadonly,
+  JsonCodecInput,
   PgFiniteDecimal,
   PgJson,
   PgJsonCodec,
@@ -28,6 +28,7 @@ type GenericValue =
 
 const codecs = new WeakMap<object, PgJsonPlan>()
 const documents = new WeakSet<object>()
+const byteCodecs = new WeakSet<object>()
 const genericPlan: PgJsonPlan = Object.freeze({ kind: 'generic' })
 
 function fail(message: string): never {
@@ -304,6 +305,7 @@ function scalarSource(type: PostgresTypeFact, value: GenericValue): string {
 
 function freezeValue(value: unknown): unknown {
   if (value === null || typeof value !== 'object') return value
+  if (value instanceof Uint8Array) return value
   if (isPgDecimal(value)) return value
   if (Array.isArray(value)) return Object.freeze(value.map(freezeValue))
   const result: Record<string, unknown> = {}
@@ -316,8 +318,12 @@ function decoded(plan: PgJsonPlan, value: GenericValue): unknown {
   switch (plan.kind) {
     case 'generic':
       return value
+    case 'document': {
+      const contents = decoded(plan.plan, value)
+      return jsonDocument(encoded(plan.plan, contents), contents, cachedJsonCodec(plan.plan))
+    }
     case 'string':
-      if (typeof value === 'string') return value
+      if (typeof value === 'string' && (!plan.values || plan.values.includes(value))) return value
       return fail('Expected JSON string')
     case 'number':
       if (isDecimalAtom(value)) return value
@@ -381,8 +387,13 @@ function encoded(plan: PgJsonPlan, value: unknown, ancestors = new Set<object>()
   switch (plan.kind) {
     case 'generic':
       return genericSource(value, ancestors, true)
+    case 'document':
+      if (!isPgJson(value)) return fail('Expected a projected JSON document')
+      if (plan.nullable && value.value === null)
+        return fail('A nullable projected JSON column represents wire null as SQL NULL')
+      return encoded(plan.plan, value.value, ancestors)
     case 'string':
-      if (typeof value === 'string') return JSON.stringify(value)
+      if (typeof value === 'string' && (!plan.values || plan.values.includes(value))) return JSON.stringify(value)
       return fail('Expected JSON string')
     case 'number':
       if (isDecimalAtom(value)) return formatDecimal(value)
@@ -457,6 +468,9 @@ function domain(plan: PgJsonPlan): Set<string> {
     case 'generic':
       result = new Set(['null', 'boolean', 'string', 'number', 'array', 'object'])
       break
+    case 'document':
+      result = domain(plan.plan)
+      break
     case 'null':
       result = new Set(['null'])
       break
@@ -516,10 +530,17 @@ function disjoint(a: PgJsonPlan, b: PgJsonPlan): boolean {
 
 function checkedPlan(plan: PgJsonPlan): PgJsonPlan {
   switch (plan.kind) {
+    case 'document':
+      return Object.freeze({ kind: 'document', plan: checkedPlan(plan.plan), nullable: plan.nullable })
     case 'generic':
     case 'null':
       return Object.freeze({ kind: plan.kind })
     case 'string':
+      return Object.freeze({
+        kind: 'string',
+        ...(plan.values ? { values: Object.freeze([...plan.values]) } : {}),
+        nullable: plan.nullable,
+      })
     case 'number':
       return Object.freeze({ kind: plan.kind, nullable: plan.nullable })
     case 'literal':
@@ -575,7 +596,36 @@ function checkedPlan(plan: PgJsonPlan): PgJsonPlan {
 
 export function createJsonCodec(plan: PgJsonPlan): PgJsonCodec<unknown> {
   const codec = Object.freeze({ valueModel: 'postgres-lossless-v1' }) as PgJsonCodec<unknown>
-  codecs.set(codec, checkedPlan(plan))
+  const checked = checkedPlan(plan)
+  codecs.set(codec, checked)
+  if (hasBytea(checked)) byteCodecs.add(codec)
+  return codec
+}
+
+function hasBytea(plan: PgJsonPlan): boolean {
+  switch (plan.kind) {
+    case 'scalar':
+      return scalarName(plan.type) === 'bytea'
+    case 'document':
+      return hasBytea(plan.plan)
+    case 'object':
+      return plan.fields.some((field) => hasBytea(field.plan))
+    case 'array':
+      return hasBytea(plan.element)
+    case 'union':
+      return plan.alternatives.some(hasBytea)
+    default:
+      return false
+  }
+}
+
+const generatedCodecs = new WeakMap<PgJsonPlan, PgJsonCodec<unknown>>()
+
+export function cachedJsonCodec(plan: PgJsonPlan): PgJsonCodec<unknown> {
+  const cached = generatedCodecs.get(plan)
+  if (cached) return cached
+  const codec = createJsonCodec(plan)
+  if (Object.isFrozen(plan)) generatedCodecs.set(plan, codec)
   return codec
 }
 
@@ -600,13 +650,27 @@ export function parseJson<T>(source: string, codec: PgJsonCodec<T>): PgJson<T>
 export function parseJson(source: string, codec: PgJsonCodec<unknown> = genericCodec): unknown {
   if (typeof source !== 'string') return fail('JSON source must be a string')
   const value = decoded(codecPlan(codec), parseGeneric(source))
-  const document = Object.freeze({ kind: 'json', source, value, codec }) as PgJson<unknown>
+  return jsonDocument(source, value, codec)
+}
+
+function jsonDocument(source: string, value: unknown, codec: PgJsonCodec<unknown>): PgJson<unknown> {
+  const initial = byteCodecs.has(codec) ? encoded(codecPlan(codec), value) : undefined
+  const document = Object.freeze({
+    kind: 'json',
+    get source() {
+      if (initial === undefined) return source
+      const current = encoded(codecPlan(codec), value)
+      return current === initial ? source : current
+    },
+    value,
+    codec,
+  }) as PgJson<unknown>
   documents.add(document)
   return document
 }
 
 export function json<const T extends PgJsonInput>(value: T): PgJson<JsonDecoded<T>>
-export function json<T>(value: NoInfer<JsonReadonly<T>>, codec: PgJsonCodec<T>): PgJson<T>
+export function json<T>(value: NoInfer<JsonCodecInput<T>>, codec: PgJsonCodec<T>): PgJson<T>
 export function json(value: unknown, codec: PgJsonCodec<unknown> = genericCodec): unknown {
   return parseJson(encoded(codecPlan(codec), value), codec)
 }

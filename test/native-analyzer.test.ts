@@ -54,6 +54,8 @@ interface NativeRte {
   readonly cteName?: string
   readonly cteSelfReference?: boolean
   readonly erefColumnNames?: readonly string[]
+  readonly functionOrdinality?: boolean
+  readonly functionOutputs?: readonly { readonly expression: NativeExpr; readonly columnCount: number }[]
   readonly groupExprs?: readonly NativeExpr[]
   readonly joinAliasVars?: readonly (NativeExpr | null)[]
   readonly kind: string
@@ -2888,23 +2890,24 @@ testWithDatabase('native analyzer maps direct DML parameters to PostgreSQL targe
   await assert.rejects(database.query(intersectRightLineageSql, [null]), /null value in column "email"/u)
   await database.query(intersectRightLineageSql, ['different@example.test'])
 
-  const filteredProjection = await analyze(
-    database,
-    `insert into public.accounts(email)
-       select $1::text where false`
-  )
+  const countBeforeFiltered = await database.query('select count(*)::int as n from public.accounts')
+  const filteredSql = 'insert into public.accounts(email) select $1::text where false'
+  const filteredProjection = await analyze(database, filteredSql)
   assert.deepEqual(filteredProjection.statements[0]?.queries[0]?.dmlParameterNullAdmissions, [
-    { admission: 'unknown', basis: 'unresolved', paramId: 1 },
+    { admission: 'accepts', basis: 'action_unreachable_when_null', paramId: 1 },
   ])
+  await database.query(filteredSql, [null])
 
-  const nullableFilteredProjection = await analyze(
-    database,
-    `insert into public.accounts(display_name)
-       select $1::text where false`
-  )
+  const nullableFilteredSql = 'insert into public.accounts(display_name) select $1::text where false'
+  const nullableFilteredProjection = await analyze(database, nullableFilteredSql)
   assert.deepEqual(nullableFilteredProjection.statements[0]?.queries[0]?.dmlParameterNullAdmissions, [
-    { admission: 'accepts', basis: 'direct_target_null_admission', paramId: 1 },
+    { admission: 'accepts', basis: 'action_unreachable_when_null', paramId: 1 },
   ])
+  await database.query(nullableFilteredSql, [null])
+  assert.deepEqual(
+    (await database.query('select count(*)::int as n from public.accounts')).rows,
+    countBeforeFiltered.rows
+  )
 
   const limitedSetOperation = await analyze(
     database,
@@ -3341,3 +3344,61 @@ testWithDatabase('native analyzer maps direct DML parameters to PostgreSQL targe
     ]
   )
 })
+
+testWithDatabase('tracks indirect parameter use and range function outputs', async (database) => {
+  await database.query(`create function public.null_sensitive(value integer)
+    returns integer language plpgsql as $$
+    begin
+      if value is null then raise exception 'null input'; end if;
+      return value;
+    end $$`)
+  const indirect = `with input as materialized (select $1::integer as x)
+    select public.null_sensitive(x) from input`
+  assert.deepEqual((await analyze(database, indirect)).paramUsageNullAdmissions, ['unknown'])
+  await assert.rejects(database.query(indirect, [null]), /null input/u)
+  const passthrough = 'with input as materialized (select $1::integer as x) select x from input'
+  assert.deepEqual((await analyze(database, passthrough)).paramUsageNullAdmissions, ['accepts'])
+
+  const range = await analyze(database, "select * from jsonb_array_elements('[1]'::jsonb) with ordinality")
+  const rte = range.statements[0]?.queries[0]?.rtable.find((entry) => entry.kind === 'FUNCTION')
+  assert.equal(rte?.functionOrdinality, true)
+  assert.equal(rte?.functionOutputs?.[0]?.columnCount, 1)
+  assert.equal(rte?.functionOutputs?.[0]?.expression.tag, 'FuncExpr')
+})
+
+testWithDatabase(
+  'indirect parameters remain conservative through rows, set operations, and domains',
+  async (database) => {
+    await database.query(`create function public.indirect_explode(value integer) returns integer language plpgsql as $$
+    begin if value is null then raise exception 'indirect null'; end if; return value; end $$`)
+    await database.query(`create function public.indirect_explode_row(value record) returns integer language plpgsql as $$
+    begin if value.v is null then raise exception 'indirect null'; end if; return value.v; end $$`)
+    await database.query('create domain public.indirect_not_null as integer not null')
+    await database.query('create domain public.indirect_check as integer check (public.indirect_explode(value) > 0)')
+    const cases = [
+      'with c as (select $1::int v) select public.indirect_explode_row(c) from c',
+      'with c(v) as (select 1 union all select $1::int) select public.indirect_explode(v) from c',
+      'with recursive c(v) as (select $1::int union all select v from c where false) select public.indirect_explode(v) from c',
+      'with c as (select $1::int v) select v::public.indirect_not_null from c',
+      'with c as (select $1::int v) select v::text::public.indirect_not_null from c',
+      'with c as (select $1::int v) select v::public.indirect_check from c',
+      'with c as (select $1::int v) select public.indirect_explode((select v from c))',
+      'with c as (select $1::int v) select (select v from c)::public.indirect_not_null',
+      'with c as (select $1::int v) select sum(1) over (rows between (select v from c) preceding and current row)',
+      'with c as (select $1::int v) select * from public.accounts tablesample system ((select v from c))',
+      'with c as (select $1::int v) select public.indirect_explode((select 1 from c where v is not null))',
+      'with c as (select $1::int v) select (select 1 from c where v is not null)::public.indirect_not_null',
+      'with c as (select $1::int v) select sum(1) over (rows between (select 1 from c where v is not null) preceding and current row)',
+      'with c as (select $1::int v) select * from public.accounts tablesample system ((select 1 from c where v is not null))',
+      'with c as (select 1 v where $1::int is not null) select public.indirect_explode((select v from c))',
+    ]
+    for (const sql of cases) {
+      assert.deepEqual((await analyze(database, sql)).paramUsageNullAdmissions, ['unknown'], sql)
+      await assert.rejects(database.query(sql, [null]))
+    }
+    assert.deepEqual(
+      (await analyze(database, 'with c as (select $1::int v) select v from c')).paramUsageNullAdmissions,
+      ['accepts']
+    )
+  }
+)

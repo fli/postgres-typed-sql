@@ -1,18 +1,8 @@
 import type { PostgresTypeFact } from './postgres-types.js'
-import type { PgJsonCodec, PgJsonPlan } from './value-types.js'
+import type { PgJsonPlan } from './value-types.js'
 import { parsePgArray, formatPgArray } from './array-values.js'
-import { createJsonCodec, encodeJsonParameter, parseJson } from './json-values.js'
+import { cachedJsonCodec, encodeJsonParameter, parseJson } from './json-values.js'
 import { decodePgScalar, encodePgScalar } from './scalar-values.js'
-
-const jsonCodecs = new WeakMap<PgJsonPlan, PgJsonCodec<unknown>>()
-
-function jsonCodec(plan: PgJsonPlan): PgJsonCodec<unknown> {
-  const cached = jsonCodecs.get(plan)
-  if (cached) return cached
-  const codec = createJsonCodec(plan)
-  if (Object.isFrozen(plan)) jsonCodecs.set(plan, codec)
-  return codec
-}
 
 export function decodePgValue(type: PostgresTypeFact, source: string, jsonPlan?: PgJsonPlan): unknown {
   if (type.pgTypeKind === 'domain' && type.pgBaseType) return decodePgValue(type.pgBaseType, source, jsonPlan)
@@ -25,7 +15,7 @@ export function decodePgValue(type: PostgresTypeFact, source: string, jsonPlan?:
     })
   }
   if (type.pgTypeSchema === 'pg_catalog' && (type.pgTypeName === 'json' || type.pgTypeName === 'jsonb')) {
-    return jsonPlan ? parseJson(source, jsonCodec(jsonPlan)) : parseJson(source)
+    return jsonPlan ? parseJson(source, cachedJsonCodec(jsonPlan)) : parseJson(source)
   }
   return decodePgScalar(type, source)
 }
