@@ -117,6 +117,25 @@ test('NULL admission composes through selected outputs and remains conservative 
     assert.equal(analysis.parameters.find((parameter) => parameter.name === 'value')?.nullAdmission, 'accepts')
     await project.compile(sourcePath, `-- @nullable value\n${sql}`)
   })
+  await t.test('NULL guard through a CTE preserves the required value', async () => {
+    const sql = `with input as (select :value::text value)
+      update ${schema}.items set required = case when input.value is null then items.required else input.value end
+      from input where items.id = :id::integer returning items.id`
+    const analysis = await project.analyze(sourcePath, `-- @bindNull value\n${sql}`)
+    assert.equal(analysis.parameters.find((parameter) => parameter.name === 'value')?.nullAdmission, 'accepts')
+    await project.compile(sourcePath, `-- @nullable value\n${sql}`)
+  })
+  await t.test('CTE provided flag cannot prove a conditional required write', async () => {
+    const sql = `with input as (select :value::text value, :provided::boolean provided)
+      update ${schema}.items set required = case when input.provided then input.value else items.required end
+      from input where items.id = :id::integer returning items.id`
+    const analysis = await project.analyze(sourcePath, `-- @bindNull value\n${sql}`)
+    assert.notEqual(analysis.parameters.find((parameter) => parameter.name === 'value')?.nullAdmission, 'accepts')
+    await assert.rejects(
+      project.compile(sourcePath, `-- @nullable value\n${sql}`),
+      /@nullable value cannot be satisfied/u
+    )
+  })
   await t.test('dependent CHECK remains uncertain', async () => {
     const sql = `insert into ${schema}.checked(value, guard) values (:value::text, :guard::boolean)`
     const analysis = await project.analyze(sourcePath, `-- @bindNull value\n${sql}`)
