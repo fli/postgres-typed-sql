@@ -103,7 +103,7 @@ test('NULL admission explains the actual blockers through the public project API
       assert.match(generated, /readonly value: string \| null/u)
       await assert.rejects(project.compile(sourcePath, `-- @nullable value\n${fixture.sql}`), (error: unknown) => {
         assert.ok(error instanceof Error)
-        assert.ok(error.message.includes(`${sourcePath}:1`))
+        assert.ok(error.message.includes('probe.typed.sql:1'))
         assert.match(error.message, /@nullable value cannot be satisfied/u)
         for (const pattern of fixture.identity) assert.match(error.message, pattern)
         if (/offset/iu.test(error.message)) assert.match(error.message, /compiled.*(?:byte|offset)/iu)

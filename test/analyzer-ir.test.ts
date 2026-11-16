@@ -1150,6 +1150,72 @@ testWithDatabase(
         name: 'staleSchema',
         sql: 'select account.id from public.accounts account',
       },
+      ...[
+        {
+          name: 'missingReasons',
+          mutate: (analysis: MutableEnvelopeObject) => {
+            delete analysis.paramTypeNullAdmissionReasons
+          },
+        },
+        {
+          name: 'misalignedReasons',
+          mutate: (analysis: MutableEnvelopeObject) => {
+            analysis.paramUsageNullAdmissionReasons = []
+          },
+        },
+        {
+          name: 'invalidReasonCode',
+          mutate: (analysis: MutableEnvelopeObject) => {
+            analysis.paramTypeNullAdmissions = ['unknown']
+            analysis.paramTypeNullAdmissionReasons = [[{ code: 'future', message: 'Unknown' }]]
+          },
+        },
+        {
+          name: 'invalidReasonOffset',
+          mutate: (analysis: MutableEnvelopeObject) => {
+            analysis.paramTypeNullAdmissions = ['unknown']
+            analysis.paramTypeNullAdmissionReasons = [
+              [{ code: 'unresolved', message: 'Unknown', compiledByteOffset: -1 }],
+            ]
+          },
+        },
+        {
+          name: 'acceptedWithReason',
+          mutate: (analysis: MutableEnvelopeObject) => {
+            analysis.paramTypeNullAdmissions = ['accepts']
+            analysis.paramTypeNullAdmissionReasons = [[{ code: 'unresolved', message: 'Unknown' }]]
+          },
+        },
+        {
+          name: 'unknownWithRejection',
+          mutate: (analysis: MutableEnvelopeObject) => {
+            analysis.paramTypeNullAdmissions = ['unknown']
+            analysis.paramTypeNullAdmissionReasons = [[{ code: 'target_not_null', message: 'Rejected' }]]
+          },
+        },
+        {
+          name: 'rejectionWithoutProof',
+          mutate: (analysis: MutableEnvelopeObject) => {
+            analysis.paramTypeNullAdmissions = ['rejects']
+            analysis.paramTypeNullAdmissionReasons = [[{ code: 'unresolved', message: 'Unknown' }]]
+          },
+        },
+      ].map(({ name, mutate }) => ({
+        corrupt: mutate,
+        error: /analyzer returned inconsistent parameter NULL-admission evidence/u,
+        name,
+        sql: 'select $1::text',
+      })),
+      {
+        corrupt(analysis) {
+          firstEnvelopeQuery(analysis).dmlParameterNullAdmissions = [
+            { admission: 'rejects', basis: 'direct_target_null_admission', paramId: 1, reasons: [] },
+          ]
+        },
+        error: /analyzer returned an inconsistent DML parameter NULL-admission fact/u,
+        name: 'dmlRejectionWithoutReason',
+        sql: 'select $1::text',
+      },
       {
         corrupt(analysis) {
           delete firstEnvelopeQuery(analysis).dmlDirectAssignments

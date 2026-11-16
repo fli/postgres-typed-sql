@@ -1,3 +1,5 @@
+import type { TypedSqlNullAdmissionReason } from './analyzer-ir-model.js'
+export type { TypedSqlNullAdmissionReason, TypedSqlNullAdmissionReasonCode } from './analyzer-ir-model.js'
 import type { SupportedExtension } from './engine.js'
 
 /** Version of both the report shape and its semantic guarantees. */
@@ -34,6 +36,8 @@ export interface TypedSqlParameterAnalysis {
   readonly nullBinding: 'nonNull' | 'provedNullable' | 'callerNullable'
   /** Every modeled use admits NULL, a use rejects NULL, or acceptance is unresolved. */
   readonly nullAdmission: 'accepts' | 'rejects' | 'unknown'
+  /** Native evidence behind a rejection or unresolved admission. */
+  readonly nullAdmissionReasons: readonly TypedSqlNullAdmissionReason[]
 }
 
 export interface TypedSqlStatementAnalysis {

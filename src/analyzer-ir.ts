@@ -51,6 +51,7 @@ import {
   type TypedSqlPostgresIrCompiledConfig,
   type TypedSqlPostgresIrJsonField,
   type TypedSqlPostgresIrJsonShape,
+  type TypedSqlNullAdmissionReason,
   type TypedSqlPostgresIrParam,
   type TypedSqlPostgresIrParamNullAdmission,
   type TypedSqlPostgresIrResultNullability,
@@ -97,7 +98,7 @@ export type {
   TypedSqlPostgresIrRowBounds,
 } from './analyzer-ir-model.js'
 
-const ANALYZER_SCHEMA_VERSION = 12
+const ANALYZER_SCHEMA_VERSION = 13
 const ANALYZER_SQL_FUNCTION = 'pg_temp.postgres_typed_sql_analyze'
 
 const ANALYSIS_CATALOG_CACHE_LIMIT = 1024
@@ -1619,42 +1620,53 @@ function accessEvidence(queries: readonly PgAnalyzerQuery[]): TypedSqlPostgresIr
   return first ? { kind: 'notProvenReadOnly', reasons: [first, ...rest] } : { kind: 'provenReadOnly' }
 }
 
+interface NullAdmissionEvidence {
+  readonly admission: TypedSqlPostgresIrParamNullAdmission
+  readonly reasons: readonly TypedSqlNullAdmissionReason[]
+}
+
 function combineParameterNullAdmission(
-  current: TypedSqlPostgresIrParamNullAdmission | undefined,
-  next: TypedSqlPostgresIrParamNullAdmission
-): TypedSqlPostgresIrParamNullAdmission {
-  if (current === 'rejects' || next === 'rejects') {
-    return 'rejects'
-  }
-  if (current === 'unknown' || next === 'unknown') {
-    return 'unknown'
-  }
-  return 'accepts'
+  current: NullAdmissionEvidence,
+  next: NullAdmissionEvidence
+): NullAdmissionEvidence {
+  const admission =
+    current.admission === 'rejects' || next.admission === 'rejects'
+      ? 'rejects'
+      : current.admission === 'unknown' || next.admission === 'unknown'
+        ? 'unknown'
+        : 'accepts'
+  return { admission, reasons: [...current.reasons, ...next.reasons] }
 }
 
 function dmlParameterNullAdmissions(
   queries: readonly PgAnalyzerQuery[],
-  paramTypeNullAdmissions: readonly TypedSqlPostgresIrParamNullAdmission[],
-  paramUsageNullAdmissions: readonly TypedSqlPostgresIrParamNullAdmission[]
-): ReadonlyMap<number, TypedSqlPostgresIrParamNullAdmission> {
-  const admissionByParamId = new Map<number, TypedSqlPostgresIrParamNullAdmission>()
-  for (const [index, admission] of paramTypeNullAdmissions.entries()) {
-    admissionByParamId.set(
+  analysis: PgAnalyzerResult
+): ReadonlyMap<number, NullAdmissionEvidence> {
+  const evidenceByParamId = new Map<number, NullAdmissionEvidence>()
+  for (const [index, admission] of analysis.paramTypeNullAdmissions.entries()) {
+    const typeReasons = analysis.paramTypeNullAdmissionReasons[index]
+    const usageAdmission = analysis.paramUsageNullAdmissions[index]
+    const usageReasons = analysis.paramUsageNullAdmissionReasons[index]
+    if (!typeReasons || !usageAdmission || !usageReasons) {
+      throw new Error('analyzer returned incomplete parameter NULL-admission evidence.')
+    }
+    evidenceByParamId.set(
       index + 1,
-      combineParameterNullAdmission(admission, paramUsageNullAdmissions[index] ?? 'unknown')
+      combineParameterNullAdmission(
+        { admission, reasons: typeReasons },
+        { admission: usageAdmission, reasons: usageReasons }
+      )
     )
   }
   for (const query of queries) {
     walkQueryTree(query, (nested) => {
       for (const fact of nested.dmlParameterNullAdmissions) {
-        admissionByParamId.set(
-          fact.paramId,
-          combineParameterNullAdmission(admissionByParamId.get(fact.paramId), fact.admission)
-        )
+        const current = evidenceByParamId.get(fact.paramId)
+        if (current) evidenceByParamId.set(fact.paramId, combineParameterNullAdmission(current, fact))
       }
     })
   }
-  return admissionByParamId
+  return evidenceByParamId
 }
 
 function walkQuery(query: PgAnalyzerQuery, visitExpr: (expr: PgAnalyzerExpr) => void): void {
@@ -4376,19 +4388,17 @@ function normalizeCompiledIr(catalog: CatalogFacts, analyzed: AnalyzedCompiledCo
   })
 
   const checkConstraintParamTypes = checkedColumnParamTypes(catalog, rewrittenQueries, analysis.paramTypeOids)
-  const nullAdmissionByParamId = dmlParameterNullAdmissions(
-    rewrittenQueries,
-    analysis.paramTypeNullAdmissions,
-    analysis.paramUsageNullAdmissions
-  )
+  const nullAdmissionByParamId = dmlParameterNullAdmissions(rewrittenQueries, analysis)
   const params = config.parameterNames.map((name, index): TypedSqlPostgresIrParam => {
     const oid = analysis.paramTypeOids[index]
     const typeFact = typeFactForOid(catalog, oid, undefined)
     const checkConstraintType = checkConstraintParamTypes.get(index + 1)
-    const nullAdmission = nullAdmissionByParamId.get(index + 1) ?? 'unknown'
+    const evidence = nullAdmissionByParamId.get(index + 1)
+    if (!evidence) throw new Error('analyzer returned no parameter NULL-admission evidence.')
     return {
       name,
-      nullAdmission,
+      nullAdmission: evidence.admission,
+      nullAdmissionReasons: evidence.reasons,
       ...typeFact,
       ...(checkConstraintType ? { checkConstraintType } : {}),
     }
@@ -4427,6 +4437,46 @@ function hasExactlyKeys(value: object, expected: readonly string[]): boolean {
   return actual.length === expected.length && actual.every((key, index) => key === expected[index])
 }
 
+const rejectingReasonCodes = new Set(['target_not_null', 'domain_not_null', 'check_rejects', 'required_nonnull'])
+const unknownReasonCodes = new Set([
+  'conditional_required_nonnull',
+  'opaque_callable',
+  'opaque_trigger',
+  'check_unresolved',
+  'domain_unresolved',
+  'index_unresolved',
+  'unsupported_projection',
+  'write_unresolved',
+  'unresolved',
+])
+
+function validNullAdmissionEvidence(admission: unknown, reasons: unknown): boolean {
+  if (!Array.isArray(reasons)) return false
+  let hasRejection = false
+  for (const reason of reasons) {
+    if (typeof reason !== 'object' || reason === null) return false
+    const keys = 'compiledByteOffset' in reason ? ['code', 'compiledByteOffset', 'message'] : ['code', 'message']
+    if (
+      !hasExactlyKeys(reason, keys) ||
+      typeof reason.code !== 'string' ||
+      (!rejectingReasonCodes.has(reason.code) && !unknownReasonCodes.has(reason.code)) ||
+      typeof reason.message !== 'string' ||
+      reason.message.trim().length === 0 ||
+      ('compiledByteOffset' in reason &&
+        (typeof reason.compiledByteOffset !== 'number' ||
+          !Number.isInteger(reason.compiledByteOffset) ||
+          reason.compiledByteOffset < 0))
+    )
+      return false
+    if (rejectingReasonCodes.has(reason.code)) hasRejection = true
+  }
+  return admission === 'accepts'
+    ? reasons.length === 0
+    : admission === 'rejects'
+      ? hasRejection
+      : admission === 'unknown' && reasons.length > 0 && !hasRejection
+}
+
 function validateDmlQueryEnvelope(query: PgAnalyzerQuery, parameterCount: number): void {
   walkQueryTree(query, (nested) => {
     if (!Array.isArray(nested.dmlDirectAssignments)) {
@@ -4455,7 +4505,8 @@ function validateDmlQueryEnvelope(query: PgAnalyzerQuery, parameterCount: number
       if (
         typeof fact !== 'object' ||
         fact === null ||
-        !hasExactlyKeys(fact, ['admission', 'basis', 'paramId']) ||
+        !hasExactlyKeys(fact, ['admission', 'basis', 'paramId', 'reasons']) ||
+        !validNullAdmissionEvidence(fact.admission, fact.reasons) ||
         !isPositiveInteger(fact.paramId) ||
         fact.paramId > parameterCount ||
         !(
@@ -4515,15 +4566,33 @@ function validateSingleStatementAnalyzerEnvelope(
       `analyzer returned ${analysis.paramTypeOids.length} parameter types for ${parameterCount} compiled parameters.`
     )
   }
-  if (analysis.paramTypeNullAdmissions.length !== parameterCount) {
+  if (!Array.isArray(analysis.paramTypeNullAdmissions) || analysis.paramTypeNullAdmissions.length !== parameterCount) {
     throw new Error(
-      `analyzer returned ${analysis.paramTypeNullAdmissions.length} parameter type NULL admissions for ${parameterCount} compiled parameters.`
+      `analyzer returned ${analysis.paramTypeNullAdmissions?.length ?? 0} parameter type NULL admissions for ${parameterCount} compiled parameters.`
     )
   }
-  if (analysis.paramUsageNullAdmissions.length !== parameterCount) {
+  if (
+    !Array.isArray(analysis.paramUsageNullAdmissions) ||
+    analysis.paramUsageNullAdmissions.length !== parameterCount
+  ) {
     throw new Error(
-      `analyzer returned ${analysis.paramUsageNullAdmissions.length} parameter usage NULL admissions for ${parameterCount} compiled parameters.`
+      `analyzer returned ${analysis.paramUsageNullAdmissions?.length ?? 0} parameter usage NULL admissions for ${parameterCount} compiled parameters.`
     )
+  }
+
+  for (const [admissions, reasons] of [
+    [analysis.paramTypeNullAdmissions, analysis.paramTypeNullAdmissionReasons],
+    [analysis.paramUsageNullAdmissions, analysis.paramUsageNullAdmissionReasons],
+  ] as const) {
+    if (
+      !Array.isArray(admissions) ||
+      !Array.isArray(reasons) ||
+      admissions.length !== parameterCount ||
+      reasons.length !== parameterCount ||
+      admissions.some((admission, index) => !validNullAdmissionEvidence(admission, reasons[index]))
+    ) {
+      throw new Error('analyzer returned inconsistent parameter NULL-admission evidence.')
+    }
   }
 
   const statement = analysis.statements[0]
