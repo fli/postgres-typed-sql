@@ -155,6 +155,13 @@ test('NULL admission explains the actual blockers through the public project API
       const parameter = analysis.parameters.find((candidate) => candidate.name === 'value')
       assert.ok(parameter)
       assert.equal(parameter.nullAdmission, fixture.outcome)
+      const reasonKeys = parameter.nullAdmissionReasons.map((reason) =>
+        JSON.stringify([reason.code, reason.message, reason.compiledByteOffset])
+      )
+      assert.equal(new Set(reasonKeys).size, reasonKeys.length)
+      if (fixture.name === 'rejection dominates an opaque use') {
+        assert.ok(parameter.nullAdmissionReasons.some((reason) => reason.code === 'opaque_callable'))
+      }
       const reason = parameter.nullAdmissionReasons.find((candidate) => candidate.code === fixture.code)
       assert.ok(reason, `missing ${fixture.code}`)
       for (const pattern of fixture.identity) assert.match(reason.message, pattern)

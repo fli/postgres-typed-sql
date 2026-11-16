@@ -1635,7 +1635,20 @@ function combineParameterNullAdmission(
       : current.admission === 'unknown' || next.admission === 'unknown'
         ? 'unknown'
         : 'accepts'
-  return { admission, reasons: [...current.reasons, ...next.reasons] }
+  const reasons = [...current.reasons]
+  for (const reason of next.reasons) {
+    if (
+      !reasons.some(
+        (existing) =>
+          existing.code === reason.code &&
+          existing.message === reason.message &&
+          existing.compiledByteOffset === reason.compiledByteOffset
+      )
+    ) {
+      reasons.push(reason)
+    }
+  }
+  return { admission, reasons }
 }
 
 function dmlParameterNullAdmissions(
