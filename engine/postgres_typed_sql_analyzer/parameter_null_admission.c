@@ -491,7 +491,7 @@ indirect_callable_walker(Node *node, void *opaque)
         Oid callable = IsA(node, FuncExpr) ? ((FuncExpr *) node)->funcid :
           get_opcode(((OpExpr *) node)->opno);
         context->evidence.reasons = pts_add_null_reason(context->evidence.reasons,
-          "opaque_callable", psprintf("callable %s may reject NULL",
+          "opaque_callable", psprintf("evaluation of callable %s with NULL is not proved safe",
             format_procedure_qualified(callable)), exprLocation(node));
       }
       else
@@ -549,7 +549,7 @@ parameter_usage_null_admission_walker(Node *node, void *walker_context)
           "domain_unresolved", psprintf(nested_rejection
             ? "domain coercion to %s: enclosing query execution is not proved unconditional"
             : conditional_rejection
-              ? "domain coercion to %s is reached only under an unresolved CASE condition or COALESCE argument"
+              ? "domain coercion to %s is reached only under an unresolved CASE condition, COALESCE argument, or Boolean operand"
               : "domain coercion to %s depends on an unresolved expression",
             format_type_be_qualified(coerce->resulttype)), exprLocation(node));
       if (!conditional_rejection && !nested_rejection && argument.evaluation_safe && argument.proof == PTS_NULL_PROOF_NULL)
@@ -571,7 +571,7 @@ parameter_usage_null_admission_walker(Node *node, void *walker_context)
         mark_parameter_usage(context, PTS_NULL_UNKNOWN);
         if (OidIsValid(callable))
           context->evidence.reasons = pts_add_null_reason(context->evidence.reasons,
-            "opaque_callable", psprintf("callable %s may reject NULL",
+            "opaque_callable", psprintf("evaluation of callable %s with NULL is not proved safe",
               format_procedure_qualified(callable)), exprLocation(node));
       }
       break;
@@ -689,11 +689,38 @@ parameter_usage_null_admission_walker(Node *node, void *walker_context)
       PtsNullEvaluation evaluation = pts_check_parameter_null_evaluation(
         node, context->param_id, context->node_analysis);
 
+      const BoolExpr *boolean = (const BoolExpr *) node;
+      bool outer_conditional = context->conditional;
+      ListCell *cell;
+
       if (!evaluation.evaluation_safe)
       {
         mark_unknown_expression(context, node, "boolean expression evaluation is unresolved");
       }
-      break;
+      foreach(cell, boolean->args)
+      {
+        ListCell *other_cell;
+        bool conditional = outer_conditional;
+
+        if (boolean->boolop != NOT_EXPR)
+          foreach(other_cell, boolean->args)
+          {
+            PtsNullEvaluation other;
+
+            if (other_cell == cell)
+              continue;
+            other = pts_check_parameter_null_evaluation(
+              (const Node *) lfirst(other_cell), context->param_id, context->node_analysis);
+            if (!other.evaluation_safe ||
+                (other.proof != PTS_NULL_PROOF_NULL &&
+                 other.proof != (boolean->boolop == AND_EXPR ? PTS_NULL_PROOF_TRUE : PTS_NULL_PROOF_FALSE)))
+              conditional = true;
+          }
+        context->conditional = conditional;
+        parameter_usage_null_admission_walker((Node *) lfirst(cell), context);
+      }
+      context->conditional = outer_conditional;
+      return false;
     }
     case T_CaseExpr:
     {

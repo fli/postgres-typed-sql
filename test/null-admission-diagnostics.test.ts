@@ -31,6 +31,33 @@ test(
   }
 )
 
+test(
+  'Boolean companions can bypass domain coercion on PostgreSQL',
+  { skip: !process.env.POSTGRES_TYPED_SQL_TEST_URL },
+  async () => {
+    const schema = `boolean_domain_${randomUUID().replaceAll('-', '')}`
+    const client = new Client({ connectionString: process.env.POSTGRES_TYPED_SQL_TEST_URL })
+    await client.connect()
+    try {
+      await client.query('begin')
+      await client.query(`create schema ${schema}; create domain ${schema}.required_text as text not null`)
+      for (const [operator, flag] of [
+        ['and', false],
+        ['or', true],
+      ] as const) {
+        const result = await client.query(
+          `select $1::boolean ${operator} ($2::text::${schema}.required_text = 'x') as result`,
+          [flag, null]
+        )
+        assert.equal(result.rows[0].result, flag)
+      }
+    } finally {
+      await client.query('rollback')
+      await client.end()
+    }
+  }
+)
+
 test('NULL admission explains the actual blockers through the public project API', async (t) => {
   const { openQueryProject }: typeof import('../src/query-project.js') = await import(
     new URL('../../dist/project.js', import.meta.url).href
@@ -252,6 +279,40 @@ test('NULL admission explains the actual blockers through the public project API
       `coalesce(null::text, :value::text::${domain})`,
       `case when false then 'ok'::${domain} else :value::text::${domain} end`,
       `case when :flag::boolean then (select :value::text::${domain}) else 'ok'::${domain} end, :value::text::${domain}`,
+    ]) {
+      const analysis = await project.analyze(sourcePath, `-- @bindNull value\nselect ${expression}`)
+      assert.equal(analysis.parameters.find((item) => item.name === 'value')?.nullAdmission, 'rejects', expression)
+    }
+  })
+
+  await t.test('boolean operands preserve conditional domain reachability', async () => {
+    const domain = `${schema}.required_text`
+    const cast = `(:value::text::${domain} = 'x')`
+    for (const operator of ['and', 'or']) {
+      for (const expression of [`:flag::boolean ${operator} ${cast}`, `${cast} ${operator} :flag::boolean`]) {
+        const sql = `select ${expression}`
+        const analysis = await project.analyze(sourcePath, `-- @bindNull value\n${sql}`)
+        const parameter = analysis.parameters.find((item) => item.name === 'value')
+        assert.equal(parameter?.nullAdmission, 'unknown', expression)
+        assert.ok(
+          parameter.nullAdmissionReasons.some(
+            (reason) => reason.code === 'domain_unresolved' && reason.message.includes(domain)
+          ),
+          expression
+        )
+        await assert.rejects(
+          project.compile(sourcePath, `-- @nullable value\n${sql}`),
+          /could not prove that every use accepts NULL/u
+        )
+      }
+    }
+    for (const expression of [
+      cast,
+      `not ${cast}`,
+      `true and ${cast}`,
+      `${cast} and true`,
+      `false or ${cast}`,
+      `${cast} or false`,
     ]) {
       const analysis = await project.analyze(sourcePath, `-- @bindNull value\nselect ${expression}`)
       assert.equal(analysis.parameters.find((item) => item.name === 'value')?.nullAdmission, 'rejects', expression)
