@@ -98,15 +98,23 @@ merge_parameter_usage_evidence(PtsParameterUsageEvidence *target,
   target->reasons = list_concat(target->reasons, list_copy(source->reasons));
 }
 
+typedef enum PtsUsageExecutionPhase
+{
+  PTS_USAGE_ROW,
+  PTS_USAGE_WINDOW_INIT,
+  PTS_USAGE_SAMPLE_INIT
+} PtsUsageExecutionPhase;
+
 static bool
 usage_execution_is_unconditional(const PtsParameterUsageContext *context,
-                                 bool requires_output_row)
+                                 PtsUsageExecutionPhase phase,
+                                 const TableSampleClause *sample)
 {
   const Query *query = context->scope->query;
 
   if (context->conditional || context->scope->parent != NULL)
     return false;
-  if (requires_output_row)
+  if (phase == PTS_USAGE_ROW)
     return context->root_target && query->commandType == CMD_SELECT &&
       query->jointree != NULL && query->jointree->fromlist == NIL &&
       query->jointree->quals == NULL && query->havingQual == NULL &&
@@ -115,14 +123,53 @@ usage_execution_is_unconditional(const PtsParameterUsageContext *context,
       query->windowClause == NIL && !query->hasTargetSRFs &&
       query->setOperations == NULL && !query->hasRowSecurity &&
       query->cteList == NIL;
-  return query->havingQual == NULL && query->limitOffset == NULL &&
-    query->limitCount == NULL && query->jointree != NULL &&
-    query->jointree->quals == NULL;
+  if (query->commandType != CMD_SELECT || query->querySource != QSRC_ORIGINAL ||
+      query->hasRowSecurity || query->setOperations != NULL || query->hasTargetSRFs ||
+      query->havingQual != NULL || query->limitOffset != NULL ||
+      query->limitCount != NULL || query->jointree == NULL ||
+      query->jointree->quals != NULL)
+    return false;
+  if (phase == PTS_USAGE_SAMPLE_INIT)
+  {
+    const Node *from;
+    const RangeTblEntry *rte;
+    const RangeTblRef *ref;
+
+    if (list_length(query->jointree->fromlist) != 1)
+      return false;
+    from = (const Node *) linitial(query->jointree->fromlist);
+    if (!IsA(from, RangeTblRef))
+      return false;
+    ref = (const RangeTblRef *) from;
+    rte = rt_fetch(ref->rtindex, query->rtable);
+    return rte->rtekind == RTE_RELATION && rte->tablesample == sample;
+  }
+  return true;
+}
+
+static bool
+window_has_direct_target(const Query *query, const WindowClause *window)
+{
+  ListCell *cell;
+
+  if (!query->hasWindowFuncs || list_length(query->windowClause) != 1)
+    return false;
+  foreach(cell, query->targetList)
+  {
+    const TargetEntry *target = (const TargetEntry *) lfirst(cell);
+
+    if (!target->resjunk && IsA(target->expr, WindowFunc) &&
+        ((const WindowFunc *) target->expr)->winref == window->winref)
+      return true;
+  }
+  return false;
 }
 
 static void
 mark_required_nonnull_parameter_usage(PtsParameterUsageContext *context,
-                                      const Node *expr, bool active)
+                                      const Node *expr, bool active,
+                                      PtsUsageExecutionPhase phase,
+                                      const TableSampleClause *sample)
 {
     PtsNullEvaluation evaluation;
 
@@ -142,7 +189,7 @@ mark_required_nonnull_parameter_usage(PtsParameterUsageContext *context,
   evaluation = pts_check_parameter_null_evaluation(expr, context->param_id,
                                                context->node_analysis);
   if (evaluation.proof == PTS_NULL_PROOF_NULL && evaluation.evaluation_safe && active &&
-      usage_execution_is_unconditional(context, false))
+      usage_execution_is_unconditional(context, phase, sample))
   {
     mark_parameter_usage(context, PTS_NULL_REJECTS);
     context->evidence.reasons = pts_add_null_reason(context->evidence.reasons,
@@ -565,7 +612,7 @@ parameter_usage_null_admission_walker(Node *node, void *walker_context)
         argument.proof == PTS_NULL_PROOF_NULL
         ? pts_type_null_admission(context->null_admission_analysis, coerce->resulttype)
         : PTS_NULL_UNKNOWN;
-      bool nested_rejection = !usage_execution_is_unconditional(context, true) &&
+      bool nested_rejection = !usage_execution_is_unconditional(context, PTS_USAGE_ROW, NULL) &&
         !context->conditional && admission == PTS_NULL_REJECTS;
       bool conditional_rejection = context->conditional && admission == PTS_NULL_REJECTS;
 
@@ -695,9 +742,11 @@ parameter_usage_null_admission_walker(Node *node, void *walker_context)
       const WindowClause *window = (const WindowClause *) node;
 
       mark_required_nonnull_parameter_usage(context, window->startOffset,
-        context->scope->query->hasWindowFuncs && list_length(context->scope->query->windowClause) == 1);
+        window_has_direct_target(context->scope->query, window),
+        PTS_USAGE_WINDOW_INIT, NULL);
       mark_required_nonnull_parameter_usage(context, window->endOffset,
-        context->scope->query->hasWindowFuncs && list_length(context->scope->query->windowClause) == 1);
+        window_has_direct_target(context->scope->query, window),
+        PTS_USAGE_WINDOW_INIT, NULL);
       break;
     }
     case T_TableSampleClause:
@@ -708,10 +757,10 @@ parameter_usage_null_admission_walker(Node *node, void *walker_context)
       foreach(cell, sample->args)
       {
         mark_required_nonnull_parameter_usage(
-          context, (const Node *) lfirst(cell), true);
+          context, (const Node *) lfirst(cell), true, PTS_USAGE_SAMPLE_INIT, sample);
       }
       mark_required_nonnull_parameter_usage(
-        context, (const Node *) sample->repeatable, true);
+        context, (const Node *) sample->repeatable, true, PTS_USAGE_SAMPLE_INIT, sample);
       break;
     }
     case T_BoolExpr:

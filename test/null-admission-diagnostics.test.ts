@@ -79,6 +79,43 @@ test(
         await assert.rejects(client.query(sql, [true, null]), /cannot be null|must not be null/u)
         await client.query('rollback to savepoint expected_error')
       }
+      assert.equal(
+        (
+          await client.query(
+            'select 1 from certainty_sample e cross join certainty_sample tablesample system ($1::real)',
+            [null]
+          )
+        ).rowCount,
+        0
+      )
+      for (const sql of [
+        'select count(*) over (rows $1::bigint preceding) from certainty_sample',
+        'select count(*) from certainty_sample tablesample system ($1::real)',
+      ]) {
+        await client.query('savepoint expected_error')
+        await assert.rejects(client.query(sql, [null]), /cannot be null|must not be null/u)
+        await client.query('rollback to savepoint expected_error')
+      }
+      await client.query('insert into certainty_sample values (1)')
+      assert.equal(
+        (
+          await client.query(
+            'select case when $1::boolean then count(*) over (rows $2::bigint preceding) else 1 end as result from certainty_sample',
+            [false, null]
+          )
+        ).rows[0].result,
+        '1'
+      )
+      assert.equal(
+        (
+          await client.query(
+            'select case when false then count(*) over (rows $1::bigint preceding) else 1 end as result from certainty_sample',
+            [null]
+          )
+        ).rows[0].result,
+        '1'
+      )
+      await client.query('delete from certainty_sample')
       for (const suffix of ['from certainty_sample', 'where false']) {
         assert.equal((await client.query(`select $1::text::pg_temp.certainty_text ${suffix}`, [null])).rowCount, 0)
       }
@@ -147,6 +184,9 @@ test('NULL admission explains the actual blockers through the public project API
       `select 1 from (values (:value::text::${schema}.required_text)) x(v)`,
       `select count(*) over (rows :value::bigint preceding) from ${schema}.items limit 0`,
       `select 1 window unused as (rows :value::bigint preceding)`,
+      `select case when :flag::boolean then count(*) over (rows :value::bigint preceding) else 1 end from ${schema}.items`,
+      `select case when false then count(*) over (rows :value::bigint preceding) else 1 end from ${schema}.items`,
+      `select 1 from ${schema}.items e cross join ${schema}.items tablesample system (:value::real)`,
       `select count(*) from ${schema}.items tablesample system (:value::real) where false`,
     ]) {
       const analysis = await project.analyze(sourcePath, `-- @bindNull value\n${sql}`)
