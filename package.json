@@ -54,6 +54,11 @@
       "import": "./dist/values.js",
       "default": "./dist/values.js"
     },
+    "./migration": {
+      "types": "./dist/migration.d.ts",
+      "import": "./dist/migration.js",
+      "default": "./dist/migration.js"
+    },
     "./esbuild": {
       "types": "./dist/esbuild.d.ts",
       "import": "./dist/esbuild.js",
