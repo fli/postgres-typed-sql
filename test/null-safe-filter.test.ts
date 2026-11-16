@@ -81,7 +81,10 @@ test('public compiler proves strict nullable NULL-safe filters and generates a n
     `with input as (select :value::text as value) select id from ${schema}.nullable_probe left join input on true where nullable_probe.value is not distinct from input.value`,
     `with input as (select :value::text as value) select id from ${schema}.nullable_probe cross join input where nullable_probe.value is not distinct from input.value and ${schema}.fail_on_null(input.value) = 'present'`,
   ]) {
-    await assert.rejects(project.compile(sourcePath, `-- @nullable value\n${sql}`), /@nullable value cannot be satisfied/u)
+    await assert.rejects(
+      project.compile(sourcePath, `-- @nullable value\n${sql}`),
+      /@nullable value cannot be satisfied/u
+    )
   }
 
   await mkdir(join(root, 'node_modules'))
