@@ -10,6 +10,7 @@ typedef struct PtsParameterUsageEvidence
 {
   bool seen;
   PtsNullAdmission admission;
+  List *reasons;
 } PtsParameterUsageEvidence;
 
 extern void pts_update_parameter_usage_null_admissions(

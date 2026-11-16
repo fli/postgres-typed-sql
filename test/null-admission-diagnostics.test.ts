@@ -20,12 +20,19 @@ test('NULL admission explains the actual blockers through the public project API
     create table ${schema}.modules(mode text not null, override text,
       constraint module_override_check check (mode <> 'custom' or override is not null));
     create table ${schema}.triggered(value text);
+    create table ${schema}.updates(value text, other text);
+    create table ${schema}.parents(a int, b int, primary key(a,b));
+    create table ${schema}.children(a int, b int, constraint full_key foreign key(a,b)
+      references ${schema}.parents(a,b) match full);
+    create table ${schema}."Quoted Table"("Quoted Column" text not null);
     create function ${schema}.unsafe(value text) returns text language plpgsql as $$
       begin if value is null then raise exception 'null argument'; end if; return value; end $$;
     create function ${schema}.trigger_fn() returns trigger language plpgsql as $$
       begin return new; end $$;
     create constraint trigger value_trigger after insert on ${schema}.triggered
-      deferrable initially deferred for each row execute function ${schema}.trigger_fn();`
+      deferrable initially deferred for each row execute function ${schema}.trigger_fn();
+    create trigger update_other before update of other on ${schema}.updates
+      for each row execute function ${schema}.trigger_fn();`
   )
   await writeFile(join(root, 'config.mjs'), "export default {schema: './schema.sql'}")
   const project = await openQueryProject(join(root, 'config.mjs'))
@@ -86,6 +93,61 @@ test('NULL admission explains the actual blockers through the public project API
       identity: [/items/u, /required/u],
     },
   ] as const
+
+  await t.test('UPDATE OF trigger applies only to listed columns', async () => {
+    const unrelated = await project.analyze(
+      sourcePath,
+      `-- @bindNull value\nupdate ${schema}.updates set value = :value::text`
+    )
+    assert.equal(unrelated.parameters[0]?.nullAdmission, 'accepts')
+    const applicable = await project.analyze(
+      sourcePath,
+      `-- @bindNull value\nupdate ${schema}.updates set other = :value::text`
+    )
+    const parameter = applicable.parameters[0]
+    assert.equal(parameter?.nullAdmission, 'unknown')
+    assert.ok(
+      parameter.nullAdmissionReasons.some(
+        (reason) =>
+          reason.code === 'opaque_trigger' &&
+          reason.message.includes('update_other') &&
+          reason.message.includes(`${schema}.trigger_fn`)
+      )
+    )
+  })
+
+  await t.test('destination identity includes its schema and quoted names', async () => {
+    const analysis = await project.analyze(
+      sourcePath,
+      `-- @bindNull value\ninsert into ${schema}."Quoted Table"("Quoted Column") values (:value::text)`
+    )
+    const reason = analysis.parameters[0]?.nullAdmissionReasons.find((item) => item.code === 'target_not_null')
+    assert.ok(reason)
+    assert.ok(reason.message.includes(`${schema}."Quoted Table"."Quoted Column"`))
+  })
+
+  await t.test('intermediate domain and MATCH FULL report their actual blockers', async () => {
+    for (const sql of [
+      `insert into ${schema}.items(id, value) values (1, :value::text::${schema}.required_text)`,
+      `with x as (select :value::text::${schema}.required_text value)
+       insert into ${schema}.items(id, value) select 1, value from x`,
+    ]) {
+      const analysis = await project.analyze(sourcePath, `-- @bindNull value\n${sql}`)
+      const parameter = analysis.parameters.find((item) => item.name === 'value')
+      assert.equal(parameter?.nullAdmission, 'rejects')
+      assert.ok(
+        parameter.nullAdmissionReasons.some(
+          (reason) => reason.code === 'domain_not_null' && reason.message.includes(`${schema}.required_text`)
+        )
+      )
+    }
+    const analysis = await project.analyze(
+      sourcePath,
+      `-- @bindNull value\ninsert into ${schema}.children(a,b) values (:value::int, 1)`
+    )
+    const reason = analysis.parameters[0]?.nullAdmissionReasons.find((item) => item.code === 'required_nonnull')
+    assert.ok(reason?.message.includes('full_key'))
+  })
 
   for (const fixture of cases) {
     await t.test(fixture.name, async () => {

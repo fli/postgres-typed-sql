@@ -3,6 +3,7 @@
 
 #include "postgres.h"
 
+#include "lib/stringinfo.h"
 #include "nodes/bitmapset.h"
 #include "nodes/parsenodes.h"
 
@@ -13,10 +14,25 @@ typedef enum PtsNullAdmission
   PTS_NULL_UNKNOWN
 } PtsNullAdmission;
 
-typedef struct PtsNullAdmissionAnalysis PtsNullAdmissionAnalysis;
+typedef struct PtsNullAdmissionReason
+{
+  const char *code;
+  const char *message;
+  int compiled_byte_offset;
+} PtsNullAdmissionReason;
 
-/* Opaque: callers must use the capability queries below. */
+typedef struct PtsNullAdmissionAnalysis PtsNullAdmissionAnalysis;
 typedef struct PtsDmlWriteEnforcement PtsDmlWriteEnforcement;
+
+extern List *pts_add_null_reason(List *reasons, const char *code,
+                                 const char *message, int offset);
+extern void pts_append_null_reasons(StringInfo out, const List *reasons);
+extern List *pts_type_null_reasons(PtsNullAdmissionAnalysis *analysis, Oid type_oid);
+extern List *pts_column_check_null_reasons(PtsNullAdmissionAnalysis *analysis,
+                                            Oid relid, AttrNumber attnum);
+extern const List *pts_dml_write_null_reasons(const PtsDmlWriteEnforcement *enforcement);
+
+
 
 extern PtsNullAdmission pts_combine_null_admission(PtsNullAdmission left,
                                                    PtsNullAdmission right);
@@ -30,7 +46,7 @@ extern PtsNullAdmission pts_column_check_null_admission(
   PtsNullAdmissionAnalysis *analysis, Oid relid, AttrNumber target_attnum);
 extern PtsNullAdmission pts_match_full_null_admission(
   const List *foreign_keys, const List *target_list, int param_id,
-  AttrNumber target_attnum);
+  AttrNumber target_attnum, List **reasons);
 
 extern PtsDmlWriteEnforcement *pts_inspect_dml_write_enforcement(
   const Query *query, const RangeTblEntry *target_rte, CmdType action);

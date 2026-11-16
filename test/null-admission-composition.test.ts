@@ -24,6 +24,8 @@ test('NULL admission composes through selected outputs and remains conservative 
     create table ${schema}.modules(mode text not null, override text, constraint module_override_check check (mode <> 'custom' or override is not null));
     create function ${schema}.unsafe(value text) returns text language plpgsql as $$
       begin if value is null then raise exception 'null argument'; end if; return value; end $$;
+    create function ${schema}.unsafe_integer(value integer) returns integer language plpgsql as $$
+      begin raise exception 'called unsafe integer'; end $$;
     create function ${schema}.trigger_fn() returns trigger language plpgsql as $$
       begin return new; end $$;
     create table ${schema}.triggered(value text);
@@ -89,6 +91,30 @@ test('NULL admission composes through selected outputs and remains conservative 
       project.compile(sourcePath, `-- @nullable value\n${nested}`),
       /@nullable value cannot be satisfied/u
     )
+  })
+  await t.test('nested producers can make an opaque call reachable', async () => {
+    const queries = [
+      `with x as (select 1 as v from (select 1 where :value::text is null) y)
+       select ${schema}.unsafe_integer(x.v) from x`,
+      `with y as (select 1 where :value::text is null), x as (select 1 v from y)
+       select ${schema}.unsafe_integer(x.v) from x`,
+      `with x as (select 1 v from (select 1 from generate_series(1, 2) where :value::text is null) y)
+       select (select x.v from x)`,
+      `with y as (update ${schema}.items set required = 'x' where :value::text is null returning id),
+       x as (select 1 v from y) select ${schema}.unsafe_integer(x.v) from x`,
+    ]
+    for (const sql of queries) {
+      const analysis = await project.analyze(sourcePath, `-- @bindNull value\n${sql}`)
+      assert.equal(analysis.parameters.find((parameter) => parameter.name === 'value')?.nullAdmission, 'unknown')
+    }
+  })
+  await t.test('unrelated producer filter does not taint another parameter', async () => {
+    const sql = `with y as (select 1 where :other::text is null),
+      x as (select 1 v from y), z as (select :value::text v)
+      select z.v, ${schema}.unsafe_integer(x.v) from x cross join z`
+    const analysis = await project.analyze(sourcePath, `-- @bindNull value\n-- @bindNull other\n${sql}`)
+    assert.equal(analysis.parameters.find((parameter) => parameter.name === 'value')?.nullAdmission, 'accepts')
+    assert.equal(analysis.parameters.find((parameter) => parameter.name === 'other')?.nullAdmission, 'unknown')
   })
   await t.test('module override CHECK depends on the companion mode', async () => {
     const sql = `insert into ${schema}.modules(mode, override) values (:mode::text, :override::text)`
@@ -229,6 +255,18 @@ test('NULL admission composes through selected outputs and remains conservative 
       try {
         await client.query('begin')
         await client.query(schemaSql)
+        const cardinalitySql = `with x as (select 1 as v from (select 1 where $1::text is null) y)
+          select ${schema}.unsafe_integer(x.v) from x`
+        assert.equal((await client.query(cardinalitySql, ['present'])).rowCount, 0)
+        await client.query('savepoint cardinality_witness')
+        await assert.rejects(client.query(cardinalitySql, [null]), /called unsafe integer/u)
+        await client.query('rollback to savepoint cardinality_witness')
+        const scalarSql = `with x as (select 1 v from (select 1 from generate_series(1, 2) where $1::text is null) y)
+          select (select x.v from x)`
+        assert.equal((await client.query(scalarSql, ['present'])).rows[0]?.v, null)
+        await client.query('savepoint scalar_witness')
+        await assert.rejects(client.query(scalarSql, [null]), /more than one row/u)
+        await client.query('rollback to savepoint scalar_witness')
         let queries = 0
         const db = adapter.nodePostgres({
           client: {

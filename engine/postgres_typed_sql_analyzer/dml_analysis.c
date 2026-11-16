@@ -283,7 +283,7 @@ pts_append_dml_analysis(StringInfo out, const Query *query)
       ? ADMISSION_ACTION_UNREACHABLE : ADMISSION_ROW_VALUES_PRESERVED;
     if (!first) appendStringInfoChar(out, ',');
     first = false;
-    appendStringInfo(out, "{\"paramId\":%d,\"admission\":\"%s\",\"basis\":\"%s\"}",
+    appendStringInfo(out, "{\"paramId\":%d,\"admission\":\"%s\",\"basis\":\"%s\",\"reasons\":[]}",
                      param_id, admission_output_admission(kind),
                      admission_output_basis(kind));
   }
@@ -310,9 +310,22 @@ pts_append_dml_analysis(StringInfo out, const Query *query)
     }
     if (!first) appendStringInfoChar(out, ',');
     first = false;
-    appendStringInfo(out, "{\"paramId\":%d,\"admission\":\"%s\",\"basis\":\"%s\"}",
+    appendStringInfo(out, "{\"paramId\":%d,\"admission\":\"%s\",\"basis\":\"%s\",\"reasons\":",
                      key.param_id, admission_output_admission(key.kind),
                      admission_output_basis(key.kind));
+    {
+      List *reasons = NIL;
+      ListCell *reason_cell;
+      foreach(reason_cell, lineage)
+      {
+        const PtsDmlLineageFact *other = lfirst(reason_cell);
+        if (other->param_id == fact->param_id && other->admission == fact->admission)
+          reasons = list_concat(reasons, list_copy(other->reasons));
+      }
+      pts_append_null_reasons(out, reasons);
+      list_free(reasons);
+    }
+    appendStringInfoChar(out, '}');
   }
   appendStringInfoChar(out, ']');
   list_free_deep(admission_keys);

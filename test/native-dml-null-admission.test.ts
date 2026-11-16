@@ -2,6 +2,16 @@ import assert from 'node:assert/strict'
 
 import { analyzeNative, testWithDatabase } from './analyzer-test-support.js'
 
+function assertAdmissionFacts(
+  actual: readonly { readonly paramId: number; readonly admission: string; readonly basis: string }[] | undefined,
+  expected: unknown
+) {
+  assert.deepEqual(
+    actual?.map(({ paramId, admission, basis }) => ({ paramId, admission, basis })),
+    expected
+  )
+}
+
 type DmlAdmission = {
   readonly paramId: number
 } & (
@@ -53,7 +63,7 @@ testWithDatabase(
       facts.dmlDirectAssignments.map(({ paramId }) => paramId),
       [1]
     )
-    assert.deepEqual(facts.dmlParameterNullAdmissions, [{ admission: 'unknown', basis: 'unresolved', paramId: 1 }])
+    assertAdmissionFacts(facts.dmlParameterNullAdmissions, [{ admission: 'unknown', basis: 'unresolved', paramId: 1 }])
     await assert.rejects(database.query(sql, [null]), /null index key/u)
   }
 )
@@ -81,7 +91,7 @@ testWithDatabase(
       partialFacts.dmlDirectAssignments.map(({ paramId }) => paramId),
       [1]
     )
-    assert.deepEqual(partialFacts.dmlParameterNullAdmissions, [
+    assertAdmissionFacts(partialFacts.dmlParameterNullAdmissions, [
       { admission: 'unknown', basis: 'unresolved', paramId: 1 },
     ])
     await assert.rejects(database.query(partialSql, [null]), /null partial predicate/u)
@@ -98,7 +108,7 @@ testWithDatabase(
       exclusionFacts.dmlDirectAssignments.map(({ paramId }) => paramId),
       [1]
     )
-    assert.deepEqual(exclusionFacts.dmlParameterNullAdmissions, [
+    assertAdmissionFacts(exclusionFacts.dmlParameterNullAdmissions, [
       { admission: 'unknown', basis: 'unresolved', paramId: 1 },
     ])
     await database.query(exclusionSql, [null])
@@ -116,7 +126,7 @@ testWithDatabase('incomplete enforcement preserves structural identity and defin
     nndFacts.dmlDirectAssignments.map(({ paramId }) => paramId),
     [1]
   )
-  assert.deepEqual(nndFacts.dmlParameterNullAdmissions, [
+  assertAdmissionFacts(nndFacts.dmlParameterNullAdmissions, [
     { admission: 'rejects', basis: 'direct_target_null_admission', paramId: 1 },
   ])
 
@@ -132,7 +142,7 @@ testWithDatabase('incomplete enforcement preserves structural identity and defin
     rlsFacts.dmlDirectAssignments.map(({ paramId }) => paramId),
     [1]
   )
-  assert.deepEqual(rlsFacts.dmlParameterNullAdmissions, [{ admission: 'unknown', basis: 'unresolved', paramId: 1 }])
+  assertAdmissionFacts(rlsFacts.dmlParameterNullAdmissions, [{ admission: 'unknown', basis: 'unresolved', paramId: 1 }])
 })
 
 testWithDatabase('constant and leaf-partition checks participate in target NULL admission', async (database) => {
@@ -140,7 +150,7 @@ testWithDatabase('constant and leaf-partition checks participate in target NULL 
   const constantSql = 'insert into public.constant_check_probe(value) values ($1::integer)'
   const constantFacts = queryFacts(await analyze(database, constantSql))
 
-  assert.deepEqual(constantFacts.dmlParameterNullAdmissions, [
+  assertAdmissionFacts(constantFacts.dmlParameterNullAdmissions, [
     { admission: 'rejects', basis: 'direct_target_null_admission', paramId: 1 },
   ])
   await assert.rejects(database.query(constantSql, [null]), /constant_check_probe_check/u)
@@ -148,7 +158,7 @@ testWithDatabase('constant and leaf-partition checks participate in target NULL 
   const unreachableSql = `update public.constant_check_probe
       set value = $1::integer where $1::integer is not null`
   const unreachableFacts = queryFacts(await analyze(database, unreachableSql))
-  assert.deepEqual(unreachableFacts.dmlParameterNullAdmissions, [
+  assertAdmissionFacts(unreachableFacts.dmlParameterNullAdmissions, [
     { admission: 'accepts', basis: 'action_unreachable_when_null', paramId: 1 },
   ])
   await database.query(unreachableSql, [null])
@@ -167,7 +177,9 @@ testWithDatabase('constant and leaf-partition checks participate in target NULL 
     leafFacts.dmlDirectAssignments.map(({ paramId }) => paramId),
     [1]
   )
-  assert.deepEqual(leafFacts.dmlParameterNullAdmissions, [{ admission: 'unknown', basis: 'unresolved', paramId: 1 }])
+  assertAdmissionFacts(leafFacts.dmlParameterNullAdmissions, [
+    { admission: 'unknown', basis: 'unresolved', paramId: 1 },
+  ])
   await assert.rejects(database.query(leafSql, [null]), /partition constraint/u)
 })
 
@@ -206,7 +218,7 @@ testWithDatabase(
       set value = coalesce($1::integer, value)`
     const preservedFacts = queryFacts(await analyze(database, preservedSql))
 
-    assert.deepEqual(preservedFacts.dmlParameterNullAdmissions, [
+    assertAdmissionFacts(preservedFacts.dmlParameterNullAdmissions, [
       { admission: 'accepts', basis: 'row_values_preserved_when_null', paramId: 1 },
     ])
     await database.query(preservedSql, [null])
@@ -308,7 +320,7 @@ testWithDatabase('JSON constructor NULL proof requires static safe keys and scal
 testWithDatabase('guarded insert source reports an unreachable action', async (database) => {
   await database.query('create table public.guarded_insert_probe (value integer not null)')
   const sql = 'insert into public.guarded_insert_probe(value) select $1::int where $1 is not null'
-  assert.deepEqual(queryFacts(await analyze(database, sql)).dmlParameterNullAdmissions, [
+  assertAdmissionFacts(queryFacts(await analyze(database, sql)).dmlParameterNullAdmissions, [
     { admission: 'accepts', basis: 'action_unreachable_when_null', paramId: 1 },
   ])
   await database.query(sql, [null])

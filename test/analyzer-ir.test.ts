@@ -296,7 +296,7 @@ testWithDatabase(
         assert.ok(error instanceof Error)
         assert.ok(!(error instanceof AggregateError))
         assert.match(error.message, /queries\/staleAnalyzerFirst\.typed\.sql/u)
-        assert.match(error.message, /analyzer returned unsupported schema version 6; expected 12/u)
+        assert.match(error.message, /analyzer returned unsupported schema version 6; expected 13/u)
         return true
       }
     )
@@ -1146,7 +1146,7 @@ testWithDatabase(
         corrupt(analysis) {
           analysis.schemaVersion = 6
         },
-        error: /analyzer returned unsupported schema version 6; expected 12/u,
+        error: /analyzer returned unsupported schema version 6; expected 13/u,
         name: 'staleSchema',
         sql: 'select account.id from public.accounts account',
       },

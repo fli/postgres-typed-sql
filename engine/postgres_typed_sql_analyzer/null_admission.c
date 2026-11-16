@@ -15,7 +15,10 @@
 #include "parser/parsetree.h"
 #include "utils/fmgroids.h"
 #include "utils/hsearch.h"
+#include "utils/json.h"
+#include "utils/builtins.h"
 #include "utils/lsyscache.h"
+#include "utils/regproc.h"
 #include "utils/rel.h"
 #include "utils/relcache.h"
 #include "utils/syscache.h"
@@ -35,12 +38,14 @@ typedef struct ColumnNullAdmissionEntry
 {
   ColumnNullAdmissionKey key;
   PtsNullAdmission admission;
+  List *reasons;
 } ColumnNullAdmissionEntry;
 
 typedef struct TypeNullAdmissionEntry
 {
   Oid type_oid;
   PtsNullAdmission admission;
+  List *reasons;
 } TypeNullAdmissionEntry;
 
 struct PtsNullAdmissionAnalysis
@@ -57,7 +62,40 @@ struct PtsDmlWriteEnforcement
   bool complete_target_null_constraints;
   bool has_generated_columns;
   List *match_full_foreign_keys;
+  List *reasons;
 };
+
+List *
+pts_add_null_reason(List *reasons, const char *code, const char *message, int offset)
+{
+  PtsNullAdmissionReason *reason = palloc(sizeof(*reason));
+  reason->code = code;
+  reason->message = message;
+  reason->compiled_byte_offset = offset;
+  return lappend(reasons, reason);
+}
+
+void
+pts_append_null_reasons(StringInfo out, const List *reasons)
+{
+  ListCell *cell;
+  bool first = true;
+  appendStringInfoChar(out, '[');
+  foreach(cell, reasons)
+  {
+    const PtsNullAdmissionReason *reason = lfirst(cell);
+    if (!first) appendStringInfoChar(out, ',');
+    first = false;
+    appendStringInfoString(out, "{\"code\":");
+    escape_json(out, reason->code);
+    appendStringInfoString(out, ",\"message\":");
+    escape_json(out, reason->message);
+    if (reason->compiled_byte_offset >= 0)
+      appendStringInfo(out, ",\"compiledByteOffset\":%d", reason->compiled_byte_offset);
+    appendStringInfoChar(out, '}');
+  }
+  appendStringInfoChar(out, ']');
+}
 
 PtsNullAdmission
 pts_combine_null_admission(PtsNullAdmission left, PtsNullAdmission right)
@@ -133,6 +171,7 @@ pts_type_null_admission(PtsNullAdmissionAnalysis *analysis, Oid type_oid)
   Form_pg_type type;
   bool found;
   PtsNullAdmission admission = PTS_NULL_ADMITS;
+  List *reasons = NIL;
 
   entry = analysis == NULL
             ? NULL
@@ -160,12 +199,21 @@ pts_type_null_admission(PtsNullAdmissionAnalysis *analysis, Oid type_oid)
       if (constraint->constrainttype == DOM_CONSTRAINT_NOTNULL)
       {
         admission = PTS_NULL_REJECTS;
-        break;
+        reasons = pts_add_null_reason(reasons, "domain_not_null",
+          psprintf("domain %s does not allow NULL", format_type_be_qualified(type_oid)), -1);
+        continue;
       }
       if (constraint->constrainttype == DOM_CONSTRAINT_CHECK)
-        admission = pts_combine_null_admission(
-          admission, null_evaluation_admission(pts_check_null_evaluation(
-            (const Node *) constraint->check_expr, 0)));
+      {
+        PtsNullAdmission check = null_evaluation_admission(pts_check_null_evaluation(
+          (const Node *) constraint->check_expr, 0));
+        admission = pts_combine_null_admission(admission, check);
+        if (check != PTS_NULL_ADMITS)
+          reasons = pts_add_null_reason(reasons,
+            check == PTS_NULL_REJECTS ? "check_rejects" : "domain_unresolved",
+            psprintf("domain %s constraint %s %s NULL", format_type_be_qualified(type_oid),
+                     constraint->name, check == PTS_NULL_REJECTS ? "rejects" : "may reject"), -1);
+      }
     }
   }
   ReleaseSysCache(tuple);
@@ -175,6 +223,7 @@ pts_type_null_admission(PtsNullAdmissionAnalysis *analysis, Oid type_oid)
     entry = hash_search(analysis->type_admissions, &type_oid,
                         HASH_ENTER, &found);
     entry->admission = admission;
+    entry->reasons = reasons;
   }
 
   return admission;
@@ -210,7 +259,7 @@ collect_column_mentions(Node *node, void *opaque)
 
 static void
 update_column_admission(HTAB *cache, Oid relid, AttrNumber attnum,
-                        PtsNullEvaluation evaluation)
+                        PtsNullEvaluation evaluation, const char *name)
 {
   ColumnNullAdmissionKey key;
   ColumnNullAdmissionEntry *entry;
@@ -221,8 +270,15 @@ update_column_admission(HTAB *cache, Oid relid, AttrNumber attnum,
   key.attnum = attnum;
   entry = hash_search(cache, &key, HASH_FIND, &found);
   if (found)
-    entry->admission = pts_combine_null_admission(
-      entry->admission, null_evaluation_admission(evaluation));
+  {
+    PtsNullAdmission admission = null_evaluation_admission(evaluation);
+    entry->admission = pts_combine_null_admission(entry->admission, admission);
+    if (admission != PTS_NULL_ADMITS)
+      entry->reasons = pts_add_null_reason(entry->reasons,
+        admission == PTS_NULL_REJECTS ? "check_rejects" : "check_unresolved",
+        psprintf("CHECK constraint %s on %s %s NULL", name,
+                 quote_qualified_identifier(get_namespace_name(get_rel_namespace(relid)), get_rel_name(relid)), admission == PTS_NULL_REJECTS ? "rejects" : "may reject"), -1);
+  }
 }
 
 static void
@@ -247,6 +303,7 @@ populate_column_admissions(HTAB *cache, Oid relid)
     key.attnum = attribute->attnum;
     entry = hash_search(cache, &key, HASH_ENTER, &found);
     entry->admission = PTS_NULL_ADMITS;
+    entry->reasons = NIL;
   }
   if (constraints != NULL)
   {
@@ -268,19 +325,19 @@ populate_column_admissions(HTAB *cache, Oid relid)
       {
         for (attnum = 1; attnum <= descriptor->natts; attnum++)
           update_column_admission(cache, relid, attnum,
-            pts_check_null_evaluation(check, attnum));
+            pts_check_null_evaluation(check, attnum), constraint->ccname);
       }
       else if (bms_is_empty(mentions.attnums))
       {
         for (attnum = 1; attnum <= descriptor->natts; attnum++)
           update_column_admission(cache, relid, attnum,
-            pts_check_null_evaluation(check, attnum));
+            pts_check_null_evaluation(check, attnum), constraint->ccname);
       }
       else
       {
         while ((attnum = bms_next_member(mentions.attnums, attnum)) >= 0)
           update_column_admission(cache, relid, (AttrNumber) attnum,
-            pts_check_null_evaluation(check, (AttrNumber) attnum));
+            pts_check_null_evaluation(check, (AttrNumber) attnum), constraint->ccname);
       }
       bms_free(mentions.attnums);
     }
@@ -311,10 +368,41 @@ pts_column_check_null_admission(PtsNullAdmissionAnalysis *analysis, Oid relid,
   return found ? entry->admission : PTS_NULL_UNKNOWN;
 }
 
+List *
+pts_type_null_reasons(PtsNullAdmissionAnalysis *analysis, Oid type_oid)
+{
+  bool found;
+  TypeNullAdmissionEntry *entry;
+  (void) pts_type_null_admission(analysis, type_oid);
+  entry = hash_search(analysis->type_admissions, &type_oid, HASH_FIND, &found);
+  return found ? entry->reasons : NIL;
+}
+
+List *
+pts_column_check_null_reasons(PtsNullAdmissionAnalysis *analysis, Oid relid,
+                              AttrNumber attnum)
+{
+  ColumnNullAdmissionKey key;
+  ColumnNullAdmissionEntry *entry;
+  bool found;
+  memset(&key, 0, sizeof(key));
+  key.relid = relid;
+  key.attnum = attnum;
+  (void) pts_column_check_null_admission(analysis, relid, attnum);
+  entry = hash_search(analysis->column_admissions, &key, HASH_FIND, &found);
+  return found ? entry->reasons : NIL;
+}
+
+const List *
+pts_dml_write_null_reasons(const PtsDmlWriteEnforcement *enforcement)
+{
+  return enforcement == NULL ? NIL : enforcement->reasons;
+}
+
 PtsNullAdmission
 pts_match_full_null_admission(const List *foreign_keys,
                               const List *target_list, int param_id,
-                              AttrNumber target_attnum)
+                              AttrNumber target_attnum, List **reasons)
 {
   PtsNullAdmission admission = PTS_NULL_ADMITS;
   ListCell *cell;
@@ -354,9 +442,19 @@ pts_match_full_null_admission(const List *foreign_keys,
         saw_nonnull = true;
     }
     if (saw_null && saw_nonnull)
+    {
       admission = pts_combine_null_admission(admission, PTS_NULL_REJECTS);
+      *reasons = pts_add_null_reason(*reasons, "required_nonnull",
+        psprintf("MATCH FULL foreign key %s rejects a mixture of NULL and non-NULL key values",
+                 get_constraint_name(foreign_key->conoid)), -1);
+    }
     else if (saw_unknown)
+    {
       admission = pts_combine_null_admission(admission, PTS_NULL_UNKNOWN);
+      *reasons = pts_add_null_reason(*reasons, "write_unresolved",
+        psprintf("MATCH FULL foreign key %s depends on other key values",
+                 get_constraint_name(foreign_key->conoid)), -1);
+    }
   }
   return admission;
 }
@@ -437,12 +535,23 @@ pts_inspect_dml_write_enforcement(const Query *query,
                          security_boundary || query->withCheckOptions != NIL ||
                          unvalidated_enforcement;
 
+  if (routed_target || form->relispartition)
+    result->reasons = pts_add_null_reason(result->reasons, "write_unresolved",
+      psprintf("partition routing or constraints on %s may affect the write", RelationGetRelationName(relation)), -1);
+  if (security_boundary || query->withCheckOptions != NIL)
+    result->reasons = pts_add_null_reason(result->reasons, "write_unresolved",
+      psprintf("row security or write policies on %s may affect the write", RelationGetRelationName(relation)), -1);
+  if (form->relkind == RELKIND_FOREIGN_TABLE || unvalidated_enforcement)
+    result->reasons = pts_add_null_reason(result->reasons, "write_unresolved",
+      psprintf("foreign table or unvalidated constraints on %s may affect the write", RelationGetRelationName(relation)), -1);
   for (index = 0; index < descriptor->natts; index++)
   {
     Form_pg_attribute attribute = TupleDescAttr(descriptor, index);
     if (!attribute->attisdropped && attribute->attgenerated != '\0')
     {
       result->has_generated_columns = true;
+      result->reasons = pts_add_null_reason(result->reasons, "write_unresolved",
+        psprintf("generated column %s on %s may affect the write", NameStr(attribute->attname), RelationGetRelationName(relation)), -1);
       admission_incomplete = true;
       preservation_opaque = true;
     }
@@ -458,6 +567,8 @@ pts_inspect_dml_write_enforcement(const Query *query,
       {
         admission_incomplete = true;
         preservation_opaque = true;
+        result->reasons = pts_add_null_reason(result->reasons, "check_unresolved",
+          psprintf("CHECK constraint %s on %s has unresolved enforcement", check->ccname, RelationGetRelationName(relation)), -1);
       }
     }
   }
@@ -469,6 +580,20 @@ pts_inspect_dml_write_enforcement(const Query *query,
     bool relevant =
       (action == CMD_INSERT && TRIGGER_FOR_INSERT(trigger->tgtype)) ||
       (action == CMD_UPDATE && TRIGGER_FOR_UPDATE(trigger->tgtype));
+    if (relevant && action == CMD_UPDATE && trigger->tgnattr > 0 &&
+        !result->has_generated_columns && query->querySource == QSRC_ORIGINAL)
+    {
+      ListCell *target_cell;
+      relevant = false;
+      foreach(target_cell, query->targetList)
+      {
+        const TargetEntry *target = lfirst_node(TargetEntry, target_cell);
+        int attr;
+        if (target->resjunk) continue;
+        for (attr = 0; attr < trigger->tgnattr; attr++)
+          if (target->resno == trigger->tgattr[attr]) relevant = true;
+      }
+    }
     if (relevant && trigger->tgenabled != TRIGGER_DISABLED &&
         (!trigger->tgisinternal || trigger->tgisclone))
     {
@@ -477,6 +602,14 @@ pts_inspect_dml_write_enforcement(const Query *query,
         identity_opaque = true;
       preservation_opaque = true;
       admission_incomplete = true;
+      result->reasons = pts_add_null_reason(result->reasons, "opaque_trigger",
+        psprintf("%s %s %s trigger %s on %s executes %s",
+          TRIGGER_FOR_BEFORE(trigger->tgtype) ? "BEFORE" :
+          TRIGGER_FOR_INSTEAD(trigger->tgtype) ? "INSTEAD OF" : "AFTER",
+          action == CMD_INSERT ? "INSERT" : "UPDATE",
+          TRIGGER_FOR_ROW(trigger->tgtype) ? "ROW" : "STATEMENT",
+          trigger->tgname, quote_qualified_identifier(get_namespace_name(get_rel_namespace(relid)), get_rel_name(relid)),
+          format_procedure_qualified(trigger->tgfoid)), -1);
       if (!TRIGGER_FOR_ROW(trigger->tgtype))
         action_unreachable_opaque = true;
     }
@@ -493,7 +626,12 @@ pts_inspect_dml_write_enforcement(const Query *query,
          index_relation->rd_index->indisexclusion ||
          (index_relation->rd_index->indisunique &&
           index_relation->rd_index->indnullsnotdistinct)))
+    {
       admission_incomplete = true;
+      result->reasons = pts_add_null_reason(result->reasons, "index_unresolved",
+        psprintf("index %s on %s has constraints or expressions whose NULL behavior is unresolved",
+                 RelationGetRelationName(index_relation), quote_qualified_identifier(get_namespace_name(get_rel_namespace(relid)), get_rel_name(relid))), -1);
+    }
     index_close(index_relation, AccessShareLock);
   }
   list_free(index_oids);

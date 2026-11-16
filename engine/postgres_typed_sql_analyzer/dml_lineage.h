@@ -15,6 +15,7 @@ typedef struct PtsDmlLineageFact
   Oid target_type_oid;
   PtsNullAdmission admission;
   bool direct_assignment;
+  List *reasons;
 } PtsDmlLineageFact;
 
 extern List *pts_collect_dml_lineage(const Query *query);
