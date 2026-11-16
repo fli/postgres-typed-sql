@@ -202,6 +202,62 @@ test('NULL admission explains the actual blockers through the public project API
     }
   })
 
+  await t.test('conditional expression reachability does not claim a proven domain rejection', async () => {
+    const domain = `${schema}.required_text`
+    const cases = [
+      [
+        `case when :value::text is distinct from :flag::text then 'ok'::${domain} else :value::text::${domain} end`,
+        'CASE condition',
+      ],
+      [
+        `case when :value::text is distinct from :flag::text then 'ok'::${domain} when true then :value::text::${domain} end`,
+        'CASE condition',
+      ],
+      [
+        `case when :flag::boolean then (select :value::text::${domain}) else 'ok'::${domain} end`,
+        'enclosing query execution',
+      ],
+      [
+        `case when :flag::boolean then 'ok'::${domain} else (select :value::text::${domain}) end`,
+        'enclosing query execution',
+      ],
+      [`case when false then (select :value::text::${domain}) else 'ok'::${domain} end`, 'enclosing query execution'],
+      [
+        `case when :flag::boolean then (with x as (select :value::text::${domain} v) select v from x) else 'ok'::${domain} end`,
+        'enclosing query execution',
+      ],
+      [`coalesce(:flag::text, :value::text::${domain})`, 'COALESCE'],
+    ] as const
+    for (const [expression, reasonText] of cases) {
+      const sql = `select ${expression}`
+      const analysis = await project.analyze(sourcePath, `-- @bindNull value\n${sql}`)
+      const parameter = analysis.parameters.find((item) => item.name === 'value')
+      assert.equal(parameter?.nullAdmission, 'unknown', expression)
+      assert.ok(
+        parameter.nullAdmissionReasons.some(
+          (reason) =>
+            reason.code === 'domain_unresolved' &&
+            reason.message.includes(domain) &&
+            reason.message.includes(reasonText)
+        ),
+        expression
+      )
+      await assert.rejects(
+        project.compile(sourcePath, `-- @nullable value\n${sql}`),
+        /could not prove that every use accepts NULL/u
+      )
+    }
+    for (const expression of [
+      `coalesce(:value::text::${domain}, :flag::text)`,
+      `coalesce(null::text, :value::text::${domain})`,
+      `case when false then 'ok'::${domain} else :value::text::${domain} end`,
+      `case when :flag::boolean then (select :value::text::${domain}) else 'ok'::${domain} end, :value::text::${domain}`,
+    ]) {
+      const analysis = await project.analyze(sourcePath, `-- @bindNull value\nselect ${expression}`)
+      assert.equal(analysis.parameters.find((item) => item.name === 'value')?.nullAdmission, 'rejects', expression)
+    }
+  })
+
   await t.test('UPDATE OF trigger applies only to listed columns', async () => {
     const unrelated = await project.analyze(
       sourcePath,

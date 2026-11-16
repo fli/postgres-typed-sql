@@ -540,16 +540,19 @@ parameter_usage_null_admission_walker(Node *node, void *walker_context)
         argument.proof == PTS_NULL_PROOF_NULL
         ? pts_type_null_admission(context->null_admission_analysis, coerce->resulttype)
         : PTS_NULL_UNKNOWN;
+      bool nested_rejection = context->scope->parent != NULL && admission == PTS_NULL_REJECTS;
       bool conditional_rejection = context->conditional && admission == PTS_NULL_REJECTS;
 
-      mark_parameter_usage(context, conditional_rejection ? PTS_NULL_UNKNOWN : admission);
-      if (conditional_rejection || !argument.evaluation_safe || argument.proof != PTS_NULL_PROOF_NULL)
+      mark_parameter_usage(context, conditional_rejection || nested_rejection ? PTS_NULL_UNKNOWN : admission);
+      if (conditional_rejection || nested_rejection || !argument.evaluation_safe || argument.proof != PTS_NULL_PROOF_NULL)
         context->evidence.reasons = pts_add_null_reason(context->evidence.reasons,
-          "domain_unresolved", psprintf(conditional_rejection
-            ? "domain coercion to %s is reached only under an unresolved CASE condition"
-            : "domain coercion to %s depends on an unresolved expression",
+          "domain_unresolved", psprintf(nested_rejection
+            ? "domain coercion to %s: enclosing query execution is not proved unconditional"
+            : conditional_rejection
+              ? "domain coercion to %s is reached only under an unresolved CASE condition or COALESCE argument"
+              : "domain coercion to %s depends on an unresolved expression",
             format_type_be_qualified(coerce->resulttype)), exprLocation(node));
-      if (!conditional_rejection && argument.evaluation_safe && argument.proof == PTS_NULL_PROOF_NULL)
+      if (!conditional_rejection && !nested_rejection && argument.evaluation_safe && argument.proof == PTS_NULL_PROOF_NULL)
         context->evidence.reasons = list_concat(context->evidence.reasons,
           list_copy(pts_type_null_reasons(context->null_admission_analysis, coerce->resulttype)));
       break;
@@ -734,11 +737,34 @@ parameter_usage_null_admission_walker(Node *node, void *walker_context)
           context->conditional = outer_conditional;
           return false;
         }
-        if (condition.proof == PTS_NULL_PROOF_UNKNOWN)
+        if (condition.proof != PTS_NULL_PROOF_TRUE &&
+            condition.proof != PTS_NULL_PROOF_FALSE &&
+            condition.proof != PTS_NULL_PROOF_NULL)
           prior_unknown = true;
       }
       context->conditional = outer_conditional || prior_unknown;
       parameter_usage_null_admission_walker((Node *) case_expr->defresult, context);
+      context->conditional = outer_conditional;
+      return false;
+    }
+    case T_CoalesceExpr:
+    {
+      const CoalesceExpr *coalesce = (const CoalesceExpr *) node;
+      bool outer_conditional = context->conditional;
+      bool prior_may_be_nonnull = false;
+      ListCell *cell;
+
+      foreach(cell, coalesce->args)
+      {
+        Node *argument = (Node *) lfirst(cell);
+        PtsNullEvaluation evaluation = pts_check_parameter_null_evaluation(
+          argument, context->param_id, context->node_analysis);
+
+        context->conditional = outer_conditional || prior_may_be_nonnull;
+        parameter_usage_null_admission_walker(argument, context);
+        if (evaluation.proof != PTS_NULL_PROOF_NULL)
+          prior_may_be_nonnull = true;
+      }
       context->conditional = outer_conditional;
       return false;
     }
@@ -752,7 +778,6 @@ parameter_usage_null_admission_walker(Node *node, void *walker_context)
     case T_CollateExpr:
     case T_ArrayExpr:
     case T_RowExpr:
-    case T_CoalesceExpr:
     case T_NullTest:
     case T_BooleanTest:
     case T_CommonTableExpr:
