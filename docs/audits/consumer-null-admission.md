@@ -14,6 +14,20 @@ The final report has `complete: true`. While the replay runs, `<output.json>.par
 
 The 143 substitutions in the captured baseline are experiments, not 143 defects. This inventory tests neither SQL rewrites nor combinations of declaration changes. An accepted substitution establishes compiler admission for that query, not that callers should change their declarations.
 
+## Recorded result
+
+The completed 2026-11-16 replay contains 143 individual substitutions across 44 complete query snapshots, using the actual configuration and schema. [The per-declaration inventory](consumer-null-admission.tsv) records the source hashes, outcome, and a named example for every blocker category. The full JSON produced by the replay retains every structured reason.
+
+| Outcome                               | Published beta.30 baseline | Candidate |
+| ------------------------------------- | -------------------------: | --------: |
+| Strict substitutions accepted         |                          0 |         0 |
+| Insufficient proof, `unknown`         |                        142 |       143 |
+| Demonstrated rejecting use, `rejects` |                          1 |         0 |
+
+The changed rejection classification is an UPDATE that may affect no rows. Its required destination remains identified, and strict `@nullable` still fails. The compiler retains direct-assignment metadata and CHECK-derived input types separately from row-production certainty.
+
+No declaration in these complete snapshots gains strict proof. The reduced fixtures gain selected-output CTE, subquery, and guarded-write proofs; the original statements retain opaque effects, relevant constraints, dependent inputs, or unsupported analysis. All 44 original queries still compile with their existing directives. Their executable JavaScript hashes match the baseline, every snapshot source hash matches, and all 48 watched consumer input hashes match. The accepted-substitution executable comparison is vacuous because no substitution was accepted; the positive upstream fixtures separately check identical generated executables and one driver query per call.
+
 ## Proof cases
 
 The upstream regressions reduce the consumer statements to independent fixtures. They preserve the relevant NULL behavior without requiring a consumer SQL rewrite.
@@ -36,3 +50,5 @@ Each parameter analysis also contains `nullAdmissionReasons`. A reason has a sta
 Required destinations and rejecting domains or constraints identify an input-contract failure. Conditional required writes and companion-dependent constraints need a stronger caller contract. Opaque callables, triggers, indexes, and unsupported projections identify the evidence the compiler lacks. Retain caller admission when that responsibility belongs to the application; report a reduced unsupported proof case when the SQL should be provable. No runtime NULL check or additional database query participates in these proofs.
 
 The report field is additive. Existing generated parameter signatures and statement execution remain unchanged. Consumers that enforce exact analysis-object keys or snapshots must include the new field.
+
+Execution certainty stays bounded. Domain casts in nested queries, filtered or potentially empty projections, and unsupported expression positions can remain `unknown`. Required window and sample inputs use separate initialization proofs; conditional or unused windows and sampling joins remain conservative. These limits preserve strict admission while avoiding a false claim that PostgreSQL must reject a bypassed use.
