@@ -172,10 +172,12 @@ indirect_parameter_walker(Node *node, void *opaque)
     IndirectQueryEntry *entry;
     bool result;
 
-    if (scope == NULL || var->varno == 0 || var->varattno < 0 ||
+    if (scope == NULL || var->varno == 0 ||
         var->varno > list_length(scope->query->rtable))
-      return false;
+      return true;
     rte = rt_fetch(var->varno, scope->query->rtable);
+    if (var->varattno < 0)
+      return rte->rtekind != RTE_RELATION;
     if (var->varattno == 0)
     {
       int attno;
@@ -202,7 +204,7 @@ indirect_parameter_walker(Node *node, void *opaque)
         return indirect_parameter_walker(
           (Node *) list_nth(expressions, var->varattno - 1), &nested);
       }
-      return false;
+      return true;
     }
     if (rte->rtekind == RTE_VALUES)
     {
@@ -213,7 +215,7 @@ indirect_parameter_walker(Node *node, void *opaque)
       foreach(cell, rte->values_lists)
       {
         const List *row = (const List *) lfirst(cell);
-        if (var->varattno <= list_length(row) &&
+        if (var->varattno > list_length(row) ||
             indirect_parameter_walker(
               (Node *) list_nth(row, var->varattno - 1), &nested))
           return true;
@@ -231,7 +233,7 @@ indirect_parameter_walker(Node *node, void *opaque)
         source = (const Query *) cte->ctequery;
     }
     if (source == NULL)
-      return false;
+      return rte->rtekind != RTE_RELATION;
     child.query = source;
     child.parent = owner;
     nested.usage = context->usage;
@@ -259,7 +261,7 @@ indirect_parameter_walker(Node *node, void *opaque)
         !source->hasWindowFuncs && !source->hasTargetSRFs &&
         !source->hasModifyingCTE && source->groupClause == NIL &&
         source->groupingSets == NIL && source->havingQual == NULL &&
-        source->setOperations == NULL)
+        source->distinctClause == NIL && source->setOperations == NULL)
     {
       const TargetEntry *target = pts_target_entry_by_resno(
         source->targetList, var->varattno);
@@ -386,6 +388,7 @@ indirect_callable_walker(Node *node, void *opaque)
       !IsA(node, RelabelType) && !IsA(node, CollateExpr) &&
       !IsA(node, ArrayExpr) && !IsA(node, RowExpr) &&
       !IsA(node, NullTest) && !IsA(node, BooleanTest) &&
+      !IsA(node, BoolExpr) &&
       !(IsA(node, SubLink) &&
         scalar_sublink_null_with_null_parameter((SubLink *) node, context)) &&
       indirect_parameter_walker(node, &indirect))
