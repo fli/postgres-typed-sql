@@ -3344,7 +3344,7 @@ testWithDatabase('native analyzer maps direct DML parameters to PostgreSQL targe
       where new.value is not null
       do also insert into public.conditional_rule_sink(value) values (new.value)`)
   const conditionalRule = await analyze(database, 'insert into public.conditional_rule_source(value) values ($1)')
-  assert.deepEqual(
+  assertAdmissionFacts(
     conditionalRule.statements[0]?.queries
       .flatMap((query) => query.dmlParameterNullAdmissions)
       .toSorted((left, right) => left.admission.localeCompare(right.admission)),
