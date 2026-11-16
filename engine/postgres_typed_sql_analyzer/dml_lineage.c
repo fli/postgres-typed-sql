@@ -5,6 +5,7 @@
 #include "optimizer/clauses.h"
 #include "parser/parsetree.h"
 #include "utils/hsearch.h"
+#include "utils/builtins.h"
 #include "utils/lsyscache.h"
 #include "utils/syscache.h"
 #include "dml_lineage.h"
@@ -36,6 +37,7 @@ typedef struct LineageVisitKey
   const Node *node;
   AttrNumber output_attnum;
   PtsNullAdmission null_admission;
+  Oid domain_oid;
   bool value_preserving;
   bool null_propagating;
   bool unconditional;
@@ -48,6 +50,7 @@ typedef struct LineageWorkItem
   const Node *node;
   AttrNumber output_attnum;
   PtsNullAdmission null_admission;
+  Oid domain_oid;
   bool value_preserving;
   bool null_propagating;
   bool unconditional;
@@ -71,12 +74,13 @@ typedef struct DmlLineageContext
   const List *target_list;
   const List *match_full_foreign_keys;
   const PtsDmlWriteEnforcement *enforcement;
+  bool requires_existing_row;
 } DmlLineageContext;
 
 static const Node *
 unwrap_direct_assignment_expr(DmlLineageContext *context, const Node *expr,
                               PtsNullAdmission *null_admission,
-                              bool *direct_assignment)
+                              bool *direct_assignment, Oid *domain_oid)
 {
   const Node *current = expr;
 
@@ -106,6 +110,9 @@ unwrap_direct_assignment_expr(DmlLineageContext *context, const Node *expr,
       {
         const CoerceToDomain *coerce = (const CoerceToDomain *) current;
 
+        if (pts_type_null_admission(context->null_admission_analysis,
+                                    coerce->resulttype) != PTS_NULL_ADMITS)
+          *domain_oid = coerce->resulttype;
         *null_admission = pts_combine_null_admission(
           *null_admission,
           pts_type_null_admission(context->null_admission_analysis,
@@ -140,7 +147,7 @@ static void
 append_dml_parameter_target(DmlLineageContext *context, int param_id,
                             PtsNullAdmission path_admission,
                             bool value_preserving, bool null_propagating,
-                            bool unconditional)
+                            bool unconditional, Oid domain_oid)
 {
   HeapTuple tuple;
   Form_pg_attribute attribute;
@@ -148,7 +155,9 @@ append_dml_parameter_target(DmlLineageContext *context, int param_id,
   Oid type_oid;
   PtsNullAdmission target_admission;
   bool direct_assignment;
+  bool write_identity;
   bool found;
+  List *reasons = NIL;
 
   if (!OidIsValid(context->target_relid) || context->target_attnum <= 0 || param_id <= 0)
   {
@@ -169,13 +178,25 @@ append_dml_parameter_target(DmlLineageContext *context, int param_id,
   }
 
   type_oid = attribute->atttypid;
+  write_identity = pts_dml_write_has_structural_assignment_identity(context->enforcement);
   target_admission = null_propagating ? path_admission : PTS_NULL_UNKNOWN;
-  if (null_propagating && attribute->attnotnull)
+  if (null_propagating && OidIsValid(domain_oid))
+    reasons = list_concat(reasons, list_copy(pts_type_null_reasons(
+      context->null_admission_analysis, domain_oid)));
+  if (null_propagating && write_identity && attribute->attnotnull)
   {
     target_admission = PTS_NULL_REJECTS;
+    reasons = pts_add_null_reason(reasons,
+      unconditional && !context->requires_existing_row ? "target_not_null" : "conditional_required_nonnull",
+      psprintf("%s.%s %s NULL", quote_qualified_identifier(get_namespace_name(get_rel_namespace(context->target_relid)), get_rel_name(context->target_relid)),
+               quote_identifier(NameStr(attribute->attname)), unconditional && !context->requires_existing_row ? "does not allow" : "may receive"), -1);
   }
-  if (null_propagating)
+  if (null_propagating && write_identity)
   {
+    reasons = list_concat(reasons, list_copy(pts_column_check_null_reasons(
+      context->null_admission_analysis, context->target_relid, context->target_attnum)));
+    reasons = list_concat(reasons, list_copy(pts_type_null_reasons(
+      context->null_admission_analysis, type_oid)));
     target_admission = pts_combine_null_admission(
       target_admission,
       pts_column_check_null_admission(context->null_admission_analysis,
@@ -187,20 +208,37 @@ append_dml_parameter_target(DmlLineageContext *context, int param_id,
       target_admission,
       pts_match_full_null_admission(context->match_full_foreign_keys,
                                 context->target_list, param_id,
-                                context->target_attnum));
+                                context->target_attnum, &reasons));
   }
-  if (target_admission != PTS_NULL_REJECTS &&
-      !pts_dml_write_has_complete_target_null_constraints(context->enforcement))
+  if (!pts_dml_write_has_complete_target_null_constraints(context->enforcement))
   {
+    reasons = list_concat(reasons, list_copy(pts_dml_write_null_reasons(context->enforcement)));
+    if (target_admission != PTS_NULL_REJECTS)
+      target_admission = PTS_NULL_UNKNOWN;
+  }
+  if ((!unconditional || context->requires_existing_row) && target_admission == PTS_NULL_REJECTS)
+  {
+    ListCell *reason_cell;
+    List *conditional_reasons = NIL;
+    foreach(reason_cell, reasons)
+    {
+      const PtsNullAdmissionReason *reason = lfirst(reason_cell);
+      if (strcmp(reason->code, "target_not_null") == 0 ||
+          strcmp(reason->code, "domain_not_null") == 0 ||
+          strcmp(reason->code, "check_rejects") == 0 ||
+          strcmp(reason->code, "required_nonnull") == 0)
+        conditional_reasons = pts_add_null_reason(conditional_reasons,
+          "conditional_required_nonnull", psprintf("conditional write: %s", reason->message), -1);
+      else
+        conditional_reasons = lappend(conditional_reasons, (void *) reason);
+    }
+    reasons = conditional_reasons;
+    if (context->requires_existing_row)
+      reasons = pts_add_null_reason(reasons, "conditional_required_nonnull",
+        "UPDATE may affect no rows", -1);
     target_admission = PTS_NULL_UNKNOWN;
   }
-  if (!unconditional && target_admission == PTS_NULL_REJECTS)
-  {
-    target_admission = PTS_NULL_UNKNOWN;
-  }
-  direct_assignment = value_preserving && unconditional &&
-                      pts_dml_write_has_structural_assignment_identity(
-                        context->enforcement);
+  direct_assignment = value_preserving && unconditional && write_identity;
 
   memset(&lookup_key, 0, sizeof(lookup_key));
   lookup_key.param_id = param_id;
@@ -225,6 +263,11 @@ append_dml_parameter_target(DmlLineageContext *context, int param_id,
     fact->target_type_oid = type_oid;
     fact->admission = target_admission;
     fact->direct_assignment = direct_assignment;
+    if (target_admission != PTS_NULL_ADMITS && reasons == NIL)
+      reasons = pts_add_null_reason(reasons, "write_unresolved",
+        psprintf("NULL behavior for write to %s.%s is unresolved",
+                 quote_qualified_identifier(get_namespace_name(get_rel_namespace(context->target_relid)), get_rel_name(context->target_relid)), quote_identifier(NameStr(attribute->attname))), -1);
+    fact->reasons = reasons;
     *context->facts_list = lappend(*context->facts_list, fact);
   }
 
@@ -237,7 +280,7 @@ enqueue_lineage_work(DmlLineageContext *context, LineageWorkQueue *work,
                      const Node *node, AttrNumber output_attnum,
                      PtsNullAdmission null_admission,
                      bool value_preserving, bool null_propagating,
-                     bool unconditional)
+                     bool unconditional, Oid domain_oid)
 {
   LineageVisitKey key;
   LineageWorkItem *item;
@@ -254,6 +297,7 @@ enqueue_lineage_work(DmlLineageContext *context, LineageWorkQueue *work,
   key.node = node;
   key.output_attnum = output_attnum;
   key.null_admission = null_admission;
+  key.domain_oid = domain_oid;
   key.value_preserving = value_preserving;
   key.null_propagating = null_propagating;
   key.unconditional = unconditional;
@@ -269,6 +313,7 @@ enqueue_lineage_work(DmlLineageContext *context, LineageWorkQueue *work,
   item->node = node;
   item->output_attnum = output_attnum;
   item->null_admission = null_admission;
+  item->domain_oid = domain_oid;
   item->value_preserving = value_preserving;
   item->null_propagating = null_propagating;
   item->unconditional = unconditional;
@@ -307,7 +352,7 @@ enqueue_unknown_lineage_walker(Node *node, void *walker_context)
     if (param->paramkind == PARAM_EXTERN)
     {
       append_dml_parameter_target(context->lineage, param->paramid,
-                                  PTS_NULL_UNKNOWN, false, false, false);
+                                  PTS_NULL_UNKNOWN, false, false, false, InvalidOid);
     }
     return false;
   }
@@ -315,7 +360,7 @@ enqueue_unknown_lineage_walker(Node *node, void *walker_context)
   {
     enqueue_lineage_work(context->lineage, context->work, LINEAGE_WORK_EXPR,
                          context->scope, node, 0, PTS_NULL_UNKNOWN,
-                         false, false, false);
+                         false, false, false, InvalidOid);
     return false;
   }
   if (IsA(node, Query))
@@ -342,7 +387,7 @@ append_direct_parameter_targets(DmlLineageContext *context, const PtsQueryScope 
   LineageWorkQueue work = {NULL, NULL};
 
   enqueue_lineage_work(context, &work, LINEAGE_WORK_EXPR, scope, expr, 0,
-                       null_admission, true, true, unconditional);
+                       null_admission, true, true, unconditional, InvalidOid);
 
   while (work.head != NULL)
   {
@@ -366,7 +411,7 @@ append_direct_parameter_targets(DmlLineageContext *context, const PtsQueryScope 
                              item->scope, item->scope->query->setOperations,
                              item->output_attnum, item->null_admission,
                              item->value_preserving, item->null_propagating,
-                             unconditional);
+                             unconditional, item->domain_oid);
       }
       else
       {
@@ -377,7 +422,7 @@ append_direct_parameter_targets(DmlLineageContext *context, const PtsQueryScope 
           enqueue_lineage_work(context, &work, LINEAGE_WORK_EXPR, item->scope,
                                (const Node *) target->expr, 0, item->null_admission,
                                item->value_preserving, item->null_propagating,
-                               unconditional);
+                               unconditional, item->domain_oid);
         }
       }
       pfree(item);
@@ -396,37 +441,37 @@ append_direct_parameter_targets(DmlLineageContext *context, const PtsQueryScope 
             enqueue_lineage_work(context, &work, LINEAGE_WORK_SET_OPERATION,
                                  item->scope, set->larg, item->output_attnum,
                                  item->null_admission, item->value_preserving,
-                                 item->null_propagating, item->unconditional);
+                                 item->null_propagating, item->unconditional, item->domain_oid);
             enqueue_lineage_work(context, &work, LINEAGE_WORK_SET_OPERATION,
                                  item->scope, set->rarg, item->output_attnum,
                                  item->null_admission, item->value_preserving,
-                                 item->null_propagating, item->unconditional);
+                                 item->null_propagating, item->unconditional, item->domain_oid);
             break;
           case SETOP_INTERSECT:
             enqueue_lineage_work(context, &work, LINEAGE_WORK_SET_OPERATION,
                                  item->scope, set->larg, item->output_attnum,
                                  item->null_admission, item->value_preserving,
-                                 item->null_propagating, false);
+                                 item->null_propagating, false, item->domain_oid);
             enqueue_lineage_work(context, &work, LINEAGE_WORK_SET_OPERATION,
                                  item->scope, set->rarg, item->output_attnum,
                                  item->null_admission, item->value_preserving,
-                                 item->null_propagating, false);
+                                 item->null_propagating, false, item->domain_oid);
             break;
           case SETOP_EXCEPT:
             enqueue_lineage_work(context, &work, LINEAGE_WORK_SET_OPERATION,
                                  item->scope, set->larg, item->output_attnum,
                                  item->null_admission, item->value_preserving,
-                                 item->null_propagating, false);
+                                 item->null_propagating, false, item->domain_oid);
             break;
           case SETOP_NONE:
             enqueue_lineage_work(context, &work, LINEAGE_WORK_SET_OPERATION,
                                  item->scope, set->larg, item->output_attnum,
                                  item->null_admission, item->value_preserving,
-                                 item->null_propagating, false);
+                                 item->null_propagating, false, item->domain_oid);
             enqueue_lineage_work(context, &work, LINEAGE_WORK_SET_OPERATION,
                                  item->scope, set->rarg, item->output_attnum,
                                  item->null_admission, item->value_preserving,
-                                 item->null_propagating, false);
+                                 item->null_propagating, false, item->domain_oid);
             break;
         }
       }
@@ -448,7 +493,7 @@ append_direct_parameter_targets(DmlLineageContext *context, const PtsQueryScope 
                                  child_scope, (const Node *) rte->subquery,
                                  item->output_attnum, item->null_admission,
                                  item->value_preserving, item->null_propagating,
-                                 item->unconditional);
+                                 item->unconditional, item->domain_oid);
           }
         }
       }
@@ -460,9 +505,10 @@ append_direct_parameter_targets(DmlLineageContext *context, const PtsQueryScope 
     {
       PtsNullAdmission item_admission = item->null_admission;
       bool value_preserving = item->value_preserving;
+      Oid domain_oid = item->domain_oid;
       const Node *unwrapped = unwrap_direct_assignment_expr(context, item->node,
                                                             &item_admission,
-                                                            &value_preserving);
+                                                            &value_preserving, &domain_oid);
 
       if (unwrapped != NULL && IsA(unwrapped, Param))
       {
@@ -472,7 +518,7 @@ append_direct_parameter_targets(DmlLineageContext *context, const PtsQueryScope 
         {
           append_dml_parameter_target(context, param->paramid, item_admission,
                                       value_preserving, item->null_propagating,
-                                      item->unconditional);
+                                      item->unconditional, domain_oid);
         }
       }
       else if (unwrapped != NULL && IsA(unwrapped, Var))
@@ -505,7 +551,7 @@ append_direct_parameter_targets(DmlLineageContext *context, const PtsQueryScope 
                                      variable_scope,
                                      (const Node *) insert_target->expr,
                                      0, item_admission, false,
-                                     item->null_propagating, false);
+                                     item->null_propagating, false, domain_oid);
               }
             }
             else if (var->varattno == InvalidAttrNumber)
@@ -544,7 +590,7 @@ append_direct_parameter_targets(DmlLineageContext *context, const PtsQueryScope 
                                      variable_scope,
                                      (const Node *) list_nth(row, var->varattno - 1),
                                      0, item_admission, value_preserving,
-                                     item->null_propagating, item->unconditional);
+                                     item->null_propagating, item->unconditional, domain_oid);
               }
             }
           }
@@ -557,7 +603,7 @@ append_direct_parameter_targets(DmlLineageContext *context, const PtsQueryScope 
                                  child_scope, (const Node *) rte->subquery,
                                  var->varattno, item_admission,
                                  value_preserving, item->null_propagating,
-                                 item->unconditional);
+                                 item->unconditional, domain_oid);
           }
           else if (var->varattno > 0 && rte->rtekind == RTE_CTE)
           {
@@ -576,7 +622,7 @@ append_direct_parameter_targets(DmlLineageContext *context, const PtsQueryScope 
                                    cte_scope, (const Node *) cte_query,
                                    var->varattno, item_admission,
                                    value_preserving, item->null_propagating,
-                                   item->unconditional);
+                                   item->unconditional, domain_oid);
             }
           }
           else if (var->varattno > 0 && rte->rtekind == RTE_JOIN &&
@@ -587,7 +633,7 @@ append_direct_parameter_targets(DmlLineageContext *context, const PtsQueryScope 
                                  (const Node *) list_nth(rte->joinaliasvars,
                                                         var->varattno - 1),
                                  0, item_admission, value_preserving,
-                                 item->null_propagating, item->unconditional);
+                                 item->null_propagating, item->unconditional, domain_oid);
           }
           else if (var->varattno > 0 && rte->rtekind == RTE_GROUP &&
                    var->varattno <= list_length(rte->groupexprs))
@@ -597,7 +643,7 @@ append_direct_parameter_targets(DmlLineageContext *context, const PtsQueryScope 
                                  (const Node *) list_nth(rte->groupexprs,
                                                         var->varattno - 1),
                                  0, item_admission, value_preserving,
-                                 item->null_propagating, item->unconditional);
+                                 item->null_propagating, item->unconditional, domain_oid);
           }
           else if (var->varattno == InvalidAttrNumber &&
                    (rte->rtekind == RTE_VALUES ||
@@ -713,7 +759,7 @@ append_direct_parameter_targets(DmlLineageContext *context, const PtsQueryScope 
                                           &condition_context);
           enqueue_lineage_work(context, &work, LINEAGE_WORK_EXPR, item->scope,
                                (const Node *) when->result, 0, item_admission,
-                               false, item->null_propagating, false);
+                               false, item->null_propagating, false, domain_oid);
           if (condition.evaluation_safe && condition.proof == PTS_NULL_PROOF_TRUE)
           {
             include_default = false;
@@ -724,7 +770,7 @@ append_direct_parameter_targets(DmlLineageContext *context, const PtsQueryScope 
           enqueue_lineage_work(context, &work, LINEAGE_WORK_EXPR, item->scope,
                                (const Node *) case_expr->defresult, 0,
                                item_admission, false, item->null_propagating,
-                               false);
+                               false, domain_oid);
       }
       else if (unwrapped != NULL)
       {
@@ -744,7 +790,7 @@ append_direct_parameter_targets(DmlLineageContext *context, const PtsQueryScope 
 static void
 collect_targets_from_list(List **facts_list, const PtsQueryScope *scope,
                          const List *target_list, Oid target_relid,
-                         bool unconditional,
+                         bool unconditional, bool requires_existing_row,
                          const PtsDmlWriteEnforcement *enforcement,
                          HTAB *facts,
                          PtsNullAdmissionAnalysis *null_admission_analysis)
@@ -772,6 +818,7 @@ collect_targets_from_list(List **facts_list, const PtsQueryScope *scope,
       context.match_full_foreign_keys =
         pts_dml_write_match_full_foreign_keys(enforcement);
       context.enforcement = enforcement;
+      context.requires_existing_row = requires_existing_row;
       context.visited = hash_create("typed SQL DML lineage visits", 32,
                                     &visited_control, HASH_ELEM | HASH_BLOBS);
       append_direct_parameter_targets(&context, scope, (const Node *) target->expr,
@@ -815,7 +862,7 @@ pts_collect_dml_lineage(const Query *query)
                              query->commandType == CMD_UPDATE ||
                              (query->commandType == CMD_INSERT &&
                               pts_query_output_is_unconditional(&scope)),
-                             enforcement, facts, null_admission_analysis);
+                             query->commandType == CMD_UPDATE, enforcement, facts, null_admission_analysis);
     pts_release_dml_write_enforcement(enforcement);
   }
 
@@ -827,7 +874,7 @@ pts_collect_dml_lineage(const Query *query)
 
     collect_targets_from_list(&lineage, &scope,
                              query->onConflict->onConflictSet,
-                             target_relid, false, enforcement, facts,
+                             target_relid, false, true, enforcement, facts,
                              null_admission_analysis);
     pts_release_dml_write_enforcement(enforcement);
   }
@@ -846,13 +893,13 @@ pts_collect_dml_lineage(const Query *query)
       if (action->commandType == CMD_INSERT)
       {
         collect_targets_from_list(&lineage, &scope, action->targetList,
-                                 target_relid, false, insert_enforcement, facts,
+                                 target_relid, false, false, insert_enforcement, facts,
                                  null_admission_analysis);
       }
       else if (action->commandType == CMD_UPDATE)
       {
         collect_targets_from_list(&lineage, &scope, action->targetList,
-                                 target_relid, false, update_enforcement, facts,
+                                 target_relid, false, true, update_enforcement, facts,
                                  null_admission_analysis);
       }
     }

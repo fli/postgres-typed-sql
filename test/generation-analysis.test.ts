@@ -348,12 +348,9 @@ test('binding NULL permission is explicit and independent of proved or unresolve
   const result = await generateTypedSql(configFor(root), { analysis: true })
   assert.equal(result.analysis.version, 2)
   const parameter = (name: string) => result.analysis.statements.find((entry) => entry.export === name)?.parameters[0]
-  assert.deepEqual(parameter('query'), {
-    name: 'input_value',
-    propertyName: 'inputValue',
-    nullBinding: 'callerNullable',
-    nullAdmission: 'rejects',
-  })
+  assert.equal(parameter('query')?.nullBinding, 'callerNullable')
+  assert.equal(parameter('query')?.nullAdmission, 'rejects')
+  assert.ok(parameter('query')?.nullAdmissionReasons.some((reason) => reason.code === 'target_not_null'))
   assert.equal(parameter('unknown')?.nullBinding, 'callerNullable')
   assert.equal(parameter('unknown')?.nullAdmission, 'unknown')
   assert.equal(parameter('proved')?.nullBinding, 'provedNullable')

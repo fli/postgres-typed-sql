@@ -52,9 +52,32 @@ export interface TypedSqlPostgresIrParam extends PostgresTypeFact {
   readonly checkConstraintType?: TypedSqlPostgresIrCheckConstraintTypeExpression
   readonly name: string
   readonly nullAdmission: TypedSqlPostgresIrParamNullAdmission
+  readonly nullAdmissionReasons: readonly TypedSqlNullAdmissionReason[]
 }
 
 export type TypedSqlPostgresIrParamNullAdmission = 'accepts' | 'rejects' | 'unknown'
+
+export type TypedSqlNullAdmissionReasonCode =
+  | 'target_not_null'
+  | 'domain_not_null'
+  | 'check_rejects'
+  | 'required_nonnull'
+  | 'conditional_required_nonnull'
+  | 'opaque_callable'
+  | 'opaque_trigger'
+  | 'check_unresolved'
+  | 'domain_unresolved'
+  | 'index_unresolved'
+  | 'unsupported_projection'
+  | 'write_unresolved'
+  | 'unresolved'
+
+export interface TypedSqlNullAdmissionReason {
+  readonly code: TypedSqlNullAdmissionReasonCode
+  readonly message: string
+  /** Zero-based UTF-8 byte offset in compiled SQL, when available. */
+  readonly compiledByteOffset?: number
+}
 
 export interface TypedSqlPostgresIrColumn extends PostgresTypeFact {
   /** Present only when the SQL expression proves a flat array result. */

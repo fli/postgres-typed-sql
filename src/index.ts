@@ -18,6 +18,8 @@ export type {
   TypedSqlAccessEvidence,
   TypedSqlAnalysisInput,
   TypedSqlGenerationAnalysis,
+  TypedSqlNullAdmissionReason,
+  TypedSqlNullAdmissionReasonCode,
   TypedSqlParameterAnalysis,
   TypedSqlStatementAnalysis,
 } from './generation-analysis.js'

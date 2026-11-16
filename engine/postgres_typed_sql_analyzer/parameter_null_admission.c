@@ -6,8 +6,10 @@
 #include "nodes/primnodes.h"
 #include "parser/parsetree.h"
 #include "utils/fmgroids.h"
+#include "utils/builtins.h"
 #include "utils/hsearch.h"
 #include "utils/lsyscache.h"
+#include "utils/regproc.h"
 
 #include "null_admission.h"
 #include "null_evaluation.h"
@@ -30,6 +32,7 @@ typedef struct IndirectQueryKey
   const Query *query;
   const IndirectScopeEntry *owner;
   int depth;
+  AttrNumber output_attnum;
 } IndirectQueryKey;
 
 typedef struct IndirectQueryEntry
@@ -41,6 +44,8 @@ typedef struct IndirectQueryEntry
 typedef struct PtsParameterUsageContext
 {
   int param_id;
+  bool conditional;
+  bool root_target;
   PtsParameterUsageEvidence evidence;
   PtsNullAdmissionAnalysis *null_admission_analysis;
   PtsParameterNodeAnalysis *node_analysis;
@@ -67,6 +72,15 @@ mark_parameter_usage(PtsParameterUsageContext *context,
 }
 
 static void
+mark_unknown_expression(PtsParameterUsageContext *context, const Node *node,
+                        const char *description)
+{
+  mark_parameter_usage(context, PTS_NULL_UNKNOWN);
+  context->evidence.reasons = pts_add_null_reason(context->evidence.reasons,
+    "unresolved", description, exprLocation(node));
+}
+
+static void
 merge_parameter_usage_evidence(PtsParameterUsageEvidence *target,
                                const PtsParameterUsageEvidence *source)
 {
@@ -81,17 +95,89 @@ merge_parameter_usage_evidence(PtsParameterUsageEvidence *target,
   }
   target->admission = pts_combine_null_admission(target->admission,
                                              source->admission);
+  target->reasons = list_concat(target->reasons, list_copy(source->reasons));
+}
+
+typedef enum PtsUsageExecutionPhase
+{
+  PTS_USAGE_ROW,
+  PTS_USAGE_WINDOW_INIT,
+  PTS_USAGE_SAMPLE_INIT
+} PtsUsageExecutionPhase;
+
+static bool
+usage_execution_is_unconditional(const PtsParameterUsageContext *context,
+                                 PtsUsageExecutionPhase phase,
+                                 const TableSampleClause *sample)
+{
+  const Query *query = context->scope->query;
+
+  if (context->conditional || context->scope->parent != NULL)
+    return false;
+  if (phase == PTS_USAGE_ROW)
+    return context->root_target && query->commandType == CMD_SELECT &&
+      query->jointree != NULL && query->jointree->fromlist == NIL &&
+      query->jointree->quals == NULL && query->havingQual == NULL &&
+      query->limitOffset == NULL && query->limitCount == NULL &&
+      !query->hasAggs && query->groupClause == NIL && query->groupingSets == NIL &&
+      query->windowClause == NIL && !query->hasTargetSRFs &&
+      query->setOperations == NULL && !query->hasRowSecurity &&
+      query->cteList == NIL;
+  if (query->commandType != CMD_SELECT || query->querySource != QSRC_ORIGINAL ||
+      query->hasRowSecurity || query->setOperations != NULL || query->hasTargetSRFs ||
+      query->havingQual != NULL || query->limitOffset != NULL ||
+      query->limitCount != NULL || query->jointree == NULL ||
+      query->jointree->quals != NULL)
+    return false;
+  if (phase == PTS_USAGE_SAMPLE_INIT)
+  {
+    const Node *from;
+    const RangeTblEntry *rte;
+    const RangeTblRef *ref;
+
+    if (list_length(query->jointree->fromlist) != 1)
+      return false;
+    from = (const Node *) linitial(query->jointree->fromlist);
+    if (!IsA(from, RangeTblRef))
+      return false;
+    ref = (const RangeTblRef *) from;
+    rte = rt_fetch(ref->rtindex, query->rtable);
+    return rte->rtekind == RTE_RELATION && rte->tablesample == sample;
+  }
+  return true;
+}
+
+static bool
+window_has_direct_target(const Query *query, const WindowClause *window)
+{
+  ListCell *cell;
+
+  if (!query->hasWindowFuncs || list_length(query->windowClause) != 1)
+    return false;
+  foreach(cell, query->targetList)
+  {
+    const TargetEntry *target = (const TargetEntry *) lfirst(cell);
+
+    if (!target->resjunk && IsA(target->expr, WindowFunc) &&
+        ((const WindowFunc *) target->expr)->winref == window->winref)
+      return true;
+  }
+  return false;
 }
 
 static void
 mark_required_nonnull_parameter_usage(PtsParameterUsageContext *context,
-                                      const Node *expr)
+                                      const Node *expr, bool active,
+                                      PtsUsageExecutionPhase phase,
+                                      const TableSampleClause *sample)
 {
     PtsNullEvaluation evaluation;
 
   if (mentions_indirect_parameter((Node *) expr, context))
   {
     mark_parameter_usage(context, PTS_NULL_UNKNOWN);
+    context->evidence.reasons = pts_add_null_reason(context->evidence.reasons,
+      "conditional_required_nonnull", "an expression may require a non-NULL value", exprLocation(expr));
     return;
   }
 
@@ -102,14 +188,20 @@ mark_required_nonnull_parameter_usage(PtsParameterUsageContext *context,
 
   evaluation = pts_check_parameter_null_evaluation(expr, context->param_id,
                                                context->node_analysis);
-  if (evaluation.proof == PTS_NULL_PROOF_NULL && evaluation.evaluation_safe)
+  if (evaluation.proof == PTS_NULL_PROOF_NULL && evaluation.evaluation_safe && active &&
+      usage_execution_is_unconditional(context, phase, sample))
   {
     mark_parameter_usage(context, PTS_NULL_REJECTS);
+    context->evidence.reasons = pts_add_null_reason(context->evidence.reasons,
+      "required_nonnull", "this expression requires a non-NULL value", exprLocation(expr));
   }
-  else if (evaluation.proof == PTS_NULL_PROOF_UNKNOWN ||
+  else if (evaluation.proof == PTS_NULL_PROOF_NULL ||
+           evaluation.proof == PTS_NULL_PROOF_UNKNOWN ||
            !evaluation.evaluation_safe)
   {
     mark_parameter_usage(context, PTS_NULL_UNKNOWN);
+    context->evidence.reasons = pts_add_null_reason(context->evidence.reasons,
+      "conditional_required_nonnull", "this expression may require a non-NULL value", exprLocation(expr));
   }
 }
 
@@ -134,6 +226,52 @@ intern_indirect_scope(HTAB *scopes, const PtsQueryScope *scope)
 }
 
 static bool
+projection_source_cardinality_independent(const PtsQueryScope *scope, int depth)
+{
+  const Query *query = scope->query;
+  const RangeTblEntry *rte;
+  const Query *source;
+  const PtsQueryScope *owner = scope;
+  PtsQueryScope child;
+  RangeTblRef *ref;
+
+  if (depth > 32 || query->commandType != CMD_SELECT || query->jointree == NULL ||
+      query->jointree->quals != NULL || query->limitCount != NULL ||
+      query->limitOffset != NULL || query->hasAggs || query->hasWindowFuncs ||
+      query->hasTargetSRFs || query->hasModifyingCTE || query->hasRowSecurity ||
+      query->groupClause != NIL || query->groupingSets != NIL ||
+      query->havingQual != NULL || query->distinctClause != NIL ||
+      query->setOperations != NULL)
+    return false;
+  if (query->jointree->fromlist == NIL)
+    return true;
+  if (list_length(query->jointree->fromlist) != 1 ||
+      !IsA(linitial(query->jointree->fromlist), RangeTblRef))
+    return false;
+  ref = linitial_node(RangeTblRef, query->jointree->fromlist);
+  if (ref->rtindex <= 0 || ref->rtindex > list_length(query->rtable))
+    return false;
+  rte = rt_fetch(ref->rtindex, query->rtable);
+  if (rte->rtekind == RTE_RELATION)
+    return true;
+  if (rte->rtekind == RTE_SUBQUERY)
+    source = rte->subquery;
+  else if (rte->rtekind == RTE_CTE && !rte->self_reference)
+  {
+    const CommonTableExpr *cte;
+    owner = pts_query_scope_at_level(scope, rte->ctelevelsup);
+    cte = owner == NULL ? NULL : pts_cte_by_name(owner->query, rte->ctename);
+    if (cte == NULL || !IsA(cte->ctequery, Query)) return false;
+    source = (const Query *) cte->ctequery;
+  }
+  else
+    return false;
+  child.query = source;
+  child.parent = owner;
+  return projection_source_cardinality_independent(&child, depth + 1);
+}
+
+static bool
 indirect_parameter_walker(Node *node, void *opaque)
 {
   IndirectParameterContext *context = opaque;
@@ -154,8 +292,27 @@ indirect_parameter_walker(Node *node, void *opaque)
     PtsQueryScope child = {query, context->scope};
     IndirectParameterContext nested = {context->usage, &child,
                                       context->depth + 1};
-    return query_tree_walker((Query *) query, indirect_parameter_walker,
-                             &nested, QTW_IGNORE_CTE_SUBQUERIES);
+    ListCell *cell;
+    if (query_tree_walker((Query *) query, indirect_parameter_walker,
+                          &nested, QTW_IGNORE_CTE_SUBQUERIES))
+      return true;
+    foreach(cell, query->rtable)
+    {
+      const RangeTblEntry *rte = lfirst_node(RangeTblEntry, cell);
+      const PtsQueryScope *owner;
+      const CommonTableExpr *cte;
+      IndirectParameterContext producer;
+      if (rte->rtekind != RTE_CTE) continue;
+      if (rte->self_reference) return true;
+      owner = pts_query_scope_at_level(&child, rte->ctelevelsup);
+      cte = owner == NULL ? NULL : pts_cte_by_name(owner->query, rte->ctename);
+      if (cte == NULL || !IsA(cte->ctequery, Query)) return true;
+      producer.usage = context->usage;
+      producer.scope = owner;
+      producer.depth = nested.depth;
+      if (indirect_parameter_walker((Node *) cte->ctequery, &producer)) return true;
+    }
+    return false;
   }
   if (IsA(node, Var))
   {
@@ -171,10 +328,12 @@ indirect_parameter_walker(Node *node, void *opaque)
     IndirectQueryEntry *entry;
     bool result;
 
-    if (scope == NULL || var->varno == 0 || var->varattno < 0 ||
+    if (scope == NULL || var->varno == 0 ||
         var->varno > list_length(scope->query->rtable))
-      return false;
+      return true;
     rte = rt_fetch(var->varno, scope->query->rtable);
+    if (var->varattno < 0)
+      return rte->rtekind != RTE_RELATION;
     if (var->varattno == 0)
     {
       int attno;
@@ -201,7 +360,7 @@ indirect_parameter_walker(Node *node, void *opaque)
         return indirect_parameter_walker(
           (Node *) list_nth(expressions, var->varattno - 1), &nested);
       }
-      return false;
+      return true;
     }
     if (rte->rtekind == RTE_VALUES)
     {
@@ -212,12 +371,27 @@ indirect_parameter_walker(Node *node, void *opaque)
       foreach(cell, rte->values_lists)
       {
         const List *row = (const List *) lfirst(cell);
-        if (var->varattno <= list_length(row) &&
+        if (var->varattno > list_length(row) ||
             indirect_parameter_walker(
               (Node *) list_nth(row, var->varattno - 1), &nested))
           return true;
       }
       return false;
+    }
+    if (rte->rtekind == RTE_FUNCTION)
+    {
+      ListCell *cell;
+      nested.usage = context->usage;
+      nested.scope = scope;
+      nested.depth = context->depth + 1;
+      foreach(cell, rte->functions)
+      {
+        const RangeTblFunction *function = lfirst_node(RangeTblFunction, cell);
+        if (function->funcexpr == NULL ||
+            indirect_parameter_walker(function->funcexpr, &nested))
+          return true;
+      }
+      return rte->functions == NIL;
     }
     if (rte->rtekind == RTE_SUBQUERY)
       source = rte->subquery;
@@ -230,7 +404,7 @@ indirect_parameter_walker(Node *node, void *opaque)
         source = (const Query *) cte->ctequery;
     }
     if (source == NULL)
-      return false;
+      return rte->rtekind != RTE_RELATION;
     child.query = source;
     child.parent = owner;
     nested.usage = context->usage;
@@ -240,12 +414,23 @@ indirect_parameter_walker(Node *node, void *opaque)
     key.query = source;
     key.owner = intern_indirect_scope(context->usage->indirect_scopes, owner);
     key.depth = nested.depth;
+    key.output_attnum = var->varattno;
     entry = hash_search(context->usage->indirect_queries, &key, HASH_FIND, NULL);
     if (entry != NULL)
       return entry->mentions_parameter;
 
-    result = query_tree_walker((Query *) source, indirect_parameter_walker,
-                               &nested, QTW_IGNORE_CTE_SUBQUERIES);
+    if (projection_source_cardinality_independent(&child, 0))
+    {
+      const TargetEntry *target = pts_target_entry_by_resno(
+        source->targetList, var->varattno);
+      result = target == NULL || indirect_parameter_walker(
+        (Node *) target->expr, &nested);
+    }
+    else
+    {
+      IndirectParameterContext producer = {context->usage, owner, nested.depth};
+      result = indirect_parameter_walker((Node *) source, &producer);
+    }
     entry = hash_search(context->usage->indirect_queries, &key, HASH_ENTER, NULL);
     entry->mentions_parameter = result;
     return result;
@@ -362,10 +547,30 @@ indirect_callable_walker(Node *node, void *opaque)
       !IsA(node, RelabelType) && !IsA(node, CollateExpr) &&
       !IsA(node, ArrayExpr) && !IsA(node, RowExpr) &&
       !IsA(node, NullTest) && !IsA(node, BooleanTest) &&
+      !IsA(node, BoolExpr) &&
       !(IsA(node, SubLink) &&
         scalar_sublink_null_with_null_parameter((SubLink *) node, context)) &&
       indirect_parameter_walker(node, &indirect))
-    mark_parameter_usage(context, PTS_NULL_UNKNOWN);
+  {
+    PtsNullEvaluation evaluation = pts_check_parameter_null_evaluation_scoped(
+      node, context->param_id, context->scope);
+
+    if (!evaluation.depends_on_subject || !evaluation.evaluation_safe)
+    {
+      mark_parameter_usage(context, PTS_NULL_UNKNOWN);
+      if (IsA(node, FuncExpr) || IsA(node, OpExpr))
+      {
+        Oid callable = IsA(node, FuncExpr) ? ((FuncExpr *) node)->funcid :
+          get_opcode(((OpExpr *) node)->opno);
+        context->evidence.reasons = pts_add_null_reason(context->evidence.reasons,
+          "opaque_callable", psprintf("evaluation of callable %s with NULL is not proved safe",
+            format_procedure_qualified(callable)), exprLocation(node));
+      }
+      else
+        context->evidence.reasons = pts_add_null_reason(context->evidence.reasons,
+          "unsupported_projection", "a projected expression may depend on a NULL-sensitive row source", exprLocation(node));
+    }
+  }
   return expression_tree_walker(node, indirect_callable_walker, opaque);
 }
 
@@ -378,11 +583,6 @@ parameter_usage_null_admission_walker(Node *node, void *walker_context)
   if (node == NULL)
   {
     return false;
-  }
-  if (context->evidence.seen &&
-      context->evidence.admission == PTS_NULL_REJECTS)
-  {
-    return true;
   }
   if (IsA(node, Query))
   {
@@ -408,12 +608,28 @@ parameter_usage_null_admission_walker(Node *node, void *walker_context)
         (const Node *) coerce->arg, context->param_id,
         context->node_analysis);
 
-      mark_parameter_usage(
-        context,
-        argument.evaluation_safe && argument.proof == PTS_NULL_PROOF_NULL
-          ? pts_type_null_admission(context->null_admission_analysis,
-                                coerce->resulttype)
-          : PTS_NULL_UNKNOWN);
+      PtsNullAdmission admission = argument.evaluation_safe &&
+        argument.proof == PTS_NULL_PROOF_NULL
+        ? pts_type_null_admission(context->null_admission_analysis, coerce->resulttype)
+        : PTS_NULL_UNKNOWN;
+      bool nested_rejection = !usage_execution_is_unconditional(context, PTS_USAGE_ROW, NULL) &&
+        !context->conditional && admission == PTS_NULL_REJECTS;
+      bool conditional_rejection = context->conditional && admission == PTS_NULL_REJECTS;
+
+      mark_parameter_usage(context, conditional_rejection || nested_rejection ? PTS_NULL_UNKNOWN : admission);
+      if (conditional_rejection || nested_rejection || !argument.evaluation_safe || argument.proof != PTS_NULL_PROOF_NULL)
+        context->evidence.reasons = pts_add_null_reason(context->evidence.reasons,
+          "domain_unresolved", psprintf(nested_rejection
+            ? (context->scope->parent != NULL
+              ? "domain coercion to %s: enclosing query execution is not proved unconditional"
+              : "domain coercion to %s: query row production or execution is not proved unconditional")
+            : conditional_rejection
+              ? "domain coercion to %s is reached only under an unresolved CASE condition, COALESCE argument, or Boolean operand"
+              : "domain coercion to %s depends on an unresolved expression",
+            format_type_be_qualified(coerce->resulttype)), exprLocation(node));
+      if (!conditional_rejection && !nested_rejection && argument.evaluation_safe && argument.proof == PTS_NULL_PROOF_NULL)
+        context->evidence.reasons = list_concat(context->evidence.reasons,
+          list_copy(pts_type_null_reasons(context->null_admission_analysis, coerce->resulttype)));
       break;
     }
     case T_FuncExpr:
@@ -425,7 +641,13 @@ parameter_usage_null_admission_walker(Node *node, void *walker_context)
        * leakproof callable can safely evaluate a non-NULL CASE/COALESCE arm. */
       if (!evaluation.evaluation_safe)
       {
+        Oid callable = IsA(node, FuncExpr) ? ((FuncExpr *) node)->funcid :
+          get_opcode(((OpExpr *) node)->opno);
         mark_parameter_usage(context, PTS_NULL_UNKNOWN);
+        if (OidIsValid(callable))
+          context->evidence.reasons = pts_add_null_reason(context->evidence.reasons,
+            "opaque_callable", psprintf("evaluation of callable %s with NULL is not proved safe",
+              format_procedure_qualified(callable)), exprLocation(node));
       }
       break;
     }
@@ -441,7 +663,7 @@ parameter_usage_null_admission_walker(Node *node, void *walker_context)
            evaluation.proof != PTS_NULL_PROOF_TRUE &&
            evaluation.proof != PTS_NULL_PROOF_FALSE))
       {
-        mark_parameter_usage(context, PTS_NULL_UNKNOWN);
+        mark_unknown_expression(context, node, "scalar-array operator evaluation is unresolved");
       }
       break;
     }
@@ -455,7 +677,7 @@ parameter_usage_null_admission_walker(Node *node, void *walker_context)
       if (argument.proof != PTS_NULL_PROOF_NULL ||
           !argument.evaluation_safe)
       {
-        mark_parameter_usage(context, PTS_NULL_UNKNOWN);
+        mark_unknown_expression(context, node, "input/output cast evaluation is unresolved");
       }
       break;
     }
@@ -469,7 +691,7 @@ parameter_usage_null_admission_walker(Node *node, void *walker_context)
       if (argument.proof != PTS_NULL_PROOF_NULL ||
           !argument.evaluation_safe)
       {
-        mark_parameter_usage(context, PTS_NULL_UNKNOWN);
+        mark_unknown_expression(context, node, "array coercion evaluation is unresolved");
       }
       break;
     }
@@ -483,7 +705,7 @@ parameter_usage_null_admission_walker(Node *node, void *walker_context)
       if (argument.proof != PTS_NULL_PROOF_NULL ||
           !argument.evaluation_safe)
       {
-        mark_parameter_usage(context, PTS_NULL_UNKNOWN);
+        mark_unknown_expression(context, node, "row type conversion evaluation is unresolved");
       }
       break;
     }
@@ -511,7 +733,7 @@ parameter_usage_null_admission_walker(Node *node, void *walker_context)
       }
       if (!null_short_circuit || !arguments_safe)
       {
-        mark_parameter_usage(context, PTS_NULL_UNKNOWN);
+        mark_unknown_expression(context, node, "distinctness operator evaluation is unresolved");
       }
       break;
     }
@@ -519,8 +741,12 @@ parameter_usage_null_admission_walker(Node *node, void *walker_context)
     {
       const WindowClause *window = (const WindowClause *) node;
 
-      mark_required_nonnull_parameter_usage(context, window->startOffset);
-      mark_required_nonnull_parameter_usage(context, window->endOffset);
+      mark_required_nonnull_parameter_usage(context, window->startOffset,
+        window_has_direct_target(context->scope->query, window),
+        PTS_USAGE_WINDOW_INIT, NULL);
+      mark_required_nonnull_parameter_usage(context, window->endOffset,
+        window_has_direct_target(context->scope->query, window),
+        PTS_USAGE_WINDOW_INIT, NULL);
       break;
     }
     case T_TableSampleClause:
@@ -531,10 +757,10 @@ parameter_usage_null_admission_walker(Node *node, void *walker_context)
       foreach(cell, sample->args)
       {
         mark_required_nonnull_parameter_usage(
-          context, (const Node *) lfirst(cell));
+          context, (const Node *) lfirst(cell), true, PTS_USAGE_SAMPLE_INIT, sample);
       }
       mark_required_nonnull_parameter_usage(
-        context, (const Node *) sample->repeatable);
+        context, (const Node *) sample->repeatable, true, PTS_USAGE_SAMPLE_INIT, sample);
       break;
     }
     case T_BoolExpr:
@@ -542,22 +768,51 @@ parameter_usage_null_admission_walker(Node *node, void *walker_context)
       PtsNullEvaluation evaluation = pts_check_parameter_null_evaluation(
         node, context->param_id, context->node_analysis);
 
+      const BoolExpr *boolean = (const BoolExpr *) node;
+      bool outer_conditional = context->conditional;
+      ListCell *cell;
+
       if (!evaluation.evaluation_safe)
       {
-        mark_parameter_usage(context, PTS_NULL_UNKNOWN);
+        mark_unknown_expression(context, node, "boolean expression evaluation is unresolved");
       }
-      break;
+      foreach(cell, boolean->args)
+      {
+        ListCell *other_cell;
+        bool conditional = outer_conditional;
+
+        if (boolean->boolop != NOT_EXPR)
+          foreach(other_cell, boolean->args)
+          {
+            PtsNullEvaluation other;
+
+            if (other_cell == cell)
+              continue;
+            other = pts_check_parameter_null_evaluation(
+              (const Node *) lfirst(other_cell), context->param_id, context->node_analysis);
+            if (!other.evaluation_safe ||
+                (other.proof != PTS_NULL_PROOF_NULL &&
+                 other.proof != (boolean->boolop == AND_EXPR ? PTS_NULL_PROOF_TRUE : PTS_NULL_PROOF_FALSE)))
+              conditional = true;
+          }
+        context->conditional = conditional;
+        parameter_usage_null_admission_walker((Node *) lfirst(cell), context);
+      }
+      context->conditional = outer_conditional;
+      return false;
     }
     case T_CaseExpr:
     {
       const CaseExpr *case_expr = (const CaseExpr *) node;
       ListCell *cell;
+      bool outer_conditional = context->conditional;
+      bool prior_unknown = false;
       PtsNullEvaluation evaluation = pts_check_parameter_null_evaluation(
         node, context->param_id, context->node_analysis);
 
       if (!evaluation.evaluation_safe)
       {
-        mark_parameter_usage(context, PTS_NULL_UNKNOWN);
+        mark_unknown_expression(context, node, "CASE expression evaluation is unresolved");
       }
       else
       {
@@ -565,7 +820,8 @@ parameter_usage_null_admission_walker(Node *node, void *walker_context)
       }
       if (case_expr->arg != NULL)
       {
-        break;
+        parameter_usage_null_admission_walker((Node *) case_expr->arg, context);
+        prior_unknown = true;
       }
       foreach(cell, case_expr->args)
       {
@@ -573,21 +829,65 @@ parameter_usage_null_admission_walker(Node *node, void *walker_context)
         PtsNullEvaluation condition = pts_check_parameter_null_evaluation(
           (const Node *) when->expr, context->param_id, context->node_analysis);
 
-        if (parameter_usage_null_admission_walker((Node *) when->expr, context))
-          return true;
+        context->conditional = outer_conditional || prior_unknown;
+        parameter_usage_null_admission_walker((Node *) when->expr, context);
         if (condition.proof != PTS_NULL_PROOF_FALSE &&
-            condition.proof != PTS_NULL_PROOF_NULL &&
-            parameter_usage_null_admission_walker((Node *) when->result, context))
-          return true;
-        if (condition.proof == PTS_NULL_PROOF_TRUE)
+            condition.proof != PTS_NULL_PROOF_NULL)
+        {
+          context->conditional = outer_conditional || prior_unknown ||
+            condition.proof != PTS_NULL_PROOF_TRUE;
+          parameter_usage_null_admission_walker((Node *) when->result, context);
+        }
+        if (case_expr->arg == NULL && condition.proof == PTS_NULL_PROOF_TRUE)
+        {
+          context->conditional = outer_conditional;
           return false;
+        }
+        if (condition.proof != PTS_NULL_PROOF_TRUE &&
+            condition.proof != PTS_NULL_PROOF_FALSE &&
+            condition.proof != PTS_NULL_PROOF_NULL)
+          prior_unknown = true;
       }
-      return parameter_usage_null_admission_walker((Node *) case_expr->defresult,
-                                                    context);
+      context->conditional = outer_conditional || prior_unknown;
+      parameter_usage_null_admission_walker((Node *) case_expr->defresult, context);
+      context->conditional = outer_conditional;
+      return false;
+    }
+    case T_CoalesceExpr:
+    {
+      const CoalesceExpr *coalesce = (const CoalesceExpr *) node;
+      bool outer_conditional = context->conditional;
+      bool prior_may_be_nonnull = false;
+      ListCell *cell;
+
+      foreach(cell, coalesce->args)
+      {
+        Node *argument = (Node *) lfirst(cell);
+        PtsNullEvaluation evaluation = pts_check_parameter_null_evaluation(
+          argument, context->param_id, context->node_analysis);
+
+        context->conditional = outer_conditional || prior_may_be_nonnull;
+        parameter_usage_null_admission_walker(argument, context);
+        if (evaluation.proof != PTS_NULL_PROOF_NULL)
+          prior_may_be_nonnull = true;
+      }
+      context->conditional = outer_conditional;
+      return false;
     }
     case T_Query:
     case T_List:
+      break;
     case T_TargetEntry:
+    {
+      const TargetEntry *target = (const TargetEntry *) node;
+      bool outer_target = context->root_target;
+
+      context->root_target = !target->resjunk &&
+        list_member_ptr(context->scope->query->targetList, target);
+      parameter_usage_null_admission_walker((Node *) target->expr, context);
+      context->root_target = outer_target;
+      return false;
+    }
     case T_NamedArgExpr:
     case T_SubLink:
     case T_FieldSelect:
@@ -595,7 +895,6 @@ parameter_usage_null_admission_walker(Node *node, void *walker_context)
     case T_CollateExpr:
     case T_ArrayExpr:
     case T_RowExpr:
-    case T_CoalesceExpr:
     case T_NullTest:
     case T_BooleanTest:
     case T_CommonTableExpr:
@@ -610,16 +909,11 @@ parameter_usage_null_admission_walker(Node *node, void *walker_context)
     case T_RangeTblFunction:
       break;
     default:
-      /* Unmodeled parameter-bearing semantics cannot prove acceptance. */
-      mark_parameter_usage(context, PTS_NULL_UNKNOWN);
+      mark_unknown_expression(context, node,
+        psprintf("parameter-bearing expression node %d is not modeled", (int) nodeTag(node)));
       break;
   }
 
-  if (context->evidence.seen &&
-      context->evidence.admission == PTS_NULL_REJECTS)
-  {
-    return true;
-  }
   return expression_tree_walker(node,
                                 parameter_usage_null_admission_walker,
                                 walker_context);
@@ -639,7 +933,8 @@ parameter_usage_null_admission_query(const PtsQueryScope *scope,
   /* PostgreSQL's query_tree_walker deliberately does not visit utilityStmt. */
   if (scope->query->utilityStmt != NULL)
   {
-    mark_parameter_usage(context, PTS_NULL_UNKNOWN);
+    mark_unknown_expression(context, scope->query->utilityStmt,
+                            "utility statement parameter use is not modeled");
   }
   return query_tree_walker(
     (Query *) scope->query, parameter_usage_null_admission_walker,
@@ -663,7 +958,9 @@ pts_update_parameter_usage_null_admissions(const Query *query,
     HASHCTL query_ctl = {0};
     PtsParameterUsageContext context = {
       index + 1,
-      {false, PTS_NULL_UNKNOWN},
+      false,
+      false,
+      {false, PTS_NULL_UNKNOWN, NIL},
       null_admission_analysis,
       node_analysis,
       NULL,

@@ -449,7 +449,13 @@ test('public project snapshots expose runtime facts without outputs and reject f
     assert.equal(buffer.exports.executor, 'default')
     const nullable = await project.analyze(sourcePath, '-- @bindNull id\nselect id from widget where id = :id')
     assert.deepEqual(nullable.parameters, [
-      { name: 'id', propertyName: 'id', nullBinding: 'callerNullable', nullAdmission: 'accepts' },
+      {
+        name: 'id',
+        propertyName: 'id',
+        nullBinding: 'callerNullable',
+        nullAdmission: 'accepts',
+        nullAdmissionReasons: [],
+      },
     ])
     assert.equal(buffer.descriptor.resultKind, 'one')
     assert.match(buffer.moduleText, /select 1 as value/u)

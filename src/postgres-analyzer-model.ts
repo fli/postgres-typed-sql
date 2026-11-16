@@ -1,8 +1,10 @@
-import type { TypedSqlPostgresIrParamNullAdmission } from './analyzer-ir-model.js'
+import type { TypedSqlNullAdmissionReason, TypedSqlPostgresIrParamNullAdmission } from './analyzer-ir-model.js'
 
 export interface PgAnalyzerResult {
   readonly paramTypeOids: readonly number[]
   readonly paramTypeNullAdmissions: readonly TypedSqlPostgresIrParamNullAdmission[]
+  readonly paramTypeNullAdmissionReasons: readonly (readonly TypedSqlNullAdmissionReason[])[]
+  readonly paramUsageNullAdmissionReasons: readonly (readonly TypedSqlNullAdmissionReason[])[]
   readonly paramUsageNullAdmissions: readonly TypedSqlPostgresIrParamNullAdmission[]
   readonly postgresVersionNum: number
   readonly rawStatementCount: number
@@ -77,16 +79,19 @@ export type PgAnalyzerDmlParameterNullAdmission =
       readonly admission: 'accepts'
       readonly basis: 'action_unreachable_when_null' | 'row_values_preserved_when_null'
       readonly paramId: number
+      readonly reasons: readonly TypedSqlNullAdmissionReason[]
     }
   | {
       readonly admission: Exclude<TypedSqlPostgresIrParamNullAdmission, 'unknown'>
       readonly basis: 'direct_target_null_admission'
       readonly paramId: number
+      readonly reasons: readonly TypedSqlNullAdmissionReason[]
     }
   | {
       readonly admission: 'unknown'
       readonly basis: 'unresolved'
       readonly paramId: number
+      readonly reasons: readonly TypedSqlNullAdmissionReason[]
     }
 
 export interface PgAnalyzerTarget {

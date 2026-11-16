@@ -1119,7 +1119,13 @@ async function resolveTypedSqlWithAnalyzer(
             ? 'PostgreSQL proves that one of its uses rejects NULL'
             : 'PostgreSQL could not prove that every use accepts NULL'
         throw new Error(
-          `${config.sourceFile}:${parameter.nullBinding?.line}: @nullable ${parameter.name} cannot be satisfied because ${reason}.` +
+          `${config.sourceFile}:${parameter.nullBinding?.line}: @nullable ${parameter.name} cannot be satisfied because ${reason}. ` +
+            analyzed.nullAdmissionReasons
+              .map(
+                (detail) =>
+                  `[${detail.code}] ${detail.message}${detail.compiledByteOffset === undefined ? '' : ` (compiled SQL byte offset ${detail.compiledByteOffset})`}`
+              )
+              .join(' ') +
             (analyzed.nullAdmission === 'unknown'
               ? ` Use @bindNull ${parameter.name} when the caller owns NULL admission for this input.`
               : '')
@@ -1135,6 +1141,7 @@ async function resolveTypedSqlWithAnalyzer(
               ? 'callerNullable'
               : 'nonNull',
         nullAdmission: analyzed.nullAdmission,
+        nullAdmissionReasons: analyzed.nullAdmissionReasons,
       })
       return {
         name: parameter.name,

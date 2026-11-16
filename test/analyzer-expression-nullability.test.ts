@@ -200,7 +200,7 @@ test('native expression metadata retains strictness, volatility, filters, having
       [sql]
     )
     const analysis = JSON.parse(result.rows[0]?.analysis ?? '') as PgAnalyzerResult
-    assert.equal(analysis.schemaVersion, 12)
+    assert.equal(analysis.schemaVersion, 13)
     const query = analysis.statements[0]?.queries[0]
     assert.ok(query)
     const expressions = query.targetList?.map((target) => target.expr) ?? []

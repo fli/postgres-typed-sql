@@ -51,6 +51,7 @@ assert.deepEqual(
     propertyName: 'widgetLabel',
     nullBinding: 'provedNullable',
     nullAdmission: 'accepts',
+    nullAdmissionReasons: [],
   }
 )
 

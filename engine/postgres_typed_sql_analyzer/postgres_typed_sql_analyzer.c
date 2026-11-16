@@ -4446,6 +4446,13 @@ append_param_type_null_admissions(StringInfo out, const Oid *param_types,
         ? pts_type_null_admission(analysis, param_types[index])
         : PTS_NULL_UNKNOWN));
   }
+  appendStringInfoString(out, "],\"paramTypeNullAdmissionReasons\":[");
+  for (index = 0; index < param_count; index++)
+  {
+    if (index > 0) appendStringInfoChar(out, ',');
+    pts_append_null_reasons(out, OidIsValid(param_types[index])
+      ? pts_type_null_reasons(analysis, param_types[index]) : NIL);
+  }
   appendStringInfoChar(out, ']');
   pts_destroy_null_admission_analysis(analysis);
 }
@@ -4470,6 +4477,15 @@ append_param_usage_null_admissions(StringInfo out,
                             ? evidence[index].admission
                             : PTS_NULL_UNKNOWN));
   }
+  appendStringInfoString(out, "],\"paramUsageNullAdmissionReasons\":[");
+  for (index = 0; index < param_count; index++)
+  {
+    List *reasons = evidence[index].reasons;
+    if (index > 0) appendStringInfoChar(out, ',');
+    if (reasons == NIL && (!evidence[index].seen || evidence[index].admission == PTS_NULL_UNKNOWN))
+      reasons = pts_add_null_reason(NIL, "unresolved", "parameter NULL usage is unresolved", -1);
+    pts_append_null_reasons(out, reasons);
+  }
   appendStringInfoChar(out, ']');
 }
 
@@ -4491,7 +4507,7 @@ postgres_typed_sql_analyze(PG_FUNCTION_ARGS)
   usage_null_admission_analysis = pts_create_null_admission_analysis();
 
   initStringInfo(&out);
-  appendStringInfoString(&out, "{\"schemaVersion\":12,\"postgresVersionNum\":");
+  appendStringInfoString(&out, "{\"schemaVersion\":13,\"postgresVersionNum\":");
   appendStringInfo(&out, "%d", PG_VERSION_NUM);
   appendStringInfoString(&out, ",\"rawStatementCount\":");
   appendStringInfo(&out, "%d", list_length(raw_trees));

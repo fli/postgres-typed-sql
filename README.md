@@ -75,7 +75,10 @@ limit 1
 
 Both declarations generate a required parameter property that accepts `null`.
 `@bindNull` grants permission to bind SQL NULL; it does not establish that execution
-will succeed. The analysis report keeps that permission separate from admission evidence.
+will succeed. The analysis report keeps that permission separate from admission evidence. Each parameter’s
+`nullAdmissionReasons` lists native evidence for a rejection or unresolved proof, with stable
+codes and a compiled SQL UTF-8 byte offset when available. Strict `@nullable` errors include
+the same evidence.
 No input CTE is needed. A plain `null` JSON parameter means SQL NULL; `json(null)`
 means a non-null JSON document containing JSON null.
 

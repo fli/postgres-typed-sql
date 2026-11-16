@@ -4,6 +4,7 @@
 #include "catalog/pg_type_d.h"
 #include "nodes/nodeFuncs.h"
 #include "nodes/primnodes.h"
+#include "parser/parsetree.h"
 #include "utils/hsearch.h"
 #include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
@@ -35,6 +36,8 @@ typedef struct NullProofSubject
   AttrNumber target_attnum;
   int param_id;
   PtsParameterNodeAnalysis *node_analysis;
+  const PtsQueryScope *scope;
+  int depth;
 } NullProofSubject;
 
 typedef struct PtsParameterNodeKey
@@ -223,6 +226,30 @@ json_constructor_evaluation_safe(const FuncExpr *function,
   return true;
 }
 
+static bool
+from_has_only_inner_joins(const Node *node)
+{
+  ListCell *cell;
+
+  if (node == NULL || IsA(node, RangeTblRef))
+    return true;
+  if (IsA(node, JoinExpr))
+  {
+    const JoinExpr *join = (const JoinExpr *) node;
+    return join->jointype == JOIN_INNER &&
+           from_has_only_inner_joins(join->larg) &&
+           from_has_only_inner_joins(join->rarg);
+  }
+  if (IsA(node, FromExpr))
+  {
+    foreach(cell, ((const FromExpr *) node)->fromlist)
+      if (!from_has_only_inner_joins((const Node *) lfirst(cell)))
+        return false;
+    return true;
+  }
+  return false;
+}
+
 static PtsNullEvaluation
 check_null_evaluation_for_subject_uncached(const Node *expr,
                                            const NullProofSubject *subject)
@@ -257,6 +284,41 @@ check_null_evaluation_for_subject_uncached(const Node *expr,
           variable->varattno == subject->target_attnum)
       {
         return pts_make_null_evaluation(PTS_NULL_PROOF_NULL, true, true);
+      }
+      if (subject->scope != NULL && subject->depth < 32 && variable->varattno > 0)
+      {
+        const PtsQueryScope *scope = pts_query_scope_at_level(subject->scope, variable->varlevelsup);
+        const RangeTblEntry *rte = NULL;
+        const Query *source = NULL;
+        const PtsQueryScope *owner = scope;
+        const TargetEntry *target;
+
+        if (scope != NULL && from_has_only_inner_joins((const Node *) scope->query->jointree) &&
+            variable->varno > 0 &&
+            variable->varno <= list_length(scope->query->rtable))
+          rte = rt_fetch(variable->varno, scope->query->rtable);
+        if (rte != NULL && rte->rtekind == RTE_SUBQUERY)
+          source = rte->subquery;
+        else if (rte != NULL && rte->rtekind == RTE_CTE && !rte->self_reference)
+        {
+          const CommonTableExpr *cte;
+          owner = pts_query_scope_at_level(scope, rte->ctelevelsup);
+          cte = owner == NULL ? NULL : pts_cte_by_name(owner->query, rte->ctename);
+          if (cte != NULL && !cte->cterecursive && IsA(cte->ctequery, Query))
+            source = (const Query *) cte->ctequery;
+        }
+        if (source != NULL && source->commandType == CMD_SELECT &&
+            !source->hasAggs && !source->hasWindowFuncs && !source->hasTargetSRFs &&
+            source->groupClause == NIL && source->groupingSets == NIL &&
+            source->setOperations == NULL &&
+            (target = pts_target_entry_by_resno(source->targetList, variable->varattno)) != NULL)
+        {
+          PtsQueryScope child = {source, owner};
+          NullProofSubject nested = *subject;
+          nested.scope = &child;
+          nested.depth++;
+          return check_null_evaluation_for_subject((const Node *) target->expr, &nested);
+        }
       }
       return pts_make_null_evaluation(PTS_NULL_PROOF_UNKNOWN, true, false);
     }
@@ -671,7 +733,7 @@ check_null_evaluation_for_subject_uncached(const Node *expr,
 PtsNullEvaluation
 pts_check_null_evaluation(const Node *expr, AttrNumber target_attnum)
 {
-  const NullProofSubject subject = {target_attnum, 0, NULL};
+  const NullProofSubject subject = {target_attnum, 0, NULL, NULL, 0};
 
   return check_null_evaluation_for_subject(expr, &subject);
 }
@@ -680,7 +742,16 @@ PtsNullEvaluation
 pts_check_parameter_null_evaluation(const Node *expr, int param_id,
                                 PtsParameterNodeAnalysis *node_analysis)
 {
-  const NullProofSubject subject = {0, param_id, node_analysis};
+  const NullProofSubject subject = {0, param_id, node_analysis, NULL, 0};
+
+  return check_null_evaluation_for_subject(expr, &subject);
+}
+
+PtsNullEvaluation
+pts_check_parameter_null_evaluation_scoped(const Node *expr, int param_id,
+                                            const PtsQueryScope *scope)
+{
+  const NullProofSubject subject = {0, param_id, NULL, scope, 0};
 
   return check_null_evaluation_for_subject(expr, &subject);
 }

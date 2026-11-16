@@ -55,6 +55,11 @@ test('public compiler proves strict nullable NULL-safe filters and generates a n
     `with changed as (insert into ${schema}.nullable_probe values (1, :value::text) returning value)
       select value from changed`,
     'with input as (select :value::text as value) select value from input',
+    `with input as (select :value::text as value, :other::integer as other) select id from ${schema}.nullable_probe cross join input where nullable_probe.value is not distinct from input.value`,
+    `with input as (select :value::text as value, :other::text as other) select input.value, ${schema}.fail_on_null(input.other) from input`,
+    `with input as (select :value::text as value, ${schema}.fail_on_null(:other::text) as other) select id from ${schema}.nullable_probe cross join input where nullable_probe.value is not distinct from input.value and input.other = 'present'`,
+    `with input as (select :value::text as value) select id from ${schema}.nullable_probe cross join input where nullable_probe.value is not distinct from input.value`,
+    `with input as (select :value::text as value), nested as (select value from input) select id from ${schema}.nullable_probe cross join nested where nullable_probe.value is not distinct from nested.value`,
   ]) {
     await project.compile(sourcePath, `-- @nullable value\n${control}`)
   }
@@ -69,6 +74,16 @@ test('public compiler proves strict nullable NULL-safe filters and generates a n
       project.compile(sourcePath, `-- @nullable value\nselect id from ${schema}.nullable_probe where ${predicate}`),
       /@nullable value cannot be satisfied/u,
       predicate
+    )
+  }
+
+  for (const sql of [
+    `with input as (select :value::text as value) select id from ${schema}.nullable_probe left join input on true where nullable_probe.value is not distinct from input.value`,
+    `with input as (select :value::text as value) select id from ${schema}.nullable_probe cross join input where nullable_probe.value is not distinct from input.value and ${schema}.fail_on_null(input.value) = 'present'`,
+  ]) {
+    await assert.rejects(
+      project.compile(sourcePath, `-- @nullable value\n${sql}`),
+      /@nullable value cannot be satisfied/u
     )
   }
 

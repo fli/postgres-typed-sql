@@ -34,6 +34,8 @@ testWithDatabase('scalar filters retain unknown for NULL-enabled cardinality and
     begin if value is null then raise exception 'null argument'; end if; return value; end $$`)
   await db.query(`create domain public.nonnull_int as int not null`)
   const cases = [
+    `with input as (select $1::int as value)
+      select public.fail_on_null((select 1 from input where value is not null))`,
     `select (select x.id from (values (1), (2)) x(id) where $1::int is null)`,
     `select (select x.id from (values (1), (2)) x(id) where x.id = $1::int or $1 is null)`,
     `select (select public.fail_on_null($1::int))`,
@@ -53,8 +55,8 @@ testWithDatabase('scalar filters retain unknown for NULL-enabled cardinality and
   for (const sql of cases) {
     assert.deepEqual((await analyzeNative<UsageAnalysis>(db, sql)).paramUsageNullAdmissions, ['unknown'], sql)
   }
-  const cardinality = cases[0]
-  const callable = cases[2]
+  const cardinality = cases[1]
+  const callable = cases[3]
   assert.ok(cardinality && callable)
   await assert.rejects(db.query(cardinality, [null]), /more than one row/u)
   await assert.rejects(db.query(callable, [null]), /null argument/u)
