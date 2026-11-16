@@ -30,6 +30,7 @@ typedef struct IndirectQueryKey
   const Query *query;
   const IndirectScopeEntry *owner;
   int depth;
+  AttrNumber output_attnum;
 } IndirectQueryKey;
 
 typedef struct IndirectQueryEntry
@@ -240,12 +241,35 @@ indirect_parameter_walker(Node *node, void *opaque)
     key.query = source;
     key.owner = intern_indirect_scope(context->usage->indirect_scopes, owner);
     key.depth = nested.depth;
+    key.output_attnum = var->varattno;
     entry = hash_search(context->usage->indirect_queries, &key, HASH_FIND, NULL);
     if (entry != NULL)
       return entry->mentions_parameter;
 
-    result = query_tree_walker((Query *) source, indirect_parameter_walker,
-                               &nested, QTW_IGNORE_CTE_SUBQUERIES);
+    /* A plain projection's value depends only on its selected output.  Keep
+     * the whole-source fallback when row selection or unsupported query
+     * features could make a projected value depend on source cardinality. */
+    if (source->commandType == CMD_SELECT && source->jointree != NULL &&
+        source->jointree->quals == NULL &&
+        (source->jointree->fromlist == NIL ||
+         (list_length(source->jointree->fromlist) == 1 &&
+          IsA(linitial(source->jointree->fromlist), RangeTblRef))) &&
+        source->limitCount == NULL &&
+        source->limitOffset == NULL && !source->hasAggs &&
+        !source->hasWindowFuncs && !source->hasTargetSRFs &&
+        !source->hasModifyingCTE && source->groupClause == NIL &&
+        source->groupingSets == NIL && source->havingQual == NULL &&
+        source->setOperations == NULL)
+    {
+      const TargetEntry *target = pts_target_entry_by_resno(
+        source->targetList, var->varattno);
+
+      result = target == NULL || indirect_parameter_walker(
+        (Node *) target->expr, &nested);
+    }
+    else
+      result = query_tree_walker((Query *) source, indirect_parameter_walker,
+                                 &nested, QTW_IGNORE_CTE_SUBQUERIES);
     entry = hash_search(context->usage->indirect_queries, &key, HASH_ENTER, NULL);
     entry->mentions_parameter = result;
     return result;

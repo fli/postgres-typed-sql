@@ -56,6 +56,7 @@ test('public compiler proves strict nullable NULL-safe filters and generates a n
       select value from changed`,
     'with input as (select :value::text as value) select value from input',
     `with input as (select :value::text as value, :other::integer as other) select id from ${schema}.nullable_probe cross join input where nullable_probe.value is not distinct from input.value`,
+    `with input as (select :value::text as value, :other::text as other) select input.value, ${schema}.fail_on_null(input.other) from input`,
     `with input as (select :value::text as value) select id from ${schema}.nullable_probe cross join input where nullable_probe.value is not distinct from input.value`,
     `with input as (select :value::text as value), nested as (select value from input) select id from ${schema}.nullable_probe cross join nested where nullable_probe.value is not distinct from nested.value`,
   ]) {
