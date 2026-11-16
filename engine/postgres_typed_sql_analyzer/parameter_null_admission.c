@@ -45,6 +45,7 @@ typedef struct PtsParameterUsageContext
 {
   int param_id;
   bool conditional;
+  bool root_target;
   PtsParameterUsageEvidence evidence;
   PtsNullAdmissionAnalysis *null_admission_analysis;
   PtsParameterNodeAnalysis *node_analysis;
@@ -97,9 +98,31 @@ merge_parameter_usage_evidence(PtsParameterUsageEvidence *target,
   target->reasons = list_concat(target->reasons, list_copy(source->reasons));
 }
 
+static bool
+usage_execution_is_unconditional(const PtsParameterUsageContext *context,
+                                 bool requires_output_row)
+{
+  const Query *query = context->scope->query;
+
+  if (context->conditional || context->scope->parent != NULL)
+    return false;
+  if (requires_output_row)
+    return context->root_target && query->commandType == CMD_SELECT &&
+      query->jointree != NULL && query->jointree->fromlist == NIL &&
+      query->jointree->quals == NULL && query->havingQual == NULL &&
+      query->limitOffset == NULL && query->limitCount == NULL &&
+      !query->hasAggs && query->groupClause == NIL && query->groupingSets == NIL &&
+      query->windowClause == NIL && !query->hasTargetSRFs &&
+      query->setOperations == NULL && !query->hasRowSecurity &&
+      query->cteList == NIL;
+  return query->havingQual == NULL && query->limitOffset == NULL &&
+    query->limitCount == NULL && query->jointree != NULL &&
+    query->jointree->quals == NULL;
+}
+
 static void
 mark_required_nonnull_parameter_usage(PtsParameterUsageContext *context,
-                                      const Node *expr)
+                                      const Node *expr, bool active)
 {
     PtsNullEvaluation evaluation;
 
@@ -118,13 +141,15 @@ mark_required_nonnull_parameter_usage(PtsParameterUsageContext *context,
 
   evaluation = pts_check_parameter_null_evaluation(expr, context->param_id,
                                                context->node_analysis);
-  if (evaluation.proof == PTS_NULL_PROOF_NULL && evaluation.evaluation_safe)
+  if (evaluation.proof == PTS_NULL_PROOF_NULL && evaluation.evaluation_safe && active &&
+      usage_execution_is_unconditional(context, false))
   {
     mark_parameter_usage(context, PTS_NULL_REJECTS);
     context->evidence.reasons = pts_add_null_reason(context->evidence.reasons,
       "required_nonnull", "this expression requires a non-NULL value", exprLocation(expr));
   }
-  else if (evaluation.proof == PTS_NULL_PROOF_UNKNOWN ||
+  else if (evaluation.proof == PTS_NULL_PROOF_NULL ||
+           evaluation.proof == PTS_NULL_PROOF_UNKNOWN ||
            !evaluation.evaluation_safe)
   {
     mark_parameter_usage(context, PTS_NULL_UNKNOWN);
@@ -540,14 +565,17 @@ parameter_usage_null_admission_walker(Node *node, void *walker_context)
         argument.proof == PTS_NULL_PROOF_NULL
         ? pts_type_null_admission(context->null_admission_analysis, coerce->resulttype)
         : PTS_NULL_UNKNOWN;
-      bool nested_rejection = context->scope->parent != NULL && admission == PTS_NULL_REJECTS;
+      bool nested_rejection = !usage_execution_is_unconditional(context, true) &&
+        !context->conditional && admission == PTS_NULL_REJECTS;
       bool conditional_rejection = context->conditional && admission == PTS_NULL_REJECTS;
 
       mark_parameter_usage(context, conditional_rejection || nested_rejection ? PTS_NULL_UNKNOWN : admission);
       if (conditional_rejection || nested_rejection || !argument.evaluation_safe || argument.proof != PTS_NULL_PROOF_NULL)
         context->evidence.reasons = pts_add_null_reason(context->evidence.reasons,
           "domain_unresolved", psprintf(nested_rejection
-            ? "domain coercion to %s: enclosing query execution is not proved unconditional"
+            ? (context->scope->parent != NULL
+              ? "domain coercion to %s: enclosing query execution is not proved unconditional"
+              : "domain coercion to %s: query row production or execution is not proved unconditional")
             : conditional_rejection
               ? "domain coercion to %s is reached only under an unresolved CASE condition, COALESCE argument, or Boolean operand"
               : "domain coercion to %s depends on an unresolved expression",
@@ -666,8 +694,10 @@ parameter_usage_null_admission_walker(Node *node, void *walker_context)
     {
       const WindowClause *window = (const WindowClause *) node;
 
-      mark_required_nonnull_parameter_usage(context, window->startOffset);
-      mark_required_nonnull_parameter_usage(context, window->endOffset);
+      mark_required_nonnull_parameter_usage(context, window->startOffset,
+        context->scope->query->hasWindowFuncs && list_length(context->scope->query->windowClause) == 1);
+      mark_required_nonnull_parameter_usage(context, window->endOffset,
+        context->scope->query->hasWindowFuncs && list_length(context->scope->query->windowClause) == 1);
       break;
     }
     case T_TableSampleClause:
@@ -678,10 +708,10 @@ parameter_usage_null_admission_walker(Node *node, void *walker_context)
       foreach(cell, sample->args)
       {
         mark_required_nonnull_parameter_usage(
-          context, (const Node *) lfirst(cell));
+          context, (const Node *) lfirst(cell), true);
       }
       mark_required_nonnull_parameter_usage(
-        context, (const Node *) sample->repeatable);
+        context, (const Node *) sample->repeatable, true);
       break;
     }
     case T_BoolExpr:
@@ -798,6 +828,16 @@ parameter_usage_null_admission_walker(Node *node, void *walker_context)
     case T_Query:
     case T_List:
     case T_TargetEntry:
+    {
+      const TargetEntry *target = (const TargetEntry *) node;
+      bool outer_target = context->root_target;
+
+      context->root_target = !target->resjunk &&
+        list_member_ptr(context->scope->query->targetList, target);
+      parameter_usage_null_admission_walker((Node *) target->expr, context);
+      context->root_target = outer_target;
+      return false;
+    }
     case T_NamedArgExpr:
     case T_SubLink:
     case T_FieldSelect:
@@ -868,6 +908,7 @@ pts_update_parameter_usage_null_admissions(const Query *query,
     HASHCTL query_ctl = {0};
     PtsParameterUsageContext context = {
       index + 1,
+      false,
       false,
       {false, PTS_NULL_UNKNOWN, NIL},
       null_admission_analysis,

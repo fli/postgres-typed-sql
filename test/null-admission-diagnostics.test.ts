@@ -58,6 +58,49 @@ test(
   }
 )
 
+test(
+  'conditional query execution and domain projection on PostgreSQL',
+  { skip: !process.env.POSTGRES_TYPED_SQL_TEST_URL },
+  async () => {
+    const client = new Client({ connectionString: process.env.POSTGRES_TYPED_SQL_TEST_URL })
+    await client.connect()
+    try {
+      await client.query('begin')
+      await client.query(
+        'create temporary table certainty_sample(id integer); create domain pg_temp.certainty_text as text not null'
+      )
+      for (const inner of [
+        'select count(*) over (rows $2::bigint preceding) from certainty_sample',
+        'select count(*) from certainty_sample tablesample system ($2::real)',
+      ]) {
+        const sql = `select case when $1::boolean then (${inner}) else 1 end as result`
+        assert.equal((await client.query(sql, [false, null])).rows[0].result, '1')
+        await client.query('savepoint expected_error')
+        await assert.rejects(client.query(sql, [true, null]), /cannot be null|must not be null/u)
+        await client.query('rollback to savepoint expected_error')
+      }
+      for (const suffix of ['from certainty_sample', 'where false']) {
+        assert.equal((await client.query(`select $1::text::pg_temp.certainty_text ${suffix}`, [null])).rowCount, 0)
+      }
+      assert.equal(
+        (await client.query('select 1 from (values ($1::text::pg_temp.certainty_text)) x(v)', [null])).rowCount,
+        1
+      )
+      assert.equal(
+        (await client.query('select count($1::text::pg_temp.certainty_text) as count from certainty_sample', [null]))
+          .rows[0].count,
+        '0'
+      )
+      await client.query('savepoint expected_error')
+      await assert.rejects(client.query('select $1::text::pg_temp.certainty_text', [null]), /does not allow null/u)
+      await client.query('rollback to savepoint expected_error')
+    } finally {
+      await client.query('rollback')
+      await client.end()
+    }
+  }
+)
+
 test('NULL admission explains the actual blockers through the public project API', async (t) => {
   const { openQueryProject }: typeof import('../src/query-project.js') = await import(
     new URL('../../dist/project.js', import.meta.url).href
@@ -93,6 +136,42 @@ test('NULL admission explains the actual blockers through the public project API
   const project = await openQueryProject(join(root, 'config.mjs'))
   t.after(() => project.close())
   const sourcePath = join(root, 'probe.typed.sql')
+
+  await t.test('query execution governs rejection evidence', async () => {
+    for (const sql of [
+      `select case when :flag::boolean then (select count(*) over (rows :value::bigint preceding) from ${schema}.items) else 1 end`,
+      `select case when :flag::boolean then (select count(*) from ${schema}.items tablesample system (:value::real)) else 1 end`,
+      `select :value::text::${schema}.required_text from ${schema}.items`,
+      `select :value::text::${schema}.required_text where false`,
+      `select count(:value::text::${schema}.required_text) from ${schema}.items`,
+      `select 1 from (values (:value::text::${schema}.required_text)) x(v)`,
+      `select count(*) over (rows :value::bigint preceding) from ${schema}.items limit 0`,
+      `select 1 window unused as (rows :value::bigint preceding)`,
+      `select count(*) from ${schema}.items tablesample system (:value::real) where false`,
+    ]) {
+      const analysis = await project.analyze(sourcePath, `-- @bindNull value\n${sql}`)
+      const parameter = analysis.parameters.find((item) => item.name === 'value')
+      assert.equal(parameter?.nullAdmission, 'unknown', sql)
+      await assert.rejects(
+        project.compile(sourcePath, `-- @nullable value\n${sql}`),
+        /@nullable value cannot be satisfied/u
+      )
+      assert.ok(
+        parameter.nullAdmissionReasons.some(
+          (reason) =>
+            reason.code === (sql.includes('required_text') ? 'domain_unresolved' : 'conditional_required_nonnull')
+        )
+      )
+    }
+    for (const sql of [
+      `select :value::text::${schema}.required_text`,
+      `select count(*) over (rows :value::bigint preceding) from ${schema}.items`,
+      `select count(*) from ${schema}.items tablesample system (:value::real)`,
+    ]) {
+      const analysis = await project.analyze(sourcePath, `-- @bindNull value\n${sql}`)
+      assert.equal(analysis.parameters.find((item) => item.name === 'value')?.nullAdmission, 'rejects', sql)
+    }
+  })
 
   await t.test('range function outputs depend on their inputs', async () => {
     for (const input of ["'constant'", ':other::text']) {
