@@ -154,6 +154,7 @@ append_dml_parameter_target(DmlLineageContext *context, int param_id,
   Oid type_oid;
   PtsNullAdmission target_admission;
   bool direct_assignment;
+  bool write_identity;
   bool found;
   List *reasons = NIL;
 
@@ -176,11 +177,12 @@ append_dml_parameter_target(DmlLineageContext *context, int param_id,
   }
 
   type_oid = attribute->atttypid;
+  write_identity = pts_dml_write_has_structural_assignment_identity(context->enforcement);
   target_admission = null_propagating ? path_admission : PTS_NULL_UNKNOWN;
   if (null_propagating && OidIsValid(domain_oid))
     reasons = list_concat(reasons, list_copy(pts_type_null_reasons(
       context->null_admission_analysis, domain_oid)));
-  if (null_propagating && attribute->attnotnull)
+  if (null_propagating && write_identity && attribute->attnotnull)
   {
     target_admission = PTS_NULL_REJECTS;
     reasons = pts_add_null_reason(reasons,
@@ -188,7 +190,7 @@ append_dml_parameter_target(DmlLineageContext *context, int param_id,
       psprintf("%s.%s %s NULL", quote_qualified_identifier(get_namespace_name(get_rel_namespace(context->target_relid)), get_rel_name(context->target_relid)),
                quote_identifier(NameStr(attribute->attname)), unconditional ? "does not allow" : "may receive"), -1);
   }
-  if (null_propagating)
+  if (null_propagating && write_identity)
   {
     reasons = list_concat(reasons, list_copy(pts_column_check_null_reasons(
       context->null_admission_analysis, context->target_relid, context->target_attnum)));
@@ -232,9 +234,7 @@ append_dml_parameter_target(DmlLineageContext *context, int param_id,
     reasons = conditional_reasons;
     target_admission = PTS_NULL_UNKNOWN;
   }
-  direct_assignment = value_preserving && unconditional &&
-                      pts_dml_write_has_structural_assignment_identity(
-                        context->enforcement);
+  direct_assignment = value_preserving && unconditional && write_identity;
 
   memset(&lookup_key, 0, sizeof(lookup_key));
   lookup_key.param_id = param_id;

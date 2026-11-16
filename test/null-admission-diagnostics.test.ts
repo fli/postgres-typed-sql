@@ -138,6 +138,56 @@ test(
   }
 )
 
+test(
+  'before-row trigger writes and eager coercion on PostgreSQL',
+  { skip: !process.env.POSTGRES_TYPED_SQL_TEST_URL },
+  async () => {
+    const schema = `write_identity_${randomUUID().replaceAll('-', '')}`
+    const client = new Client({ connectionString: process.env.POSTGRES_TYPED_SQL_TEST_URL })
+    await client.connect()
+    try {
+      await client.query('begin')
+      await client.query(`create schema ${schema};
+        create domain ${schema}.required_text as text not null;
+        create table ${schema}.rewrite(value text not null);
+        create table ${schema}.skip(value text not null);
+        create table ${schema}.plain(value text not null);
+        create table ${schema}.after_row(value text not null);
+        create table ${schema}.checked(value text check (value is not null));
+        create function ${schema}.rewrite_null() returns trigger language plpgsql as $$
+          begin new.value := 'fixed'; return new; end $$;
+        create function ${schema}.skip_row() returns trigger language plpgsql as $$
+          begin return null; end $$;
+        create function ${schema}.identity() returns trigger language plpgsql as $$
+          begin return new; end $$;
+        create trigger rewrite_null before insert on ${schema}.rewrite for each row execute function ${schema}.rewrite_null();
+        create trigger skip_row before insert on ${schema}.skip for each row execute function ${schema}.skip_row();
+        create trigger after_row after insert on ${schema}.after_row for each row execute function ${schema}.identity();`)
+      assert.equal(
+        (await client.query(`insert into ${schema}.rewrite values ($1::text) returning value`, [null])).rows[0].value,
+        'fixed'
+      )
+      assert.equal(
+        (await client.query(`insert into ${schema}.skip values ($1::text) returning value`, [null])).rowCount,
+        0
+      )
+      for (const sql of [
+        `insert into ${schema}.plain values ($1::text)`,
+        `insert into ${schema}.after_row values ($1::text)`,
+        `insert into ${schema}.checked values ($1::text)`,
+        `insert into ${schema}.rewrite values ($1::text::${schema}.required_text)`,
+      ]) {
+        await client.query('savepoint expected_error')
+        await assert.rejects(client.query(sql, [null]), /null value|check constraint/u)
+        await client.query('rollback to savepoint expected_error')
+      }
+    } finally {
+      await client.query('rollback')
+      await client.end()
+    }
+  }
+)
+
 test('NULL admission explains the actual blockers through the public project API', async (t) => {
   const { openQueryProject }: typeof import('../src/query-project.js') = await import(
     new URL('../../dist/project.js', import.meta.url).href
@@ -155,6 +205,22 @@ test('NULL admission explains the actual blockers through the public project API
     create table ${schema}.modules(mode text not null, override text,
       constraint module_override_check check (mode <> 'custom' or override is not null));
     create table ${schema}.triggered(value text);
+    create table ${schema}.before_rewrite(value text not null);
+    create table ${schema}.before_skip(value text not null);
+    create table ${schema}.after_trigger(value text not null);
+    create table ${schema}.plain_required(value text not null);
+    create table ${schema}.domain_target(value ${schema}.required_text);
+    create table ${schema}.checked(value text check (value is not null));
+    create function ${schema}.rewrite_null() returns trigger language plpgsql as $$
+      begin new.value := 'fixed'; return new; end $$;
+    create function ${schema}.skip_row() returns trigger language plpgsql as $$
+      begin return null; end $$;
+    create trigger rewrite_null before insert on ${schema}.before_rewrite
+      for each row execute function ${schema}.rewrite_null();
+    create trigger skip_row before insert on ${schema}.before_skip
+      for each row execute function ${schema}.skip_row();
+    create trigger rewrite_domain before insert on ${schema}.domain_target
+      for each row execute function ${schema}.rewrite_null();
     create table ${schema}.updates(value text, other text);
     create table ${schema}.parents(a int, b int, primary key(a,b));
     create table ${schema}.children(a int, b int, constraint full_key foreign key(a,b)
@@ -166,6 +232,8 @@ test('NULL admission explains the actual blockers through the public project API
       begin return new; end $$;
     create constraint trigger value_trigger after insert on ${schema}.triggered
       deferrable initially deferred for each row execute function ${schema}.trigger_fn();
+    create trigger after_row after insert on ${schema}.after_trigger
+      for each row execute function ${schema}.trigger_fn();
     create trigger update_other before update of other on ${schema}.updates
       for each row execute function ${schema}.trigger_fn();`
   )
@@ -436,6 +504,48 @@ test('NULL admission explains the actual blockers through the public project API
       const analysis = await project.analyze(sourcePath, `-- @bindNull value\nselect ${expression}`)
       assert.equal(analysis.parameters.find((item) => item.name === 'value')?.nullAdmission, 'rejects', expression)
     }
+  })
+
+  await t.test('write constraints respect before-row trigger identity', async () => {
+    for (const [table, trigger] of [
+      ['before_rewrite', 'rewrite_null'],
+      ['before_skip', 'skip_row'],
+    ] as const) {
+      const sql = `insert into ${schema}.${table}(value) values (:value::text) returning value`
+      const parameter = (await project.analyze(sourcePath, `-- @bindNull value\n${sql}`)).parameters[0]
+      assert.equal(parameter?.nullAdmission, 'unknown', table)
+      assert.ok(
+        parameter.nullAdmissionReasons.some(
+          (reason) => reason.code === 'opaque_trigger' && reason.message.includes(trigger)
+        )
+      )
+      assert.ok(!parameter.nullAdmissionReasons.some((reason) => reason.code === 'target_not_null'))
+      await assert.rejects(
+        project.compile(sourcePath, `-- @nullable value\n${sql}`),
+        /@nullable value cannot be satisfied/u
+      )
+    }
+    for (const table of ['plain_required', 'after_trigger', 'checked']) {
+      const sql = `insert into ${schema}.${table}(value) values (:value::text)`
+      const parameter = (await project.analyze(sourcePath, `-- @bindNull value\n${sql}`)).parameters[0]
+      assert.equal(parameter?.nullAdmission, 'rejects', table)
+    }
+    const sql = `insert into ${schema}.before_rewrite(value) values (:value::text::${schema}.required_text)`
+    const parameter = (await project.analyze(sourcePath, `-- @bindNull value\n${sql}`)).parameters[0]
+    assert.equal(parameter?.nullAdmission, 'rejects')
+    assert.ok(
+      parameter.nullAdmissionReasons.some(
+        (reason) => reason.code === 'domain_not_null' && reason.message.includes(`${schema}.required_text`)
+      )
+    )
+    const targetSql = `insert into ${schema}.domain_target(value) values (:value::text)`
+    const target = (await project.analyze(sourcePath, `-- @bindNull value\n${targetSql}`)).parameters[0]
+    assert.equal(target?.nullAdmission, 'rejects')
+    assert.ok(
+      target.nullAdmissionReasons.some(
+        (reason) => reason.code === 'domain_not_null' && reason.message.includes(`${schema}.required_text`)
+      )
+    )
   })
 
   await t.test('UPDATE OF trigger applies only to listed columns', async () => {
