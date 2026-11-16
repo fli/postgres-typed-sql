@@ -4,6 +4,32 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
+import { Client } from 'pg'
+
+test(
+  'range function joins execute with NULL on PostgreSQL',
+  { skip: !process.env.POSTGRES_TYPED_SQL_TEST_URL },
+  async () => {
+    const schema = `range_function_${randomUUID().replaceAll('-', '')}`
+    const client = new Client({ connectionString: process.env.POSTGRES_TYPED_SQL_TEST_URL })
+    await client.connect()
+    try {
+      await client.query('begin')
+      await client.query(`create schema ${schema};
+      create table ${schema}.items(id integer primary key);
+      insert into ${schema}.items values (1);
+      create function ${schema}.resolve(text) returns setof ${schema}.items language sql as $$
+        select * from ${schema}.items $$`)
+      const sql = `select p.id from ${schema}.items p
+      left join lateral ${schema}.resolve('constant') r on p.id = r.id where p.id = $1::integer`
+      assert.equal((await client.query(sql, [null])).rowCount, 0)
+      assert.equal((await client.query(sql, [1])).rowCount, 1)
+    } finally {
+      await client.query('rollback')
+      await client.end()
+    }
+  }
+)
 
 test('NULL admission explains the actual blockers through the public project API', async (t) => {
   const { openQueryProject }: typeof import('../src/query-project.js') = await import(
@@ -17,6 +43,8 @@ test('NULL admission explains the actual blockers through the public project API
     `create schema ${schema};
     create domain ${schema}.required_text as text not null;
     create table ${schema}.items(id integer primary key, value text, required text not null);
+    create function ${schema}.resolve(text) returns setof ${schema}.items language sql as $$
+      select * from ${schema}.items $$;
     create table ${schema}.modules(mode text not null, override text,
       constraint module_override_check check (mode <> 'custom' or override is not null));
     create table ${schema}.triggered(value text);
@@ -38,6 +66,39 @@ test('NULL admission explains the actual blockers through the public project API
   const project = await openQueryProject(join(root, 'config.mjs'))
   t.after(() => project.close())
   const sourcePath = join(root, 'probe.typed.sql')
+
+  await t.test('range function outputs depend on their inputs', async () => {
+    for (const input of ["'constant'", ':other::text']) {
+      const sql = `select p.id from ${schema}.items p
+        left join lateral ${schema}.resolve(${input}) r on p.id = r.id
+        where p.id = :value::integer`
+      await project.compile(sourcePath, `-- @nullable value\n${sql}`)
+    }
+    const dependent = `select p.id from ${schema}.items p
+      left join lateral ${schema}.resolve(:value::text) r on p.id = r.id`
+    const rowsFrom = `select p.id from ${schema}.items p
+      left join lateral rows from (${schema}.resolve('constant'), ${schema}.resolve(:value::text))
+        r(first_id, first_value, first_required, second_id, second_value, second_required)
+      on p.id = r.first_id`
+    const upstream = `with input as (select :value::text value)
+      select p.id from ${schema}.items p cross join input
+      left join lateral ${schema}.resolve(input.value) r on p.id = r.id`
+    for (const sql of [dependent, rowsFrom, upstream]) {
+      const analysis = await project.analyze(sourcePath, `-- @bindNull value\n${sql}`)
+      const parameter = analysis.parameters.find((item) => item.name === 'value')
+      assert.equal(parameter?.nullAdmission, 'unknown')
+      assert.ok(parameter.nullAdmissionReasons.some((reason) => reason.message.includes('int4eq')))
+      await assert.rejects(project.compile(sourcePath, `-- @nullable value\n${sql}`), /could not prove/u)
+    }
+    for (const sql of [
+      `select jsonb_build_object('id', q.id) from (select id from ${schema}.items where id = :value::integer limit 1) q`,
+      `with q as (select id from ${schema}.items where id = :value::integer limit 1) select jsonb_build_object('id', q.id) from q`,
+      `select jsonb_build_object('id', (select id from ${schema}.items where id = :value::integer limit 1))`,
+    ]) {
+      const analysis = await project.analyze(sourcePath, `-- @bindNull value\n${sql}`)
+      assert.equal(analysis.parameters.find((item) => item.name === 'value')?.nullAdmission, 'unknown')
+    }
+  })
 
   const cases = [
     {

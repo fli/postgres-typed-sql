@@ -306,6 +306,21 @@ indirect_parameter_walker(Node *node, void *opaque)
       }
       return false;
     }
+    if (rte->rtekind == RTE_FUNCTION)
+    {
+      ListCell *cell;
+      nested.usage = context->usage;
+      nested.scope = scope;
+      nested.depth = context->depth + 1;
+      foreach(cell, rte->functions)
+      {
+        const RangeTblFunction *function = lfirst_node(RangeTblFunction, cell);
+        if (function->funcexpr == NULL ||
+            indirect_parameter_walker(function->funcexpr, &nested))
+          return true;
+      }
+      return rte->functions == NIL;
+    }
     if (rte->rtekind == RTE_SUBQUERY)
       source = rte->subquery;
     else if (rte->rtekind == RTE_CTE && !rte->self_reference)
