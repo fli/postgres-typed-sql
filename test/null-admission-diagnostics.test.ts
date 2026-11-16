@@ -94,6 +94,53 @@ test('NULL admission explains the actual blockers through the public project API
     },
   ] as const
 
+  await t.test('conditional domain coercions report uncertainty', async () => {
+    for (const expression of [
+      `case when :flag::boolean then :value::text::${schema}.required_text else 'ok'::${schema}.required_text end`,
+      `case when :flag::boolean then 'ok'::${schema}.required_text else :value::text::${schema}.required_text end`,
+      `case :flag::boolean when true then :value::text::${schema}.required_text else 'ok'::${schema}.required_text end`,
+      `case :flag::boolean when true then 'ok'::${schema}.required_text else :value::text::${schema}.required_text end`,
+      `case when :flag::boolean then case when :other::boolean then :value::text::${schema}.required_text else 'ok'::${schema}.required_text end else 'ok'::${schema}.required_text end`,
+    ]) {
+      for (const sql of [`select ${expression}`, `insert into ${schema}.items(id, value) values (1, ${expression})`]) {
+        const analysis = await project.analyze(sourcePath, `-- @bindNull value\n${sql}`)
+        const parameter = analysis.parameters.find((item) => item.name === 'value')
+        assert.equal(parameter?.nullAdmission, 'unknown')
+        assert.ok(
+          parameter.nullAdmissionReasons.some(
+            (reason) =>
+              reason.code === 'domain_unresolved' &&
+              reason.message.includes(`${schema}.required_text`) &&
+              reason.message.includes('CASE condition')
+          )
+        )
+        await assert.rejects(
+          project.compile(sourcePath, `-- @nullable value\n${sql}`),
+          /could not prove that every use accepts NULL/u
+        )
+      }
+    }
+    const conditionUse = await project.analyze(
+      sourcePath,
+      `-- @bindNull value\nselect case when :value::text::${schema}.required_text is null then 1 else 2 end`
+    )
+    assert.equal(conditionUse.parameters.find((item) => item.name === 'value')?.nullAdmission, 'rejects')
+    const subjectUse = await project.analyze(
+      sourcePath,
+      `-- @bindNull value\nselect case :value::text::${schema}.required_text when 'x' then 1 else 2 end`
+    )
+    assert.equal(subjectUse.parameters.find((item) => item.name === 'value')?.nullAdmission, 'rejects')
+    for (const [condition, outcome] of [
+      ['true', 'rejects'],
+      ['false', 'unknown'],
+      ['null::boolean', 'unknown'],
+    ] as const) {
+      const sql = `select case when ${condition} then :value::text::${schema}.required_text else 'ok'::${schema}.required_text end`
+      const analysis = await project.analyze(sourcePath, `-- @bindNull value\n${sql}`)
+      assert.equal(analysis.parameters.find((item) => item.name === 'value')?.nullAdmission, outcome)
+    }
+  })
+
   await t.test('UPDATE OF trigger applies only to listed columns', async () => {
     const unrelated = await project.analyze(
       sourcePath,

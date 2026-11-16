@@ -44,6 +44,7 @@ typedef struct IndirectQueryEntry
 typedef struct PtsParameterUsageContext
 {
   int param_id;
+  bool conditional;
   PtsParameterUsageEvidence evidence;
   PtsNullAdmissionAnalysis *null_admission_analysis;
   PtsParameterNodeAnalysis *node_analysis;
@@ -520,17 +521,20 @@ parameter_usage_null_admission_walker(Node *node, void *walker_context)
         (const Node *) coerce->arg, context->param_id,
         context->node_analysis);
 
-      mark_parameter_usage(
-        context,
-        argument.evaluation_safe && argument.proof == PTS_NULL_PROOF_NULL
-          ? pts_type_null_admission(context->null_admission_analysis,
-                                coerce->resulttype)
-          : PTS_NULL_UNKNOWN);
-      if (!argument.evaluation_safe || argument.proof != PTS_NULL_PROOF_NULL)
+      PtsNullAdmission admission = argument.evaluation_safe &&
+        argument.proof == PTS_NULL_PROOF_NULL
+        ? pts_type_null_admission(context->null_admission_analysis, coerce->resulttype)
+        : PTS_NULL_UNKNOWN;
+      bool conditional_rejection = context->conditional && admission == PTS_NULL_REJECTS;
+
+      mark_parameter_usage(context, conditional_rejection ? PTS_NULL_UNKNOWN : admission);
+      if (conditional_rejection || !argument.evaluation_safe || argument.proof != PTS_NULL_PROOF_NULL)
         context->evidence.reasons = pts_add_null_reason(context->evidence.reasons,
-          "domain_unresolved", psprintf("domain coercion to %s depends on an unresolved expression",
+          "domain_unresolved", psprintf(conditional_rejection
+            ? "domain coercion to %s is reached only under an unresolved CASE condition"
+            : "domain coercion to %s depends on an unresolved expression",
             format_type_be_qualified(coerce->resulttype)), exprLocation(node));
-      if (argument.evaluation_safe && argument.proof == PTS_NULL_PROOF_NULL)
+      if (!conditional_rejection && argument.evaluation_safe && argument.proof == PTS_NULL_PROOF_NULL)
         context->evidence.reasons = list_concat(context->evidence.reasons,
           list_copy(pts_type_null_reasons(context->null_admission_analysis, coerce->resulttype)));
       break;
@@ -677,6 +681,8 @@ parameter_usage_null_admission_walker(Node *node, void *walker_context)
     {
       const CaseExpr *case_expr = (const CaseExpr *) node;
       ListCell *cell;
+      bool outer_conditional = context->conditional;
+      bool prior_unknown = false;
       PtsNullEvaluation evaluation = pts_check_parameter_null_evaluation(
         node, context->param_id, context->node_analysis);
 
@@ -690,7 +696,8 @@ parameter_usage_null_admission_walker(Node *node, void *walker_context)
       }
       if (case_expr->arg != NULL)
       {
-        break;
+        parameter_usage_null_admission_walker((Node *) case_expr->arg, context);
+        prior_unknown = true;
       }
       foreach(cell, case_expr->args)
       {
@@ -698,17 +705,27 @@ parameter_usage_null_admission_walker(Node *node, void *walker_context)
         PtsNullEvaluation condition = pts_check_parameter_null_evaluation(
           (const Node *) when->expr, context->param_id, context->node_analysis);
 
-        if (parameter_usage_null_admission_walker((Node *) when->expr, context))
-          return true;
+        context->conditional = outer_conditional || prior_unknown;
+        parameter_usage_null_admission_walker((Node *) when->expr, context);
         if (condition.proof != PTS_NULL_PROOF_FALSE &&
-            condition.proof != PTS_NULL_PROOF_NULL &&
-            parameter_usage_null_admission_walker((Node *) when->result, context))
-          return true;
-        if (condition.proof == PTS_NULL_PROOF_TRUE)
+            condition.proof != PTS_NULL_PROOF_NULL)
+        {
+          context->conditional = outer_conditional || prior_unknown ||
+            condition.proof != PTS_NULL_PROOF_TRUE;
+          parameter_usage_null_admission_walker((Node *) when->result, context);
+        }
+        if (case_expr->arg == NULL && condition.proof == PTS_NULL_PROOF_TRUE)
+        {
+          context->conditional = outer_conditional;
           return false;
+        }
+        if (condition.proof == PTS_NULL_PROOF_UNKNOWN)
+          prior_unknown = true;
       }
-      return parameter_usage_null_admission_walker((Node *) case_expr->defresult,
-                                                    context);
+      context->conditional = outer_conditional || prior_unknown;
+      parameter_usage_null_admission_walker((Node *) case_expr->defresult, context);
+      context->conditional = outer_conditional;
+      return false;
     }
     case T_Query:
     case T_List:
@@ -784,6 +801,7 @@ pts_update_parameter_usage_null_admissions(const Query *query,
     HASHCTL query_ctl = {0};
     PtsParameterUsageContext context = {
       index + 1,
+      false,
       {false, PTS_NULL_UNKNOWN, NIL},
       null_admission_analysis,
       node_analysis,
