@@ -1,4 +1,4 @@
-# Driah NULL admission inventory
+# Consumer NULL admission inventory
 
 Run the inventory against the consumer's actual project configuration and a captured baseline.
 
@@ -18,7 +18,7 @@ The upstream regressions reduce the consumer statements to independent fixtures.
 
 | Case                                              | Proof covered                                                                                                                                   | Boundary retained                                                                                                                                                    |
 | ------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Description UPDATE using `IS DISTINCT FROM`       | A NULL-safe comparison and a nullable destination can admit NULL.                                                                               | The complete Driah updates also change metadata and execute notification and search triggers. Applicable opaque effects prevent strict proof.                        |
+| Description UPDATE using `IS DISTINCT FROM`       | A NULL-safe comparison and a nullable destination can admit NULL.                                                                               | The complete consumer updates also change metadata and execute notification and search triggers. Applicable opaque effects prevent strict proof.                        |
 | Playback `source_build_plan_id`                   | Selected input CTE projections preserve NULL through nested projections, comparisons, and nullable writes.                                      | The complete statement includes a deferred package INSERT trigger and index enforcement. The surrounding workflow also performs separate lookups and locks.          |
 | NULL-guarded required-column UPDATE               | A projected NULL may select the existing required value. Every assignment must preserve the row and existing enforcement must permit the proof. | An independent `provided` flag can select the NULL arm, so it does not establish admission.                                                                          |
 | Module naming override                            | The CHECK is part of destination admission.                                                                                                     | `custom` with NULL is invalid; automatic mode with NULL can be valid. A flat scalar cannot prove the companion relationship. Existing consumer unions remain useful. |
