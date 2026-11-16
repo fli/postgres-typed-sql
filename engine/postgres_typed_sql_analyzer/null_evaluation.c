@@ -375,6 +375,31 @@ check_null_evaluation_for_subject_uncached(const Node *expr,
       return pts_make_null_evaluation(proof, argument.evaluation_safe,
                                   argument.depends_on_subject);
     }
+    case T_DistinctExpr:
+    {
+      const DistinctExpr *distinct = (const DistinctExpr *) expr;
+      PtsNullEvaluation left = check_null_evaluation_for_subject(
+        (const Node *) linitial(distinct->args), subject);
+      PtsNullEvaluation right = check_null_evaluation_for_subject(
+        (const Node *) lsecond(distinct->args), subject);
+      bool left_null = left.proof == PTS_NULL_PROOF_NULL;
+      bool right_null = right.proof == PTS_NULL_PROOF_NULL;
+      PtsNullProof proof = left_null || right_null
+                             ? PTS_NULL_PROOF_NONNULL
+                             : PTS_NULL_PROOF_UNKNOWN;
+
+      if (left_null && right_null)
+        proof = PTS_NULL_PROOF_FALSE;
+      else if ((left_null && right.proof != PTS_NULL_PROOF_UNKNOWN) ||
+               (right_null && left.proof != PTS_NULL_PROOF_UNKNOWN))
+        proof = PTS_NULL_PROOF_TRUE;
+
+      return pts_make_null_evaluation(
+        proof,
+        left.evaluation_safe && right.evaluation_safe &&
+          (left_null || right_null || operator_evaluation_safe(distinct->opno)),
+        left.depends_on_subject || right.depends_on_subject);
+    }
     case T_BoolExpr:
     {
       const BoolExpr *boolean = (const BoolExpr *) expr;
