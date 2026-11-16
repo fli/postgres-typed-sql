@@ -316,8 +316,8 @@ test('generation rejects missing, incompatible, and duplicate function signature
 
 test('contract projections infer nested fields and track external SQL inputs', async (t) => {
   const projectionSchema = `create function public.projection_contract(bad boolean) returns jsonb language sql as $$
-    select case when bad then '{"kind":"ready","item":{"item_id":"wrong"}}'::jsonb
-      else '{"kind":"ready","item":{"item_id":7}}'::jsonb end $$;`
+    select case when bad then '{"kind":"ready","item":{"kind":"present","value":{"item_id":"wrong"}}}'::jsonb
+      else '{"kind":"ready","item":{"kind":"present","value":{"item_id":7}}}'::jsonb end $$;`
   const root = await createMinimalFixture(
     projectionSchema,
     'select public.projection_contract(:bad::boolean) as result'
@@ -330,7 +330,10 @@ test('contract projections infer nested fields and track external SQL inputs', a
     schema: 'public',
     name: 'projection_contract',
     argumentTypes: ['bool'],
-    variants: { unavailable: {}, ready: { item: { projection: 'projections/item.typed.sql' } } },
+    variants: {
+      unavailable: {},
+      ready: { item: { variants: { present: { value: { projection: 'projections/item.typed.sql' } }, absent: {} } } },
+    },
   } as const
   const options = {
     rootDir: root,
@@ -391,7 +394,7 @@ test('contract projections infer nested fields and track external SQL inputs', a
     default: (
       db: PostgresExecutor,
       params: { bad: boolean }
-    ) => Promise<{ result: PgJson<{ kind: string; item?: { itemId: number } }> | null }>
+    ) => Promise<{ result: PgJson<{ kind: string; item?: { kind: string; value: { itemId: number } } }> | null }>
   }>(root, 'query')
   const client = new Client({
     connectionString,
@@ -402,7 +405,10 @@ test('contract projections infer nested fields and track external SQL inputs', a
   try {
     await client.query(projectionSchema)
     const db = adapter.nodePostgres({ client })
-    assert.deepEqual((await run(db, { bad: false })).result?.value, { kind: 'ready', item: { itemId: 7 } })
+    assert.deepEqual((await run(db, { bad: false })).result?.value, {
+      kind: 'ready',
+      item: { kind: 'present', value: { itemId: 7 } },
+    })
     await assert.rejects(run(db, { bad: true }), { name: 'PgExecutionError', phase: 'decode' })
     const changedPath = join(root, 'changed.mjs')
     await writeFile(
@@ -448,9 +454,33 @@ test('projection preserves a directly called function contract', async (t) => {
   assert.match(generated, /"found"/)
   assert.match(generated, /count: number/)
   assert.match(generated, /nested: .* \| null/)
-  if (!connectionString) return
   await mkdir(join(root, 'node_modules'))
   await symlink(packageRoot, join(root, 'node_modules/postgres-typed-sql'), 'dir')
+  const consume = join(root, 'consume.mts')
+  await writeFile(
+    consume,
+    `import type { QueryRow } from './queries/query.typed-sql.js'
+declare const row: QueryRow
+if (row.result?.value.kind === 'yes') {
+  const nested = row.result.value.item.nested
+  if (nested?.value.kind === 'found') { const count: number = nested.value.count; void count }
+}`
+  )
+  const host = ts.createCompilerHost({})
+  const program = ts.createProgram(
+    [consume],
+    {
+      strict: true,
+      noEmit: true,
+      skipLibCheck: true,
+      module: ts.ModuleKind.NodeNext,
+      target: ts.ScriptTarget.ES2023,
+      types: [],
+    },
+    host
+  )
+  assert.equal(ts.formatDiagnosticsWithColorAndContext(ts.getPreEmitDiagnostics(program), host), '')
+  if (!connectionString) return
   const adapter: typeof import('../src/adapters/node-postgres.js') = await import(
     new URL('../../dist/adapters/node-postgres.js', import.meta.url).href
   )
@@ -470,6 +500,20 @@ test('projection preserves a directly called function contract', async (t) => {
       kind: 'yes',
       item: { nested: null },
     })
+    for (const nested of ['{"kind":"found","count":7}', '{"kind":"missing"}']) {
+      await client.query(`create or replace function public.outer_contract() returns jsonb language sql as $$
+        select jsonb_build_object('kind', 'yes', 'item', jsonb_build_object('nested', '${nested}'::jsonb)) $$`)
+      const value = (await run(adapter.nodePostgres({ client }))).result?.value
+      assert.ok(value && typeof value === 'object' && 'item' in value)
+      assert.ok(value.item && typeof value.item === 'object' && 'nested' in value.item)
+      assert.ok(value.item.nested && typeof value.item.nested === 'object' && 'value' in value.item.nested)
+      assert.deepEqual(value.item.nested.value, JSON.parse(nested))
+    }
+    for (const nested of ['{"kind":"found"}', '{"kind":"invalid"}', '{}']) {
+      await client.query(`create or replace function public.outer_contract() returns jsonb language sql as $$
+        select jsonb_build_object('kind', 'yes', 'item', jsonb_build_object('nested', '${nested}'::jsonb)) $$`)
+      await assert.rejects(run(adapter.nodePostgres({ client })), { name: 'PgExecutionError', phase: 'decode' })
+    }
   } finally {
     await client.query('drop function if exists public.outer_contract(), public.inner_contract()')
     await client.end()
@@ -501,4 +545,222 @@ test('root projections reject cycles and colliding result names', async (t) => {
   }
   await writeFile(projection, 'select public.root_projection() as nested')
   await assert.rejects(generateFixture(root, options), /Cyclic JSONB contract projections/u)
+})
+
+test('nested variants generate discriminated types and validate codecs', async (t) => {
+  const root = await createMinimalFixture(
+    `create function public.nested_contract(payload jsonb) returns jsonb language sql as $$ select payload $$;`,
+    'select public.nested_contract(:payload::jsonb) as result'
+  )
+  t.after(() => rm(root, { recursive: true, force: true }))
+  const branches = { found: { count: 'int4' }, missing: {} } as const
+  await generateFixture(root, {
+    jsonbFunctionContracts: [
+      {
+        schema: 'public',
+        name: 'nested_contract',
+        argumentTypes: ['jsonb'],
+        returns: {
+          object: {
+            item: { variants: branches },
+            list: { array: { variants: branches } },
+            maybe: { nullable: { variants: branches } },
+            optional: { optional: { variants: branches } },
+            outer: { variants: { a: { inner: { variants: branches } }, b: {} } },
+          },
+        },
+      },
+    ],
+  })
+  await mkdir(join(root, 'node_modules'))
+  await symlink(packageRoot, join(root, 'node_modules/postgres-typed-sql'), 'dir')
+  const consume = join(root, 'consume.mts')
+  await writeFile(
+    consume,
+    `
+import type { QueryRow } from './queries/query.typed-sql.js'
+declare const row: QueryRow
+if (row.result) {
+  const item = row.result.value.item
+  if (item.kind === 'found') { const count: number = item.count; void count }
+  else {
+    const kind: 'missing' = item.kind; void kind
+  }
+  const listItem = row.result.value.list[0]
+  if (listItem?.kind === 'found') { const count: number = listItem.count; void count }
+  const maybe = row.result.value.maybe
+  if (maybe?.kind === 'found') { const count: number = maybe.count; void count }
+  const optional = row.result.value.optional
+  if (optional?.kind === 'found') { const count: number = optional.count; void count }
+  const outer = row.result.value.outer
+  if (outer.kind === 'a' && outer.inner.kind === 'found') { const count: number = outer.inner.count; void count }
+}
+`
+  )
+  const host = ts.createCompilerHost({})
+  const program = ts.createProgram(
+    [consume],
+    {
+      strict: true,
+      noEmit: true,
+      skipLibCheck: true,
+      module: ts.ModuleKind.NodeNext,
+      target: ts.ScriptTarget.ES2023,
+      types: [],
+    },
+    host
+  )
+  assert.equal(ts.formatDiagnosticsWithColorAndContext(ts.getPreEmitDiagnostics(program), host), '')
+  await writeFile(
+    consume,
+    `import type { QueryRow } from './queries/query.typed-sql.js'
+declare const row: QueryRow
+if (row.result?.value.item.kind === 'missing') row.result.value.item.count
+`
+  )
+  const invalidProgram = ts.createProgram([consume], {
+    strict: true,
+    noEmit: true,
+    skipLibCheck: true,
+    module: ts.ModuleKind.NodeNext,
+    target: ts.ScriptTarget.ES2023,
+    types: [],
+  })
+  assert.match(
+    ts.formatDiagnosticsWithColorAndContext(ts.getPreEmitDiagnostics(invalidProgram), host),
+    /Property 'count' does not exist/
+  )
+  const values: typeof import('../src/values.js') = await import(new URL('../../dist/values.js', import.meta.url).href)
+  const generated = await importQuery<{ query: { jsonCodecs: { result: Parameters<typeof values.json>[1] } } }>(
+    root,
+    'query'
+  )
+  const codec = generated.query.jsonCodecs.result
+  const valid = {
+    item: { kind: 'found', count: 2 },
+    list: [{ kind: 'missing' }, { kind: 'found', count: 3 }],
+    maybe: null,
+    outer: { kind: 'a', inner: { kind: 'missing' } },
+  }
+  const validPayloads = [
+    valid,
+    { ...valid, optional: { kind: 'missing' }, maybe: { kind: 'found', count: 1 } },
+    {
+      ...valid,
+      item: { kind: 'missing' },
+      list: [],
+      optional: { kind: 'found', count: 4 },
+      maybe: { kind: 'missing' },
+      outer: { kind: 'b' },
+    },
+    { ...valid, outer: { kind: 'a', inner: { kind: 'found', count: 5 } } },
+  ]
+  const invalidPayloads = [
+    ...[{}, { kind: 'bad' }, { kind: 'found' }, { kind: 'found', count: 'bad' }, null].map((item) => ({
+      ...valid,
+      item,
+    })),
+    { ...valid, list: [{ kind: 'found' }] },
+    { ...valid, maybe: { kind: 'bad' } },
+    { ...valid, optional: null },
+    { ...valid, optional: { kind: 'found' } },
+    { ...valid, outer: { kind: 'a', inner: { kind: 'found' } } },
+  ]
+  for (const payload of validPayloads) {
+    assert.deepEqual(values.json(payload, codec).value, payload)
+    assert.deepEqual(values.parseJson(JSON.stringify(payload), codec).value, payload)
+  }
+  for (const payload of invalidPayloads) {
+    assert.throws(() => values.json(payload, codec))
+    assert.throws(() => values.parseJson(JSON.stringify(payload), codec))
+  }
+  if (!connectionString) return
+  const adapter: typeof import('../src/adapters/node-postgres.js') = await import(
+    new URL('../../dist/adapters/node-postgres.js', import.meta.url).href
+  )
+  const { default: run } = await importQuery<{
+    default: (db: PostgresExecutor, params: { payload: unknown }) => Promise<{ result: PgJson | null }>
+  }>(root, 'query')
+  const client = new Client({ connectionString })
+  await client.connect()
+  try {
+    await client.query(await readFile(join(root, 'schema.sql'), 'utf8'))
+    const db = adapter.nodePostgres({ client })
+    for (const payload of validPayloads)
+      assert.deepEqual((await run(db, { payload: values.json(payload) })).result?.value, payload)
+    for (const payload of invalidPayloads)
+      await assert.rejects(run(db, { payload: values.json(payload) }), {
+        name: 'PgExecutionError',
+        phase: 'decode',
+      })
+  } finally {
+    await client.query('drop function if exists public.nested_contract(jsonb)')
+    await client.end()
+  }
+})
+
+test('root returns variants preserve JSON null and SQL null distinctions', async (t) => {
+  const root = await createMinimalFixture(
+    `create function public.variant_null(mode text) returns jsonb language sql as $$
+      select case mode when 'sql' then null when 'json' then 'null'::jsonb else '{"kind":"a"}'::jsonb end $$;`,
+    `select public.variant_null(:mode::text) as result`
+  )
+  t.after(() => rm(root, { recursive: true, force: true }))
+  const variants = { a: {}, b: {} } as const
+  await mkdir(join(root, 'node_modules'))
+  await symlink(packageRoot, join(root, 'node_modules/postgres-typed-sql'), 'dir')
+  const values: typeof import('../src/values.js') = await import(new URL('../../dist/values.js', import.meta.url).href)
+  const adapter: typeof import('../src/adapters/node-postgres.js') = await import(
+    new URL('../../dist/adapters/node-postgres.js', import.meta.url).href
+  )
+  const client = connectionString ? new Client({ connectionString }) : undefined
+  if (client) {
+    await client.connect()
+    await client.query(await readFile(join(root, 'schema.sql'), 'utf8'))
+  }
+  try {
+    for (const [nullable, allowJsonNull] of [
+      [false, false],
+      [true, false],
+      [false, true],
+      [true, true],
+    ] as const) {
+      await generateFixture(root, {
+        jsonbFunctionContracts: [
+          {
+            schema: 'public',
+            name: 'variant_null',
+            argumentTypes: ['text'],
+            returns: nullable ? { nullable: { variants } } : { variants },
+            ...(allowJsonNull ? { allowJsonNull: true as const } : {}),
+          },
+        ],
+      })
+      const source = await readFile(join(root, 'queries/query.typed-sql.ts'), 'utf8')
+      const path = join(root, `case-${nullable}-${allowJsonNull}.mjs`)
+      await writeFile(
+        path,
+        ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.ESNext } }).outputText
+      )
+      const generated = (await import(pathToFileURL(path).href)) as {
+        query: { jsonCodecs: { result: Parameters<typeof values.json>[1] } }
+        default: (db: PostgresExecutor, params: { mode: string }) => Promise<{ result: PgJson | null }>
+      }
+      const codec = generated.query.jsonCodecs.result
+      assert.deepEqual(values.json({ kind: 'a' }, codec).value, { kind: 'a' })
+      if (nullable || allowJsonNull) assert.equal(values.json(null, codec).value, null)
+      else assert.throws(() => values.json(null, codec))
+      if (client) {
+        const run = (mode: string) => generated.default(adapter.nodePostgres({ client }), { mode })
+        assert.equal((await run('sql')).result, null)
+        if (nullable || allowJsonNull) assert.equal((await run('json')).result?.value, null)
+        else await assert.rejects(run('json'), { name: 'PgExecutionError', phase: 'decode' })
+      }
+    }
+  } finally {
+    if (client) {
+      await client.query('drop function if exists public.variant_null(text)')
+      await client.end()
+    }
+  }
 })

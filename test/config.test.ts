@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { resolveConfig as resolveConfigBase } from '../src/config.js'
+import { jsonbContractProjectionPaths, resolveConfig as resolveConfigBase } from '../src/config.js'
 
 const resolveConfig = resolveConfigBase
 
@@ -158,4 +158,54 @@ test('JSONB contracts require exactly one contract form', () => {
       }),
     /must name a .typed.sql file/u
   )
+})
+
+test('nested variants validate branches, depth, and projection discovery', () => {
+  const resolveUntypedConfig = (config: unknown) => resolveConfig(config as Parameters<typeof resolveConfig>[0])
+  const base = { schema: 'public', name: 'f', argumentTypes: [] } as const
+  const variants = {
+    a: { item: { projection: 'one.typed.sql' } },
+    b: { item: { optional: { projection: 'two.typed.sql' } } },
+  } as const
+  const resolved = resolveConfig({
+    schema: 'schema.sql',
+    jsonbFunctionContracts: [
+      { ...base, returns: { object: { x: { array: { nullable: { variants } } }, y: { variants } } } },
+      { ...base, variants: { a: { nested: { variants } }, b: {} } },
+    ],
+  })
+  assert.deepEqual(jsonbContractProjectionPaths(resolved.jsonbFunctionContracts), ['one.typed.sql', 'two.typed.sql'])
+  for (const invalid of [
+    { variants: {} },
+    { variants: { a: {} } },
+    { variants: { a: { kind: 'string' }, b: {} } },
+    { variants: { a: {}, b: null } },
+    { variants: { a: {}, b: {} }, array: 'string' },
+  ]) {
+    assert.throws(() =>
+      resolveUntypedConfig({
+        schema: 'schema.sql',
+        jsonbFunctionContracts: [{ ...base, returns: invalid }],
+      })
+    )
+  }
+  let shape: unknown = 'string'
+  for (let i = 0; i < 100; i++) shape = { array: shape }
+  const parse = (value: unknown) =>
+    resolveUntypedConfig({
+      schema: 'schema.sql',
+      jsonbFunctionContracts: [{ ...base, returns: value }],
+    })
+  assert.doesNotThrow(() => parse(shape))
+  let nested: unknown = { variants: { a: { field: 'string' }, b: {} } }
+  for (let i = 0; i < 99; i++) nested = { array: nested }
+  assert.doesNotThrow(() => parse(nested))
+  assert.throws(() => parse({ array: nested }), /too deeply nested/u)
+  assert.doesNotThrow(() =>
+    resolveUntypedConfig({
+      schema: 'schema.sql',
+      jsonbFunctionContracts: [{ ...base, variants: { a: { field: shape }, b: {} } }],
+    })
+  )
+  assert.throws(() => parse({ variants: { a: { field: shape }, b: {} } }), /too deeply nested/u)
 })

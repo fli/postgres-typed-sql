@@ -129,6 +129,21 @@ export default defineConfig({
 })
 ```
 
+A `variants` shape can also appear inside `returns`, an object field, an array, or another
+variant. Each `variants` map must contain at least two alternatives. The generator adds the
+required literal `kind` field, so do not declare it in a branch.
+
+```js
+returns: { object: {
+  result: { variants: { found: { count: 'int4' }, missing: {} } },
+  history: { array: { variants: { found: { count: 'int4' }, missing: {} } } },
+  previous: { optional: { nullable: { variants: { found: { count: 'int4' }, missing: {} } } } },
+} }
+```
+
+`optional` permits a field to be absent. `nullable` permits its value to be JSON null.
+Use both when either is valid.
+
 Add the other fields the application reads to the contract. The keys in each object are the
 wire names. Generated properties follow `naming.structuredJsonFields`. Unlisted fields are
 preserved as generic JSON at runtime and aren't part of the generated TypeScript type.

@@ -27,10 +27,12 @@ export type JsonbContractShape =
   | 'int4'
   | 'json'
   | 'null'
+  | { readonly variants: JsonbContractVariants }
   | { readonly projection: string }
   | { readonly object: Readonly<Record<string, JsonbContractField>> }
   | { readonly array: JsonbContractShape }
   | { readonly nullable: JsonbContractShape }
+type JsonbContractVariants = Readonly<Record<string, Readonly<Record<string, JsonbContractField>>>>
 export type JsonbContractField = JsonbContractShape | { readonly optional: JsonbContractShape }
 export type JsonbFunctionContract = {
   readonly schema: string
@@ -40,7 +42,7 @@ export type JsonbFunctionContract = {
 } & (
   | { readonly returns: JsonbContractShape; readonly variants?: never }
   | {
-      readonly variants: Readonly<Record<string, Readonly<Record<string, JsonbContractField>>>>
+      readonly variants: JsonbContractVariants
       readonly returns?: never
     }
 )
@@ -192,6 +194,8 @@ function contractShape(value: unknown, depth: number): JsonbContractShape {
         )
           throw new Error('JSONB contract projection must name a .typed.sql file.')
         return { projection: record.projection }
+      case 'variants':
+        return { variants: contractVariants(record.variants, depth + 1) }
       case 'object':
         return { object: contractFields(record.object, depth + 1) }
       case 'array':
@@ -212,6 +216,18 @@ function contractFields(value: unknown, depth: number): Readonly<Record<string, 
           return [key, { optional: contractShape(record.optional, depth) }]
       }
       return [key, contractShape(entry, depth)]
+    })
+  )
+}
+
+function contractVariants(value: unknown, fieldsDepth: number): JsonbContractVariants {
+  const entries = Object.entries(contractRecord(value))
+  if (entries.length < 2) throw new Error('JSONB contract requires at least two variants.')
+  return Object.fromEntries(
+    entries.map(([tag, fields]) => {
+      const parsed = contractFields(fields, fieldsDepth)
+      if (Object.hasOwn(parsed, 'kind')) throw new Error('JSONB contract variant cannot declare kind.')
+      return [tag, parsed]
     })
   )
 }
@@ -241,36 +257,31 @@ function parseContracts(input: unknown): readonly JsonbFunctionContract[] {
         returns: contractShape(contract.returns, 0),
         allowJsonNull: contract.allowJsonNull,
       }
-    const entries = Object.entries(contractRecord(contract.variants))
-    if (entries.length < 2) throw new Error('JSONB contract requires at least two variants.')
-    const variants = Object.fromEntries(
-      entries.map(([tag, fields]) => {
-        const parsed = contractFields(fields, 0)
-        if (Object.hasOwn(parsed, 'kind')) throw new Error('JSONB contract variant cannot declare kind.')
-        return [tag, parsed]
-      })
-    )
+    const variants = contractVariants(contract.variants, 0)
     return { schema, name, argumentTypes, variants, allowJsonNull: contract.allowJsonNull }
   })
 }
 
 export function jsonbContractProjectionPaths(contracts: readonly JsonbFunctionContract[]): string[] {
   const paths = new Set<string>()
+  const visitFields = (fields: Readonly<Record<string, JsonbContractField>>): void => {
+    for (const field of Object.values(fields))
+      visit(typeof field === 'object' && 'optional' in field ? field.optional : field)
+  }
+  const visitVariants = (variants: JsonbContractVariants): void => {
+    for (const fields of Object.values(variants)) visitFields(fields)
+  }
   const visit = (value: JsonbContractShape): void => {
     if (typeof value === 'string') return
     if ('projection' in value) paths.add(value.projection)
     else if ('array' in value) visit(value.array)
     else if ('nullable' in value) visit(value.nullable)
-    else
-      for (const field of Object.values(value.object))
-        visit(typeof field === 'object' && 'optional' in field ? field.optional : field)
+    else if ('variants' in value) visitVariants(value.variants)
+    else visitFields(value.object)
   }
   for (const contract of contracts) {
     if (contract.returns !== undefined) visit(contract.returns)
-    else
-      for (const fields of Object.values(contract.variants))
-        for (const field of Object.values(fields))
-          visit(typeof field === 'object' && 'optional' in field ? field.optional : field)
+    else visitVariants(contract.variants)
   }
   return [...paths]
 }
