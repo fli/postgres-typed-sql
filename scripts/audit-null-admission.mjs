@@ -35,6 +35,7 @@ for (const entry of baseline) {
     isAbsolute(entry.file) ||
     entry.file.split('/').includes('..') ||
     typeof entry.parameter !== 'string' ||
+    !/^[A-Za-z_][A-Za-z0-9_]*$/u.test(entry.parameter) ||
     typeof entry.accepted !== 'boolean' ||
     !(typeof entry.diagnostic === 'string' || entry.diagnostic === null)
   ) {
@@ -111,3 +112,7 @@ log(
     executableMismatches: results.filter((r) => r.current.executableMatchesOriginal === false).length,
   })
 )
+
+if (results.some((result) => result.current.executableMatchesOriginal === false)) {
+  throw new Error('Executable output changed for an accepted substitution; see inventory.')
+}
