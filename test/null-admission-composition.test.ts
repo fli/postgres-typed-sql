@@ -110,6 +110,13 @@ test('NULL admission composes through selected outputs and remains conservative 
       /@nullable value cannot be satisfied/u
     )
   })
+  await t.test('NULL-guarded required assignment preserves the existing row', async () => {
+    const sql = `update ${schema}.items set required = case when :value::text is null then required else :value::text end
+      where id = :id::integer returning id`
+    const analysis = await project.analyze(sourcePath, `-- @bindNull value\n${sql}`)
+    assert.equal(analysis.parameters.find((parameter) => parameter.name === 'value')?.nullAdmission, 'accepts')
+    await project.compile(sourcePath, `-- @nullable value\n${sql}`)
+  })
   await t.test('dependent CHECK remains uncertain', async () => {
     const sql = `insert into ${schema}.checked(value, guard) values (:value::text, :guard::boolean)`
     const analysis = await project.analyze(sourcePath, `-- @bindNull value\n${sql}`)
