@@ -2779,9 +2779,16 @@ testWithDatabase('native analyzer maps direct DML parameters to PostgreSQL targe
     'update public.accounts account set display_name = $1::text, email = $2 where account.id = $3'
   )
   assertAdmissionFacts(update.statements[0]?.queries[0]?.dmlParameterNullAdmissions, [
-    { admission: 'rejects', basis: 'direct_target_null_admission', paramId: 2 },
+    { admission: 'unknown', basis: 'unresolved', paramId: 2 },
     { admission: 'accepts', basis: 'direct_target_null_admission', paramId: 1 },
   ])
+  assert.deepEqual(
+    update.statements[0]?.queries[0]?.dmlDirectAssignments.toSorted((a, b) => a.paramId - b.paramId),
+    [
+      { paramId: 1, ...accountColumnByName.display_name },
+      { paramId: 2, ...accountColumnByName.email },
+    ]
+  )
 
   const upsert = await analyze(
     database,
