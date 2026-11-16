@@ -3,6 +3,7 @@
 
 #include "postgres.h"
 #include "nodes/nodes.h"
+#include "query_scope.h"
 
 typedef enum PtsNullProof
 {
@@ -29,6 +30,8 @@ extern PtsNullEvaluation pts_check_null_evaluation(const Node *expr,
                                                    AttrNumber target_attnum);
 extern PtsNullEvaluation pts_check_parameter_null_evaluation(
   const Node *expr, int param_id, PtsParameterNodeAnalysis *node_analysis);
+extern PtsNullEvaluation pts_check_parameter_null_evaluation_scoped(
+  const Node *expr, int param_id, const PtsQueryScope *scope);
 extern PtsParameterNodeAnalysis *pts_create_parameter_node_analysis(void);
 extern void pts_destroy_parameter_node_analysis(
   PtsParameterNodeAnalysis *analysis);

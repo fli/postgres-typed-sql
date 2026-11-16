@@ -365,7 +365,13 @@ indirect_callable_walker(Node *node, void *opaque)
       !(IsA(node, SubLink) &&
         scalar_sublink_null_with_null_parameter((SubLink *) node, context)) &&
       indirect_parameter_walker(node, &indirect))
-    mark_parameter_usage(context, PTS_NULL_UNKNOWN);
+  {
+    PtsNullEvaluation evaluation = pts_check_parameter_null_evaluation_scoped(
+      node, context->param_id, context->scope);
+
+    if (!evaluation.depends_on_subject || !evaluation.evaluation_safe)
+      mark_parameter_usage(context, PTS_NULL_UNKNOWN);
+  }
   return expression_tree_walker(node, indirect_callable_walker, opaque);
 }
 
