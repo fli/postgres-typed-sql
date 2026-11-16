@@ -827,6 +827,7 @@ parameter_usage_null_admission_walker(Node *node, void *walker_context)
     }
     case T_Query:
     case T_List:
+      break;
     case T_TargetEntry:
     {
       const TargetEntry *target = (const TargetEntry *) node;
