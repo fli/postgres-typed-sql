@@ -314,3 +314,33 @@ testWithDatabase('guarded insert source reports an unreachable action', async (d
   await database.query(sql, [null])
   assert.deepEqual((await database.query('select * from public.guarded_insert_probe')).rows, [])
 })
+
+testWithDatabase(
+  'CTE NULL guards preserve the old required value without borrowing provided flags',
+  async (database) => {
+    await database.query('create table public.cte_guard_probe (id integer primary key, value text not null)')
+    await database.query("insert into public.cte_guard_probe values (1, 'old')")
+    const guarded = `with input as (select $1::text as value)
+    update public.cte_guard_probe as target
+    set value = case when input.value is null then target.value else input.value end
+    from input where target.id = 1 returning target.value`
+    const facts = queryFacts(await analyze(database, guarded))
+    assert.ok(
+      facts.dmlParameterNullAdmissions.some(
+        (fact) => fact.paramId === 1 && fact.admission === 'accepts' && fact.basis === 'row_values_preserved_when_null'
+      )
+    )
+    assert.deepEqual((await database.query(guarded, [null])).rows, [{ value: 'old' }])
+    assert.deepEqual((await database.query(guarded, ['new'])).rows, [{ value: 'new' }])
+
+    const provided = `with input as (select $1::text as value, $2::boolean as provided)
+    update public.cte_guard_probe as target
+    set value = case when input.provided then input.value else target.value end
+    from input where target.id = 1`
+    const providedFacts = queryFacts(await analyze(database, provided))
+    assert.ok(
+      providedFacts.dmlParameterNullAdmissions.some((fact) => fact.paramId === 1 && fact.admission === 'unknown')
+    )
+    await assert.rejects(database.query(provided, [null, true]), /null value/u)
+  }
+)

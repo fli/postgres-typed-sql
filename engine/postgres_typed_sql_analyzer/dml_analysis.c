@@ -133,7 +133,7 @@ whole_row_preserved(const Query *query, int param_id,
 }
 
 static Bitmapset *
-prove_action_wide_admissions(const Query *query)
+prove_action_wide_admissions(const Query *query, const List *lineage)
 {
   const RangeTblEntry *target_rte = NULL;
   const Query *source = query;
@@ -183,6 +183,14 @@ prove_action_wide_admissions(const Query *query)
     if (!target->resjunk && target->resno > 0)
       collect_params((Node *) target->expr, &collector);
   }
+  if (query->commandType == CMD_UPDATE)
+  {
+    foreach(cell, lineage)
+    {
+      const PtsDmlLineageFact *fact = lfirst(cell);
+      collector.params = bms_add_member(collector.params, fact->param_id);
+    }
+  }
   while ((param_id = bms_next_member(collector.params, param_id)) >= 0)
   {
     PtsNullEvaluation predicate = source->jointree == NULL ||
@@ -225,7 +233,7 @@ void
 pts_append_dml_analysis(StringInfo out, const Query *query)
 {
   List *lineage = pts_collect_dml_lineage(query);
-  Bitmapset *action_proven_params = prove_action_wide_admissions(query);
+  Bitmapset *action_proven_params = prove_action_wide_admissions(query, lineage);
   List *direct_keys = NIL;
   List *admission_keys = NIL;
   ListCell *cell;

@@ -290,16 +290,25 @@ null_substitution_value(const Node *expr,
     case T_Var:
     {
       const Var *variable = (const Var *) expr;
-      return context->query != NULL && context->query->commandType == CMD_UPDATE &&
-             variable->varlevelsup == 0 &&
-             variable->varno == context->query->resultRelation &&
-             variable->varattno == context->target_attnum &&
-             variable->varnullingrels == NULL &&
-             variable->varreturningtype == VAR_RETURNING_DEFAULT
-               ? context->old_target_nullness == PTS_OLD_TARGET_NULLNESS_NULL
-                   ? PTS_SUBSTITUTED_NULL
-                   : PTS_SUBSTITUTED_SAME_OLD_TARGET_VALUE
-               : PTS_SUBSTITUTED_UNKNOWN;
+      if (context->query != NULL && context->query->commandType == CMD_UPDATE &&
+          variable->varlevelsup == 0 &&
+          variable->varno == context->query->resultRelation &&
+          variable->varattno == context->target_attnum &&
+          variable->varnullingrels == NULL &&
+          variable->varreturningtype == VAR_RETURNING_DEFAULT)
+        return context->old_target_nullness == PTS_OLD_TARGET_NULLNESS_NULL
+                 ? PTS_SUBSTITUTED_NULL : PTS_SUBSTITUTED_SAME_OLD_TARGET_VALUE;
+      if (context->query != NULL)
+      {
+        PtsQueryScope scope = {context->query, NULL};
+        PtsNullEvaluation evaluation = pts_check_parameter_null_evaluation_scoped(
+          expr, context->param_id, &scope);
+
+        if (evaluation.depends_on_subject && evaluation.evaluation_safe &&
+            evaluation.proof == PTS_NULL_PROOF_NULL)
+          return PTS_SUBSTITUTED_NULL;
+      }
+      return PTS_SUBSTITUTED_UNKNOWN;
     }
     case T_RelabelType:
       return null_substitution_value(
