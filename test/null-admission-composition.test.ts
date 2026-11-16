@@ -21,6 +21,7 @@ test('NULL admission composes through selected outputs and remains conservative 
   const schemaSql = `create schema ${schema};
     create table ${schema}.items(id integer primary key, value text, required text not null);
     create table ${schema}.checked(value text, guard boolean, constraint dependent_check check (guard or value is not null));
+    create table ${schema}.modules(mode text not null, override text, constraint module_override_check check (mode <> 'custom' or override is not null));
     create function ${schema}.unsafe(value text) returns text language plpgsql as $$
       begin if value is null then raise exception 'null argument'; end if; return value; end $$;
     create function ${schema}.trigger_fn() returns trigger language plpgsql as $$
@@ -54,15 +55,50 @@ test('NULL admission composes through selected outputs and remains conservative 
     })
   }
   await t.test('independent unsafe callable remains unknown', async () => {
-    const sql = `${filters[0]} and ${schema}.unsafe(:value::text) = 'present'`
-    // Keep the callable in a valid predicate before ORDER BY.
-    const valid = sql.replace(' order by i.id and ', ' and ') + ' order by i.id'
+    const valid = `with input as (select :value::text as value)
+      select i.id from ${schema}.items i cross join input
+      where i.value is not distinct from input.value and ${schema}.unsafe(:value::text) = 'present'`
     const analysis = await project.analyze(sourcePath, `-- @bindNull value\n${valid}`)
     assert.equal(analysis.parameters.find((parameter) => parameter.name === 'value')?.nullAdmission, 'unknown')
     await assert.rejects(
       project.compile(sourcePath, `-- @nullable value\n${valid}`),
       /@nullable value cannot be satisfied/u
     )
+  })
+  await t.test('an opaque callable on another parameter does not taint the projected value', async () => {
+    const sql = `with input as (select :value::text as value, ${schema}.unsafe(:other::text) as other)
+      select i.id from ${schema}.items i cross join input
+      where i.value is not distinct from input.value and input.other = 'present'`
+    const analysis = await project.analyze(sourcePath, `-- @bindNull value\n-- @bindNull other\n${sql}`)
+    assert.equal(analysis.parameters.find((parameter) => parameter.name === 'value')?.nullAdmission, 'accepts')
+    assert.equal(analysis.parameters.find((parameter) => parameter.name === 'other')?.nullAdmission, 'unknown')
+    await project.compile(sourcePath, `-- @nullable value\n-- @bindNull other\n${sql}`)
+  })
+  await t.test('selected sibling and nested callable preserve parameter independence', async () => {
+    const sibling = `with input as (select :value::text value, :other::text other)
+      select input.value, ${schema}.unsafe(input.other) from input`
+    const analysis = await project.analyze(sourcePath, `-- @bindNull value\n-- @bindNull other\n${sibling}`)
+    assert.equal(analysis.parameters.find((parameter) => parameter.name === 'value')?.nullAdmission, 'accepts')
+    assert.equal(analysis.parameters.find((parameter) => parameter.name === 'other')?.nullAdmission, 'unknown')
+    await project.compile(sourcePath, `-- @nullable value\n-- @bindNull other\n${sibling}`)
+    const nested = `with first as (select :value::text value), second as (select value from first)
+      select ${schema}.unsafe(value) from second`
+    const nestedAnalysis = await project.analyze(sourcePath, `-- @bindNull value\n${nested}`)
+    assert.equal(nestedAnalysis.parameters.find((parameter) => parameter.name === 'value')?.nullAdmission, 'unknown')
+    await assert.rejects(
+      project.compile(sourcePath, `-- @nullable value\n${nested}`),
+      /@nullable value cannot be satisfied/u
+    )
+  })
+  await t.test('module override CHECK depends on the companion mode', async () => {
+    const sql = `insert into ${schema}.modules(mode, override) values (:mode::text, :override::text)`
+    const analysis = await project.analyze(sourcePath, `-- @bindNull override\n${sql}`)
+    assert.equal(analysis.parameters.find((parameter) => parameter.name === 'override')?.nullAdmission, 'unknown')
+    await assert.rejects(
+      project.compile(sourcePath, `-- @nullable override\n${sql}`),
+      /@nullable override cannot be satisfied/u
+    )
+    await project.compile(sourcePath, `-- @bindNull override\n${sql}`)
   })
   await t.test('nullable insert and provided-flag patch', async () => {
     await project.compile(sourcePath, `-- @nullable value\n${nullableInsert}`)
@@ -132,9 +168,10 @@ test('NULL admission composes through selected outputs and remains conservative 
       )
       async function load<Params, Result>(
         name: string,
-        sql: string
+        sql: string,
+        directive = '-- @nullable value'
       ): Promise<(db: PostgresExecutor, params: Params) => Promise<Result>> {
-        const generated = await project.compile(sourcePath, `-- @nullable value\n${sql}`)
+        const generated = await project.compile(sourcePath, `${directive}\n${sql}`)
         const path = join(root, `${name}.mjs`)
         await writeFile(
           path,
@@ -150,6 +187,11 @@ test('NULL admission composes through selected outputs and remains conservative 
       const filter = await load<{ value: string | null }, { id: number }[]>('filter', filterSql)
       const insert = await load<{ id: number; value: string | null }, unknown>('insert', nullableInsert)
       const patch = await load<{ id: number; value: string | null; provided: boolean }, unknown>('patch', nullablePatch)
+      const moduleInsert = await load<{ mode: string; override: string | null }, unknown>(
+        'module',
+        `insert into ${schema}.modules(mode, override) values (:mode::text, :override::text)`,
+        '-- @bindNull override'
+      )
       const client = new Client({ connectionString })
       await client.connect()
       try {
@@ -174,6 +216,17 @@ test('NULL admission composes through selected outputs and remains conservative 
         assert.equal(queries, 4)
         assert.deepEqual(await filter(db, { value: null }), [{ id: 1 }])
         assert.equal(queries, 5)
+        await moduleInsert(db, { mode: 'automatic', override: null })
+        assert.equal(queries, 6)
+        await client.query('savepoint invalid_module')
+        await assert.rejects(moduleInsert(db, { mode: 'custom', override: null }), (error: unknown) => {
+          assert.ok(error instanceof Error)
+          assert.ok(error.cause instanceof Error)
+          assert.match(error.cause.message, /module_override_check/u)
+          return true
+        })
+        assert.equal(queries, 7)
+        await client.query('rollback to savepoint invalid_module')
         await assert.rejects(
           client.query(
             `update ${schema}.items set required = case when $1::boolean then $2::text else required end where id = 1`,
