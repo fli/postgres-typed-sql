@@ -1,6 +1,6 @@
 {
   "name": "postgres-typed-sql",
-  "version": "0.1.0-beta.28",
+  "version": "0.1.0-beta.29",
   "description": "PostgreSQL-native typed SQL generation for TypeScript",
   "type": "module",
   "license": "MIT",
@@ -53,11 +53,6 @@
       "types": "./dist/values.d.ts",
       "import": "./dist/values.js",
       "default": "./dist/values.js"
-    },
-    "./migration": {
-      "types": "./dist/migration.d.ts",
-      "import": "./dist/migration.js",
-      "default": "./dist/migration.js"
     },
     "./esbuild": {
       "types": "./dist/esbuild.d.ts",

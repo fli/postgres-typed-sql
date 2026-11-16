@@ -213,43 +213,10 @@ maps SQL NULL to `undefined`; `document === null ? null : document.value` preser
 SQL NULL as `null`. A non-null PgJson containing JSON null has `.value === null`.
 Do not blindly autofix between those cases.
 
-Use the optional `postgres-typed-sql/migration` entry point to review statically
-visible call boundaries in an existing TypeScript program:
-
-```ts
-import ts from 'typescript'
-import { findPgJsonUnknownFlows } from 'postgres-typed-sql/migration'
-
-const findings = findPgJsonUnknownFlows(ts, program)
-console.error(
-  ts.formatDiagnosticsWithColorAndContext(findings, {
-    getCanonicalFileName: (file) => file,
-    getCurrentDirectory: () => process.cwd(),
-    getNewLine: () => '\n',
-  })
-)
-if (findings.length > 0) process.exitCode = 1
-```
-
-Supply the same TypeScript instance used to create `program`. If your application
-uses virtual SQL modules, supply the program from its existing mapper-aware host.
-The checker does not compile SQL or construct overlays. The runtime and ordinary
-generation do not load TypeScript. The checker is tested with TypeScript 5.8.3.
-
-Diagnostic 95001 reports a branded PgJson flowing into an `unknown` argument or
-known property, including statically typed intermediate objects and effective
-spread properties. `.value` and forwarding to a PgJson parameter remain clean.
-Intentional forwarding to an unknown-accepting document consumer can also produce
-findings. Review those findings at the integration boundary. The checker has no
-inline suppression directives or automatic fixes.
-
-This is an opt-in migration aid. It checks call/new arguments, follows known
-properties to depth five, and recognizes brands through imports or exports of
-`postgres-typed-sql`, `/values`, and `/scalars`. Already-erased `unknown` or `any`,
-dynamic properties, rest arguments, broad destination unions, return/assignment
-flows, and deeper dataflow can escape it. Legitimate document consumers accepting
-unknown can produce findings. Review findings manually; no automatic unwrap or
-claim of complete migration safety is provided.
+The library keeps one lossless document representation. A domain parser that accepts
+`unknown` cannot use TypeScript's brand to reject a PgJson wrapper. Review these
+application boundaries explicitly and pass `.value` where the parser expects the
+decoded value. No additional runtime validator or automatic unwrapping is needed.
 
 Unwrapping does not reparse or revalidate. Generated nested JSONB projections,
 exact numeric values, bytea values, SQL/JSON null distinctions, and fixture codecs

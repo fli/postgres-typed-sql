@@ -232,8 +232,8 @@ accepted only where a generated projection codec declares a JSON column boundary
 
 See the [consumer migration examples](docs/consumer-contract-migration.md) for the four consumer changes.
 See [native value migration](https://github.com/fli/postgres-typed-sql/blob/main/docs/native-value-migration.md)
-for nullable scalar filters, exact string IDs, RPC integer boundaries, and the optional
-`postgres-typed-sql/migration` checker for PgJson values passed to `unknown` parsers.
+for nullable scalar filters, exact string IDs, RPC integer boundaries, and passing
+decoded PgJson values to domain parsers.
 
 Use the code for API details:
 

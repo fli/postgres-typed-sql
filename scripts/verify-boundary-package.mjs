@@ -52,7 +52,6 @@ try {
       )
       run[name] = (await import(pathToFileURL(file).href)).default
     }
-    const { findPgJsonUnknownFlows } = await import(pathToFileURL(require.resolve('postgres-typed-sql/migration')).href)
     const fixture = join(root, 'consumer.mts')
     await writeFile(
       fixture,
@@ -67,7 +66,6 @@ try {
       target: ts.ScriptTarget.ES2023,
     })
     assert.deepEqual(ts.getPreEmitDiagnostics(program), [])
-    assert.equal(findPgJsonUnknownFlows(ts, program).length, 1)
     const client = new Client({
       connectionString: process.env.POSTGRES_TYPED_SQL_TEST_URL,
       options:
@@ -107,7 +105,7 @@ try {
       })
       assert.equal(calls, 2)
       process.stdout.write(
-        'Installed package generated strict nullable SQL; exact int8/int4 and migration diagnostic passed; read/write issued exactly two driver queries.\n'
+        'Installed package generated strict nullable SQL; exact int8/int4 and generated declarations passed; read/write issued exactly two driver queries.\n'
       )
     } finally {
       await client.query(`drop schema ${schema} cascade`)
