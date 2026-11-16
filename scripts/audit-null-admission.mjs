@@ -1,6 +1,6 @@
 import { log } from 'node:console'
 import { createHash } from 'node:crypto'
-import { readFile, writeFile } from 'node:fs/promises'
+import { readFile, rm, writeFile } from 'node:fs/promises'
 import { isAbsolute, join, resolve } from 'node:path'
 import { pathToFileURL, URL } from 'node:url'
 import ts from 'typescript'
@@ -98,12 +98,23 @@ try {
         gained: !entry.accepted && current.accepted,
       })
     }
+    await writeFile(
+      `${resolve(outputArg)}.partial.json`,
+      `${JSON.stringify({ complete: false, baselineSha256: hash(baselineText), configIdentity: project.configIdentity, inputs, results }, null, 2)}\n`
+    )
   }
 } finally {
   await project.close()
 }
-const output = { baselineSha256: hash(baselineText), configIdentity: project.configIdentity, inputs, results }
+const output = {
+  complete: true,
+  baselineSha256: hash(baselineText),
+  configIdentity: project.configIdentity,
+  inputs,
+  results,
+}
 await writeFile(resolve(outputArg), `${JSON.stringify(output, null, 2)}\n`)
+await rm(`${resolve(outputArg)}.partial.json`, { force: true })
 log(
   JSON.stringify({
     declarations: results.length,
