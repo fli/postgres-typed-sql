@@ -188,6 +188,70 @@ test(
   }
 )
 
+test(
+  'UPDATE NULL constraints run only for affected rows on PostgreSQL',
+  { skip: !process.env.POSTGRES_TYPED_SQL_TEST_URL },
+  async () => {
+    const schema = `update_certainty_${randomUUID().replaceAll('-', '')}`
+    const client = new Client({ connectionString: process.env.POSTGRES_TYPED_SQL_TEST_URL })
+    await client.connect()
+    try {
+      await client.query('begin')
+      await client.query(`create schema ${schema}; create table ${schema}.items(value text not null, guard text)`)
+      const sql = `update ${schema}.items set value = $1::text, guard = $1::text`
+      assert.equal((await client.query(sql, [null])).rowCount, 0)
+      await client.query(`insert into ${schema}.items values ('ok', 'ok')`)
+      assert.equal((await client.query(`${sql} where false`, [null])).rowCount, 0)
+      await client.query('savepoint expected_error')
+      await assert.rejects(client.query(sql, [null]), /null value/u)
+      await client.query('rollback to savepoint expected_error')
+    } finally {
+      await client.query('rollback')
+      await client.end()
+    }
+  }
+)
+
+test(
+  'INSERT RETURNING domain coercion depends on a produced row on PostgreSQL',
+  { skip: !process.env.POSTGRES_TYPED_SQL_TEST_URL },
+  async () => {
+    const client = new Client({ connectionString: process.env.POSTGRES_TYPED_SQL_TEST_URL })
+    await client.connect()
+    try {
+      await client.query('begin')
+      await client.query(
+        'create temporary table returning_certainty(value text unique); create domain pg_temp.returning_required as text not null'
+      )
+      const returning = 'returning ($1::text)::pg_temp.returning_required'
+      assert.equal(
+        (await client.query(`insert into returning_certainty select $1::text where false ${returning}`, [null]))
+          .rowCount,
+        0
+      )
+      await client.query("insert into returning_certainty values ('existing')")
+      assert.equal(
+        (
+          await client.query(
+            `insert into returning_certainty values ('existing') on conflict do nothing ${returning}`,
+            [null]
+          )
+        ).rowCount,
+        0
+      )
+      await client.query('savepoint expected_error')
+      await assert.rejects(
+        client.query(`insert into returning_certainty values ($1::text) ${returning}`, [null]),
+        /domain.*does not allow null/u
+      )
+      await client.query('rollback to savepoint expected_error')
+    } finally {
+      await client.query('rollback')
+      await client.end()
+    }
+  }
+)
+
 test('NULL admission explains the actual blockers through the public project API', async (t) => {
   const { openQueryProject }: typeof import('../src/query-project.js') = await import(
     new URL('../../dist/project.js', import.meta.url).href
@@ -334,6 +398,13 @@ test('NULL admission explains the actual blockers through the public project API
       sql: `insert into ${schema}.items(id, required) values (1, :value::text)`,
       outcome: 'rejects',
       code: 'target_not_null',
+      identity: [/items/u, /required/u],
+    },
+    {
+      name: 'direct UPDATE required destination',
+      sql: `update ${schema}.items set required = :value::text`,
+      outcome: 'unknown',
+      code: 'conditional_required_nonnull',
       identity: [/items/u, /required/u],
     },
     {

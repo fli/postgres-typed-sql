@@ -1520,6 +1520,15 @@ set value = coalesce(:value::text, value)
   output = await readFile(join(root, 'queries/query.typed-sql.ts'), 'utf8')
   assert.match(output, /readonly value: string \| null/u)
   assert.doesNotMatch(output, /readonly value: CheckedValues__Value/u)
+
+  await writeFile(
+    join(root, 'queries/query.typed.sql'),
+    `update public.checked_values set value = :value::text
+`
+  )
+  await generateTypedSql(config)
+  output = await readFile(join(root, 'queries/query.typed-sql.ts'), 'utf8')
+  assert.match(output, /readonly value: 'A' \| 'B'/u)
 })
 
 test('does not narrow CHECK parameters across rewriting triggers or miss INTERSECT right-side lineage', async () => {

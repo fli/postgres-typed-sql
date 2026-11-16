@@ -1985,7 +1985,7 @@ testWithDatabase(
     assert.equal(query('rewrittenInsert').params[0]?.checkConstraintType, undefined)
 
     assert.equal(query('domainTypedSource').params[0]?.nullAdmission, 'rejects')
-    assert.equal(query('rejectingReturningUse').params[0]?.nullAdmission, 'rejects')
+    assert.equal(query('rejectingReturningUse').params[0]?.nullAdmission, 'unknown')
     assert.equal(query('nullExtendedInsert').params[0]?.nullAdmission, 'accepts')
     assert.equal(query('nullExtendedInsert').params[0]?.checkConstraintType, undefined)
     assert.deepEqual(query('nestedRowLock').accessEvidence, {

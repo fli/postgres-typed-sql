@@ -356,3 +356,34 @@ testWithDatabase(
     await assert.rejects(database.query(provided, [null, true]), /null value/u)
   }
 )
+
+testWithDatabase(
+  'UPDATE required targets depend on an existing row while keeping assignment identity',
+  async (database) => {
+    await database.query('create table public.update_certainty_probe (value text not null, guard text)')
+    for (const sql of [
+      'update public.update_certainty_probe set value = $1::text',
+      'update public.update_certainty_probe set value = $1::text where false',
+      'update public.update_certainty_probe set value = $1::text, guard = $1::text',
+    ]) {
+      const facts = queryFacts(await analyze(database, sql))
+      assert.ok(facts.dmlDirectAssignments.some(({ paramId }) => paramId === 1))
+      assert.ok(
+        facts.dmlParameterNullAdmissions.some((fact) =>
+          sql.includes('where false')
+            ? fact.admission === 'accepts' && fact.basis === 'action_unreachable_when_null'
+            : fact.admission === 'unknown' && fact.basis === 'unresolved'
+        )
+      )
+      await database.query(sql, [null])
+    }
+  }
+)
+
+testWithDatabase('UPDATE domain coercion depends on a row', async (database) => {
+  await database.query('create domain public.update_required_text as text not null')
+  await database.query('create table public.update_domain_probe (value public.update_required_text)')
+  const coercion = queryFacts(await analyze(database, 'update public.update_domain_probe set value = $1::text'))
+  assertAdmissionFacts(coercion.dmlParameterNullAdmissions, [{ admission: 'unknown', basis: 'unresolved', paramId: 1 }])
+  await database.query('update public.update_domain_probe set value = $1::text', [null])
+})

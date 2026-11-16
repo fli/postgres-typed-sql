@@ -74,6 +74,7 @@ typedef struct DmlLineageContext
   const List *target_list;
   const List *match_full_foreign_keys;
   const PtsDmlWriteEnforcement *enforcement;
+  bool requires_existing_row;
 } DmlLineageContext;
 
 static const Node *
@@ -186,9 +187,9 @@ append_dml_parameter_target(DmlLineageContext *context, int param_id,
   {
     target_admission = PTS_NULL_REJECTS;
     reasons = pts_add_null_reason(reasons,
-      unconditional ? "target_not_null" : "conditional_required_nonnull",
+      unconditional && !context->requires_existing_row ? "target_not_null" : "conditional_required_nonnull",
       psprintf("%s.%s %s NULL", quote_qualified_identifier(get_namespace_name(get_rel_namespace(context->target_relid)), get_rel_name(context->target_relid)),
-               quote_identifier(NameStr(attribute->attname)), unconditional ? "does not allow" : "may receive"), -1);
+               quote_identifier(NameStr(attribute->attname)), unconditional && !context->requires_existing_row ? "does not allow" : "may receive"), -1);
   }
   if (null_propagating && write_identity)
   {
@@ -215,7 +216,7 @@ append_dml_parameter_target(DmlLineageContext *context, int param_id,
     if (target_admission != PTS_NULL_REJECTS)
       target_admission = PTS_NULL_UNKNOWN;
   }
-  if (!unconditional && target_admission == PTS_NULL_REJECTS)
+  if ((!unconditional || context->requires_existing_row) && target_admission == PTS_NULL_REJECTS)
   {
     ListCell *reason_cell;
     List *conditional_reasons = NIL;
@@ -232,6 +233,9 @@ append_dml_parameter_target(DmlLineageContext *context, int param_id,
         conditional_reasons = lappend(conditional_reasons, (void *) reason);
     }
     reasons = conditional_reasons;
+    if (context->requires_existing_row)
+      reasons = pts_add_null_reason(reasons, "conditional_required_nonnull",
+        "UPDATE may affect no rows", -1);
     target_admission = PTS_NULL_UNKNOWN;
   }
   direct_assignment = value_preserving && unconditional && write_identity;
@@ -786,7 +790,7 @@ append_direct_parameter_targets(DmlLineageContext *context, const PtsQueryScope 
 static void
 collect_targets_from_list(List **facts_list, const PtsQueryScope *scope,
                          const List *target_list, Oid target_relid,
-                         bool unconditional,
+                         bool unconditional, bool requires_existing_row,
                          const PtsDmlWriteEnforcement *enforcement,
                          HTAB *facts,
                          PtsNullAdmissionAnalysis *null_admission_analysis)
@@ -814,6 +818,7 @@ collect_targets_from_list(List **facts_list, const PtsQueryScope *scope,
       context.match_full_foreign_keys =
         pts_dml_write_match_full_foreign_keys(enforcement);
       context.enforcement = enforcement;
+      context.requires_existing_row = requires_existing_row;
       context.visited = hash_create("typed SQL DML lineage visits", 32,
                                     &visited_control, HASH_ELEM | HASH_BLOBS);
       append_direct_parameter_targets(&context, scope, (const Node *) target->expr,
@@ -857,7 +862,7 @@ pts_collect_dml_lineage(const Query *query)
                              query->commandType == CMD_UPDATE ||
                              (query->commandType == CMD_INSERT &&
                               pts_query_output_is_unconditional(&scope)),
-                             enforcement, facts, null_admission_analysis);
+                             query->commandType == CMD_UPDATE, enforcement, facts, null_admission_analysis);
     pts_release_dml_write_enforcement(enforcement);
   }
 
@@ -869,7 +874,7 @@ pts_collect_dml_lineage(const Query *query)
 
     collect_targets_from_list(&lineage, &scope,
                              query->onConflict->onConflictSet,
-                             target_relid, false, enforcement, facts,
+                             target_relid, false, true, enforcement, facts,
                              null_admission_analysis);
     pts_release_dml_write_enforcement(enforcement);
   }
@@ -888,13 +893,13 @@ pts_collect_dml_lineage(const Query *query)
       if (action->commandType == CMD_INSERT)
       {
         collect_targets_from_list(&lineage, &scope, action->targetList,
-                                 target_relid, false, insert_enforcement, facts,
+                                 target_relid, false, false, insert_enforcement, facts,
                                  null_admission_analysis);
       }
       else if (action->commandType == CMD_UPDATE)
       {
         collect_targets_from_list(&lineage, &scope, action->targetList,
-                                 target_relid, false, update_enforcement, facts,
+                                 target_relid, false, true, update_enforcement, facts,
                                  null_admission_analysis);
       }
     }

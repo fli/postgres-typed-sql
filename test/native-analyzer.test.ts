@@ -3083,7 +3083,7 @@ testWithDatabase('native analyzer maps direct DML parameters to PostgreSQL targe
        returning ($1::text)::public.non_null_text`
   )
   assert.deepEqual(rejectingReturningUse.paramTypeNullAdmissions, ['accepts'])
-  assert.deepEqual(rejectingReturningUse.paramUsageNullAdmissions, ['rejects'])
+  assert.deepEqual(rejectingReturningUse.paramUsageNullAdmissions, ['unknown'])
 
   const domainTargets = await analyze(
     database,
