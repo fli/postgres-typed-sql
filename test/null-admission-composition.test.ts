@@ -208,6 +208,12 @@ test('NULL admission composes through selected outputs and remains conservative 
         )
         return loaded.default
       }
+      const guarded = await load<{ id: number; value: string | null }, unknown>(
+        'guarded',
+        `with input as (select :value::text value)
+          update ${schema}.items set required = case when input.value is null then items.required else input.value end
+          from input where items.id = :id::integer returning items.id`
+      )
       const filterSql = filters[0]
       assert.ok(filterSql)
       const filter = await load<{ value: string | null }, { id: number }[]>('filter', filterSql)
@@ -244,6 +250,18 @@ test('NULL admission composes through selected outputs and remains conservative 
         assert.equal(queries, 5)
         await moduleInsert(db, { mode: 'automatic', override: null })
         assert.equal(queries, 6)
+        await guarded(db, { id: 1, value: null })
+        assert.equal(queries, 7)
+        assert.equal(
+          (await client.query(`select required from ${schema}.items where id = 1`)).rows[0]?.required,
+          'required'
+        )
+        await guarded(db, { id: 1, value: 'changed' })
+        assert.equal(queries, 8)
+        assert.equal(
+          (await client.query(`select required from ${schema}.items where id = 1`)).rows[0]?.required,
+          'changed'
+        )
         await client.query('savepoint invalid_module')
         await assert.rejects(moduleInsert(db, { mode: 'custom', override: null }), (error: unknown) => {
           assert.ok(error instanceof Error)
@@ -251,7 +269,7 @@ test('NULL admission composes through selected outputs and remains conservative 
           assert.match(error.cause.message, /module_override_check/u)
           return true
         })
-        assert.equal(queries, 7)
+        assert.equal(queries, 9)
         await client.query('rollback to savepoint invalid_module')
         await assert.rejects(
           client.query(
