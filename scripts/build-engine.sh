@@ -4,7 +4,13 @@ set -eu
 project_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 source_dir=${PGLITE_SOURCE_DIR:-"$project_root/source/pglite"}
 
+identity=$("$project_root/scripts/prepare-engine.sh" --print-identity | sed -n 's/^key=//p' | sed -n '1p')
 "$project_root/scripts/prepare-engine.sh"
+prepared_identity=$("$project_root/scripts/prepare-engine.sh" --print-identity | sed -n 's/^key=//p' | sed -n '1p')
+if [ "$identity" != "$prepared_identity" ]; then
+  echo 'Engine sources changed during preparation. Rebuild before publishing its cache.' >&2
+  exit 1
+fi
 builder_image=electricsql/pglite-builder:3.1.74-7
 if ! docker image inspect "$builder_image" >/dev/null 2>&1; then
   if ! docker pull "$builder_image"; then
@@ -35,6 +41,10 @@ pnpm --dir "$source_dir" install --frozen-lockfile --ignore-scripts
 pnpm --dir "$source_dir" wasm:build
 pnpm --dir "$source_dir" ts:build
 
-identity=$("$project_root/scripts/prepare-engine.sh" --print-identity | sed -n 's/^key=//p' | sed -n '1p')
+current_identity=$("$project_root/scripts/prepare-engine.sh" --print-identity | sed -n 's/^key=//p' | sed -n '1p')
+if [ "$identity" != "$current_identity" ]; then
+  echo 'Engine sources changed during the build. Rebuild before publishing its cache.' >&2
+  exit 1
+fi
 printf '%s\n' "$identity" >"$source_dir/.postgres-typed-sql-build-identity"
 "$project_root/scripts/prepare-engine.sh" --mark-built

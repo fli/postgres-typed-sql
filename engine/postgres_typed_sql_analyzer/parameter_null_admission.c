@@ -1,9 +1,11 @@
 #include "postgres.h"
 
+#include "catalog/pg_type_d.h"
 #include "nodes/nodeFuncs.h"
 #include "nodes/parsenodes.h"
 #include "nodes/primnodes.h"
 #include "parser/parsetree.h"
+#include "utils/fmgroids.h"
 #include "utils/hsearch.h"
 #include "utils/lsyscache.h"
 
@@ -259,6 +261,95 @@ mentions_indirect_parameter(Node *node, PtsParameterUsageContext *context)
 }
 
 static bool
+qual_cannot_be_true_with_null(const Node *qual,
+                              PtsParameterUsageContext *context)
+{
+  PtsNullEvaluation evaluation;
+  ListCell *cell;
+
+  if (qual == NULL)
+    return false;
+  evaluation = pts_check_parameter_null_evaluation(qual, context->param_id,
+                                                    context->node_analysis);
+  if (!evaluation.evaluation_safe)
+    return false;
+  if (evaluation.proof == PTS_NULL_PROOF_FALSE ||
+      evaluation.proof == PTS_NULL_PROOF_NULL)
+    return true;
+  if (!IsA(qual, BoolExpr) || ((const BoolExpr *) qual)->boolop != AND_EXPR)
+    return false;
+  foreach(cell, ((const BoolExpr *) qual)->args)
+  {
+    if (qual_cannot_be_true_with_null(lfirst(cell), context))
+      return true;
+  }
+  return false;
+}
+
+static bool
+scalar_bound_safe_with_null(const Node *bound,
+                            PtsParameterUsageContext *context)
+{
+  PtsNullEvaluation evaluation;
+
+  if (bound == NULL)
+    return true;
+  evaluation = pts_check_parameter_null_evaluation(bound, context->param_id,
+                                                    context->node_analysis);
+  if (!evaluation.evaluation_safe)
+    return false;
+  if (evaluation.proof == PTS_NULL_PROOF_NULL)
+    return true;
+  if (IsA(bound, Const))
+  {
+    const Const *constant = (const Const *) bound;
+
+    if (constant->constisnull)
+      return true;
+    switch (constant->consttype)
+    {
+      case INT2OID:
+        return DatumGetInt16(constant->constvalue) >= 0;
+      case INT4OID:
+        return DatumGetInt32(constant->constvalue) >= 0;
+      case INT8OID:
+        return DatumGetInt64(constant->constvalue) >= 0;
+      default:
+        return false;
+    }
+  }
+  if (IsA(bound, FuncExpr))
+  {
+    const FuncExpr *function = (const FuncExpr *) bound;
+
+    if ((function->funcid == F_INT8_INT4 || function->funcid == F_INT8_INT2) &&
+        list_length(function->args) == 1)
+      return scalar_bound_safe_with_null(linitial(function->args), context);
+  }
+  return false;
+}
+
+static bool
+scalar_sublink_null_with_null_parameter(const SubLink *link,
+                                        PtsParameterUsageContext *context)
+{
+  const Query *query;
+
+  if (link->subLinkType != EXPR_SUBLINK || !IsA(link->subselect, Query))
+    return false;
+  query = (const Query *) link->subselect;
+  if (query->commandType != CMD_SELECT || query->hasAggs ||
+      query->groupClause != NIL || query->groupingSets != NIL ||
+      query->havingQual != NULL || query->setOperations != NULL ||
+      query->hasTargetSRFs || query->hasModifyingCTE || query->hasRowSecurity ||
+      query->jointree == NULL ||
+      !scalar_bound_safe_with_null(query->limitCount, context) ||
+      !scalar_bound_safe_with_null(query->limitOffset, context))
+    return false;
+  return qual_cannot_be_true_with_null(query->jointree->quals, context);
+}
+
+static bool
 indirect_callable_walker(Node *node, void *opaque)
 {
   PtsParameterUsageContext *context = opaque;
@@ -271,6 +362,8 @@ indirect_callable_walker(Node *node, void *opaque)
       !IsA(node, RelabelType) && !IsA(node, CollateExpr) &&
       !IsA(node, ArrayExpr) && !IsA(node, RowExpr) &&
       !IsA(node, NullTest) && !IsA(node, BooleanTest) &&
+      !(IsA(node, SubLink) &&
+        scalar_sublink_null_with_null_parameter((SubLink *) node, context)) &&
       indirect_parameter_walker(node, &indirect))
     mark_parameter_usage(context, PTS_NULL_UNKNOWN);
   return expression_tree_walker(node, indirect_callable_walker, opaque);
