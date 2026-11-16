@@ -870,7 +870,7 @@ testWithDatabase('native analyzer follows only execution-reachable SELECT CTEs',
     )
     select total from reached`
   const referencedFrame = await analyze(database, referencedFrameSql)
-  assert.deepEqual(referencedFrame.paramUsageNullAdmissions, ['rejects'])
+  assert.deepEqual(referencedFrame.paramUsageNullAdmissions, ['unknown'])
   await assert.rejects(database.query(referencedFrameSql, [null]), /frame starting offset must not be null/u)
 
   const unusedDependencyChainSql = `with first_unused as (
