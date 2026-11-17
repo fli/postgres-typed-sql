@@ -46,6 +46,7 @@ function shape(
   if ('nullable' in value) return { ...shape(value.nullable, projection), nullability: nullable }
   if ('array' in value) return { kind: 'array', element: shape(value.array, projection), nullability: nonNull }
   if ('projection' in value) return projection(value.projection)
+  if ('variants' in value) return variantShape(value.variants, projection)
   return {
     kind: 'object',
     fields: objectFields(value.object, projection),
@@ -70,7 +71,17 @@ function contractShape(
         }
       : result
   }
-  const alternatives: TypedSqlPostgresIrJsonShape[] = Object.entries(contract.variants).map(([variant, fields]) => ({
+  const result = variantShape(contract.variants, projection)
+  return contract.allowJsonNull
+    ? { ...result, alternatives: [...result.alternatives, { kind: 'null', nullability: nonNull }] }
+    : result
+}
+
+function variantShape(
+  variants: Readonly<Record<string, Readonly<Record<string, JsonbContractField>>>>,
+  projection: (path: string) => TypedSqlPostgresIrJsonShape
+): Extract<TypedSqlPostgresIrJsonShape, { kind: 'union' }> {
+  const alternatives: TypedSqlPostgresIrJsonShape[] = Object.entries(variants).map(([variant, fields]) => ({
     kind: 'object',
     nullability: nonNull,
     fields: [
@@ -78,7 +89,6 @@ function contractShape(
       ...objectFields(fields, projection),
     ],
   }))
-  if (contract.allowJsonNull) alternatives.push({ kind: 'null', nullability: nonNull })
   return { kind: 'union', alternatives, nullability: nonNull }
 }
 
