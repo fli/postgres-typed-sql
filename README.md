@@ -53,6 +53,13 @@ must stay stable. The default is `false`. The worker discards its database and c
 an analysis error or when the project closes. Source text and native statement analysis still run
 for each request.
 
+Set `assumeRepeatableProjectionAnalysis: true` to reuse JSONB contract projection analysis within
+one whole-project snapshot. Enable it only if the catalog and name resolution stay stable and
+repeated native analysis of each projection produces the same result without observable side
+effects. PostgreSQL can run code during parsing, including type input functions and domain checks.
+For example, a domain check that advances a sequence makes a projection unsuitable for reuse.
+This option defaults to `false` and applies independently of catalog query reuse.
+
 ### Declare nullable inputs
 
 Parameters reject SQL NULL by default. `-- @nullable name` permits it only when analysis

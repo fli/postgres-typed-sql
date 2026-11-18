@@ -314,6 +314,87 @@ test('generation rejects missing, incompatible, and duplicate function signature
   )
 })
 
+test('project analysis shares contract projections with the same facts as standalone analysis', async (t) => {
+  const sql = 'select public.project_item(:id::int4) as result'
+  const root = await createMinimalFixture(
+    "create function public.project_item(int4) returns jsonb language sql as $$ select '{}'::jsonb $$;",
+    sql
+  )
+  t.after(() => rm(root, { recursive: true, force: true }))
+  await writeFile(join(root, 'queries/second.typed.sql'), sql)
+  await writeFile(join(root, 'queries/r-projected.typed.sql'), 'select :id::int4 as item_id')
+  await writeFile(join(root, 'external.typed.sql'), 'select true as available')
+
+  const configPath = join(root, 'postgres-typed-sql.config.mjs')
+  const options = {
+    schema: 'schema.sql',
+    include: ['queries'],
+    assumeRepeatableProjectionAnalysis: true,
+    jsonbFunctionContracts: [
+      {
+        schema: 'public',
+        name: 'project_item',
+        argumentTypes: ['int4'],
+        variants: {
+          unavailable: {},
+          ready: {
+            first: { projection: 'queries/r-projected.typed.sql' },
+            second: { projection: 'queries/r-projected.typed.sql' },
+            external: { projection: 'external.typed.sql' },
+          },
+        },
+      },
+    ],
+  } satisfies PostgresTypedSqlConfig
+  await writeFile(configPath, `export default ${JSON.stringify(options)}`)
+  const project = await openQueryProject(configPath)
+  t.after(() => project.close())
+
+  const snapshot = await project.analyzeProject()
+  assert.deepEqual(
+    snapshot.statements.map((statement) => statement.source),
+    ['query', 'r-projected', 'second'].map((name) => join(root, `queries/${name}.typed.sql`))
+  )
+  assert.ok(
+    snapshot.inputs.some((input) => input.role === 'projection' && input.path === join(root, 'external.typed.sql'))
+  )
+  for (const statement of snapshot.statements) {
+    assert.deepEqual(statement, await project.analyze(statement.source, await readFile(statement.source, 'utf8')))
+  }
+})
+
+test('stable catalog reuse still analyzes each JSONB projection for each statement by default', async (t) => {
+  const sql = 'select public.project_item() as result'
+  const root = await createMinimalFixture(
+    `create sequence projection_inputs maxvalue 2 start with 2;
+     create domain probe_value as integer check (nextval('projection_inputs') > 0);
+     create function public.project_item() returns jsonb language sql as $$ select '{}'::jsonb $$;`,
+    sql
+  )
+  t.after(() => rm(root, { recursive: true, force: true }))
+  await writeFile(join(root, 'queries/second.typed.sql'), sql)
+  await writeFile(join(root, 'external.typed.sql'), "select 1 as item_id from unnest('{1}'::probe_value[])")
+  const configPath = join(root, 'postgres-typed-sql.config.mjs')
+  const options = {
+    schema: 'schema.sql',
+    include: ['queries'],
+    assumeStableAnalysisCatalog: true,
+    jsonbFunctionContracts: [
+      {
+        schema: 'public',
+        name: 'project_item',
+        argumentTypes: [],
+        returns: { projection: 'external.typed.sql' },
+      },
+    ],
+  } satisfies PostgresTypedSqlConfig
+  await writeFile(configPath, `export default ${JSON.stringify(options)}`)
+  const project = await openQueryProject(configPath)
+  t.after(() => project.close())
+
+  await assert.rejects(project.analyzeProject(), /external\.typed\.sql:.*nextval: reached maximum value/u)
+})
+
 test('contract projections infer nested fields and track external SQL inputs', async (t) => {
   const projectionSchema = `create function public.projection_contract(bad boolean) returns jsonb language sql as $$
     select case when bad then '{"kind":"ready","item":{"kind":"present","value":{"item_id":"wrong"}}}'::jsonb

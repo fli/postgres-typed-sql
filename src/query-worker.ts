@@ -8,7 +8,7 @@ import { MessageChannel, type MessagePort } from 'node:worker_threads'
 import { jsonbContractProjectionPaths, resolveConfig, type PostgresTypedSqlConfig } from './config.js'
 import { trackConfigImports } from './config-loader-sync.js'
 import { createAnalysisDatabase, type AnalysisDatabase } from './engine.js'
-import { analyzeTypedSqlSource, findTypedSqlFiles } from './generator.js'
+import { analyzeTypedSqlSource, analyzeTypedSqlSources, findTypedSqlFiles } from './generator.js'
 import { buildCatalogTypes } from './catalog-generator.js'
 import { enableAnalysisCatalogReuse } from './analyzer-ir.js'
 import { projectAnalysisVersion } from './project-facts.js'
@@ -166,13 +166,12 @@ async function main(): Promise<void> {
               result = await buildCatalogTypes(database, config)
             } else if (message.operation === 'project') {
               const paths = await inventory()
-              const statements = []
-              for (const sourcePath of paths) {
-                const content = await readFile(sourcePath, 'utf8')
-                statements.push(
-                  await analyzeTypedSqlSource({ sourcePath, content, database, config, projectionContents })
-                )
-              }
+              const statements = await analyzeTypedSqlSources({
+                sourcePaths: paths,
+                database,
+                config,
+                projectionContents,
+              })
               if (JSON.stringify(paths) !== JSON.stringify(await inventory()))
                 throw new Error('SQL inventory changed during analysis.')
               for (const statement of statements) {
