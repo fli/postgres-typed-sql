@@ -52,6 +52,8 @@ export interface PostgresTypedSqlConfig {
   readonly jsonbFunctionContracts?: readonly JsonbFunctionContract[]
   /** Reuse catalog query results in a project session whose catalog and catalog name resolution are stable. */
   readonly assumeStableAnalysisCatalog?: boolean
+  /** Reuse JSONB contract projections within a project analysis when their native analysis is repeatable. */
+  readonly assumeRepeatableProjectionAnalysis?: boolean
   /** Directories recursively searched for *.typed.sql files. Defaults to rootDir. */
   readonly include?: readonly string[]
   /** Exact module specifiers written into generated TypeScript. */
@@ -75,6 +77,7 @@ export interface ResolvedPostgresTypedSqlNamingConfig {
 }
 
 export interface ResolvedPostgresTypedSqlConfig {
+  readonly assumeRepeatableProjectionAnalysis?: true
   readonly assumeStableAnalysisCatalog?: true
   readonly jsonbFunctionContracts: readonly JsonbFunctionContract[]
   readonly extensions: readonly SupportedExtension[]
@@ -111,6 +114,10 @@ export function resolveConfig(config: PostgresTypedSqlConfig): ResolvedPostgresT
   if (Object.hasOwn(config, 'codecProfile')) {
     throw new Error('codecProfile is no longer supported. Map the built-in lossless values in application code.')
   }
+  const assumeRepeatableProjectionAnalysis = config.assumeRepeatableProjectionAnalysis
+  if (assumeRepeatableProjectionAnalysis !== undefined && typeof assumeRepeatableProjectionAnalysis !== 'boolean') {
+    throw new Error('assumeRepeatableProjectionAnalysis must be a boolean.')
+  }
   const assumeStableAnalysisCatalog = config.assumeStableAnalysisCatalog
   if (assumeStableAnalysisCatalog !== undefined && typeof assumeStableAnalysisCatalog !== 'boolean') {
     throw new Error('assumeStableAnalysisCatalog must be a boolean.')
@@ -137,6 +144,7 @@ export function resolveConfig(config: PostgresTypedSqlConfig): ResolvedPostgresT
   }
 
   return {
+    ...(assumeRepeatableProjectionAnalysis ? { assumeRepeatableProjectionAnalysis: true } : {}),
     ...(assumeStableAnalysisCatalog ? { assumeStableAnalysisCatalog: true } : {}),
     jsonbFunctionContracts: parseContracts(config.jsonbFunctionContracts),
     extensions: config.extensions ?? [],
